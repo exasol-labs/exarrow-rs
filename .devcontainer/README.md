@@ -4,15 +4,26 @@ This dev container uses Docker Compose to run both the development environment a
 
 ## Services
 
-### dev-con (Development Container)
-- Debian Bookworm with Rust toolchain
-- Claude Code CLI and OpenSpec CLI pre-installed
-- Firewall configured for restricted network access
+* `dev-con`: Development container
+* `dev-exa-db`: Exasol database container
 
-### dev-exa-db (Exasol Database)
+## `dev-exa-db` (Exasol Database)
 - Image: `exasol/docker-db:2025.2.0-arm64dev.0`
-- Port: 8563 (exposed to localhost)
+- Port: `8563`
+- Default credentials:
+  - User: `sys`
+  - Password: `exasol`
 - Runs in privileged mode (required by Exasol)
+
+Run ARM-based Exasol container on macOS:
+
+```bash
+docker run --name exasoldb \
+            -p 8563:8563 \
+            -d \
+            --privileged \
+            exasol/docker-db:2025.2.0-arm64dev.0
+```
 
 ## Connecting to Exasol
 
@@ -26,10 +37,13 @@ From the host machine:
 
 ## Starting the Environment
 
-The dev container will automatically start both containers when opened in VS Code with the Dev Containers extension.
+```bash
+docker compose up -d
+```
 
 ## Starting the firewall
 
+Within the container run:
 ```bash
-"postStartCommand": "sudo /usr/local/bin/init-firewall.sh",
+sudo /usr/local/bin/init-firewall.sh
 ```

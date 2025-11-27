@@ -1,5 +1,5 @@
 {
-  "name": "Claude Code Sandbox",
+  "name": "Development Sandbox",
   "dockerComposeFile": "docker-compose.yml",
   "service": "dev-con",
   "workspaceFolder": "/workspace",
