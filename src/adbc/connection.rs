@@ -73,7 +73,10 @@ impl Connection {
         let mut transport = WebSocketTransport::new();
 
         // Convert ConnectionParams to TransportConnectionParams
-        let transport_params = TransportConnectionParams::new(params.host.clone(), params.port);
+        let transport_params = TransportConnectionParams::new(params.host.clone(), params.port)
+            .with_tls(params.use_tls)
+            .with_validate_server_certificate(params.validate_server_certificate)
+            .with_timeout(params.connection_timeout.as_millis() as u64);
 
         // Connect
         transport.connect(&transport_params).await.map_err(|e| {
@@ -309,13 +312,13 @@ impl Connection {
     /// # }
     /// ```
     pub async fn begin_transaction(&self) -> Result<(), QueryError> {
+        // Exasol doesn't have a BEGIN statement - transactions are implicit.
+        // Starting a transaction just means we're tracking that autocommit is off.
+        // The actual transaction begins with the first DML/query.
         self.session
             .begin_transaction()
             .await
             .map_err(|e| QueryError::TransactionError(e.to_string()))?;
-
-        // Execute BEGIN statement
-        self.execute_update("BEGIN").await?;
 
         Ok(())
     }
