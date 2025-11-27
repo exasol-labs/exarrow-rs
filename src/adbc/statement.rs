@@ -331,9 +331,9 @@ impl std::fmt::Display for Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::auth::{AuthResponseData, Credentials};
+    use crate::connection::auth::AuthResponseData;
     use crate::connection::session::SessionConfig;
-    use crate::transport::messages::{ColumnInfo, DataType, ResultData, ResultSetHandle};
+    use crate::transport::messages::{ResultData, ResultSetHandle};
     use crate::transport::protocol::QueryResult as TransportQueryResult;
     use async_trait::async_trait;
     use mockall::mock;
