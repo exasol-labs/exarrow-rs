@@ -10,14 +10,19 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    ports:
+      - "23:22"
     volumes:
       - ..:/workspace:cached
     environment:
       - RUST_BACKTRACE=1
+      - EXASOL_HOST=dev-exa-db
+      - EXASOL_PORT=8563
+    networks:
+      - devnet
     depends_on:
-      - dev-exa-db
-    # Keep container running
-    command: sleep infinity
+      dev-exa-db:
+        condition: service_started
 
   dev-exa-db:
     image: exasol/docker-db:2025.2.0-arm64dev.0
@@ -25,3 +30,9 @@ services:
     privileged: true
     ports:
       - "8564:8563"
+    networks:
+      - devnet
+
+networks:
+  devnet:
+    driver: bridge
