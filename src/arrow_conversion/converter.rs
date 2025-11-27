@@ -222,6 +222,7 @@ fn transpose_rows_to_columns(rows: &[Vec<Value>], num_columns: usize) -> Vec<Vec
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::transport::messages::DataType;

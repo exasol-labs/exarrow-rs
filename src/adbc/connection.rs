@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_connection_builder() {
-        let builder = ConnectionBuilder::new()
+        let _builder = ConnectionBuilder::new()
             .host("localhost")
             .port(8563)
             .username("test")

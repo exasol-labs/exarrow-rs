@@ -1073,7 +1073,7 @@ mod tests {
 
     #[test]
     fn test_ffi_driver_creation() {
-        let mut driver = FfiDriver::default();
+        let mut driver = FfiDriver;
         let db = driver.new_database();
         assert!(db.is_ok());
     }

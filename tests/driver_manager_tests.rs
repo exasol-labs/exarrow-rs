@@ -666,7 +666,7 @@ fn test_driver_manager_execute_update() {
     // Create schema
     {
         let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(&format!("CREATE SCHEMA {}", schema_name))
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
             .expect("Failed to set SQL query");
         let result = stmt.execute_update();
         assert!(
@@ -679,7 +679,7 @@ fn test_driver_manager_execute_update() {
     // Create table
     {
         let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(&format!(
+        stmt.set_sql_query(format!(
             "CREATE TABLE {}.test_table (id INTEGER, name VARCHAR(100))",
             schema_name
         ))
@@ -695,7 +695,7 @@ fn test_driver_manager_execute_update() {
     // Insert row
     {
         let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(&format!(
+        stmt.set_sql_query(format!(
             "INSERT INTO {}.test_table (id, name) VALUES (1, 'test')",
             schema_name
         ))
@@ -710,7 +710,7 @@ fn test_driver_manager_execute_update() {
     // Verify data
     {
         let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(&format!(
+        stmt.set_sql_query(format!(
             "SELECT COUNT(*) AS cnt FROM {}.test_table",
             schema_name
         ))
@@ -728,7 +728,7 @@ fn test_driver_manager_execute_update() {
     // Cleanup
     {
         let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(&format!("DROP SCHEMA {} CASCADE", schema_name))
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
             .expect("Failed to set SQL query");
         let _ = stmt.execute_update();
     }

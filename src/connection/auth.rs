@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_secure_string_zeros_on_drop() {
-        let mut data = {
+        let _data = {
             let secure = SecureString::new("password".to_string());
             // Clone the underlying data to test it gets zeroed
             secure.data.clone()
@@ -353,8 +353,8 @@ mod tests {
         // After SecureString is dropped, original data should remain
         // but a new SecureString drop should zero its own data
         let secure = SecureString::new("test1234".to_string());
-        let ptr = secure.data.as_ptr();
-        let len = secure.data.len();
+        let _ptr = secure.data.as_ptr();
+        let _len = secure.data.len();
 
         drop(secure);
 
