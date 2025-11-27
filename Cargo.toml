@@ -9,9 +9,13 @@ repository = "https://github.com/your-org/exarrow-rs"
 keywords = ["exasol", "adbc", "arrow", "database", "driver"]
 categories = ["database"]
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 # Apache Arrow support
 arrow = "54.0"
+arrow-array = "54.0"
 arrow-schema = "54.0"
 
 # Async runtime
@@ -40,6 +44,22 @@ urlencoding = "2.1"
 # Hex encoding for binary data
 hex = "0.4"
 
+# RSA encryption for Exasol authentication
+rsa = "0.9"
+base64 = "0.22"
+rand = "0.8"
+
+# ADBC core traits (optional, for FFI export)
+adbc_core = { version = "0.21.0", optional = true }
+adbc_ffi = { version = "0.21.0", optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.13"
+# ADBC driver manager and core for integration testing
+adbc_driver_manager = "0.21"
+adbc_core = "0.21"
+
+[features]
+default = []
+ffi = ["dep:adbc_core", "dep:adbc_ffi"]

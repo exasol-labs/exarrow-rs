@@ -625,7 +625,7 @@ mod tests {
                 };
 
                 Ok(TransportQueryResult::ResultSet {
-                    handle: ResultSetHandle::new(1),
+                    handle: Some(ResultSetHandle::new(1)),
                     data,
                 })
             });

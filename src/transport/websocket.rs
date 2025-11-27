@@ -4,16 +4,23 @@
 //! Exasol databases using the Exasol WebSocket protocol.
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream,
+    WebSocketStream,
+};
 
 use crate::error::TransportError;
 
 use super::messages::{
-    CloseResultSetRequest, CloseResultSetResponse, DisconnectRequest, DisconnectResponse,
-    ExecuteRequest, ExecuteResponse, FetchRequest, FetchResponse, LoginRequest, LoginResponse,
-    ResultData, ResultSetHandle, SessionInfo,
+    AuthRequest, CloseResultSetRequest, CloseResultSetResponse, DisconnectRequest,
+    DisconnectResponse, ExecuteRequest, ExecuteResponse, FetchRequest, FetchResponse,
+    LoginInitRequest, LoginResponse, PublicKeyResponse, ResultData, ResultSetHandle, SessionInfo,
 };
 use super::protocol::{ConnectionParams, Credentials, QueryResult, TransportProtocol};
 
@@ -53,6 +60,10 @@ impl WebSocketTransport {
     }
 
     /// Send a message and receive a response.
+    ///
+    /// Exasol may send intermediate status messages (like "EXECUTING") before
+    /// the actual JSON response. This method skips those messages and returns
+    /// only the final JSON response.
     async fn send_receive<T, R>(&mut self, request: &T) -> Result<R, TransportError>
     where
         T: serde::Serialize,
@@ -73,21 +84,36 @@ impl WebSocketTransport {
             .await
             .map_err(|e| TransportError::SendError(e.to_string()))?;
 
-        // Receive response
-        let response_msg = ws_stream
-            .next()
-            .await
-            .ok_or_else(|| TransportError::ReceiveError("Connection closed".to_string()))?
-            .map_err(|e| TransportError::ReceiveError(e.to_string()))?;
+        // Receive response, skipping intermediate status messages
+        loop {
+            let response_msg = ws_stream
+                .next()
+                .await
+                .ok_or_else(|| TransportError::ReceiveError("Connection closed".to_string()))?
+                .map_err(|e| TransportError::ReceiveError(e.to_string()))?;
 
-        // Parse response
-        let response_text = response_msg
-            .to_text()
-            .map_err(|e| TransportError::ProtocolError(format!("Invalid message format: {}", e)))?;
+            // Parse response
+            let response_text = response_msg
+                .to_text()
+                .map_err(|e| TransportError::ProtocolError(format!("Invalid message format: {}", e)))?;
 
-        let response: R = serde_json::from_str(response_text)?;
+            // Skip intermediate status messages (e.g., "EXECUTING", "FETCHING")
+            // These are plain text, not JSON objects starting with '{'
+            if !response_text.starts_with('{') {
+                continue;
+            }
 
-        Ok(response)
+            let response: R = serde_json::from_str(response_text).map_err(|e| {
+                // Include context in error for debugging
+                let preview: String = response_text.chars().take(200).collect();
+                TransportError::InvalidResponse(format!(
+                    "JSON parse error: {}. Response preview: '{}'",
+                    e, preview
+                ))
+            })?;
+
+            return Ok(response);
+        }
     }
 
     /// Check response status and return error if not ok.
@@ -111,6 +137,31 @@ impl WebSocketTransport {
         }
         Ok(())
     }
+
+    /// Encrypt password using RSA with PKCS#1 v1.5 padding.
+    ///
+    /// The password is encrypted using the server's public key and then
+    /// base64-encoded for transmission.
+    fn encrypt_password(
+        password: &str,
+        public_key_pem: &str,
+    ) -> Result<String, TransportError> {
+        // Parse the RSA public key from PEM format
+        let public_key = RsaPublicKey::from_pkcs1_pem(public_key_pem).map_err(|e| {
+            TransportError::ProtocolError(format!("Failed to parse RSA public key: {}", e))
+        })?;
+
+        // Encrypt the password using PKCS#1 v1.5 padding
+        let mut rng = rand::thread_rng();
+        let encrypted = public_key
+            .encrypt(&mut rng, Pkcs1v15Encrypt, password.as_bytes())
+            .map_err(|e| {
+                TransportError::ProtocolError(format!("Failed to encrypt password: {}", e))
+            })?;
+
+        // Base64-encode the encrypted password
+        Ok(STANDARD.encode(&encrypted))
+    }
 }
 
 impl Default for WebSocketTransport {
@@ -130,8 +181,29 @@ impl TransportProtocol for WebSocketTransport {
 
         let url = params.to_websocket_url();
 
-        // Connect with timeout
-        let connect_future = connect_async(&url);
+        // Create TLS connector if needed
+        let connector = if params.use_tls {
+            let mut tls_builder = native_tls::TlsConnector::builder();
+            if !params.validate_server_certificate {
+                tls_builder.danger_accept_invalid_certs(true);
+                tls_builder.danger_accept_invalid_hostnames(true);
+            }
+            let tls_connector = tls_builder
+                .build()
+                .map_err(|e| TransportError::TlsError(e.to_string()))?;
+            Some(Connector::NativeTls(tls_connector))
+        } else {
+            None
+        };
+
+        // Connect with optional TLS connector
+        let connect_future = connect_async_tls_with_config(
+            &url,
+            None,      // WebSocket config
+            false,     // disable_nagle
+            connector, // TLS connector
+        );
+
         let (ws_stream, _) = tokio::time::timeout(
             tokio::time::Duration::from_millis(params.timeout_ms),
             connect_future,
@@ -158,15 +230,35 @@ impl TransportProtocol for WebSocketTransport {
             ));
         }
 
-        // Send login request
-        let request = LoginRequest::new(credentials.username.clone(), credentials.password.clone());
-        let response: LoginResponse = self.send_receive(&request).await?;
+        // Step 1: Send login init request to get the server's public key
+        let init_request = LoginInitRequest::new();
+        let key_response: PublicKeyResponse = self.send_receive(&init_request).await?;
 
         // Check response status
-        self.check_status(&response.status, &response.exception)?;
+        self.check_status(&key_response.status, &key_response.exception)?;
 
-        // Extract session info
-        let session_data = response
+        // Extract public key data
+        let key_data = key_response.response_data.ok_or_else(|| {
+            TransportError::InvalidResponse("Missing public key data in response".to_string())
+        })?;
+
+        // Step 2: Encrypt password using the server's RSA public key
+        let encrypted_password =
+            Self::encrypt_password(&credentials.password, &key_data.public_key_pem)?;
+
+        // Step 3: Send authentication request with encrypted password
+        let auth_request = AuthRequest::new(
+            credentials.username.clone(),
+            encrypted_password,
+            "exarrow-rs".to_string(),
+        );
+        let login_response: LoginResponse = self.send_receive(&auth_request).await?;
+
+        // Check response status
+        self.check_status(&login_response.status, &login_response.exception)?;
+
+        // Step 4: Extract session info from the final response
+        let session_data = login_response
             .response_data
             .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
 
@@ -208,17 +300,20 @@ impl TransportProtocol for WebSocketTransport {
 
         match result.result_type.as_str() {
             "resultSet" => {
-                // SELECT query with result set
-                let handle = result.result_set_handle.ok_or_else(|| {
-                    TransportError::InvalidResponse("Missing result set handle".to_string())
+                // SELECT query with result set - data is nested in result_set field
+                let result_set = result.result_set.as_ref().ok_or_else(|| {
+                    TransportError::InvalidResponse(format!(
+                        "Missing result_set data. Result: {:?}",
+                        result
+                    ))
                 })?;
 
-                let columns = result.columns.clone().ok_or_else(|| {
+                let columns = result_set.columns.clone().ok_or_else(|| {
                     TransportError::InvalidResponse("Missing columns".to_string())
                 })?;
 
-                let rows = result.data.clone().unwrap_or_default();
-                let total_rows = result.num_rows.unwrap_or(0);
+                let rows = result_set.data.clone().unwrap_or_default();
+                let total_rows = result_set.num_rows.unwrap_or(0);
 
                 let data = ResultData {
                     columns,
@@ -226,7 +321,10 @@ impl TransportProtocol for WebSocketTransport {
                     total_rows,
                 };
 
-                Ok(QueryResult::result_set(ResultSetHandle::new(handle), data))
+                // Handle may be None when all data fits in one response
+                let handle = result_set.result_set_handle.map(ResultSetHandle::new);
+
+                Ok(QueryResult::result_set(handle, data))
             }
             "rowCount" => {
                 // INSERT/UPDATE/DELETE query
@@ -301,10 +399,13 @@ impl TransportProtocol for WebSocketTransport {
         }
 
         // Send disconnect request if authenticated
+        // We ignore errors here because:
+        // 1. The server may close the connection before responding
+        // 2. We're closing anyway, so errors don't matter
         if self.state == ConnectionState::Authenticated {
             let request = DisconnectRequest::new();
-            let response: DisconnectResponse = self.send_receive(&request).await?;
-            self.check_status(&response.status, &response.exception)?;
+            // Try to send disconnect, but don't fail if it doesn't work
+            let _ = self.send_receive::<_, DisconnectResponse>(&request).await;
         }
 
         // Close WebSocket connection
@@ -446,6 +547,50 @@ mod tests {
         if let Err(TransportError::ProtocolError(msg)) = result {
             assert!(msg.contains("Syntax error"));
             assert!(msg.contains("42000"));
+        } else {
+            panic!("Expected ProtocolError");
+        }
+    }
+
+    #[test]
+    fn test_encrypt_password_with_valid_key() {
+        // This is a test RSA public key (2048-bit) in PKCS#1 PEM format
+        // Generated specifically for testing - NOT for production use
+        let test_public_key_pem = r#"-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEA0m59l2u9iDnMbrXHfqkOrn2dVQ3vfBJqcDuFUK03d+1PZGbVlNCq
+nbl6SRU1TGxj3CUvYGFvFr3VXLmVl8o0FNZIj8s2LHxqH8wvJkWmEEuiN6dFm6dV
+Gg4TLHqKjKBgQoWY2X2qFYDJl6xKEj5RBb9ygEgDxvUq8dLl9cYFl4VYHJ4H8Hgp
+8EJxfReFUPKoGWnzqNtDfIqI3XqFJNaKz6L8j3sI4EEnzc3E9ynSFD0CgYBWx5q0
+UvD9PX9mL6sJB0BT0E5kFNLQqN7hJlzLFXrC8qG5dMKGjxI+G1hZ2L3dE7lLvWay
+0LlY3C2eR5YU1wIDAQAB
+-----END RSA PUBLIC KEY-----"#;
+
+        let result =
+            WebSocketTransport::encrypt_password("test_password", test_public_key_pem);
+
+        assert!(result.is_ok());
+        let encrypted = result.unwrap();
+
+        // The encrypted result should be base64-encoded
+        assert!(!encrypted.is_empty());
+
+        // Verify it's valid base64
+        let decoded = STANDARD.decode(&encrypted);
+        assert!(decoded.is_ok());
+
+        // RSA 2048-bit encryption produces 256 bytes
+        assert_eq!(decoded.unwrap().len(), 256);
+    }
+
+    #[test]
+    fn test_encrypt_password_with_invalid_key() {
+        let invalid_pem = "not a valid PEM key";
+
+        let result = WebSocketTransport::encrypt_password("password", invalid_pem);
+
+        assert!(result.is_err());
+        if let Err(TransportError::ProtocolError(msg)) = result {
+            assert!(msg.contains("Failed to parse RSA public key"));
         } else {
             panic!("Expected ProtocolError");
         }

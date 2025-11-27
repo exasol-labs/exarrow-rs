@@ -167,6 +167,10 @@ pub enum TransportError {
     /// Message receive error
     #[error("Failed to receive message: {0}")]
     ReceiveError(String),
+
+    /// TLS/SSL error
+    #[error("TLS error: {0}")]
+    TlsError(String),
 }
 
 /// ADBC-compatible error codes.
@@ -306,5 +310,12 @@ mod tests {
     fn test_error_code_display() {
         assert_eq!(AdbcErrorCode::Connection.to_string(), "CONNECTION");
         assert_eq!(AdbcErrorCode::Timeout.to_string(), "TIMEOUT");
+    }
+
+    #[test]
+    fn test_transport_tls_error() {
+        let err = TransportError::TlsError("Certificate validation failed".to_string());
+        assert!(err.to_string().contains("TLS error"));
+        assert!(err.to_string().contains("Certificate validation failed"));
     }
 }

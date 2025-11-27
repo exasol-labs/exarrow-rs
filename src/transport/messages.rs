@@ -6,7 +6,146 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Login request message.
+// ============================================================================
+// Login Protocol Messages (4-step handshake)
+// ============================================================================
+
+/// Step 1: Login init request - initiates the login handshake.
+///
+/// This is the first message sent to start the authentication process.
+/// The server responds with a public key for encrypting credentials.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginInitRequest {
+    /// Command name (always "login")
+    pub command: String,
+    /// Protocol version
+    pub protocol_version: i32,
+}
+
+impl LoginInitRequest {
+    /// Create a new login init request.
+    pub fn new() -> Self {
+        Self {
+            command: "login".to_string(),
+            protocol_version: 3,
+        }
+    }
+}
+
+impl Default for LoginInitRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Step 2: Public key response - server returns RSA public key.
+///
+/// The server responds to LoginInitRequest with this message containing
+/// the RSA public key to use for encrypting the password.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicKeyResponse {
+    /// Status of the response ("ok" or "error")
+    pub status: String,
+    /// Response data containing the public key
+    pub response_data: Option<PublicKeyData>,
+    /// Exception information if failed
+    pub exception: Option<ExceptionInfo>,
+}
+
+/// Public key data returned by the server.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicKeyData {
+    /// PEM-encoded RSA public key
+    pub public_key_pem: String,
+    /// Hex-encoded RSA modulus
+    pub public_key_modulus: String,
+    /// Hex-encoded RSA exponent
+    pub public_key_exponent: String,
+}
+
+/// Step 3: Authentication request - client sends encrypted credentials.
+///
+/// After receiving the public key, the client encrypts the password
+/// using RSA and sends this authentication request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRequest {
+    /// Username
+    pub username: String,
+    /// Base64-encoded RSA-encrypted password
+    pub password: String,
+    /// Whether to use compression
+    pub use_compression: bool,
+    /// Client name identifier
+    pub client_name: String,
+    /// Driver name identifier
+    pub driver_name: String,
+    /// Client version string
+    pub client_version: String,
+    /// Optional client OS username
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_os_username: Option<String>,
+    /// Optional session attributes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl AuthRequest {
+    /// Create a new authentication request.
+    ///
+    /// # Arguments
+    /// * `username` - The database username
+    /// * `encrypted_password` - The Base64-encoded RSA-encrypted password
+    /// * `client_name` - Name of the client application
+    pub fn new(username: String, encrypted_password: String, client_name: String) -> Self {
+        Self {
+            username,
+            password: encrypted_password,
+            use_compression: false,
+            client_name: client_name.clone(),
+            driver_name: client_name,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            client_os_username: None,
+            attributes: None,
+        }
+    }
+
+    /// Set the driver name.
+    pub fn with_driver_name(mut self, driver_name: String) -> Self {
+        self.driver_name = driver_name;
+        self
+    }
+
+    /// Set the client version.
+    pub fn with_client_version(mut self, version: String) -> Self {
+        self.client_version = version;
+        self
+    }
+
+    /// Set the client OS username.
+    pub fn with_os_username(mut self, username: String) -> Self {
+        self.client_os_username = Some(username);
+        self
+    }
+
+    /// Set session attributes.
+    pub fn with_attributes(mut self, attributes: HashMap<String, serde_json::Value>) -> Self {
+        self.attributes = Some(attributes);
+        self
+    }
+}
+
+// ============================================================================
+// Legacy Login Request (kept for reference/compatibility)
+// ============================================================================
+
+/// Login request message (legacy single-step - NOT USED for actual authentication).
+///
+/// Note: Exasol requires a 4-step handshake. Use `LoginInitRequest` and `AuthRequest`
+/// for proper authentication.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginRequest {
@@ -40,7 +179,14 @@ impl LoginRequest {
     }
 }
 
-/// Login response message.
+// ============================================================================
+// Step 4: Login Response (final authentication response)
+// ============================================================================
+
+/// Login response message (Step 4 of the handshake).
+///
+/// This is the final response after successful authentication,
+/// containing session information.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginResponse {
@@ -56,8 +202,8 @@ pub struct LoginResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginResponseData {
-    /// Session ID
-    pub session_id: String,
+    /// Session ID (numeric in Exasol WebSocket API)
+    pub session_id: i64,
     /// Protocol version accepted
     pub protocol_version: i32,
     /// Release version
@@ -71,12 +217,18 @@ pub struct LoginResponseData {
     /// Maximum varchar size
     pub max_varchar_size: Option<i64>,
     /// Maximum identifier length
+    pub max_identifier_length: Option<i64>,
+    /// Identifier quote string
     pub identifier_quote_string: Option<String>,
     /// Time zone
     pub time_zone: Option<String>,
     /// Time zone behavior
     pub time_zone_behavior: Option<String>,
 }
+
+// ============================================================================
+// Query Execution Messages
+// ============================================================================
 
 /// Execute SQL statement request.
 #[derive(Debug, Clone, Serialize)]
@@ -144,23 +296,33 @@ pub struct ExecuteResponseData {
     pub attributes: Option<HashMap<String, String>>,
 }
 
-/// Result set information.
+/// Result set information (outer wrapper in results array).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultSetInfo {
-    /// Result type
+    /// Result type: "resultSet" for SELECT, "rowCount" for DML
     pub result_type: String,
-    /// Row count (for non-SELECT statements)
+    /// Row count (for DML statements like INSERT/UPDATE/DELETE)
     pub row_count: Option<i64>,
-    /// Result set handle (for SELECT statements)
+    /// Nested result set data (for SELECT statements)
+    pub result_set: Option<ResultSetData>,
+}
+
+/// Result set data (nested inside ResultSetInfo for SELECT queries).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultSetData {
+    /// Result set handle for fetching more data
     pub result_set_handle: Option<i32>,
+    /// Number of columns
+    pub num_columns: Option<i32>,
+    /// Total number of rows in result set
+    pub num_rows: Option<i64>,
+    /// Number of rows in this message chunk
+    pub num_rows_in_message: Option<i64>,
     /// Column information
     pub columns: Option<Vec<ColumnInfo>>,
-    /// Number of rows in result set
-    pub num_rows: Option<i64>,
-    /// Number of rows in first chunk
-    pub num_rows_in_message: Option<i64>,
-    /// Data (if included in response)
+    /// Data rows (if included in response)
     pub data: Option<Vec<Vec<serde_json::Value>>>,
 }
 
@@ -194,6 +356,10 @@ pub struct DataType {
     /// Fraction (for interval types)
     pub fraction: Option<i32>,
 }
+
+// ============================================================================
+// Fetch Messages
+// ============================================================================
 
 /// Fetch request to retrieve more result data.
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +409,10 @@ pub struct FetchResponseData {
     pub data: Vec<Vec<serde_json::Value>>,
 }
 
+// ============================================================================
+// Result Set Management Messages
+// ============================================================================
+
 /// Close result set request.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -272,6 +442,10 @@ pub struct CloseResultSetResponse {
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
 }
+
+// ============================================================================
+// Session Management Messages
+// ============================================================================
 
 /// Disconnect request.
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +480,10 @@ pub struct DisconnectResponse {
     pub exception: Option<ExceptionInfo>,
 }
 
+// ============================================================================
+// Common Types
+// ============================================================================
+
 /// Exception information from Exasol.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -338,7 +516,7 @@ pub struct SessionInfo {
 impl From<LoginResponseData> for SessionInfo {
     fn from(data: LoginResponseData) -> Self {
         Self {
-            session_id: data.session_id,
+            session_id: data.session_id.to_string(),
             protocol_version: data.protocol_version,
             release_version: data.release_version,
             database_name: data.database_name,
@@ -385,6 +563,57 @@ pub struct ResultData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_login_init_request_serialization() {
+        let request = LoginInitRequest::new();
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"command\":\"login\""));
+        assert!(json.contains("\"protocolVersion\":3"));
+        // Should NOT contain username or password
+        assert!(!json.contains("username"));
+        assert!(!json.contains("password"));
+    }
+
+    #[test]
+    fn test_public_key_response_deserialization() {
+        let json = r#"{
+            "status": "ok",
+            "responseData": {
+                "publicKeyPem": "-----BEGIN RSA PUBLIC KEY-----\nMIIBCg...\n-----END RSA PUBLIC KEY-----",
+                "publicKeyModulus": "abc123",
+                "publicKeyExponent": "010001"
+            }
+        }"#;
+
+        let response: PublicKeyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status, "ok");
+
+        let data = response.response_data.unwrap();
+        assert!(data.public_key_pem.contains("BEGIN RSA PUBLIC KEY"));
+        assert_eq!(data.public_key_modulus, "abc123");
+        assert_eq!(data.public_key_exponent, "010001");
+    }
+
+    #[test]
+    fn test_auth_request_serialization() {
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "encrypted_password_base64".to_string(),
+            "exarrow-rs".to_string(),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"username\":\"sys\""));
+        assert!(json.contains("\"password\":\"encrypted_password_base64\""));
+        assert!(json.contains("\"useCompression\":false"));
+        assert!(json.contains("\"clientName\":\"exarrow-rs\""));
+        assert!(json.contains("\"driverName\":\"exarrow-rs\""));
+        assert!(json.contains("\"clientVersion\":"));
+        // Should not contain null attributes
+        assert!(!json.contains("\"attributes\":null"));
+    }
 
     #[test]
     fn test_login_request_serialization() {
@@ -434,7 +663,7 @@ mod tests {
         let json = r#"{
             "status": "ok",
             "responseData": {
-                "sessionId": "1234567890",
+                "sessionId": 1234567890,
                 "protocolVersion": 3,
                 "releaseVersion": "8.0.0",
                 "databaseName": "MYDB",
@@ -448,7 +677,7 @@ mod tests {
         assert_eq!(response.status, "ok");
 
         let data = response.response_data.unwrap();
-        assert_eq!(data.session_id, "1234567890");
+        assert_eq!(data.session_id, 1234567890);
         assert_eq!(data.protocol_version, 3);
         assert_eq!(data.release_version, "8.0.0");
         assert_eq!(data.database_name, "MYDB");
@@ -456,6 +685,7 @@ mod tests {
 
     #[test]
     fn test_execute_response_deserialization() {
+        // Use the correct nested structure: results[].resultSet.{handle, columns, data}
         let json = r#"{
             "status": "ok",
             "responseData": {
@@ -463,31 +693,34 @@ mod tests {
                 "results": [
                     {
                         "resultType": "resultSet",
-                        "resultSetHandle": 1,
-                        "numRows": 100,
-                        "numRowsInMessage": 10,
-                        "columns": [
-                            {
-                                "name": "ID",
-                                "dataType": {
-                                    "type": "DECIMAL",
-                                    "precision": 18,
-                                    "scale": 0
+                        "resultSet": {
+                            "resultSetHandle": 1,
+                            "numColumns": 2,
+                            "numRows": 100,
+                            "numRowsInMessage": 2,
+                            "columns": [
+                                {
+                                    "name": "ID",
+                                    "dataType": {
+                                        "type": "DECIMAL",
+                                        "precision": 18,
+                                        "scale": 0
+                                    }
+                                },
+                                {
+                                    "name": "NAME",
+                                    "dataType": {
+                                        "type": "VARCHAR",
+                                        "size": 100,
+                                        "characterSet": "UTF8"
+                                    }
                                 }
-                            },
-                            {
-                                "name": "NAME",
-                                "dataType": {
-                                    "type": "VARCHAR",
-                                    "size": 100,
-                                    "characterSet": "UTF8"
-                                }
-                            }
-                        ],
-                        "data": [
-                            [1, "Alice"],
-                            [2, "Bob"]
-                        ]
+                            ],
+                            "data": [
+                                [1, "Alice"],
+                                [2, "Bob"]
+                            ]
+                        }
                     }
                 ]
             }
@@ -502,17 +735,19 @@ mod tests {
 
         let result = &data.results[0];
         assert_eq!(result.result_type, "resultSet");
-        assert_eq!(result.result_set_handle.unwrap(), 1);
-        assert_eq!(result.num_rows.unwrap(), 100);
 
-        let columns = result.columns.as_ref().unwrap();
+        let result_set = result.result_set.as_ref().unwrap();
+        assert_eq!(result_set.result_set_handle.unwrap(), 1);
+        assert_eq!(result_set.num_rows.unwrap(), 100);
+
+        let columns = result_set.columns.as_ref().unwrap();
         assert_eq!(columns.len(), 2);
         assert_eq!(columns[0].name, "ID");
         assert_eq!(columns[0].data_type.type_name, "DECIMAL");
         assert_eq!(columns[1].name, "NAME");
         assert_eq!(columns[1].data_type.type_name, "VARCHAR");
 
-        let data_rows = result.data.as_ref().unwrap();
+        let data_rows = result_set.data.as_ref().unwrap();
         assert_eq!(data_rows.len(), 2);
     }
 
@@ -546,20 +781,21 @@ mod tests {
     #[test]
     fn test_session_info_from_login_response() {
         let response_data = LoginResponseData {
-            session_id: "test-session".to_string(),
+            session_id: 1234567890,
             protocol_version: 3,
             release_version: "8.0.0".to_string(),
             database_name: "TEST_DB".to_string(),
             product_name: "Exasol".to_string(),
             max_data_message_size: Some(5242880),
             max_varchar_size: None,
+            max_identifier_length: None,
             identifier_quote_string: None,
             time_zone: Some("Europe/Berlin".to_string()),
             time_zone_behavior: None,
         };
 
         let session_info: SessionInfo = response_data.into();
-        assert_eq!(session_info.session_id, "test-session");
+        assert_eq!(session_info.session_id, "1234567890");
         assert_eq!(session_info.protocol_version, 3);
         assert_eq!(session_info.max_data_message_size, 5242880);
         assert_eq!(session_info.time_zone.unwrap(), "Europe/Berlin");
