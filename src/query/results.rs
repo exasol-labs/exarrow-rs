@@ -118,11 +118,12 @@ impl ResultSet {
                     Vec::new()
                 };
 
-                let complete = data.total_rows == data.rows.len() as i64;
+                // Result is complete if all data was in initial response OR no handle provided
+                let complete = handle.is_none() || data.total_rows == data.rows.len() as i64;
 
                 Ok(Self {
                     inner: ResultSetInner::Stream {
-                        handle: Some(handle),
+                        handle, // Already Option<ResultSetHandle>
                         metadata,
                         batches,
                         complete,
@@ -648,7 +649,7 @@ mod tests {
         };
 
         let result = TransportQueryResult::ResultSet {
-            handle: ResultSetHandle::new(1),
+            handle: Some(ResultSetHandle::new(1)),
             data,
         };
 

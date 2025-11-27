@@ -530,7 +530,7 @@ fn apply_query_params(
                 let use_tls = parse_bool(&value)?;
                 builder = builder.use_tls(use_tls);
             }
-            "validate_certificate" | "verify_certificate" => {
+            "validate_certificate" | "verify_certificate" | "validateservercertificate" => {
                 let validate = parse_bool(&value)?;
                 builder = builder.validate_server_certificate(validate);
             }

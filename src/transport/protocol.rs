@@ -18,6 +18,8 @@ pub struct ConnectionParams {
     pub port: u16,
     /// Use TLS/SSL
     pub use_tls: bool,
+    /// Validate server certificate (default: true)
+    pub validate_server_certificate: bool,
     /// Connection timeout in milliseconds
     pub timeout_ms: u64,
 }
@@ -29,6 +31,7 @@ impl ConnectionParams {
             host,
             port,
             use_tls: true,
+            validate_server_certificate: true,
             timeout_ms: 30_000, // 30 seconds default
         }
     }
@@ -36,6 +39,18 @@ impl ConnectionParams {
     /// Set whether to use TLS.
     pub fn with_tls(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
+        self
+    }
+
+    /// Set whether to validate the server certificate.
+    ///
+    /// # Security Warning
+    ///
+    /// Disabling certificate validation makes the connection vulnerable to
+    /// man-in-the-middle attacks. Only disable in development environments
+    /// with self-signed certificates.
+    pub fn with_validate_server_certificate(mut self, validate: bool) -> Self {
+        self.validate_server_certificate = validate;
         self
     }
 
@@ -172,8 +187,8 @@ pub trait TransportProtocol: Send + Sync {
 pub enum QueryResult {
     /// Result set from a SELECT query
     ResultSet {
-        /// Handle for fetching data
-        handle: ResultSetHandle,
+        /// Handle for fetching more data (None if all data is in the response)
+        handle: Option<ResultSetHandle>,
         /// Result data (may include first batch of rows)
         data: ResultData,
     },
@@ -186,7 +201,7 @@ pub enum QueryResult {
 
 impl QueryResult {
     /// Create a result set query result.
-    pub fn result_set(handle: ResultSetHandle, data: ResultData) -> Self {
+    pub fn result_set(handle: Option<ResultSetHandle>, data: ResultData) -> Self {
         Self::ResultSet { handle, data }
     }
 
@@ -206,9 +221,10 @@ impl QueryResult {
     }
 
     /// Get the result set handle if this is a result set.
+    /// Returns None if all data was included in the initial response.
     pub fn handle(&self) -> Option<ResultSetHandle> {
         match self {
-            Self::ResultSet { handle, .. } => Some(*handle),
+            Self::ResultSet { handle, .. } => *handle,
             _ => None,
         }
     }
@@ -218,6 +234,17 @@ impl QueryResult {
         match self {
             Self::RowCount { count } => Some(*count),
             _ => None,
+        }
+    }
+
+    /// Check if this result has more data to fetch.
+    pub fn has_more_data(&self) -> bool {
+        match self {
+            Self::ResultSet { handle, data } => {
+                // Has more if there's a handle AND we have fewer rows than total
+                handle.is_some() && (data.rows.len() as i64) < data.total_rows
+            }
+            _ => false,
         }
     }
 }
@@ -232,6 +259,7 @@ mod tests {
         assert_eq!(params.host, "localhost");
         assert_eq!(params.port, 8563);
         assert!(params.use_tls);
+        assert!(params.validate_server_certificate);
         assert_eq!(params.timeout_ms, 30_000);
     }
 
@@ -244,7 +272,18 @@ mod tests {
         assert_eq!(params.host, "db.example.com");
         assert_eq!(params.port, 9000);
         assert!(!params.use_tls);
+        assert!(params.validate_server_certificate);
         assert_eq!(params.timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn test_connection_params_validate_certificate_disabled() {
+        let params = ConnectionParams::new("localhost".to_string(), 8563)
+            .with_tls(true)
+            .with_validate_server_certificate(false);
+
+        assert!(params.use_tls);
+        assert!(!params.validate_server_certificate);
     }
 
     #[test]
@@ -268,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_credentials_drop_clears_password() {
-        let mut creds = Credentials::new("user".to_string(), "secret".to_string());
+        let creds = Credentials::new("user".to_string(), "secret".to_string());
         assert_eq!(creds.password, "secret");
         drop(creds);
         // Password should be cleared (can't test directly after drop)
@@ -295,7 +334,7 @@ mod tests {
             total_rows: 0,
         };
 
-        let result = QueryResult::result_set(ResultSetHandle::new(1), data);
+        let result = QueryResult::result_set(Some(ResultSetHandle::new(1)), data);
         assert!(result.is_result_set());
         assert!(!result.is_row_count());
         assert_eq!(result.handle().unwrap().as_i32(), 1);
