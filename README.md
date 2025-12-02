@@ -1,6 +1,7 @@
 # exarrow-rs
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
+[![CI](https://github.com/marconae/exarrow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/marconae/exarrow-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 > ADBC-compatible driver for Exasol with Apache Arrow data format support.
@@ -30,11 +31,13 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-exarrow-rs = "0.1"
+exarrow-rs = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ## Quick Start
+
+### Basic Usage
 
 ```rust
 use exarrow_rs::adbc::Driver;
@@ -70,6 +73,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### ADBC Driver Manager
+
+Load the driver dynamically via the ADBC driver manager:
+
+```rust
+use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
+use adbc_core::{Connection, Database, Driver, Statement};
+use adbc_driver_manager::ManagedDriver;
+
+// Build the FFI library first: cargo build --release --features ffi
+
+let mut driver = ManagedDriver::load_dynamic_from_filename(
+    "target/release/libexarrow_rs.dylib", // .so on Linux
+    Some(b"ExarrowDriverInit"),
+    AdbcVersion::V110,
+)?;
+
+let opts = vec![(OptionDatabase::Uri, OptionValue::String(
+    "exasol://sys:exasol@localhost:8563".to_string()
+))];
+let db = driver.new_database_with_opts(opts)?;
+let mut conn = db.new_connection()?;
+
+let mut stmt = conn.new_statement()?;
+stmt.set_sql_query("SELECT 1")?;
+let reader = stmt.execute()?;
+```
+
+
 ## Connection String Format
 
 ```
@@ -90,23 +122,23 @@ exasol://myuser:mypass@exasol.example.com:8563/production?connection_timeout=60&
 
 | Exasol Type | Arrow Type |
 |-------------|------------|
-| BOOLEAN | Boolean |
-| CHAR, VARCHAR | Utf8 |
-| DECIMAL(p≤38, s) | Decimal128 |
-| DECIMAL(p>38, s) | Decimal256 |
-| DOUBLE | Float64 |
-| DATE | Date32 |
-| TIMESTAMP | Timestamp(Microsecond) |
-| INTERVAL YEAR TO MONTH | Interval(MonthDayNano) |
-| INTERVAL DAY TO SECOND | Interval(MonthDayNano) |
-| GEOMETRY | Binary |
+| `BOOLEAN` | `Boolean` |
+| `CHAR`, `VARCHAR` | `Utf8` |
+| `DECIMAL(p≤38, s)` | `Decimal128` |
+| `DECIMAL(p>38, s)` | `Decimal256` |
+| `DOUBLE` | `Float64` |
+| `DATE` | `Date32` |
+| `TIMESTAMP` | `Timestamp(Microsecond)` |
+| `INTERVAL YEAR TO MONTH` | `Interval(MonthDayNano)` |
+| `INTERVAL DAY TO SECOND` | `Interval(MonthDayNano)` |
+| `GEOMETRY` | `Binary` |
 
 ## Examples
 
-See the [examples/](examples/) directory for comprehensive usage examples:
+See the [examples/](examples/) directory:
 
-- `basic_usage.rs` - Complete demonstration of all features
-- `driver_manager_usage.rs` - Using the Driver Manager API
+- `basic_usage.rs` - Direct API usage
+- `driver_manager_usage.rs` - ADBC driver manager integration
 
 ## License
 
