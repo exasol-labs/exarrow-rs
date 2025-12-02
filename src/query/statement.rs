@@ -624,7 +624,7 @@ mod tests {
                             fraction: None,
                         },
                     }],
-                    rows: vec![vec![serde_json::json!(1)]],
+                    data: vec![vec![serde_json::json!(1)]],
                     total_rows: 1,
                 };
 

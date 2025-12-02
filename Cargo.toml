@@ -2,10 +2,10 @@
 name = "exarrow-rs"
 version = "0.1.0"
 edition = "2021"
-authors = ["exarrow-rs contributors"]
+authors = ["Marco Nätlitz"]
 license = "MIT"
 description = "ADBC-compatible driver for Exasol with Arrow data format support"
-repository = "https://github.com/your-org/exarrow-rs"
+repository = "https://github.com/marconae/exarrow-rs"
 keywords = ["exasol", "adbc", "arrow", "database", "driver"]
 categories = ["database"]
 
@@ -14,15 +14,15 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 # Apache Arrow support
-arrow = "54.0"
-arrow-array = "54.0"
-arrow-schema = "54.0"
+arrow = "57.1.0"
+arrow-array = "57.1.0"
+arrow-schema = "57.1.0"
 
 # Async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 
 # WebSocket client
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -47,15 +47,16 @@ hex = "0.4"
 # RSA encryption for Exasol authentication
 rsa = "0.9"
 base64 = "0.22"
-rand = "0.8"
+# Use rand_core 0.6 for compatibility with rsa crate's CryptoRng trait
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # ADBC core traits (optional, for FFI export)
 adbc_core = { version = "0.21.0", optional = true }
 adbc_ffi = { version = "0.21.0", optional = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
-mockall = "0.13"
+# Mocking for tests
+mockall = "0.14.0"
 # ADBC driver manager and core for integration testing
 adbc_driver_manager = "0.21"
 adbc_core = "0.21"
