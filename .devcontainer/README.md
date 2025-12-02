@@ -1,4 +1,4 @@
-# Devcontainer Setup
+# Development Container Setup
 
 This dev container uses Docker Compose to run both the development environment and an Exasol database.
 
@@ -24,6 +24,8 @@ docker run --name exasoldb \
             --privileged \
             exasol/docker-db:2025.2.0-arm64dev.0
 ```
+
+See [exasol/docker-db](https://hub.docker.com/r/exasol/docker-db) for more details.
 
 ## Connecting to Exasol
 

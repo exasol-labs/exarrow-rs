@@ -14,7 +14,7 @@ Before running the examples, you need:
 
 ### Basic Usage
 
-The `basic_usage.rs` example demonstrates the core functionality:
+The `basic_usage.rs` example demonstrates direct usage of the exarrow-rs API:
 
 ```bash
 cargo run --example basic_usage
@@ -24,11 +24,29 @@ This example shows:
 - Creating an ADBC driver instance
 - Opening a database connection
 - Executing queries
-- Parameter binding
 - Transaction management
 - Result processing with Arrow RecordBatches
-- Metadata queries
 - Proper connection cleanup
+
+### Driver Manager Usage
+
+The `driver_manager_usage.rs` example demonstrates loading the driver dynamically via the ADBC driver manager, which is how external applications (Python, R, etc.) would use the driver:
+
+```bash
+# First, build the FFI-enabled shared library
+cargo build --release --features ffi
+
+# Then run the example
+cargo run --example driver_manager_usage
+```
+
+This example shows:
+- Loading the driver from a shared library at runtime
+- Using the standard ADBC driver manager interface
+- Creating database and connection objects via ADBC
+- Executing queries through ADBC Statement API
+- Retrieving driver info and table types
+- DDL/DML operations through the driver manager
 
 ## Modifying Connection Settings
 
@@ -53,32 +71,6 @@ let connection = Connection::builder()
     .schema("YOUR_SCHEMA")
     .connect()
     .await?;
-```
-
-## Example Output
-
-When run successfully, you should see output similar to:
-
-```
-=== exarrow-rs Basic Usage Example ===
-
-1. Creating ADBC driver...
-   Driver: exarrow-rs v0.1.0 by exarrow-rs contributors
-   Description: ADBC-compatible driver for Exasol with Arrow data format support
-
-2. Opening database connection factory...
-   Connection string: exasol://sys@localhost:8563/TEST_SCHEMA
-
-3. Connecting to database...
-   Connected! Session ID: 123456789
-
-4. Executing a simple query...
-   Query returned 1 batch(es)
-   Batch 0: 1 rows, 3 columns
-
-...
-
-=== Example completed successfully! ===
 ```
 
 ## Troubleshooting
