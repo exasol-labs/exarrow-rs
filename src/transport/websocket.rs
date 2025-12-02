@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use rand_core::OsRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use tokio::net::TcpStream;
@@ -84,7 +85,7 @@ impl WebSocketTransport {
 
         // Send request
         ws_stream
-            .send(Message::Text(request_json))
+            .send(Message::Text(request_json.into()))
             .await
             .map_err(|e| TransportError::SendError(e.to_string()))?;
 
@@ -156,7 +157,8 @@ impl WebSocketTransport {
         })?;
 
         // Encrypt the password using PKCS#1 v1.5 padding
-        let mut rng = rand::thread_rng();
+        // Use OsRng from rand_core 0.6 for compatibility with rsa crate's CryptoRng trait
+        let mut rng = OsRng;
         let encrypted = public_key
             .encrypt(&mut rng, Pkcs1v15Encrypt, password.as_bytes())
             .map_err(|e| {
@@ -316,12 +318,13 @@ impl TransportProtocol for WebSocketTransport {
                     TransportError::InvalidResponse("Missing columns".to_string())
                 })?;
 
-                let rows = result_set.data.clone().unwrap_or_default();
+                // Data is in column-major format from Exasol
+                let data_values = result_set.data.clone().unwrap_or_default();
                 let total_rows = result_set.num_rows.unwrap_or(0);
 
                 let data = ResultData {
                     columns,
-                    rows,
+                    data: data_values,  // Column-major format
                     total_rows,
                 };
 
@@ -373,9 +376,10 @@ impl TransportProtocol for WebSocketTransport {
 
         // Note: columns are not included in fetch response,
         // they should be cached from the initial execute response
+        // Data is in column-major format from Exasol
         Ok(ResultData {
             columns: vec![], // Caller must cache columns from execute
-            rows: fetch_data.data,
+            data: fetch_data.data,  // Column-major format
             total_rows: fetch_data.num_rows,
         })
     }
@@ -501,12 +505,13 @@ impl TransportProtocol for WebSocketTransport {
                     TransportError::InvalidResponse("Missing columns".to_string())
                 })?;
 
-                let rows = result_set.data.clone().unwrap_or_default();
+                // Data is in column-major format from Exasol
+                let data_values = result_set.data.clone().unwrap_or_default();
                 let total_rows = result_set.num_rows.unwrap_or(0);
 
                 let data = ResultData {
                     columns,
-                    rows,
+                    data: data_values,  // Column-major format
                     total_rows,
                 };
 

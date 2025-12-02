@@ -737,13 +737,30 @@ impl From<i32> for ResultSetHandle {
     }
 }
 
-/// Result data containing rows and metadata.
+/// Result data containing column-major data and metadata.
+///
+/// **IMPORTANT**: Exasol WebSocket API returns data in **column-major format**.
+/// Each inner array in `data` contains all values for a single column, not a row.
+///
+/// # Example
+///
+/// For a query `SELECT id, name FROM users` returning 3 rows:
+/// ```json
+/// {
+///   "data": [
+///     [1, 2, 3],           // Column 0 (id): values for all rows
+///     ["Alice", "Bob", "Carol"]  // Column 1 (name): values for all rows
+///   ],
+///   "total_rows": 3
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ResultData {
     /// Column metadata
     pub columns: Vec<ColumnInfo>,
-    /// Data rows
-    pub rows: Vec<Vec<serde_json::Value>>,
+    /// Data in column-major format: data[col_idx][row_idx]
+    /// Each inner Vec contains all values for one column.
+    pub data: Vec<Vec<serde_json::Value>>,
     /// Total number of rows
     pub total_rows: i64,
 }
@@ -874,6 +891,7 @@ mod tests {
     #[test]
     fn test_execute_response_deserialization() {
         // Use the correct nested structure: results[].resultSet.{handle, columns, data}
+        // Note: data is in COLUMN-MAJOR format
         let json = r#"{
             "status": "ok",
             "responseData": {
@@ -884,7 +902,7 @@ mod tests {
                         "resultSet": {
                             "resultSetHandle": 1,
                             "numColumns": 2,
-                            "numRows": 100,
+                            "numRows": 2,
                             "numRowsInMessage": 2,
                             "columns": [
                                 {
@@ -905,8 +923,8 @@ mod tests {
                                 }
                             ],
                             "data": [
-                                [1, "Alice"],
-                                [2, "Bob"]
+                                [1, 2],
+                                ["Alice", "Bob"]
                             ]
                         }
                     }
@@ -926,7 +944,7 @@ mod tests {
 
         let result_set = result.result_set.as_ref().unwrap();
         assert_eq!(result_set.result_set_handle.unwrap(), 1);
-        assert_eq!(result_set.num_rows.unwrap(), 100);
+        assert_eq!(result_set.num_rows.unwrap(), 2);
 
         let columns = result_set.columns.as_ref().unwrap();
         assert_eq!(columns.len(), 2);
@@ -935,8 +953,11 @@ mod tests {
         assert_eq!(columns[1].name, "NAME");
         assert_eq!(columns[1].data_type.type_name, "VARCHAR");
 
-        let data_rows = result_set.data.as_ref().unwrap();
-        assert_eq!(data_rows.len(), 2);
+        // Column-major: 2 columns, each with 2 values
+        let data_cols = result_set.data.as_ref().unwrap();
+        assert_eq!(data_cols.len(), 2);
+        assert_eq!(data_cols[0].len(), 2); // Column 0 has 2 rows
+        assert_eq!(data_cols[1].len(), 2); // Column 1 has 2 rows
     }
 
     #[test]
