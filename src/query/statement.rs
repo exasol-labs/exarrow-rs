@@ -402,7 +402,9 @@ impl StatementBuilder {
 mod tests {
     use super::*;
     use crate::transport::messages::{ColumnInfo, DataType, ResultData, ResultSetHandle};
-    use crate::transport::protocol::{PreparedStatementHandle, QueryResult as TransportQueryResult};
+    use crate::transport::protocol::{
+        PreparedStatementHandle, QueryResult as TransportQueryResult,
+    };
     use async_trait::async_trait;
     use mockall::mock;
 

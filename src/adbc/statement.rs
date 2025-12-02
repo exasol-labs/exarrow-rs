@@ -382,7 +382,9 @@ mod tests {
     use crate::connection::auth::AuthResponseData;
     use crate::connection::session::SessionConfig;
     use crate::transport::messages::{DataType, ResultData, ResultSetHandle};
-    use crate::transport::protocol::{PreparedStatementHandle, QueryResult as TransportQueryResult};
+    use crate::transport::protocol::{
+        PreparedStatementHandle, QueryResult as TransportQueryResult,
+    };
     use async_trait::async_trait;
     use mockall::mock;
 
