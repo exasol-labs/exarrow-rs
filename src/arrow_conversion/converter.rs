@@ -1,7 +1,11 @@
 //! Main converter for transforming Exasol WebSocket JSON responses to Arrow RecordBatch.
 //!
-//! This module provides the core conversion logic that takes row-major JSON data
-//! and converts it directly to columnar Arrow format without intermediate representations.
+//! This module provides the core conversion logic that takes column-major JSON data
+//! (as returned by Exasol's WebSocket API) and converts it directly to Arrow format.
+//!
+//! **IMPORTANT**: Exasol WebSocket API returns data in column-major format, where each
+//! inner array contains all values for a single column. This converter expects data
+//! in that format.
 
 use crate::error::ConversionError;
 use crate::transport::messages::{ColumnInfo, ResultData};
@@ -70,7 +74,9 @@ impl ArrowConverter {
 
     /// Convert Exasol result data to an Arrow RecordBatch.
     ///
-    /// This performs the main conversion from row-major JSON data to columnar Arrow format.
+    /// Exasol returns data in column-major format where `data[col_idx]` contains
+    /// all values for column `col_idx`. This method converts directly to Arrow
+    /// without needing to transpose.
     ///
     /// # Arguments
     /// * `result_data` - The result data from Exasol WebSocket response
@@ -89,32 +95,26 @@ impl ArrowConverter {
         result_data: &ResultData,
     ) -> Result<RecordBatch, ConversionError> {
         // Handle empty result set
-        if result_data.rows.is_empty() {
+        if result_data.data.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
 
-        // Verify row structure matches schema
+        // Verify column count matches schema
         let num_columns = self.column_types.len();
-        for (row_idx, row) in result_data.rows.iter().enumerate() {
-            if row.len() != num_columns {
-                return Err(ConversionError::SchemaMismatch(format!(
-                    "Row {} has {} columns, expected {}",
-                    row_idx,
-                    row.len(),
-                    num_columns
-                )));
-            }
+        if result_data.data.len() != num_columns {
+            return Err(ConversionError::SchemaMismatch(format!(
+                "Data has {} columns, expected {}",
+                result_data.data.len(),
+                num_columns
+            )));
         }
 
-        // Transpose row-major data to column-major (cloning variant for borrowed data)
-        let columns_data = transpose_rows_to_columns_borrowed(&result_data.rows, num_columns);
-
-        // Build Arrow arrays for each column
+        // Build Arrow arrays for each column directly from column-major data
         let arrays: Result<Vec<_>, _> = self
             .column_types
             .iter()
             .enumerate()
-            .map(|(col_idx, exasol_type)| build_array(exasol_type, &columns_data[col_idx], col_idx))
+            .map(|(col_idx, exasol_type)| build_array(exasol_type, &result_data.data[col_idx], col_idx))
             .collect();
 
         let arrays = arrays?;
@@ -126,8 +126,8 @@ impl ArrowConverter {
 
     /// Convert Exasol result data to an Arrow RecordBatch, consuming the input.
     ///
-    /// This is an optimized version that takes ownership of the result data to avoid
-    /// cloning values during the row-to-column transpose operation.
+    /// This is an optimized version that takes ownership of the result data.
+    /// Since Exasol already returns column-major data, this avoids any copying.
     ///
     /// # Arguments
     /// * `result_data` - The result data from Exasol WebSocket response (consumed)
@@ -146,32 +146,26 @@ impl ArrowConverter {
         result_data: ResultData,
     ) -> Result<RecordBatch, ConversionError> {
         // Handle empty result set
-        if result_data.rows.is_empty() {
+        if result_data.data.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
 
-        // Verify row structure matches schema
+        // Verify column count matches schema
         let num_columns = self.column_types.len();
-        for (row_idx, row) in result_data.rows.iter().enumerate() {
-            if row.len() != num_columns {
-                return Err(ConversionError::SchemaMismatch(format!(
-                    "Row {} has {} columns, expected {}",
-                    row_idx,
-                    row.len(),
-                    num_columns
-                )));
-            }
+        if result_data.data.len() != num_columns {
+            return Err(ConversionError::SchemaMismatch(format!(
+                "Data has {} columns, expected {}",
+                result_data.data.len(),
+                num_columns
+            )));
         }
 
-        // Transpose row-major data to column-major (move variant - no cloning)
-        let columns_data = transpose_rows_to_columns(result_data.rows, num_columns);
-
-        // Build Arrow arrays for each column
+        // Build Arrow arrays for each column directly from column-major data
         let arrays: Result<Vec<_>, _> = self
             .column_types
             .iter()
             .enumerate()
-            .map(|(col_idx, exasol_type)| build_array(exasol_type, &columns_data[col_idx], col_idx))
+            .map(|(col_idx, exasol_type)| build_array(exasol_type, &result_data.data[col_idx], col_idx))
             .collect();
 
         let arrays = arrays?;
@@ -285,8 +279,9 @@ fn parse_exasol_type(
 
 /// Transpose row-major data to column-major, taking ownership to avoid clones.
 ///
-/// Converts `Vec<Vec<Value>>` (rows) to `Vec<Vec<Value>>` (columns) by moving
-/// values instead of cloning them.
+/// **Note**: This function is kept for backwards compatibility with any code
+/// that has row-major data. Exasol WebSocket API now returns column-major data
+/// directly, so this transpose is typically not needed.
 ///
 /// # Arguments
 /// * `rows` - Row-major data (consumed)
@@ -294,6 +289,7 @@ fn parse_exasol_type(
 ///
 /// # Returns
 /// Column-major data where each inner `Vec` contains all values for one column
+#[allow(dead_code)]
 fn transpose_rows_to_columns(rows: Vec<Vec<Value>>, num_columns: usize) -> Vec<Vec<Value>> {
     let num_rows = rows.len();
 
@@ -316,8 +312,9 @@ fn transpose_rows_to_columns(rows: Vec<Vec<Value>>, num_columns: usize) -> Vec<V
 
 /// Transpose row-major data to column-major from borrowed data.
 ///
-/// This version clones values since it works with borrowed data.
-/// Use `transpose_rows_to_columns` when you can pass ownership for better performance.
+/// **Note**: This function is kept for backwards compatibility with any code
+/// that has row-major data. Exasol WebSocket API now returns column-major data
+/// directly, so this transpose is typically not needed.
 ///
 /// # Arguments
 /// * `rows` - Row-major data (borrowed)
@@ -325,6 +322,7 @@ fn transpose_rows_to_columns(rows: Vec<Vec<Value>>, num_columns: usize) -> Vec<V
 ///
 /// # Returns
 /// Column-major data where each inner `Vec` contains all values for one column
+#[allow(dead_code)]
 fn transpose_rows_to_columns_borrowed(rows: &[Vec<Value>], num_columns: usize) -> Vec<Vec<Value>> {
     let num_rows = rows.len();
 
@@ -409,9 +407,10 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major: empty data means no rows
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![],
+            data: vec![],
             total_rows: 0,
         };
 
@@ -425,12 +424,16 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format:
+        // Column 0 (id): [1, 2, 3]
+        // Column 1 (name): ["Alice", "Bob", "Charlie"]
+        // Column 2 (active): [true, false, true]
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![
-                vec![json!(1), json!("Alice"), json!(true)],
-                vec![json!(2), json!("Bob"), json!(false)],
-                vec![json!(3), json!("Charlie"), json!(true)],
+            data: vec![
+                vec![json!(1), json!(2), json!(3)],               // id column
+                vec![json!("Alice"), json!("Bob"), json!("Charlie")], // name column
+                vec![json!(true), json!(false), json!(true)],      // active column
             ],
             total_rows: 3,
         };
@@ -445,12 +448,13 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![
-                vec![json!(1), json!("Alice"), json!(true)],
-                vec![json!(2), json!("Bob"), json!(false)],
-                vec![json!(3), json!("Charlie"), json!(true)],
+            data: vec![
+                vec![json!(1), json!(2), json!(3)],
+                vec![json!("Alice"), json!("Bob"), json!("Charlie")],
+                vec![json!(true), json!(false), json!(true)],
             ],
             total_rows: 3,
         };
@@ -465,12 +469,13 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format with nulls
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![
-                vec![json!(1), json!("Alice"), json!(true)],
-                vec![json!(2), json!(null), json!(false)],
-                vec![json!(null), json!("Charlie"), json!(null)],
+            data: vec![
+                vec![json!(1), json!(2), json!(null)],           // id: row 2 is null
+                vec![json!("Alice"), json!(null), json!("Charlie")], // name: row 1 is null
+                vec![json!(true), json!(false), json!(null)],     // active: row 2 is null
             ],
             total_rows: 3,
         };
@@ -490,12 +495,13 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format with nulls
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![
-                vec![json!(1), json!("Alice"), json!(true)],
-                vec![json!(2), json!(null), json!(false)],
-                vec![json!(null), json!("Charlie"), json!(null)],
+            data: vec![
+                vec![json!(1), json!(2), json!(null)],
+                vec![json!("Alice"), json!(null), json!("Charlie")],
+                vec![json!(true), json!(false), json!(null)],
             ],
             total_rows: 3,
         };
@@ -515,20 +521,23 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format for chunks
         let chunks = vec![
             ResultData {
                 columns: columns.clone(),
-                rows: vec![
-                    vec![json!(1), json!("Alice"), json!(true)],
-                    vec![json!(2), json!("Bob"), json!(false)],
+                data: vec![
+                    vec![json!(1), json!(2)],
+                    vec![json!("Alice"), json!("Bob")],
+                    vec![json!(true), json!(false)],
                 ],
                 total_rows: 4,
             },
             ResultData {
                 columns: columns.clone(),
-                rows: vec![
-                    vec![json!(3), json!("Charlie"), json!(true)],
-                    vec![json!(4), json!("Dave"), json!(false)],
+                data: vec![
+                    vec![json!(3), json!(4)],
+                    vec![json!("Charlie"), json!("Dave")],
+                    vec![json!(true), json!(false)],
                 ],
                 total_rows: 4,
             },
@@ -545,20 +554,23 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format for chunks
         let chunks = vec![
             ResultData {
                 columns: columns.clone(),
-                rows: vec![
-                    vec![json!(1), json!("Alice"), json!(true)],
-                    vec![json!(2), json!("Bob"), json!(false)],
+                data: vec![
+                    vec![json!(1), json!(2)],
+                    vec![json!("Alice"), json!("Bob")],
+                    vec![json!(true), json!(false)],
                 ],
                 total_rows: 4,
             },
             ResultData {
                 columns: columns.clone(),
-                rows: vec![
-                    vec![json!(3), json!("Charlie"), json!(true)],
-                    vec![json!(4), json!("Dave"), json!(false)],
+                data: vec![
+                    vec![json!(3), json!(4)],
+                    vec![json!("Charlie"), json!("Dave")],
+                    vec![json!(true), json!(false)],
                 ],
                 total_rows: 4,
             },
@@ -575,10 +587,14 @@ mod tests {
         let columns = create_test_columns();
         let converter = ArrowConverter::new(&columns).unwrap();
 
-        // Wrong number of columns in data
+        // Wrong number of columns in data (only 2 columns instead of 3)
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![vec![json!(1), json!("Alice")]], // Missing 'active' column
+            data: vec![
+                vec![json!(1)],          // Only id column
+                vec![json!("Alice")],    // Only name column
+                // Missing active column
+            ],
             total_rows: 1,
         };
 
@@ -598,7 +614,10 @@ mod tests {
         // Wrong number of columns in data
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![vec![json!(1), json!("Alice")]], // Missing 'active' column
+            data: vec![
+                vec![json!(1)],
+                vec![json!("Alice")],
+            ],
             total_rows: 1,
         };
 
@@ -847,21 +866,14 @@ mod tests {
 
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![
-                vec![
-                    json!(true),
-                    json!("123.45"),
-                    json!(std::f64::consts::PI),
-                    json!("2024-01-15"),
-                ],
-                vec![
-                    json!(false),
-                    json!("678.90"),
-                    json!(std::f64::consts::E),
-                    json!("2024-02-20"),
-                ],
+            data: vec![
+                vec![json!(true), json!(false)],                    // bool_col
+                vec![json!("123.45"), json!("678.90")],             // decimal_col
+                vec![json!(std::f64::consts::PI), json!(std::f64::consts::E)], // double_col
+                vec![json!("2024-01-15"), json!("2024-02-20")],     // date_col
             ],
             total_rows: 2,
         };
@@ -926,21 +938,14 @@ mod tests {
 
         let converter = ArrowConverter::new(&columns).unwrap();
 
+        // Column-major format
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![
-                vec![
-                    json!(true),
-                    json!("123.45"),
-                    json!(std::f64::consts::PI),
-                    json!("2024-01-15"),
-                ],
-                vec![
-                    json!(false),
-                    json!("678.90"),
-                    json!(std::f64::consts::E),
-                    json!("2024-02-20"),
-                ],
+            data: vec![
+                vec![json!(true), json!(false)],
+                vec![json!("123.45"), json!("678.90")],
+                vec![json!(std::f64::consts::PI), json!(std::f64::consts::E)],
+                vec![json!("2024-01-15"), json!("2024-02-20")],
             ],
             total_rows: 2,
         };
@@ -957,7 +962,7 @@ mod tests {
 
         let result_data = ResultData {
             columns: columns.clone(),
-            rows: vec![],
+            data: vec![],
             total_rows: 0,
         };
 

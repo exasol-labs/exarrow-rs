@@ -111,15 +111,22 @@ impl ResultSet {
                 let metadata = QueryMetadata::new(Arc::clone(&schema), Some(data.total_rows));
 
                 // Convert initial data to RecordBatch
-                let batches = if !data.rows.is_empty() {
-                    vec![Self::rows_to_record_batch(&data, &schema)
+                // Note: data.data is in column-major format (each inner array is a column)
+                let batches = if !data.data.is_empty() {
+                    vec![Self::column_major_to_record_batch(&data, &schema)
                         .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?]
                 } else {
                     Vec::new()
                 };
 
                 // Result is complete if all data was in initial response OR no handle provided
-                let complete = handle.is_none() || data.total_rows == data.rows.len() as i64;
+                // For column-major data, the number of rows is determined by the length of the first column
+                let num_rows_received = if data.data.is_empty() {
+                    0
+                } else {
+                    data.data[0].len() as i64
+                };
+                let complete = handle.is_none() || data.total_rows == num_rows_received;
 
                 Ok(Self {
                     inner: ResultSetInner::Stream {
@@ -207,12 +214,12 @@ impl ResultSet {
                             .await
                             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
-                        if result_data.rows.is_empty() {
+                        if result_data.data.is_empty() {
                             *complete = true;
                             break;
                         }
 
-                        let batch = Self::rows_to_record_batch(&result_data, &metadata.schema)
+                        let batch = Self::column_major_to_record_batch(&result_data, &metadata.schema)
                             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
                         all_batches.push(batch);
@@ -292,17 +299,27 @@ impl ResultSet {
         TypeMapper::exasol_to_arrow(&exasol_type, true)
     }
 
-    /// Convert result data rows to RecordBatch.
+    /// Convert column-major result data to RecordBatch.
     ///
-    /// This is a simplified implementation for Phase 1.
-    /// In production, use optimized builders for each data type.
-    fn rows_to_record_batch(
+    /// Exasol WebSocket API returns data in column-major format, where each
+    /// inner array represents all values for a single column, not a row.
+    ///
+    /// Example: For a result with 2 columns (id, name) and 3 rows:
+    /// ```json
+    /// {
+    ///   "data": [
+    ///     [1, 2, 3],           // Column 0 (id): all row values
+    ///     ["a", "b", "c"]      // Column 1 (name): all row values
+    ///   ]
+    /// }
+    /// ```
+    fn column_major_to_record_batch(
         data: &ResultData,
         schema: &Arc<Schema>,
     ) -> Result<RecordBatch, ConversionError> {
         use arrow::array::*;
 
-        if data.rows.is_empty() {
+        if data.data.is_empty() {
             // Create empty batch with schema
             let empty_arrays: Vec<Arc<dyn Array>> = schema
                 .fields()
@@ -319,19 +336,18 @@ impl ResultSet {
         for (col_idx, field) in schema.fields().iter().enumerate() {
             use arrow::datatypes::DataType;
 
+            // Get the column data (all values for this column)
+            let column_values = data.data.get(col_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+
             // Build array based on data type
             let array: Arc<dyn Array> = match field.data_type() {
                 DataType::Boolean => {
                     let mut builder = BooleanBuilder::new();
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else if let Some(b) = value.as_bool() {
-                                builder.append_value(b);
-                            } else {
-                                builder.append_null();
-                            }
+                    for value in column_values {
+                        if value.is_null() {
+                            builder.append_null();
+                        } else if let Some(b) = value.as_bool() {
+                            builder.append_value(b);
                         } else {
                             builder.append_null();
                         }
@@ -340,15 +356,11 @@ impl ResultSet {
                 }
                 DataType::Int32 => {
                     let mut builder = Int32Builder::new();
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else if let Some(i) = value.as_i64() {
-                                builder.append_value(i as i32);
-                            } else {
-                                builder.append_null();
-                            }
+                    for value in column_values {
+                        if value.is_null() {
+                            builder.append_null();
+                        } else if let Some(i) = value.as_i64() {
+                            builder.append_value(i as i32);
                         } else {
                             builder.append_null();
                         }
@@ -357,15 +369,11 @@ impl ResultSet {
                 }
                 DataType::Int64 => {
                     let mut builder = Int64Builder::new();
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else if let Some(i) = value.as_i64() {
-                                builder.append_value(i);
-                            } else {
-                                builder.append_null();
-                            }
+                    for value in column_values {
+                        if value.is_null() {
+                            builder.append_null();
+                        } else if let Some(i) = value.as_i64() {
+                            builder.append_value(i);
                         } else {
                             builder.append_null();
                         }
@@ -374,15 +382,11 @@ impl ResultSet {
                 }
                 DataType::Float64 => {
                     let mut builder = Float64Builder::new();
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else if let Some(f) = value.as_f64() {
-                                builder.append_value(f);
-                            } else {
-                                builder.append_null();
-                            }
+                    for value in column_values {
+                        if value.is_null() {
+                            builder.append_null();
+                        } else if let Some(f) = value.as_f64() {
+                            builder.append_value(f);
                         } else {
                             builder.append_null();
                         }
@@ -391,18 +395,14 @@ impl ResultSet {
                 }
                 DataType::Utf8 => {
                     let mut builder = StringBuilder::new();
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else if let Some(s) = value.as_str() {
-                                builder.append_value(s);
-                            } else {
-                                // Convert to string
-                                builder.append_value(value.to_string());
-                            }
-                        } else {
+                    for value in column_values {
+                        if value.is_null() {
                             builder.append_null();
+                        } else if let Some(s) = value.as_str() {
+                            builder.append_value(s);
+                        } else {
+                            // Convert to string
+                            builder.append_value(value.to_string());
                         }
                     }
                     Arc::new(builder.finish())
@@ -412,20 +412,16 @@ impl ResultSet {
                         .with_precision_and_scale(*precision, *scale)
                         .map_err(|e| ConversionError::ArrowError(e.to_string()))?;
 
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else if let Some(i) = value.as_i64() {
-                                // Scale the integer value
-                                let scaled = i * 10i64.pow(*scale as u32);
-                                builder.append_value(scaled as i128);
-                            } else if let Some(f) = value.as_f64() {
-                                let scaled = (f * 10f64.powi(*scale as i32)) as i128;
-                                builder.append_value(scaled);
-                            } else {
-                                builder.append_null();
-                            }
+                    for value in column_values {
+                        if value.is_null() {
+                            builder.append_null();
+                        } else if let Some(i) = value.as_i64() {
+                            // Scale the integer value
+                            let scaled = i * 10i64.pow(*scale as u32);
+                            builder.append_value(scaled as i128);
+                        } else if let Some(f) = value.as_f64() {
+                            let scaled = (f * 10f64.powi(*scale as i32)) as i128;
+                            builder.append_value(scaled);
                         } else {
                             builder.append_null();
                         }
@@ -435,15 +431,11 @@ impl ResultSet {
                 _ => {
                     // Fallback to string for unsupported types
                     let mut builder = StringBuilder::new();
-                    for row in &data.rows {
-                        if let Some(value) = row.get(col_idx) {
-                            if value.is_null() {
-                                builder.append_null();
-                            } else {
-                                builder.append_value(value.to_string());
-                            }
-                        } else {
+                    for value in column_values {
+                        if value.is_null() {
                             builder.append_null();
+                        } else {
+                            builder.append_value(value.to_string());
                         }
                     }
                     Arc::new(builder.finish())
@@ -502,12 +494,12 @@ impl ResultSetIterator {
             .await
             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
-        if result_data.rows.is_empty() {
+        if result_data.data.is_empty() {
             self.complete = true;
             return Ok(None);
         }
 
-        let batch = ResultSet::rows_to_record_batch(&result_data, &self.metadata.schema)
+        let batch = ResultSet::column_major_to_record_batch(&result_data, &self.metadata.schema)
             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
         Ok(Some(batch))
@@ -617,6 +609,9 @@ mod tests {
         let mock_transport = MockTransport::new();
         let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(mock_transport));
 
+        // Column-major data format:
+        // Column 0 (id): [1, 2]
+        // Column 1 (name): ["Alice", "Bob"]
         let data = ResultData {
             columns: vec![
                 ColumnInfo {
@@ -644,9 +639,9 @@ mod tests {
                     },
                 },
             ],
-            rows: vec![
-                vec![serde_json::json!(1), serde_json::json!("Alice")],
-                vec![serde_json::json!(2), serde_json::json!("Bob")],
+            data: vec![
+                vec![serde_json::json!(1), serde_json::json!(2)],        // Column 0: id values
+                vec![serde_json::json!("Alice"), serde_json::json!("Bob")], // Column 1: name values
             ],
             total_rows: 2,
         };
@@ -675,27 +670,104 @@ mod tests {
             Field::new("active", arrow::datatypes::DataType::Boolean, true),
         ]));
 
+        // Column-major data format:
+        // Column 0 (id): [1, 2]
+        // Column 1 (name): ["Alice", "Bob"]
+        // Column 2 (active): [true, false]
         let data = ResultData {
             columns: vec![],
-            rows: vec![
-                vec![
-                    serde_json::json!(1),
-                    serde_json::json!("Alice"),
-                    serde_json::json!(true),
-                ],
-                vec![
-                    serde_json::json!(2),
-                    serde_json::json!("Bob"),
-                    serde_json::json!(false),
-                ],
+            data: vec![
+                vec![serde_json::json!(1), serde_json::json!(2)],           // Column 0
+                vec![serde_json::json!("Alice"), serde_json::json!("Bob")], // Column 1
+                vec![serde_json::json!(true), serde_json::json!(false)],    // Column 2
             ],
             total_rows: 2,
         };
 
-        let batch = ResultSet::rows_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_single_row_single_column() {
+        // Test case for: SELECT 42 AS answer
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("answer", arrow::datatypes::DataType::Decimal128(18, 0), true),
+        ]));
+
+        // Column-major: one column with one value
+        let data = ResultData {
+            columns: vec![],
+            data: vec![
+                vec![serde_json::json!(42)],  // Column 0: answer = [42]
+            ],
+            total_rows: 1,
+        };
+
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+
+        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
+        assert_eq!(batch.num_columns(), 1, "Should have exactly 1 column");
+    }
+
+    #[tokio::test]
+    async fn test_single_row_two_columns() {
+        // Test case for: SELECT 42 AS answer, 'hello' AS greeting
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("answer", arrow::datatypes::DataType::Decimal128(18, 0), true),
+            Field::new("greeting", arrow::datatypes::DataType::Utf8, true),
+        ]));
+
+        // Column-major: two columns, each with one value
+        let data = ResultData {
+            columns: vec![],
+            data: vec![
+                vec![serde_json::json!(42)],        // Column 0: answer = [42]
+                vec![serde_json::json!("hello")],   // Column 1: greeting = ["hello"]
+            ],
+            total_rows: 1,
+        };
+
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+
+        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
+        assert_eq!(batch.num_columns(), 2, "Should have exactly 2 columns");
+    }
+
+    #[tokio::test]
+    async fn test_ten_rows_two_columns() {
+        // Test case for: SELECT LEVEL AS id, 'Row ' || LEVEL AS label FROM DUAL CONNECT BY LEVEL <= 10
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Decimal128(18, 0), true),
+            Field::new("label", arrow::datatypes::DataType::Utf8, true),
+        ]));
+
+        // Column-major: two columns, each with ten values
+        let data = ResultData {
+            columns: vec![],
+            data: vec![
+                vec![  // Column 0: id values
+                    serde_json::json!(1), serde_json::json!(2), serde_json::json!(3),
+                    serde_json::json!(4), serde_json::json!(5), serde_json::json!(6),
+                    serde_json::json!(7), serde_json::json!(8), serde_json::json!(9),
+                    serde_json::json!(10),
+                ],
+                vec![  // Column 1: label values
+                    serde_json::json!("Row 1"), serde_json::json!("Row 2"), serde_json::json!("Row 3"),
+                    serde_json::json!("Row 4"), serde_json::json!("Row 5"), serde_json::json!("Row 6"),
+                    serde_json::json!("Row 7"), serde_json::json!("Row 8"), serde_json::json!("Row 9"),
+                    serde_json::json!("Row 10"),
+                ],
+            ],
+            total_rows: 10,
+        };
+
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+
+        assert_eq!(batch.num_rows(), 10, "Should have exactly 10 rows");
+        assert_eq!(batch.num_columns(), 2, "Should have exactly 2 columns");
     }
 
     #[tokio::test]

@@ -491,7 +491,7 @@ mod tests {
                     handle: None,
                     data: ResultData {
                         columns: vec![],
-                        rows: vec![],
+                        data: vec![],
                         total_rows: 0,
                     },
                 })
@@ -533,7 +533,7 @@ mod tests {
                                 fraction: None,
                             },
                         }],
-                        rows: vec![vec![serde_json::json!(1)]],
+                        data: vec![vec![serde_json::json!(1)]],
                         total_rows: 1,
                     },
                 })
