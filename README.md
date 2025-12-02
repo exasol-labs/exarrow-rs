@@ -121,18 +121,17 @@ exasol://myuser:mypass@exasol.example.com:8563/production?connection_timeout=60&
 
 ## Type Mapping
 
-| Exasol Type | Arrow Type |
-|-------------|------------|
-| `BOOLEAN` | `Boolean` |
-| `CHAR`, `VARCHAR` | `Utf8` |
-| `DECIMAL(p≤38, s)` | `Decimal128` |
-| `DECIMAL(p>38, s)` | `Decimal256` |
-| `DOUBLE` | `Float64` |
-| `DATE` | `Date32` |
-| `TIMESTAMP` | `Timestamp(Microsecond)` |
+| Exasol Type              | Arrow Type |
+|--------------------------|------------|
+| `BOOLEAN`                | `Boolean` |
+| `CHAR`, `VARCHAR`        | `Utf8` |
+| `DECIMAL(p≤36, s)`       | `Decimal128` |
+| `DOUBLE`                 | `Float64` |
+| `DATE`                   | `Date32` |
+| `TIMESTAMP`              | `Timestamp(Microsecond)` |
 | `INTERVAL YEAR TO MONTH` | `Interval(MonthDayNano)` |
 | `INTERVAL DAY TO SECOND` | `Interval(MonthDayNano)` |
-| `GEOMETRY` | `Binary` |
+| `GEOMETRY`               | `Binary` |
 
 ## Examples
 
