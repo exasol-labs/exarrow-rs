@@ -82,10 +82,7 @@ fn load_driver() -> Result<ManagedDriver, Box<dyn Error>> {
 }
 
 /// Execute a SELECT query and return row/column counts.
-fn execute_select(
-    conn: &mut impl Connection,
-    sql: &str,
-) -> Result<(usize, usize), Box<dyn Error>> {
+fn execute_select(conn: &mut impl Connection, sql: &str) -> Result<(usize, usize), Box<dyn Error>> {
     let mut stmt = conn.new_statement()?;
     stmt.set_sql_query(sql)?;
 
@@ -102,10 +99,7 @@ fn execute_select(
 }
 
 /// Execute a DDL/DML statement and return the affected row count.
-fn execute_update(
-    conn: &mut impl Connection,
-    sql: &str,
-) -> Result<Option<i64>, Box<dyn Error>> {
+fn execute_update(conn: &mut impl Connection, sql: &str) -> Result<Option<i64>, Box<dyn Error>> {
     let mut stmt = conn.new_statement()?;
     stmt.set_sql_query(sql)?;
     stmt.execute_update().map_err(Into::into)

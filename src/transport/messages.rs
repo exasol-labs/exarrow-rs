@@ -581,9 +581,17 @@ impl ExecutePreparedStatementRequest {
     /// # Arguments
     /// * `columns` - Column metadata describing parameter types
     /// * `data` - Parameter values in column-major format (each inner Vec is one column)
-    pub fn with_data(mut self, columns: Vec<ColumnInfo>, data: Vec<Vec<serde_json::Value>>) -> Self {
+    pub fn with_data(
+        mut self,
+        columns: Vec<ColumnInfo>,
+        data: Vec<Vec<serde_json::Value>>,
+    ) -> Self {
         self.num_columns = columns.len() as i32;
-        self.num_rows = if data.is_empty() { 0 } else { data[0].len() as i32 };
+        self.num_rows = if data.is_empty() {
+            0
+        } else {
+            data[0].len() as i32
+        };
         self.columns = Some(columns);
         self.data = Some(data);
         self
@@ -1060,24 +1068,21 @@ mod tests {
 
     #[test]
     fn test_execute_prepared_statement_request_serialization() {
-        let columns = vec![
-            ColumnInfo {
-                name: "ID".to_string(),
-                data_type: DataType {
-                    type_name: "DECIMAL".to_string(),
-                    precision: Some(18),
-                    scale: Some(0),
-                    size: None,
-                    character_set: None,
-                    with_local_time_zone: None,
-                    fraction: None,
-                },
+        let columns = vec![ColumnInfo {
+            name: "ID".to_string(),
+            data_type: DataType {
+                type_name: "DECIMAL".to_string(),
+                precision: Some(18),
+                scale: Some(0),
+                size: None,
+                character_set: None,
+                with_local_time_zone: None,
+                fraction: None,
             },
-        ];
+        }];
         let data = vec![vec![serde_json::json!(1), serde_json::json!(2)]];
 
-        let request = ExecutePreparedStatementRequest::new(42)
-            .with_data(columns, data);
+        let request = ExecutePreparedStatementRequest::new(42).with_data(columns, data);
         let json = serde_json::to_string(&request).unwrap();
 
         assert!(json.contains("\"command\":\"executePreparedStatement\""));

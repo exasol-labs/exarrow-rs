@@ -12,8 +12,7 @@ use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream,
-    WebSocketStream,
+    connect_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream, WebSocketStream,
 };
 
 use crate::error::TransportError;
@@ -98,9 +97,9 @@ impl WebSocketTransport {
                 .map_err(|e| TransportError::ReceiveError(e.to_string()))?;
 
             // Parse response
-            let response_text = response_msg
-                .to_text()
-                .map_err(|e| TransportError::ProtocolError(format!("Invalid message format: {}", e)))?;
+            let response_text = response_msg.to_text().map_err(|e| {
+                TransportError::ProtocolError(format!("Invalid message format: {}", e))
+            })?;
 
             // Skip intermediate status messages (e.g., "EXECUTING", "FETCHING")
             // These are plain text, not JSON objects starting with '{'
@@ -147,10 +146,7 @@ impl WebSocketTransport {
     ///
     /// The password is encrypted using the server's public key and then
     /// base64-encoded for transmission.
-    fn encrypt_password(
-        password: &str,
-        public_key_pem: &str,
-    ) -> Result<String, TransportError> {
+    fn encrypt_password(password: &str, public_key_pem: &str) -> Result<String, TransportError> {
         // Parse the RSA public key from PEM format
         let public_key = RsaPublicKey::from_pkcs1_pem(public_key_pem).map_err(|e| {
             TransportError::ProtocolError(format!("Failed to parse RSA public key: {}", e))
@@ -204,8 +200,7 @@ impl TransportProtocol for WebSocketTransport {
 
         // Connect with optional TLS connector
         let connect_future = connect_async_tls_with_config(
-            &url,
-            None,      // WebSocket config
+            &url, None,      // WebSocket config
             false,     // disable_nagle
             connector, // TLS connector
         );
@@ -324,7 +319,7 @@ impl TransportProtocol for WebSocketTransport {
 
                 let data = ResultData {
                     columns,
-                    data: data_values,  // Column-major format
+                    data: data_values, // Column-major format
                     total_rows,
                 };
 
@@ -378,8 +373,8 @@ impl TransportProtocol for WebSocketTransport {
         // they should be cached from the initial execute response
         // Data is in column-major format from Exasol
         Ok(ResultData {
-            columns: vec![], // Caller must cache columns from execute
-            data: fetch_data.data,  // Column-major format
+            columns: vec![],       // Caller must cache columns from execute
+            data: fetch_data.data, // Column-major format
             total_rows: fetch_data.num_rows,
         })
     }
@@ -419,9 +414,9 @@ impl TransportProtocol for WebSocketTransport {
         self.check_status(&response.status, &response.exception)?;
 
         // Extract response data
-        let response_data = response.response_data.ok_or_else(|| {
-            TransportError::InvalidResponse("Missing response data".to_string())
-        })?;
+        let response_data = response
+            .response_data
+            .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
 
         // Extract parameter types from parameter_data if present
         let (num_params, parameter_types) = if let Some(param_data) = response_data.parameter_data {
@@ -511,7 +506,7 @@ impl TransportProtocol for WebSocketTransport {
 
                 let data = ResultData {
                     columns,
-                    data: data_values,  // Column-major format
+                    data: data_values, // Column-major format
                     total_rows,
                 };
 
@@ -687,9 +682,7 @@ mod tests {
         let mut transport = WebSocketTransport::new();
         let handle = PreparedStatementHandle::new(1, 0, vec![]);
 
-        let result = transport
-            .execute_prepared_statement(&handle, None)
-            .await;
+        let result = transport.execute_prepared_statement(&handle, None).await;
 
         assert!(result.is_err());
         if let Err(TransportError::ProtocolError(msg)) = result {
@@ -770,10 +763,13 @@ vJ+yVUqh0/T2f5e9E1lDNuIqLyXe8VwwUsS72A1EGtg0s77+xUQ7KiGRbHD4bsBo
 A74EI7MHQ7163wVPT0VWFRvUmmv+UO7W8wIDAQAB
 -----END RSA PUBLIC KEY-----"#;
 
-        let result =
-            WebSocketTransport::encrypt_password("test_password", test_public_key_pem);
+        let result = WebSocketTransport::encrypt_password("test_password", test_public_key_pem);
 
-        assert!(result.is_ok(), "encrypt_password failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "encrypt_password failed: {:?}",
+            result.err()
+        );
         let encrypted = result.unwrap();
 
         // The encrypted result should be base64-encoded

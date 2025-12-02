@@ -219,8 +219,9 @@ impl ResultSet {
                             break;
                         }
 
-                        let batch = Self::column_major_to_record_batch(&result_data, &metadata.schema)
-                            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+                        let batch =
+                            Self::column_major_to_record_batch(&result_data, &metadata.schema)
+                                .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
                         all_batches.push(batch);
 
@@ -568,7 +569,9 @@ impl Iterator for ResultSetIterator {
 mod tests {
     use super::*;
     use crate::transport::messages::{ColumnInfo, DataType};
-    use crate::transport::protocol::{PreparedStatementHandle, QueryResult as TransportQueryResult};
+    use crate::transport::protocol::{
+        PreparedStatementHandle, QueryResult as TransportQueryResult,
+    };
     use async_trait::async_trait;
     use mockall::mock;
 
@@ -640,7 +643,7 @@ mod tests {
                 },
             ],
             data: vec![
-                vec![serde_json::json!(1), serde_json::json!(2)],        // Column 0: id values
+                vec![serde_json::json!(1), serde_json::json!(2)], // Column 0: id values
                 vec![serde_json::json!("Alice"), serde_json::json!("Bob")], // Column 1: name values
             ],
             total_rows: 2,
@@ -677,9 +680,9 @@ mod tests {
         let data = ResultData {
             columns: vec![],
             data: vec![
-                vec![serde_json::json!(1), serde_json::json!(2)],           // Column 0
+                vec![serde_json::json!(1), serde_json::json!(2)], // Column 0
                 vec![serde_json::json!("Alice"), serde_json::json!("Bob")], // Column 1
-                vec![serde_json::json!(true), serde_json::json!(false)],    // Column 2
+                vec![serde_json::json!(true), serde_json::json!(false)], // Column 2
             ],
             total_rows: 2,
         };
@@ -693,15 +696,17 @@ mod tests {
     #[tokio::test]
     async fn test_single_row_single_column() {
         // Test case for: SELECT 42 AS answer
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("answer", arrow::datatypes::DataType::Decimal128(18, 0), true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "answer",
+            arrow::datatypes::DataType::Decimal128(18, 0),
+            true,
+        )]));
 
         // Column-major: one column with one value
         let data = ResultData {
             columns: vec![],
             data: vec![
-                vec![serde_json::json!(42)],  // Column 0: answer = [42]
+                vec![serde_json::json!(42)], // Column 0: answer = [42]
             ],
             total_rows: 1,
         };
@@ -716,7 +721,11 @@ mod tests {
     async fn test_single_row_two_columns() {
         // Test case for: SELECT 42 AS answer, 'hello' AS greeting
         let schema = Arc::new(Schema::new(vec![
-            Field::new("answer", arrow::datatypes::DataType::Decimal128(18, 0), true),
+            Field::new(
+                "answer",
+                arrow::datatypes::DataType::Decimal128(18, 0),
+                true,
+            ),
             Field::new("greeting", arrow::datatypes::DataType::Utf8, true),
         ]));
 
@@ -724,8 +733,8 @@ mod tests {
         let data = ResultData {
             columns: vec![],
             data: vec![
-                vec![serde_json::json!(42)],        // Column 0: answer = [42]
-                vec![serde_json::json!("hello")],   // Column 1: greeting = ["hello"]
+                vec![serde_json::json!(42)],      // Column 0: answer = [42]
+                vec![serde_json::json!("hello")], // Column 1: greeting = ["hello"]
             ],
             total_rows: 1,
         };
@@ -748,16 +757,30 @@ mod tests {
         let data = ResultData {
             columns: vec![],
             data: vec![
-                vec![  // Column 0: id values
-                    serde_json::json!(1), serde_json::json!(2), serde_json::json!(3),
-                    serde_json::json!(4), serde_json::json!(5), serde_json::json!(6),
-                    serde_json::json!(7), serde_json::json!(8), serde_json::json!(9),
+                vec![
+                    // Column 0: id values
+                    serde_json::json!(1),
+                    serde_json::json!(2),
+                    serde_json::json!(3),
+                    serde_json::json!(4),
+                    serde_json::json!(5),
+                    serde_json::json!(6),
+                    serde_json::json!(7),
+                    serde_json::json!(8),
+                    serde_json::json!(9),
                     serde_json::json!(10),
                 ],
-                vec![  // Column 1: label values
-                    serde_json::json!("Row 1"), serde_json::json!("Row 2"), serde_json::json!("Row 3"),
-                    serde_json::json!("Row 4"), serde_json::json!("Row 5"), serde_json::json!("Row 6"),
-                    serde_json::json!("Row 7"), serde_json::json!("Row 8"), serde_json::json!("Row 9"),
+                vec![
+                    // Column 1: label values
+                    serde_json::json!("Row 1"),
+                    serde_json::json!("Row 2"),
+                    serde_json::json!("Row 3"),
+                    serde_json::json!("Row 4"),
+                    serde_json::json!("Row 5"),
+                    serde_json::json!("Row 6"),
+                    serde_json::json!("Row 7"),
+                    serde_json::json!("Row 8"),
+                    serde_json::json!("Row 9"),
                     serde_json::json!("Row 10"),
                 ],
             ],

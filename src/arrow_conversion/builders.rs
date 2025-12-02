@@ -163,10 +163,7 @@ fn validate_decimal_precision(
     column: usize,
 ) -> Result<(), ConversionError> {
     // Remove sign and decimal point for digit counting
-    let digits: String = value_str
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let digits: String = value_str.chars().filter(|c| c.is_ascii_digit()).collect();
 
     let total_digits = digits.len();
     let max_digits = precision as usize;
@@ -998,11 +995,7 @@ mod tests {
 
     #[test]
     fn test_estimate_string_capacity() {
-        let values = vec![
-            json!("hello"),
-            json!("world"),
-            json!("test"),
-        ];
+        let values = vec![json!("hello"), json!("world"), json!("test")];
         let capacity = estimate_string_capacity(&values);
         // Average length is about 5, plus buffer, times 3 values
         assert!(capacity > 0);

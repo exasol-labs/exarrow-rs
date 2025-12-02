@@ -181,7 +181,9 @@ async fn test_connection_helper_works_when_exasol_available() {
     );
 
     // Clean up
-    conn.close().await.expect("Should be able to close connection");
+    conn.close()
+        .await
+        .expect("Should be able to close connection");
 }
 
 #[tokio::test]
@@ -278,9 +280,7 @@ async fn test_connection_closure_and_cleanup() {
     assert!(!session_id.is_empty(), "Session ID should exist");
 
     // Close the connection
-    conn.close()
-        .await
-        .expect("Connection close should succeed");
+    conn.close().await.expect("Connection close should succeed");
 
     // After closing, we can't verify is_closed on the same connection
     // because close() consumes self. But the test passing means cleanup worked.
@@ -324,9 +324,7 @@ async fn test_connection_health_check() {
 async fn test_select_from_dual() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     // Exasol supports SELECT without FROM for literals
     let batches = conn
@@ -358,9 +356,7 @@ async fn test_select_from_dual() {
 async fn test_arrow_recordbatch_schema_and_data() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let batches = conn
         .query("SELECT 100 AS num_value, 'hello' AS text_value, TRUE AS bool_value")
@@ -401,13 +397,13 @@ async fn test_arrow_recordbatch_schema_and_data() {
 async fn test_arithmetic_expressions() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     // Test various arithmetic operations
     let batches = conn
-        .query("SELECT 1+1 AS addition, 10-3 AS subtraction, 4*5 AS multiplication, 20/4 AS division")
+        .query(
+            "SELECT 1+1 AS addition, 10-3 AS subtraction, 4*5 AS multiplication, 20/4 AS division",
+        )
         .await
         .expect("Arithmetic query should succeed");
 
@@ -425,9 +421,7 @@ async fn test_arithmetic_expressions() {
 async fn test_string_data_and_utf8() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     // Test various string scenarios including UTF-8 characters
     let batches = conn
@@ -462,9 +456,7 @@ async fn test_string_data_and_utf8() {
 async fn test_create_schema() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -503,9 +495,7 @@ async fn test_create_schema() {
 async fn test_create_table_various_types() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -564,9 +554,7 @@ async fn test_create_table_various_types() {
 async fn test_drop_table() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -598,10 +586,7 @@ async fn test_drop_table() {
         .query(&format!("SELECT * FROM {}.drop_test", schema_name))
         .await;
 
-    assert!(
-        query_result.is_err(),
-        "Query on dropped table should fail"
-    );
+    assert!(query_result.is_err(), "Query on dropped table should fail");
 
     // Cleanup
     conn.execute_update(&format!("DROP SCHEMA {} CASCADE", schema_name))
@@ -616,9 +601,7 @@ async fn test_drop_table() {
 async fn test_drop_schema() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -696,9 +679,7 @@ async fn cleanup_schema(conn: &Connection, schema_name: &str) {
 async fn test_insert_single_row() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -716,11 +697,7 @@ async fn test_insert_single_row() {
         "INSERT should succeed: {:?}",
         insert_result.err()
     );
-    assert_eq!(
-        insert_result.unwrap(),
-        1,
-        "INSERT should affect 1 row"
-    );
+    assert_eq!(insert_result.unwrap(), 1, "INSERT should affect 1 row");
 
     // Cleanup
     cleanup_schema(&conn, &schema_name).await;
@@ -732,9 +709,7 @@ async fn test_insert_single_row() {
 async fn test_insert_multiple_rows() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -757,11 +732,7 @@ async fn test_insert_multiple_rows() {
         "INSERT should succeed: {:?}",
         insert_result.err()
     );
-    assert_eq!(
-        insert_result.unwrap(),
-        3,
-        "INSERT should affect 3 rows"
-    );
+    assert_eq!(insert_result.unwrap(), 3, "INSERT should affect 3 rows");
 
     // Cleanup
     cleanup_schema(&conn, &schema_name).await;
@@ -773,9 +744,7 @@ async fn test_insert_multiple_rows() {
 async fn test_select_inserted_data() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -822,9 +791,7 @@ async fn test_select_inserted_data() {
 async fn test_update_row() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -850,11 +817,7 @@ async fn test_update_row() {
         "UPDATE should succeed: {:?}",
         update_result.err()
     );
-    assert_eq!(
-        update_result.unwrap(),
-        1,
-        "UPDATE should affect 1 row"
-    );
+    assert_eq!(update_result.unwrap(), 1, "UPDATE should affect 1 row");
 
     // Verify the update
     let batches = conn
@@ -878,9 +841,7 @@ async fn test_update_row() {
 async fn test_delete_row() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -899,10 +860,7 @@ async fn test_delete_row() {
 
     // Delete one row
     let delete_result = conn
-        .execute_update(&format!(
-            "DELETE FROM {}.users WHERE id = 1",
-            schema_name
-        ))
+        .execute_update(&format!("DELETE FROM {}.users WHERE id = 1", schema_name))
         .await;
 
     assert!(
@@ -910,15 +868,14 @@ async fn test_delete_row() {
         "DELETE should succeed: {:?}",
         delete_result.err()
     );
-    assert_eq!(
-        delete_result.unwrap(),
-        1,
-        "DELETE should affect 1 row"
-    );
+    assert_eq!(delete_result.unwrap(), 1, "DELETE should affect 1 row");
 
     // Verify deletion
     let batches = conn
-        .query(&format!("SELECT COUNT(*) AS cnt FROM {}.users", schema_name))
+        .query(&format!(
+            "SELECT COUNT(*) AS cnt FROM {}.users",
+            schema_name
+        ))
         .await
         .expect("SELECT COUNT should succeed");
 
@@ -940,9 +897,7 @@ async fn test_delete_row() {
 async fn test_transaction_begin() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     // Verify not in transaction initially
     assert!(
@@ -965,9 +920,7 @@ async fn test_transaction_begin() {
     );
 
     // Rollback to clean up (don't leave open transaction)
-    conn.rollback()
-        .await
-        .expect("ROLLBACK should succeed");
+    conn.rollback().await.expect("ROLLBACK should succeed");
 
     conn.close().await.expect("Failed to close connection");
 }
@@ -977,9 +930,7 @@ async fn test_transaction_begin() {
 async fn test_transaction_commit() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -1037,9 +988,7 @@ async fn test_transaction_commit() {
 async fn test_transaction_rollback() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -1102,9 +1051,7 @@ async fn test_transaction_rollback() {
 async fn test_auto_commit_behavior() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
     setup_dml_test_table(&conn, &schema_name).await;
@@ -1154,9 +1101,7 @@ async fn test_auto_commit_behavior() {
 async fn test_integer_to_arrow_int64() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1209,10 +1154,7 @@ async fn test_integer_to_arrow_int64() {
         assert!(
             matches!(
                 dt,
-                DataType::Int64
-                    | DataType::Int32
-                    | DataType::Decimal128(_, _)
-                    | DataType::Float64
+                DataType::Int64 | DataType::Int32 | DataType::Decimal128(_, _) | DataType::Float64
             ),
             "Integer columns should be numeric Arrow type, got {:?}",
             dt
@@ -1229,9 +1171,7 @@ async fn test_integer_to_arrow_int64() {
 async fn test_varchar_to_arrow_utf8() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1304,9 +1244,7 @@ async fn test_varchar_to_arrow_utf8() {
 async fn test_decimal_type_conversion() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1369,9 +1307,7 @@ async fn test_decimal_type_conversion() {
 async fn test_null_value_handling() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1452,9 +1388,7 @@ async fn test_null_value_handling() {
 async fn test_date_timestamp_conversion() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1518,10 +1452,7 @@ async fn test_date_timestamp_conversion() {
     assert!(
         matches!(
             timestamp_field.data_type(),
-            DataType::Timestamp(_, _)
-                | DataType::Date64
-                | DataType::Int64
-                | DataType::Utf8
+            DataType::Timestamp(_, _) | DataType::Date64 | DataType::Int64 | DataType::Utf8
         ),
         "TIMESTAMP column should be Timestamp, Date64, Int64, or Utf8, got {:?}",
         timestamp_field.data_type()
@@ -1541,9 +1472,7 @@ async fn test_date_timestamp_conversion() {
 async fn test_boolean_type_conversion() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1571,10 +1500,7 @@ async fn test_boolean_type_conversion() {
     .expect("INSERT should succeed");
 
     let batches = conn
-        .query(&format!(
-            "SELECT flag FROM {}.bool_test",
-            schema_name
-        ))
+        .query(&format!("SELECT flag FROM {}.bool_test", schema_name))
         .await
         .expect("SELECT should succeed");
 
@@ -1612,9 +1538,7 @@ async fn test_boolean_type_conversion() {
 async fn test_double_type_conversion() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1672,7 +1596,10 @@ async fn test_double_type_conversion() {
 
     assert_eq!(float_array.len(), 4, "Should have 4 values");
     // Values are ordered, so first is the most negative
-    assert!(float_array.value(0) < 0.0, "First value should be negative (ordered)");
+    assert!(
+        float_array.value(0) < 0.0,
+        "First value should be negative (ordered)"
+    );
 
     // Cleanup
     cleanup_schema(&conn, &schema_name).await;
@@ -1684,9 +1611,7 @@ async fn test_double_type_conversion() {
 async fn test_large_result_set() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1748,9 +1673,7 @@ async fn test_large_result_set() {
 async fn test_empty_result_set() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1767,10 +1690,7 @@ async fn test_empty_result_set() {
 
     // Query empty table
     let batches = conn
-        .query(&format!(
-            "SELECT id, name FROM {}.empty_test",
-            schema_name
-        ))
+        .query(&format!("SELECT id, name FROM {}.empty_test", schema_name))
         .await
         .expect("SELECT from empty table should succeed");
 
@@ -1800,9 +1720,7 @@ async fn test_empty_result_set() {
 async fn test_prepared_statement_lifecycle() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     // Create a simple prepared statement
     let stmt = conn
@@ -1810,10 +1728,7 @@ async fn test_prepared_statement_lifecycle() {
         .await
         .expect("Failed to create statement");
 
-    let mut prepared = stmt
-        .prepare()
-        .await
-        .expect("Failed to prepare statement");
+    let mut prepared = stmt.prepare().await.expect("Failed to prepare statement");
 
     assert!(!prepared.is_closed());
     assert_eq!(prepared.parameter_count(), 0);
@@ -1845,9 +1760,7 @@ async fn test_prepared_statement_lifecycle() {
 async fn test_prepared_statement_with_parameters() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1925,9 +1838,7 @@ async fn test_prepared_statement_with_parameters() {
 async fn test_prepared_select_with_parameters() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -1966,10 +1877,7 @@ async fn test_prepared_select_with_parameters() {
 
     // Query for id = 2
     prepared.bind(0, 2).expect("Failed to bind param");
-    let results = prepared
-        .execute()
-        .await
-        .expect("Failed to execute select");
+    let results = prepared.execute().await.expect("Failed to execute select");
 
     let batches = results.fetch_all().await.expect("Failed to fetch");
     assert!(!batches.is_empty(), "Should return results");
@@ -1978,10 +1886,7 @@ async fn test_prepared_select_with_parameters() {
     // Query for id = 3 (reuse prepared statement)
     prepared.clear_parameters();
     prepared.bind(0, 3).expect("Failed to bind param");
-    let results = prepared
-        .execute()
-        .await
-        .expect("Failed to execute select");
+    let results = prepared.execute().await.expect("Failed to execute select");
 
     let batches = results.fetch_all().await.expect("Failed to fetch");
     assert!(!batches.is_empty(), "Should return results");
@@ -2002,9 +1907,7 @@ async fn test_prepared_select_with_parameters() {
 async fn test_prepared_statement_parameter_types() {
     skip_if_no_exasol!();
 
-    let conn = get_test_connection()
-        .await
-        .expect("Failed to connect");
+    let conn = get_test_connection().await.expect("Failed to connect");
 
     let schema_name = generate_test_schema_name();
 
@@ -2033,20 +1936,14 @@ async fn test_prepared_statement_parameter_types() {
         .await
         .expect("Failed to create statement");
 
-    let mut prepared = insert_stmt
-        .prepare()
-        .await
-        .expect("Failed to prepare");
+    let mut prepared = insert_stmt.prepare().await.expect("Failed to prepare");
 
     prepared.bind(0, true).expect("Failed to bind bool");
     prepared.bind(1, 42i64).expect("Failed to bind int");
     prepared.bind(2, 3.14f64).expect("Failed to bind float");
     prepared.bind(3, "hello").expect("Failed to bind string");
 
-    let rows = prepared
-        .execute_update()
-        .await
-        .expect("Failed to execute");
+    let rows = prepared.execute_update().await.expect("Failed to execute");
 
     assert_eq!(rows, 1);
     prepared.close().await.expect("Failed to close");
