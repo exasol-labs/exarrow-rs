@@ -800,7 +800,4 @@ A74EI7MHQ7163wVPT0VWFRvUmmv+UO7W8wIDAQAB
             panic!("Expected ProtocolError");
         }
     }
-
-    // Mock-based tests would go here with a mocked WebSocket connection
-    // For comprehensive testing, consider using mockall or similar
 }
