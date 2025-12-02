@@ -114,7 +114,9 @@ impl ArrowConverter {
             .column_types
             .iter()
             .enumerate()
-            .map(|(col_idx, exasol_type)| build_array(exasol_type, &result_data.data[col_idx], col_idx))
+            .map(|(col_idx, exasol_type)| {
+                build_array(exasol_type, &result_data.data[col_idx], col_idx)
+            })
             .collect();
 
         let arrays = arrays?;
@@ -165,7 +167,9 @@ impl ArrowConverter {
             .column_types
             .iter()
             .enumerate()
-            .map(|(col_idx, exasol_type)| build_array(exasol_type, &result_data.data[col_idx], col_idx))
+            .map(|(col_idx, exasol_type)| {
+                build_array(exasol_type, &result_data.data[col_idx], col_idx)
+            })
             .collect();
 
         let arrays = arrays?;
@@ -431,9 +435,9 @@ mod tests {
         let result_data = ResultData {
             columns: columns.clone(),
             data: vec![
-                vec![json!(1), json!(2), json!(3)],               // id column
+                vec![json!(1), json!(2), json!(3)],                   // id column
                 vec![json!("Alice"), json!("Bob"), json!("Charlie")], // name column
-                vec![json!(true), json!(false), json!(true)],      // active column
+                vec![json!(true), json!(false), json!(true)],         // active column
             ],
             total_rows: 3,
         };
@@ -459,7 +463,9 @@ mod tests {
             total_rows: 3,
         };
 
-        let batch = converter.convert_to_record_batch_owned(result_data).unwrap();
+        let batch = converter
+            .convert_to_record_batch_owned(result_data)
+            .unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 3);
     }
@@ -473,9 +479,9 @@ mod tests {
         let result_data = ResultData {
             columns: columns.clone(),
             data: vec![
-                vec![json!(1), json!(2), json!(null)],           // id: row 2 is null
+                vec![json!(1), json!(2), json!(null)], // id: row 2 is null
                 vec![json!("Alice"), json!(null), json!("Charlie")], // name: row 1 is null
-                vec![json!(true), json!(false), json!(null)],     // active: row 2 is null
+                vec![json!(true), json!(false), json!(null)], // active: row 2 is null
             ],
             total_rows: 3,
         };
@@ -506,7 +512,9 @@ mod tests {
             total_rows: 3,
         };
 
-        let batch = converter.convert_to_record_batch_owned(result_data).unwrap();
+        let batch = converter
+            .convert_to_record_batch_owned(result_data)
+            .unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 3);
 
@@ -591,9 +599,9 @@ mod tests {
         let result_data = ResultData {
             columns: columns.clone(),
             data: vec![
-                vec![json!(1)],          // Only id column
-                vec![json!("Alice")],    // Only name column
-                // Missing active column
+                vec![json!(1)], // Only id column
+                vec![json!("Alice")], // Only name column
+                                // Missing active column
             ],
             total_rows: 1,
         };
@@ -614,10 +622,7 @@ mod tests {
         // Wrong number of columns in data
         let result_data = ResultData {
             columns: columns.clone(),
-            data: vec![
-                vec![json!(1)],
-                vec![json!("Alice")],
-            ],
+            data: vec![vec![json!(1)], vec![json!("Alice")]],
             total_rows: 1,
         };
 
@@ -870,10 +875,10 @@ mod tests {
         let result_data = ResultData {
             columns: columns.clone(),
             data: vec![
-                vec![json!(true), json!(false)],                    // bool_col
-                vec![json!("123.45"), json!("678.90")],             // decimal_col
+                vec![json!(true), json!(false)],        // bool_col
+                vec![json!("123.45"), json!("678.90")], // decimal_col
                 vec![json!(std::f64::consts::PI), json!(std::f64::consts::E)], // double_col
-                vec![json!("2024-01-15"), json!("2024-02-20")],     // date_col
+                vec![json!("2024-01-15"), json!("2024-02-20")], // date_col
             ],
             total_rows: 2,
         };
@@ -950,7 +955,9 @@ mod tests {
             total_rows: 2,
         };
 
-        let batch = converter.convert_to_record_batch_owned(result_data).unwrap();
+        let batch = converter
+            .convert_to_record_batch_owned(result_data)
+            .unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 4);
     }
@@ -966,7 +973,9 @@ mod tests {
             total_rows: 0,
         };
 
-        let batch = converter.convert_to_record_batch_owned(result_data).unwrap();
+        let batch = converter
+            .convert_to_record_batch_owned(result_data)
+            .unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 3);
     }

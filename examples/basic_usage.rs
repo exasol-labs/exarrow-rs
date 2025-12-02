@@ -32,7 +32,9 @@ async fn example_simple_select(conn: &Connection) -> Result<usize, Box<dyn Error
 /// Demonstrates a full transaction: create schema, table, insert, commit, select, cleanup.
 async fn example_transaction(conn: &Connection) -> Result<usize, Box<dyn Error>> {
     // Create schema if it doesn't exist (ignore error if already exists)
-    let _ = conn.execute_update(&format!("CREATE SCHEMA {}", SCHEMA)).await;
+    let _ = conn
+        .execute_update(&format!("CREATE SCHEMA {}", SCHEMA))
+        .await;
 
     conn.execute_update(&format!(
         "CREATE TABLE {}.test_example (id INT, name VARCHAR(100))",
@@ -69,8 +71,10 @@ async fn example_transaction(conn: &Connection) -> Result<usize, Box<dyn Error>>
         .await?;
     let row_count: usize = results.iter().map(|b| b.num_rows()).sum();
 
-    conn.execute_update(&format!("DROP TABLE {}.test_example", SCHEMA)).await?;
-    conn.execute_update(&format!("DROP SCHEMA {}", SCHEMA)).await?;
+    conn.execute_update(&format!("DROP TABLE {}.test_example", SCHEMA))
+        .await?;
+    conn.execute_update(&format!("DROP SCHEMA {}", SCHEMA))
+        .await?;
     Ok(row_count)
 }
 

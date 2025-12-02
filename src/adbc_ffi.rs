@@ -299,16 +299,8 @@ impl FfiDatabase {
         };
 
         // Use overrides or originals
-        let user = self
-            .username
-            .as_deref()
-            .or(orig_user)
-            .unwrap_or("sys");
-        let pass = self
-            .password
-            .as_deref()
-            .or(orig_pass)
-            .unwrap_or("");
+        let user = self.username.as_deref().or(orig_user).unwrap_or("sys");
+        let pass = self.password.as_deref().or(orig_pass).unwrap_or("");
 
         // Rebuild URI
         if pass.is_empty() {
@@ -780,9 +772,7 @@ impl adbc_core::Connection for FfiConnection {
 
     fn commit(&mut self) -> AdbcResult<()> {
         let conn = self.ensure_connected()?;
-        get_runtime()
-            .block_on(conn.commit())
-            .map_err(to_adbc_error)
+        get_runtime().block_on(conn.commit()).map_err(to_adbc_error)
     }
 
     fn rollback(&mut self) -> AdbcResult<()> {

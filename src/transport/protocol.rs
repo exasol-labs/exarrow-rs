@@ -452,7 +452,7 @@ mod tests {
                     fraction: None,
                 },
             }],
-            data: vec![],  // Column-major: empty means no rows
+            data: vec![], // Column-major: empty means no rows
             total_rows: 0,
         };
 
