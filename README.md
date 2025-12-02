@@ -2,6 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/marconae/exarrow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/marconae/exarrow-rs/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/marconae/exarrow-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/marconae/exarrow-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 > ADBC-compatible driver for Exasol with Apache Arrow data format support.
