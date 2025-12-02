@@ -8,7 +8,3 @@ mod converter;
 
 pub use builders::{build_array, ArrayBuilder};
 pub use converter::ArrowConverter;
-
-// TODO: Add tests module
-// #[cfg(test)]
-// mod tests;
