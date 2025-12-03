@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "exarrow-rs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
