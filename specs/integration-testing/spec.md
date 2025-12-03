@@ -133,12 +133,23 @@ The system SHALL verify that Arrow data conversion is correct for real Exasol da
 - **WHEN** querying columns containing NULL values
 - **THEN** the Arrow arrays SHALL correctly represent nulls
 - **AND** the null bitmap SHALL be set appropriately
+- **AND** the null_count() method SHALL return the exact count of NULL values in each column
 
 #### Scenario: Temporal type conversion
 
 - **WHEN** querying DATE and TIMESTAMP columns
-- **THEN** the values SHALL be correctly converted to Arrow Date32/Timestamp
+- **THEN** DATE values SHALL be correctly converted to Arrow Date32 (not Utf8)
+- **AND** TIMESTAMP values SHALL be correctly converted to Arrow Timestamp
+- **AND** the conversion SHALL handle Exasol's date string format "YYYY-MM-DD"
 - **AND** time zone handling SHALL be consistent
+
+#### Scenario: Prepared statement with parameters
+
+- **WHEN** executing a prepared SELECT statement with bound parameters
+- **THEN** the parameters SHALL be correctly serialized in column-major format
+- **AND** parameter type metadata SHALL be included in the request
+- **AND** the query SHALL execute without SQL parsing errors
+- **AND** results SHALL be returned in Arrow format
 
 ### Requirement: ADBC Driver Manager Compatibility
 
