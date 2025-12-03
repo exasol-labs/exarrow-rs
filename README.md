@@ -8,24 +8,22 @@
 
 > ADBC-compatible driver for Exasol with Apache Arrow data format support.
 
-*Community-maintained. Not officially supported by Exasol.*
+*Community-maintained. Not officially supported by Exasol. This is a side-project of mine!*
 
 ## Overview
 
-`exarrow-rs` is a high-performance Rust library that provides ADBC (Arrow Database Connectivity) compatible access to Exasol databases. It enables efficient data transfer using the Apache Arrow columnar format, making it ideal for analytical workloads and data science applications.
+`exarrow-rs` is a Rust library that provides ADBC (Arrow Database Connectivity) compatible access to Exasol databases. It enables efficient data transfer using the Apache Arrow columnar format, making it ideal for analytical workloads and data science applications.
 
-`exarrow-rs` uses WebSocket-based transport using [Exasol's native WebSocket API](https://github.com/exasol/websocket-api). Arrow-native gRPC protocol for higher performance is planned for the future.
+`exarrow-rs` uses WebSocket-based transport using [Exasol's native WebSocket API](https://github.com/exasol/websocket-api).
 
 ## Features
 
 - **ADBC-Compatible Interface**: Standard database connectivity API
 - **Apache Arrow Format**: Efficient columnar data representation
-- **Async/Await**: Built on Tokio for high-performance concurrent operations
-- **Type Safety**: Comprehensive Rust type system integration
+- **Async/Await**: Built on Tokio for concurrent operations
 - **Secure**: TLS/SSL support, secure credential handling
 - **Parameter Binding**: Type-safe parameterized queries
 - **Metadata Queries**: Introspect catalogs, schemas, tables, and columns
-- **Comprehensive Error Handling**: Detailed error messages with context
 
 ## Installation
 
