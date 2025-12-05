@@ -1726,8 +1726,8 @@ mod tests {
         let data = ResultData {
             columns: vec![],
             data: vec![
-                vec![serde_json::json!(3.14159)],
-                vec![serde_json::json!(-2.71828)],
+                vec![serde_json::json!(1.23456)],
+                vec![serde_json::json!(-9.87654)],
                 vec![serde_json::json!(null)],
                 vec![serde_json::json!(0.0)],
             ],
@@ -1743,8 +1743,8 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .unwrap();
-        assert!((array.value(0) - 3.14159).abs() < 0.00001);
-        assert!((array.value(1) - (-2.71828)).abs() < 0.00001);
+        assert!((array.value(0) - 1.23456).abs() < 0.00001);
+        assert!((array.value(1) - (-9.87654)).abs() < 0.00001);
         assert!(array.is_null(2));
         assert!((array.value(3) - 0.0).abs() < 0.00001);
     }
