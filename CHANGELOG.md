@@ -18,13 +18,13 @@ All notable changes to this project will be documented in this file.
 - Column-to-row transposition now happens during JSON deserialization
 - Removed `transpose_rows_to_columns` functions from ArrowConverter
 
-## [1.0.1] - 2024-12-01
+## [1.0.1]
 
 ### Fixed
 
 - Improved type mapping documentation for DECIMAL, TIMESTAMP, and string limits
 
-## [1.0.0] - 2024-11-15
+## [1.0.0]
 
 ### Added
 
