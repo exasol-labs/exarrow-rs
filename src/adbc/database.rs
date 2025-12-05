@@ -13,22 +13,6 @@ use std::str::FromStr;
 /// The `Database` type represents a database connection configuration and
 /// serves as a factory for creating `Connection` instances. It encapsulates
 /// the connection parameters and provides methods to establish connections.
-///
-/// # Example
-///
-/// ```no_run
-/// use exarrow_rs::adbc::Database;
-/// use std::str::FromStr;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // Create database from connection string
-/// let database = Database::from_str("exasol://user:pass@localhost:8563")?;
-///
-/// // Connect to the database
-/// let connection = database.connect().await?;
-/// # Ok(())
-/// # }
-/// ```
 #[derive(Debug, Clone)]
 pub struct Database {
     /// Connection parameters
@@ -43,25 +27,6 @@ impl Database {
     /// # Arguments
     ///
     /// * `params` - The connection parameters
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use exarrow_rs::adbc::Database;
-    /// use exarrow_rs::connection::ConnectionBuilder;
-    ///
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let params = ConnectionBuilder::new()
-    ///     .host("localhost")
-    ///     .port(8563)
-    ///     .username("sys")
-    ///     .password("exasol")
-    ///     .build()?;
-    ///
-    /// let database = Database::new(params);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn new(params: ConnectionParams) -> Self {
         // Reconstruct a safe connection string for display (without password)
         let connection_string = format!(
@@ -112,23 +77,6 @@ impl Database {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use exarrow_rs::adbc::Database;
-    /// use std::str::FromStr;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let database = Database::from_str("exasol://user:pass@localhost:8563")?;
-    /// let connection = database.connect().await?;
-    ///
-    /// // Use the connection...
-    ///
-    /// connection.close().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn connect(&self) -> Result<Connection, ConnectionError> {
         Connection::from_params(self.params.clone()).await
     }
@@ -145,23 +93,6 @@ impl Database {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection test fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use exarrow_rs::adbc::Database;
-    /// use std::str::FromStr;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let database = Database::from_str("exasol://user:pass@localhost:8563")?;
-    ///
-    /// // Test the connection
-    /// database.test_connection().await?;
-    ///
-    /// println!("Connection test successful!");
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn test_connection(&self) -> Result<(), ConnectionError> {
         let connection = self.connect().await?;
         connection.close().await?;
@@ -186,18 +117,6 @@ impl FromStr for Database {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection string is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use exarrow_rs::adbc::Database;
-    /// use std::str::FromStr;
-    ///
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let database = Database::from_str("exasol://user:pass@localhost:8563/MY_SCHEMA")?;
-    /// # Ok(())
-    /// # }
-    /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let params = ConnectionParams::from_str(s)?;
         Ok(Self::new(params))

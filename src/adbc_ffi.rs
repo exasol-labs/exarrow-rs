@@ -44,37 +44,9 @@
 //!
 //! ## Using with ADBC Driver Manager (Rust)
 //!
-//! ```rust,ignore
-//! use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
-//! use adbc_core::{Connection, Database, Driver, Statement};
-//! use adbc_driver_manager::ManagedDriver;
-//!
-//! // Load the driver
-//! let mut driver = ManagedDriver::load_dynamic_from_filename(
-//!     "target/release/libexarrow_rs.dylib",  // or .so on Linux
-//!     Some(b"ExarrowDriverInit"),
-//!     AdbcVersion::V110,
-//! ).expect("Failed to load driver");
-//!
-//! // Create database with connection URI
-//! let uri = "exasol://sys:exasol@localhost:8563";
-//! let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri.to_string()))];
-//! let db = driver.new_database_with_opts(opts).expect("Failed to create database");
-//!
-//! // Create connection
-//! let mut conn = db.new_connection().expect("Failed to connect");
-//!
-//! // Create and execute statement
-//! let mut stmt = conn.new_statement().expect("Failed to create statement");
-//! stmt.set_sql_query("SELECT 1 AS result").expect("Failed to set query");
-//!
-//! // Execute and get results as Arrow RecordBatch
-//! let reader = stmt.execute().expect("Failed to execute");
-//! for batch in reader {
-//!     let batch = batch.expect("Failed to read batch");
-//!     println!("Got {} rows", batch.num_rows());
-//! }
-//! ```
+//! Load the driver with `ManagedDriver::load_dynamic_from_filename()`, create a database
+//! with `OptionDatabase::Uri` set to your connection string, then create connections and
+//! execute statements.
 //!
 //! ## Using with ADBC Driver Manager (Python)
 //!
@@ -174,19 +146,6 @@ fn to_adbc_error(err: impl std::error::Error) -> AdbcError {
 ///
 /// This wraps the internal `Driver` type to implement `adbc_core::Driver`.
 /// The driver is loaded via the `ExarrowDriverInit` entry point.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use adbc_driver_manager::ManagedDriver;
-/// use adbc_core::options::AdbcVersion;
-///
-/// let driver = ManagedDriver::load_dynamic_from_filename(
-///     "target/release/libexarrow_rs.dylib",
-///     Some(b"ExarrowDriverInit"),
-///     AdbcVersion::V110,
-/// ).expect("Failed to load driver");
-/// ```
 #[derive(Debug, Default)]
 pub struct FfiDriver;
 
@@ -219,22 +178,7 @@ impl adbc_core::Driver for FfiDriver {
 /// The primary option is `OptionDatabase::Uri` which should contain
 /// the Exasol connection string.
 ///
-/// # Connection URI Format
-///
-/// ```text
-/// exasol://[username[:password]@]host[:port][/schema]
-/// ```
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use adbc_core::options::{OptionDatabase, OptionValue};
-///
-/// let opts = vec![
-///     (OptionDatabase::Uri, OptionValue::String("exasol://sys:exasol@localhost:8563".to_string())),
-/// ];
-/// let db = driver.new_database_with_opts(opts)?;
-/// ```
+/// Connection URI format: `exasol://[username[:password]@]host[:port][/schema]`
 pub struct FfiDatabase {
     /// URI for the connection (exasol://user:pass@host:port/schema)
     uri: Option<String>,
@@ -800,17 +744,6 @@ impl adbc_core::Connection for FfiConnection {
 /// FFI-compatible ADBC Statement wrapper.
 ///
 /// Used to execute SQL queries and retrieve results as Arrow RecordBatches.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let mut stmt = conn.new_statement()?;
-/// stmt.set_sql_query("SELECT * FROM my_table")?;
-/// let reader = stmt.execute()?;
-/// for batch in reader {
-///     // Process Arrow RecordBatch
-/// }
-/// ```
 pub struct FfiStatement {
     /// Connection URI (for creating connections)
     uri: String,

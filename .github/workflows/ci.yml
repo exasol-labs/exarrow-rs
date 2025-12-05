@@ -85,12 +85,6 @@ jobs:
       - name: Run unit tests with coverage
         run: cargo llvm-cov --lib --lcov --output-path lcov-unit.info
 
-      - name: Upload unit test coverage
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-unit
-          path: lcov-unit.info
-
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
@@ -146,38 +140,8 @@ jobs:
           cargo llvm-cov --no-report --features ffi --test driver_manager_tests -- --ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov-integration.info
 
-      - name: Upload integration test coverage
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-integration
-          path: lcov-integration.info
-
       - name: Stop Exasol container
         if: always()
         run: |
           docker stop exasol-test || true
           docker rm exasol-test || true
-
-  upload-coverage:
-    name: Upload Coverage
-    runs-on: ubuntu-latest
-    needs: [unit-tests, integration-tests]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download unit test coverage
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage-unit
-
-      - name: Download integration test coverage
-        uses: actions/download-artifact@v4
-        with:
-          name: coverage-integration
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov-unit.info,lcov-integration.info
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}

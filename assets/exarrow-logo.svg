@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 175" width="200" height="175">
+  <!-- Simple green arrow -->
+  <g transform="translate(20, 95)">
+    <rect x="0" y="-8" width="120" height="16" rx="3" fill="#00A854"/>
+    <polygon points="120,-20 160,0 120,20" fill="#00A854"/>
+  </g>
+
+  <!-- Ferris riding on top of the arrow -->
+  <g transform="translate(90, 65)">
+    <!-- Body -->
+    <ellipse cx="0" cy="0" rx="32" ry="22" fill="#F74C00"/>
+
+    <!-- Shell shine -->
+    <ellipse cx="-8" cy="-6" rx="12" ry="8" fill="#FF8C42" opacity="0.5"/>
+
+    <!-- Left claw (raised up happily) -->
+    <g transform="translate(-38, -15) rotate(-20)">
+      <ellipse cx="0" cy="0" rx="14" ry="10" fill="#F74C00"/>
+      <circle cx="-10" cy="-6" r="7" fill="#F74C00"/>
+      <circle cx="-10" cy="6" r="7" fill="#F74C00"/>
+    </g>
+
+    <!-- Right claw (raised up happily) -->
+    <g transform="translate(38, -15) rotate(20)">
+      <ellipse cx="0" cy="0" rx="14" ry="10" fill="#F74C00"/>
+      <circle cx="10" cy="-6" r="7" fill="#F74C00"/>
+      <circle cx="10" cy="6" r="7" fill="#F74C00"/>
+    </g>
+
+    <!-- Eyes -->
+    <circle cx="-10" cy="-5" r="8" fill="white"/>
+    <circle cx="10" cy="-5" r="8" fill="white"/>
+    <circle cx="-7" cy="-5" r="4" fill="#222"/>
+    <circle cx="13" cy="-5" r="4" fill="#222"/>
+    <!-- Eye shine -->
+    <circle cx="-9" cy="-7" r="2" fill="white"/>
+    <circle cx="11" cy="-7" r="2" fill="white"/>
+
+    <!-- Happy smile -->
+    <path d="M -12 8 Q 0 18 12 8" stroke="#222" stroke-width="3" fill="none" stroke-linecap="round"/>
+
+    <!-- Legs (dangling below) -->
+    <line x1="-18" y1="18" x2="-22" y2="28" stroke="#CE422B" stroke-width="5" stroke-linecap="round"/>
+    <line x1="-8" y1="20" x2="-10" y2="30" stroke="#CE422B" stroke-width="5" stroke-linecap="round"/>
+    <line x1="8" y1="20" x2="10" y2="30" stroke="#CE422B" stroke-width="5" stroke-linecap="round"/>
+    <line x1="18" y1="18" x2="22" y2="28" stroke="#CE422B" stroke-width="5" stroke-linecap="round"/>
+  </g>
+
+  <!-- Text: exarrow-rs with white outline for dark mode -->
+  <!-- White stroke layer (behind) -->
+  <text x="20" y="128" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="none" stroke="white" stroke-width="4" stroke-linejoin="round" text-anchor="start">exarrow-rs</text>
+  <!-- Main text layer (on top) -->
+  <text x="20" y="128" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#333" text-anchor="start">exarrow-rs</text>
+</svg>

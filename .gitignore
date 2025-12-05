@@ -30,9 +30,8 @@ tmp
 # Secrets
 .env
 
-# Spec-driven development
+# Specs
 specs/_archive
 
 # Exclude coding agents
-.claude/commands
-.claude/agents
+.claude/

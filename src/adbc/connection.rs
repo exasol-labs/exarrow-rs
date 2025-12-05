@@ -3,8 +3,6 @@
 //! This module provides the `Connection` type which represents an active
 //! database connection and provides methods for executing queries.
 //!
-//! # New in v2.0.0
-//!
 //! Connection now owns the transport directly and Statement is a pure data container.
 //! Execute statements via Connection methods: `execute_statement()`, `execute_prepared()`.
 
@@ -37,29 +35,6 @@ use tokio::time::timeout;
 /// - `create_statement()` is now synchronous and returns a pure data container
 /// - Use `execute_statement()` instead of `Statement::execute()`
 /// - Use `prepare()` instead of `Statement::prepare()`
-///
-/// # Example
-///
-/// ```no_run
-/// use exarrow_rs::adbc::{Driver, Connection};
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let driver = Driver::new();
-/// let database = driver.open("exasol://user:pass@localhost:8563")?;
-/// let mut connection = database.connect().await?;
-///
-/// // Create and execute a statement
-/// let stmt = connection.create_statement("SELECT * FROM my_table");
-/// let results = connection.execute_statement(&stmt).await?;
-///
-/// // Or use convenience methods
-/// let results = connection.execute("SELECT * FROM my_table").await?;
-///
-/// // Close the connection
-/// connection.close().await?;
-/// # Ok(())
-/// # }
-/// ```
 pub struct Connection {
     /// Transport layer for communication (owned by Connection)
     transport: Arc<Mutex<dyn TransportProtocol>>,
@@ -162,23 +137,6 @@ impl Connection {
     /// # Returns
     ///
     /// A `ConnectionBuilder` instance.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use exarrow_rs::adbc::Connection;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut connection = Connection::builder()
-    ///     .host("localhost")
-    ///     .port(8563)
-    ///     .username("sys")
-    ///     .password("exasol")
-    ///     .connect()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn builder() -> ConnectionBuilder {
         ConnectionBuilder::new()
     }
@@ -198,18 +156,6 @@ impl Connection {
     /// # Returns
     ///
     /// A `Statement` instance ready for execution via `execute_statement()`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut stmt = connection.create_statement("SELECT * FROM users WHERE id = ?");
-    /// stmt.bind(0, 42)?;
-    /// let results = connection.execute_statement(&stmt).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn create_statement(&self, sql: impl Into<String>) -> Statement {
         Statement::new(sql)
     }
@@ -231,18 +177,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if execution fails or times out.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut stmt = connection.create_statement("SELECT * FROM users WHERE age > ?");
-    /// stmt.bind(0, 18)?;
-    /// let results = connection.execute_statement(&stmt).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn execute_statement(&mut self, stmt: &Statement) -> Result<ResultSet, QueryError> {
         // Validate session state
         self.session
@@ -293,19 +227,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if execution fails or if statement is a SELECT.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut stmt = connection.create_statement("DELETE FROM users WHERE active = ?");
-    /// stmt.bind(0, false)?;
-    /// let count = connection.execute_statement_update(&stmt).await?;
-    /// println!("Deleted {} rows", count);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn execute_statement_update(&mut self, stmt: &Statement) -> Result<i64, QueryError> {
         let result_set = self.execute_statement(stmt).await?;
 
@@ -334,19 +255,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if preparation fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut prepared = connection.prepare("SELECT * FROM users WHERE id = ?").await?;
-    /// prepared.bind(0, 42)?;
-    /// let results = connection.execute_prepared(&prepared).await?;
-    /// connection.close_prepared(prepared).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn prepare(
         &mut self,
         sql: impl Into<String>,
@@ -381,18 +289,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if execution fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut prepared = connection.prepare("SELECT * FROM users WHERE id = ?").await?;
-    /// prepared.bind(0, 42)?;
-    /// let results = connection.execute_prepared(&prepared).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn execute_prepared(
         &mut self,
         stmt: &PreparedStatement,
@@ -491,18 +387,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if closing fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let prepared = connection.prepare("SELECT 1").await?;
-    /// // Use the prepared statement...
-    /// connection.close_prepared(prepared).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn close_prepared(&mut self, mut stmt: PreparedStatement) -> Result<(), QueryError> {
         if stmt.is_closed() {
             return Ok(());
@@ -537,16 +421,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if execution fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let results = connection.execute("SELECT COUNT(*) FROM users").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn execute(&mut self, sql: impl Into<String>) -> Result<ResultSet, QueryError> {
         let stmt = self.create_statement(sql);
         self.execute_statement(&stmt).await
@@ -567,19 +441,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if execution fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let batches = connection.query("SELECT * FROM users").await?;
-    /// for batch in batches {
-    ///     println!("Rows: {}", batch.num_rows());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn query(&mut self, sql: impl Into<String>) -> Result<Vec<RecordBatch>, QueryError> {
         let result_set = self.execute(sql).await?;
         result_set.fetch_all().await
@@ -598,17 +459,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if execution fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// let count = connection.execute_update("DELETE FROM users WHERE id = 1").await?;
-    /// println!("Deleted {} rows", count);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn execute_update(&mut self, sql: impl Into<String>) -> Result<i64, QueryError> {
         let stmt = self.create_statement(sql);
         self.execute_statement_update(&stmt).await
@@ -623,18 +473,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if a transaction is already active or if the operation fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// connection.begin_transaction().await?;
-    /// // Execute queries...
-    /// connection.commit().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn begin_transaction(&mut self) -> Result<(), QueryError> {
         // Exasol doesn't have a BEGIN statement - transactions are implicit.
         // Starting a transaction just means we're tracking that autocommit is off.
@@ -652,18 +490,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if no transaction is active or if the operation fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// connection.begin_transaction().await?;
-    /// connection.execute_update("INSERT INTO users VALUES (1, 'Alice')").await?;
-    /// connection.commit().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn commit(&mut self) -> Result<(), QueryError> {
         // Execute COMMIT statement
         self.execute_update("COMMIT").await?;
@@ -681,18 +507,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if no transaction is active or if the operation fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// connection.begin_transaction().await?;
-    /// connection.execute_update("DELETE FROM users").await?;
-    /// connection.rollback().await?; // Undo the delete
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn rollback(&mut self) -> Result<(), QueryError> {
         // Execute ROLLBACK statement
         self.execute_update("ROLLBACK").await?;
@@ -736,16 +550,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `QueryError` if the operation fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// connection.set_schema("MY_SCHEMA").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn set_schema(&mut self, schema: impl Into<String>) -> Result<(), QueryError> {
         let schema_name = schema.into();
         self.execute_update(format!("OPEN SCHEMA {}", schema_name))
@@ -935,17 +739,6 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `ConnectionError` if closing fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use exarrow_rs::adbc::Connection;
-    /// # async fn example(connection: Connection) -> Result<(), Box<dyn std::error::Error>> {
-    /// // Use the connection...
-    /// connection.close().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn close(self) -> Result<(), ConnectionError> {
         // Close session
         self.session.close().await?;

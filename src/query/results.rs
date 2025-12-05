@@ -306,12 +306,10 @@ impl ResultSet {
     /// the value at that position.
     ///
     /// Example: For a result with 2 columns (id, name) and 3 rows:
-    /// ```rust,ignore
-    /// // data[row_idx][col_idx]
+    ///
     /// data[0] = [1, "a"]    // Row 0
     /// data[1] = [2, "b"]    // Row 1
     /// data[2] = [3, "c"]    // Row 2
-    /// ```
     fn column_major_to_record_batch(
         data: &ResultData,
         schema: &Arc<Schema>,

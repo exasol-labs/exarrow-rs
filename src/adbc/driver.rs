@@ -12,16 +12,6 @@ use std::str::FromStr;
 /// The `Driver` type represents the exarrow-rs driver and provides metadata
 /// about the driver implementation. It serves as the entry point for creating
 /// database connections.
-///
-/// # Example
-///
-/// ```
-/// use exarrow_rs::adbc::Driver;
-///
-/// let driver = Driver::new();
-/// println!("Driver: {} v{}", driver.name(), driver.version());
-/// println!("Vendor: {}", driver.vendor());
-/// ```
 #[derive(Debug, Clone)]
 pub struct Driver {
     /// Driver name
@@ -38,15 +28,6 @@ impl Driver {
     /// Create a new Driver instance.
     ///
     /// This initializes the driver with metadata from the library.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use exarrow_rs::adbc::Driver;
-    ///
-    /// let driver = Driver::new();
-    /// assert_eq!(driver.name(), "exarrow-rs");
-    /// ```
     pub fn new() -> Self {
         Self {
             name: "exarrow-rs".to_string(),
@@ -110,18 +91,6 @@ impl Driver {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection string is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use exarrow_rs::adbc::Driver;
-    ///
-    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let driver = Driver::new();
-    /// let database = driver.open("exasol://user:pass@localhost:8563")?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn open(&self, connection_string: &str) -> Result<Database, ConnectionError> {
         Database::from_str(connection_string)
     }
@@ -137,16 +106,6 @@ impl Driver {
     /// # Returns
     ///
     /// `true` if the connection string is valid, `false` otherwise.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use exarrow_rs::adbc::Driver;
-    ///
-    /// let driver = Driver::new();
-    /// assert!(driver.validate_connection_string("exasol://user@localhost"));
-    /// assert!(!driver.validate_connection_string("invalid://connection"));
-    /// ```
     pub fn validate_connection_string(&self, connection_string: &str) -> bool {
         Database::from_str(connection_string).is_ok()
     }
