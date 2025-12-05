@@ -14,29 +14,6 @@
 //! - `prepared` - Prepared statement handling for parameterized queries
 //! - `results` - Result set iteration and metadata handling
 //!
-//! # Example
-//!
-//! ```no_run
-//! use exarrow_rs::adbc::Connection;
-//!
-//! # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
-//! // Create a statement (now synchronous)
-//! let mut stmt = connection.create_statement("SELECT * FROM users WHERE age > ?");
-//!
-//! // Bind parameters
-//! stmt.bind(0, 18)?;
-//!
-//! // Execute via Connection
-//! let result_set = connection.execute_statement(&stmt).await?;
-//!
-//! // Iterate over results
-//! for batch in result_set.into_iterator()? {
-//!     let batch = batch?;
-//!     println!("Batch rows: {}", batch.num_rows());
-//! }
-//! # Ok(())
-//! # }
-//! ```
 
 pub mod prepared;
 pub mod results;

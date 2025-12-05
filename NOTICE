@@ -1,0 +1,63 @@
+exarrow-rs Notice
+
+This product includes software developed by third parties.
+
+================================================================================
+DIRECT DEPENDENCIES
+================================================================================
+
+Apache Arrow (arrow, arrow-array, arrow-schema)
+  License: Apache-2.0
+  https://github.com/apache/arrow-rs
+
+Apache Arrow ADBC (adbc_core, adbc_ffi)
+  License: Apache-2.0
+  https://github.com/apache/arrow-adbc
+
+Tokio
+  License: MIT
+  https://github.com/tokio-rs/tokio
+
+tokio-tungstenite
+  License: MIT
+  https://github.com/snapview/tokio-tungstenite
+
+Serde (serde, serde_json)
+  License: Apache-2.0 OR MIT
+  https://github.com/serde-rs/serde
+
+thiserror
+  License: Apache-2.0 OR MIT
+  https://github.com/dtolnay/thiserror
+
+async-trait
+  License: Apache-2.0 OR MIT
+  https://github.com/dtolnay/async-trait
+
+futures-util
+  License: Apache-2.0 OR MIT
+  https://github.com/rust-lang/futures-rs
+
+native-tls
+  License: Apache-2.0 OR MIT
+  https://github.com/sfackler/rust-native-tls
+
+rsa
+  License: Apache-2.0 OR MIT
+  https://github.com/RustCrypto/RSA
+
+base64
+  License: Apache-2.0 OR MIT
+  https://github.com/marshallpierce/rust-base64
+
+rand_core
+  License: Apache-2.0 OR MIT
+  https://github.com/rust-random/rand
+
+hex
+  License: Apache-2.0 OR MIT
+  https://github.com/KokaKiwi/rust-hex
+
+urlencoding
+  License: MIT
+  https://github.com/kornelski/rust_urlencoding

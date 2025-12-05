@@ -12,19 +12,6 @@ use crate::transport::protocol::PreparedStatementHandle;
 ///
 /// PreparedStatement stores the server-side statement handle and parameter values.
 /// Execution is performed by Connection, not by PreparedStatement itself.
-///
-/// # Example
-///
-/// ```no_run
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // PreparedStatement is created via Connection::prepare()
-/// // let mut prepared = connection.prepare("SELECT * FROM users WHERE id = ?").await?;
-/// // prepared.bind(0, 42)?;
-/// // let results = connection.execute_prepared(&prepared).await?;
-/// // connection.close_prepared(prepared).await?;
-/// # Ok(())
-/// # }
-/// ```
 pub struct PreparedStatement {
     /// Server-side prepared statement handle
     handle: PreparedStatementHandle,

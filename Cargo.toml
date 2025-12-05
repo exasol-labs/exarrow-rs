@@ -1,11 +1,9 @@
 [package]
 name = "exarrow-rs"
-version = "2.0.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["Marco Naetlitz"]
 license = "MIT"
 description = "ADBC-compatible driver for Exasol with Arrow data format support"
-repository = "https://github.com/marconae/exarrow-rs"
 keywords = ["exasol", "adbc", "arrow", "database", "driver"]
 categories = ["database"]
 
