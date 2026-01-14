@@ -42,7 +42,15 @@ use parquet::basic::{Compression as ParquetCompressionCodec, Encoding};
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
-use crate::types::ExasolType;
+use crate::types::{
+    conversion::{
+        exasol_type_to_arrow as exasol_type_to_arrow_impl,
+        parse_date_to_days as parse_date_to_days_impl,
+        parse_decimal_to_i128 as parse_decimal_to_i128_impl,
+        parse_timestamp_to_micros as parse_timestamp_to_micros_impl,
+    },
+    ExasolType,
+};
 
 /// Errors that can occur during Parquet export operations.
 #[derive(Error, Debug)]
@@ -667,71 +675,10 @@ fn parse_decimal_to_i128(
     row_idx: usize,
     col_idx: usize,
 ) -> Result<i128, ParquetExportError> {
-    let parts: Vec<&str> = value_str.split('.').collect();
-
-    let (integer_part, decimal_part) = match parts.len() {
-        1 => (parts[0], ""),
-        2 => (parts[0], parts[1]),
-        _ => {
-            return Err(ParquetExportError::CsvParse {
-                row: row_idx,
-                message: format!(
-                    "Invalid decimal format at column {}: {}",
-                    col_idx, value_str
-                ),
-            })
-        }
-    };
-
-    // Parse integer part
-    let mut result: i128 = integer_part
-        .parse()
-        .map_err(|_| ParquetExportError::CsvParse {
-            row: row_idx,
-            message: format!(
-                "Invalid integer part at column {}: {}",
-                col_idx, integer_part
-            ),
-        })?;
-
-    // Scale up
-    result = result
-        .checked_mul(10_i128.pow(scale as u32))
-        .ok_or_else(|| ParquetExportError::CsvParse {
-            row: row_idx,
-            message: format!("Numeric overflow at column {}", col_idx),
-        })?;
-
-    // Add decimal part
-    if !decimal_part.is_empty() {
-        let decimal_digits = decimal_part.len().min(scale as usize);
-        let decimal_value: i128 =
-            decimal_part[..decimal_digits]
-                .parse()
-                .map_err(|_| ParquetExportError::CsvParse {
-                    row: row_idx,
-                    message: format!(
-                        "Invalid decimal part at column {}: {}",
-                        col_idx, decimal_part
-                    ),
-                })?;
-
-        let scale_diff = scale as usize - decimal_digits;
-        let scaled_decimal = decimal_value * 10_i128.pow(scale_diff as u32);
-
-        result = result
-            .checked_add(if integer_part.starts_with('-') {
-                -scaled_decimal
-            } else {
-                scaled_decimal
-            })
-            .ok_or_else(|| ParquetExportError::CsvParse {
-                row: row_idx,
-                message: format!("Numeric overflow at column {}", col_idx),
-            })?;
-    }
-
-    Ok(result)
+    parse_decimal_to_i128_impl(value_str, scale).map_err(|e| ParquetExportError::CsvParse {
+        row: row_idx,
+        message: format!("at column {}: {}", col_idx, e),
+    })
 }
 
 /// Build a Date32 array from CSV string values.
@@ -760,59 +707,10 @@ fn parse_date_to_days(
     row_idx: usize,
     col_idx: usize,
 ) -> Result<i32, ParquetExportError> {
-    let parts: Vec<&str> = date_str.split('-').collect();
-    if parts.len() != 3 {
-        return Err(ParquetExportError::CsvParse {
-            row: row_idx,
-            message: format!("Invalid date format at column {}: {}", col_idx, date_str),
-        });
-    }
-
-    let year: i32 = parts[0].parse().map_err(|_| ParquetExportError::CsvParse {
+    parse_date_to_days_impl(date_str).map_err(|e| ParquetExportError::CsvParse {
         row: row_idx,
-        message: format!("Invalid year at column {}: {}", col_idx, parts[0]),
-    })?;
-
-    let month: u32 = parts[1].parse().map_err(|_| ParquetExportError::CsvParse {
-        row: row_idx,
-        message: format!("Invalid month at column {}: {}", col_idx, parts[1]),
-    })?;
-
-    let day: u32 = parts[2].parse().map_err(|_| ParquetExportError::CsvParse {
-        row: row_idx,
-        message: format!("Invalid day at column {}: {}", col_idx, parts[2]),
-    })?;
-
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(ParquetExportError::CsvParse {
-            row: row_idx,
-            message: format!("Invalid date values at column {}: {}", col_idx, date_str),
-        });
-    }
-
-    // Calculate days since Unix epoch
-    let days_from_year =
-        (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-    let days_from_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => unreachable!(),
-    };
-
-    let is_leap_year = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_adjustment = if month > 2 && is_leap_year { 1 } else { 0 };
-
-    Ok(days_from_year + days_from_month + day as i32 - 1 + leap_adjustment)
+        message: format!("at column {}: {}", col_idx, e),
+    })
 }
 
 /// Build a Timestamp array from CSV string values.
@@ -842,73 +740,10 @@ fn parse_timestamp_to_micros(
     row_idx: usize,
     col_idx: usize,
 ) -> Result<i64, ParquetExportError> {
-    let parts: Vec<&str> = timestamp_str.split(' ').collect();
-    if parts.is_empty() {
-        return Err(ParquetExportError::CsvParse {
-            row: row_idx,
-            message: format!(
-                "Invalid timestamp format at column {}: {}",
-                col_idx, timestamp_str
-            ),
-        });
-    }
-
-    // Parse date part
-    let days = parse_date_to_days(parts[0], row_idx, col_idx)?;
-    let mut micros = days as i64 * 86400 * 1_000_000;
-
-    // Parse time part if present
-    if parts.len() > 1 {
-        let time_parts: Vec<&str> = parts[1].split(':').collect();
-        if time_parts.len() >= 2 {
-            let hours: i64 = time_parts[0]
-                .parse()
-                .map_err(|_| ParquetExportError::CsvParse {
-                    row: row_idx,
-                    message: format!("Invalid hour at column {}: {}", col_idx, time_parts[0]),
-                })?;
-
-            let minutes: i64 = time_parts[1]
-                .parse()
-                .map_err(|_| ParquetExportError::CsvParse {
-                    row: row_idx,
-                    message: format!("Invalid minute at column {}: {}", col_idx, time_parts[1]),
-                })?;
-
-            micros += hours * 3600 * 1_000_000;
-            micros += minutes * 60 * 1_000_000;
-
-            if time_parts.len() >= 3 {
-                let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
-                let seconds: i64 =
-                    sec_parts[0]
-                        .parse()
-                        .map_err(|_| ParquetExportError::CsvParse {
-                            row: row_idx,
-                            message: format!(
-                                "Invalid second at column {}: {}",
-                                col_idx, sec_parts[0]
-                            ),
-                        })?;
-
-                micros += seconds * 1_000_000;
-
-                if sec_parts.len() > 1 {
-                    let frac = sec_parts[1];
-                    let frac_micros = if frac.len() <= 6 {
-                        let padding = 6 - frac.len();
-                        let padded = format!("{}{}", frac, "0".repeat(padding));
-                        padded.parse::<i64>().unwrap_or(0)
-                    } else {
-                        frac[..6].parse::<i64>().unwrap_or(0)
-                    };
-                    micros += frac_micros;
-                }
-            }
-        }
-    }
-
-    Ok(micros)
+    parse_timestamp_to_micros_impl(timestamp_str).map_err(|e| ParquetExportError::CsvParse {
+        row: row_idx,
+        message: format!("at column {}: {}", col_idx, e),
+    })
 }
 
 /// Build an Int64 array from CSV string values.
@@ -965,29 +800,22 @@ pub fn exasol_types_to_arrow_schema(
 
 /// Convert an Exasol type to Arrow DataType.
 fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, ParquetExportError> {
+    // Check for unsupported types in Parquet export first
     match exasol_type {
-        ExasolType::Boolean => Ok(DataType::Boolean),
-        ExasolType::Char { .. } | ExasolType::Varchar { .. } => Ok(DataType::Utf8),
-        ExasolType::Decimal { precision, scale } => Ok(DataType::Decimal128(*precision, *scale)),
-        ExasolType::Double => Ok(DataType::Float64),
-        ExasolType::Date => Ok(DataType::Date32),
-        ExasolType::Timestamp {
-            with_local_time_zone,
-        } => {
-            if *with_local_time_zone {
-                Ok(DataType::Timestamp(
-                    TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                ))
-            } else {
-                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-            }
+        ExasolType::IntervalYearToMonth
+        | ExasolType::IntervalDayToSecond { .. }
+        | ExasolType::Geometry { .. }
+        | ExasolType::Hashtype { .. } => {
+            return Err(ParquetExportError::Schema(format!(
+                "Unsupported Exasol type for Parquet export: {:?}",
+                exasol_type
+            )));
         }
-        _ => Err(ParquetExportError::Schema(format!(
-            "Unsupported Exasol type for Parquet export: {:?}",
-            exasol_type
-        ))),
+        _ => {}
     }
+
+    // Use shared implementation for supported types
+    exasol_type_to_arrow_impl(exasol_type).map_err(ParquetExportError::Schema)
 }
 
 // =============================================================================

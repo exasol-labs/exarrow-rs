@@ -19,18 +19,17 @@
 //! SHA-256 fingerprints are computed for Exasol 8.32.0+ compatibility.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use rcgen::{CertifiedKey, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 
 use crate::error::TransportError;
 
@@ -543,6 +542,48 @@ impl HttpTransportClient {
         }
     }
 
+    /// Reads exact bytes from the stream into the buffer.
+    ///
+    /// This is a helper method that abstracts the TCP/TLS stream dispatch.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer to read into
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if reading fails.
+    async fn read_exact_bytes(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        match &mut self.stream {
+            ClientConnectionStream::Tcp(stream) => {
+                stream.read_exact(buf).await?;
+                Ok(())
+            }
+            ClientConnectionStream::Tls(stream) => {
+                stream.read_exact(buf).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads a line from the stream.
+    ///
+    /// This is a helper method that abstracts the TCP/TLS stream dispatch.
+    ///
+    /// # Returns
+    ///
+    /// The line as a string (without CRLF).
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if reading fails.
+    async fn read_line_from_stream(&mut self) -> io::Result<String> {
+        match &mut self.stream {
+            ClientConnectionStream::Tcp(stream) => read_line(stream).await,
+            ClientConnectionStream::Tls(stream) => read_line(stream.as_mut()).await,
+        }
+    }
+
     /// Reads the body of a chunked transfer encoded request.
     ///
     /// This reads all chunks until the final empty chunk and returns the complete body.
@@ -559,11 +600,7 @@ impl HttpTransportClient {
 
         loop {
             // Read chunk size line
-            let size_line = match &mut self.stream {
-                ClientConnectionStream::Tcp(stream) => read_line(stream).await,
-                ClientConnectionStream::Tls(stream) => read_line(stream.as_mut()).await,
-            }
-            .map_err(|e| {
+            let size_line = self.read_line_from_stream().await.map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to read chunk size: {e}"))
             })?;
 
@@ -572,11 +609,7 @@ impl HttpTransportClient {
             if chunk_size == 0 {
                 // Final chunk - read the trailing CRLF
                 let mut trailer = [0u8; 2];
-                match &mut self.stream {
-                    ClientConnectionStream::Tcp(stream) => stream.read_exact(&mut trailer).await,
-                    ClientConnectionStream::Tls(stream) => stream.read_exact(&mut trailer).await,
-                }
-                .map_err(|e| {
+                self.read_exact_bytes(&mut trailer).await.map_err(|e| {
                     TransportError::ProtocolError(format!("Failed to read chunk trailer: {e}"))
                 })?;
                 break;
@@ -584,11 +617,7 @@ impl HttpTransportClient {
 
             // Read chunk data
             let mut chunk = vec![0u8; chunk_size];
-            match &mut self.stream {
-                ClientConnectionStream::Tcp(stream) => stream.read_exact(&mut chunk).await,
-                ClientConnectionStream::Tls(stream) => stream.read_exact(&mut chunk).await,
-            }
-            .map_err(|e| {
+            self.read_exact_bytes(&mut chunk).await.map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to read chunk data: {e}"))
             })?;
 
@@ -596,11 +625,7 @@ impl HttpTransportClient {
 
             // Read trailing CRLF after chunk data
             let mut crlf = [0u8; 2];
-            match &mut self.stream {
-                ClientConnectionStream::Tcp(stream) => stream.read_exact(&mut crlf).await,
-                ClientConnectionStream::Tls(stream) => stream.read_exact(&mut crlf).await,
-            }
-            .map_err(|e| {
+            self.read_exact_bytes(&mut crlf).await.map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to read chunk CRLF: {e}"))
             })?;
         }
@@ -743,11 +768,9 @@ impl HttpTransportClient {
             self.read_chunked_body().await?
         } else if let Some(content_length) = request.content_length() {
             let mut body = vec![0u8; content_length];
-            match &mut self.stream {
-                ClientConnectionStream::Tcp(stream) => stream.read_exact(&mut body).await,
-                ClientConnectionStream::Tls(stream) => stream.read_exact(&mut body).await,
-            }
-            .map_err(|e| TransportError::IoError(format!("Failed to read body: {e}")))?;
+            self.read_exact_bytes(&mut body)
+                .await
+                .map_err(|e| TransportError::IoError(format!("Failed to read body: {e}")))?;
             body
         } else {
             return Err(TransportError::ProtocolError(
@@ -955,267 +978,6 @@ pub fn parse_chunk_size(size_line: &str) -> Result<usize, TransportError> {
     usize::from_str_radix(size_str, 16)
         .map_err(|e| TransportError::ProtocolError(format!("Invalid chunk size '{size_str}': {e}")))
 }
-
-// =============================================================================
-// DEPRECATED: Server Mode Types (to be removed after import/export refactoring)
-// =============================================================================
-// The following types are kept for backwards compatibility with existing
-// import/export code. They will be removed once all import/export modules
-// are updated to use HttpTransportClient.
-
-/// HTTP Transport Server for handling Exasol connections.
-///
-/// # Deprecated
-///
-/// This type uses server mode which doesn't work with cloud Exasol instances.
-/// Use [`HttpTransportClient`] instead, which uses client mode.
-#[deprecated(
-    since = "2.2.0",
-    note = "Use HttpTransportClient instead. Server mode doesn't work with cloud Exasol."
-)]
-pub struct HttpTransportServer {
-    /// TCP listener for accepting connections
-    listener: TcpListener,
-    /// TLS configuration (None for unencrypted connections)
-    tls_config: Option<Arc<ServerConfig>>,
-    /// TLS certificate (for fingerprint extraction)
-    tls_certificate: Option<TlsCertificate>,
-    /// Local address the server is bound to
-    local_addr: SocketAddr,
-}
-
-#[allow(deprecated)]
-impl HttpTransportServer {
-    /// Creates a new HTTP transport server bound to an OS-assigned port.
-    pub async fn start(use_tls: bool) -> Result<Self, TransportError> {
-        Self::start_on_addr("0.0.0.0:0", use_tls).await
-    }
-
-    /// Creates a new HTTP transport server bound to a specific address.
-    pub async fn start_on_addr(addr: &str, use_tls: bool) -> Result<Self, TransportError> {
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            TransportError::IoError(format!("Failed to bind HTTP transport server: {e}"))
-        })?;
-
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| TransportError::IoError(format!("Failed to get local address: {e}")))?;
-
-        let (tls_config, tls_certificate) = if use_tls {
-            let cert = TlsCertificate::generate()?;
-            let config = Arc::new(cert.to_server_config()?);
-            (Some(config), Some(cert))
-        } else {
-            (None, None)
-        };
-
-        Ok(Self {
-            listener,
-            tls_config,
-            tls_certificate,
-            local_addr,
-        })
-    }
-
-    /// Returns the local address the server is bound to.
-    #[must_use]
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Returns the port the server is listening on.
-    #[must_use]
-    pub fn port(&self) -> u16 {
-        self.local_addr.port()
-    }
-
-    /// Returns the public key fingerprint for TLS connections.
-    #[must_use]
-    pub fn public_key_fingerprint(&self) -> Option<&str> {
-        self.tls_certificate
-            .as_ref()
-            .map(|c| c.fingerprint.as_str())
-    }
-
-    /// Accepts a single incoming connection and performs the EXA handshake.
-    #[allow(deprecated)]
-    pub async fn accept_connection(&self) -> Result<HttpTransportConnection, TransportError> {
-        let (tcp_stream, peer_addr) =
-            self.listener.accept().await.map_err(|e| {
-                TransportError::IoError(format!("Failed to accept connection: {e}"))
-            })?;
-
-        if let Some(tls_config) = &self.tls_config {
-            let acceptor = TlsAcceptor::from(Arc::clone(tls_config));
-            let tls_stream = acceptor
-                .accept(tcp_stream)
-                .await
-                .map_err(|e| TransportError::TlsError(format!("TLS handshake failed: {e}")))?;
-
-            let mut conn = HttpTransportConnection::new_tls(tls_stream, peer_addr);
-            conn.perform_handshake().await?;
-            Ok(conn)
-        } else {
-            let mut conn = HttpTransportConnection::new_tcp(tcp_stream, peer_addr);
-            conn.perform_handshake().await?;
-            Ok(conn)
-        }
-    }
-}
-
-/// Connection wrapper for HTTP transport data transfer.
-///
-/// # Deprecated
-///
-/// This type is part of server mode which doesn't work with cloud Exasol instances.
-/// Use [`HttpTransportClient`] instead.
-#[deprecated(
-    since = "2.2.0",
-    note = "Use HttpTransportClient instead. Server mode doesn't work with cloud Exasol."
-)]
-pub struct HttpTransportConnection {
-    /// The underlying stream (either TCP or TLS)
-    stream: ServerConnectionStream,
-    /// Peer address of the connected client
-    peer_addr: SocketAddr,
-    /// Internal address from handshake response (ip_string, port)
-    internal_addr: Option<(String, u16)>,
-}
-
-/// Internal enum for server-side connection streams.
-enum ServerConnectionStream {
-    Tcp(TcpStream),
-    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
-}
-
-#[allow(deprecated)]
-impl HttpTransportConnection {
-    /// Creates a new connection wrapper for a TCP stream.
-    fn new_tcp(stream: TcpStream, peer_addr: SocketAddr) -> Self {
-        Self {
-            stream: ServerConnectionStream::Tcp(stream),
-            peer_addr,
-            internal_addr: None,
-        }
-    }
-
-    /// Creates a new connection wrapper for a TLS stream.
-    fn new_tls(stream: tokio_rustls::server::TlsStream<TcpStream>, peer_addr: SocketAddr) -> Self {
-        Self {
-            stream: ServerConnectionStream::Tls(Box::new(stream)),
-            peer_addr,
-            internal_addr: None,
-        }
-    }
-
-    /// Returns the peer address of the connected client.
-    #[must_use]
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
-    }
-
-    /// Returns the internal address from the handshake response.
-    #[must_use]
-    pub fn internal_addr(&self) -> Option<&(String, u16)> {
-        self.internal_addr.as_ref()
-    }
-
-    /// Performs the EXA tunneling handshake.
-    async fn perform_handshake(&mut self) -> Result<(), TransportError> {
-        let internal_addr = match &mut self.stream {
-            ServerConnectionStream::Tcp(stream) => perform_handshake(stream).await?,
-            ServerConnectionStream::Tls(stream) => perform_handshake(stream).await?,
-        };
-        self.internal_addr = Some(internal_addr);
-        Ok(())
-    }
-
-    /// Writes data to the connection.
-    pub async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        match &mut self.stream {
-            ServerConnectionStream::Tcp(stream) => {
-                stream
-                    .write_all(data)
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to write data: {e}")))?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to flush data: {e}")))?;
-            }
-            ServerConnectionStream::Tls(stream) => {
-                stream
-                    .write_all(data)
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to write data: {e}")))?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to flush data: {e}")))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Writes a chunk of data using chunked transfer encoding.
-    pub async fn write_chunk(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        let chunk = encode_chunk(data);
-        self.write(&chunk).await
-    }
-
-    /// Writes the final empty chunk to signal end of transfer.
-    pub async fn write_final_chunk(&mut self) -> Result<(), TransportError> {
-        self.write_chunk(&[]).await
-    }
-
-    /// Reads data from the connection.
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        match &mut self.stream {
-            ServerConnectionStream::Tcp(stream) => stream
-                .read(buf)
-                .await
-                .map_err(|e| TransportError::IoError(format!("Failed to read data: {e}"))),
-            ServerConnectionStream::Tls(stream) => stream
-                .read(buf)
-                .await
-                .map_err(|e| TransportError::IoError(format!("Failed to read data: {e}"))),
-        }
-    }
-
-    /// Reads exact number of bytes from the connection.
-    pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), TransportError> {
-        match &mut self.stream {
-            ServerConnectionStream::Tcp(stream) => {
-                stream.read_exact(buf).await.map_err(|e| {
-                    TransportError::IoError(format!("Failed to read exact data: {e}"))
-                })?;
-                Ok(())
-            }
-            ServerConnectionStream::Tls(stream) => {
-                stream.read_exact(buf).await.map_err(|e| {
-                    TransportError::IoError(format!("Failed to read exact data: {e}"))
-                })?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Shuts down the connection.
-    pub async fn shutdown(&mut self) -> Result<(), TransportError> {
-        match &mut self.stream {
-            ServerConnectionStream::Tcp(stream) => stream.shutdown().await.map_err(|e| {
-                TransportError::IoError(format!("Failed to shutdown connection: {e}"))
-            }),
-            ServerConnectionStream::Tls(stream) => stream.shutdown().await.map_err(|e| {
-                TransportError::IoError(format!("Failed to shutdown connection: {e}"))
-            }),
-        }
-    }
-}
-
-// =============================================================================
-// End of deprecated server mode types
-// =============================================================================
 
 /// Reads a line (terminated by CRLF) from the stream.
 ///
@@ -1797,42 +1559,6 @@ mod tests {
             let received = reader.recv().await.unwrap();
             assert_eq!(received, vec![i]);
         }
-    }
-
-    // Tests for deprecated HttpTransportServer (kept for backwards compatibility)
-    #[allow(deprecated)]
-    #[tokio::test]
-    async fn test_http_transport_server_start() {
-        let server = HttpTransportServer::start(false).await;
-        assert!(server.is_ok());
-
-        let server = server.unwrap();
-        assert!(server.port() > 0);
-        assert!(server.public_key_fingerprint().is_none());
-    }
-
-    #[allow(deprecated)]
-    #[tokio::test]
-    async fn test_http_transport_server_start_with_tls() {
-        let server = HttpTransportServer::start(true).await;
-        assert!(server.is_ok());
-
-        let server = server.unwrap();
-        assert!(server.port() > 0);
-        assert!(server.public_key_fingerprint().is_some());
-        // Fingerprint is now "sha256//<base64>" format (52 chars)
-        assert_eq!(server.public_key_fingerprint().unwrap().len(), 52);
-    }
-
-    #[allow(deprecated)]
-    #[tokio::test]
-    async fn test_http_transport_server_specific_port() {
-        let server = HttpTransportServer::start_on_addr("127.0.0.1:0", false).await;
-        assert!(server.is_ok());
-
-        let server = server.unwrap();
-        assert!(server.port() > 0);
-        assert!(server.local_addr().ip().is_loopback());
     }
 
     #[tokio::test]

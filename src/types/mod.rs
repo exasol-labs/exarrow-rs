@@ -1,5 +1,6 @@
 //! Type mapping between Exasol and Arrow data types.
 
+pub(crate) mod conversion;
 mod mapping;
 mod schema;
 

@@ -37,7 +37,13 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::types::ExasolType;
+use crate::types::{
+    conversion::{
+        exasol_type_to_arrow as exasol_type_to_arrow_impl, parse_date_to_days,
+        parse_decimal_to_i128, parse_timestamp_to_micros,
+    },
+    ExasolType,
+};
 
 /// Errors that can occur during Arrow export operations.
 #[derive(Error, Debug)]
@@ -612,60 +618,6 @@ fn build_date32_array(
     Ok(Arc::new(builder.finish()))
 }
 
-/// Parses a date string (YYYY-MM-DD) to days since Unix epoch.
-fn parse_date_to_days(date_str: &str) -> Result<i32, String> {
-    let parts: Vec<&str> = date_str.split('-').collect();
-    if parts.len() != 3 {
-        return Err(format!(
-            "Invalid date format: {} (expected YYYY-MM-DD)",
-            date_str
-        ));
-    }
-
-    let year: i32 = parts[0]
-        .parse()
-        .map_err(|_| format!("Invalid year: {}", parts[0]))?;
-    let month: u32 = parts[1]
-        .parse()
-        .map_err(|_| format!("Invalid month: {}", parts[1]))?;
-    let day: u32 = parts[2]
-        .parse()
-        .map_err(|_| format!("Invalid day: {}", parts[2]))?;
-
-    if !(1..=12).contains(&month) {
-        return Err(format!("Month out of range: {}", month));
-    }
-    if !(1..=31).contains(&day) {
-        return Err(format!("Day out of range: {}", day));
-    }
-
-    // Calculate days since Unix epoch (1970-01-01)
-    let days_from_year =
-        (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-
-    let days_from_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => unreachable!(),
-    };
-
-    // Add leap day if after February and leap year
-    let is_leap_year = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_adjustment = if month > 2 && is_leap_year { 1 } else { 0 };
-
-    Ok(days_from_year + days_from_month + day as i32 - 1 + leap_adjustment)
-}
-
 /// Builds a Timestamp array from string values (YYYY-MM-DD HH:MM:SS format).
 fn build_timestamp_array(
     values: &[&str],
@@ -699,60 +651,6 @@ fn build_timestamp_array(
     }
 
     Ok(Arc::new(builder.finish()))
-}
-
-/// Parses a timestamp string to microseconds since Unix epoch.
-fn parse_timestamp_to_micros(timestamp_str: &str) -> Result<i64, String> {
-    // Split date and time
-    let parts: Vec<&str> = timestamp_str.split(' ').collect();
-    if parts.is_empty() {
-        return Err(format!("Invalid timestamp format: {}", timestamp_str));
-    }
-
-    // Parse date part
-    let days = parse_date_to_days(parts[0])?;
-    let mut micros = days as i64 * 86400 * 1_000_000;
-
-    // Parse time part if present
-    if parts.len() > 1 {
-        let time_parts: Vec<&str> = parts[1].split(':').collect();
-        if time_parts.len() >= 2 {
-            let hours: i64 = time_parts[0]
-                .parse()
-                .map_err(|_| format!("Invalid hour: {}", time_parts[0]))?;
-            let minutes: i64 = time_parts[1]
-                .parse()
-                .map_err(|_| format!("Invalid minute: {}", time_parts[1]))?;
-
-            micros += hours * 3600 * 1_000_000;
-            micros += minutes * 60 * 1_000_000;
-
-            if time_parts.len() >= 3 {
-                // Parse seconds and microseconds
-                let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
-                let seconds: i64 = sec_parts[0]
-                    .parse()
-                    .map_err(|_| format!("Invalid second: {}", sec_parts[0]))?;
-
-                micros += seconds * 1_000_000;
-
-                if sec_parts.len() > 1 {
-                    // Parse fractional seconds (microseconds)
-                    let frac = sec_parts[1];
-                    let frac_micros = if frac.len() <= 6 {
-                        let padding = 6 - frac.len();
-                        let padded = format!("{}{}", frac, "0".repeat(padding));
-                        padded.parse::<i64>().unwrap_or(0)
-                    } else {
-                        frac[..6].parse::<i64>().unwrap_or(0)
-                    };
-                    micros += frac_micros;
-                }
-            }
-        }
-    }
-
-    Ok(micros)
 }
 
 /// Builds a Decimal128 array from string values.
@@ -795,77 +693,9 @@ fn build_decimal128_array(
     Ok(Arc::new(builder.finish()))
 }
 
-/// Parses a decimal string to i128 with the given scale.
-fn parse_decimal_to_i128(value_str: &str, scale: i8) -> Result<i128, String> {
-    // Parse string representation of decimal
-    // Format: "123.45" or "123" or "-123.45"
-    let parts: Vec<&str> = value_str.split('.').collect();
-
-    let (integer_part, decimal_part) = match parts.len() {
-        1 => (parts[0], ""),
-        2 => (parts[0], parts[1]),
-        _ => return Err(format!("Invalid decimal format: {}", value_str)),
-    };
-
-    // Parse the integer part
-    let mut result: i128 = integer_part
-        .parse()
-        .map_err(|_| format!("Invalid integer part: {}", integer_part))?;
-
-    // Scale up by 10^scale
-    result = result
-        .checked_mul(10_i128.pow(scale as u32))
-        .ok_or_else(|| format!("Numeric overflow for value: {}", value_str))?;
-
-    // Add the decimal part
-    if !decimal_part.is_empty() {
-        let decimal_digits = decimal_part.len().min(scale as usize);
-        let decimal_value: i128 = decimal_part[..decimal_digits]
-            .parse()
-            .map_err(|_| format!("Invalid decimal part: {}", decimal_part))?;
-
-        // Scale the decimal part appropriately
-        let scale_diff = scale as usize - decimal_digits;
-        let scaled_decimal = decimal_value * 10_i128.pow(scale_diff as u32);
-
-        result = if integer_part.starts_with('-') {
-            result
-                .checked_sub(scaled_decimal)
-                .ok_or_else(|| format!("Numeric overflow for value: {}", value_str))?
-        } else {
-            result
-                .checked_add(scaled_decimal)
-                .ok_or_else(|| format!("Numeric overflow for value: {}", value_str))?
-        };
-    }
-
-    Ok(result)
-}
-
 /// Maps Exasol types to Arrow DataTypes.
 pub fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, ExportError> {
-    match exasol_type {
-        ExasolType::Boolean => Ok(DataType::Boolean),
-        ExasolType::Char { .. } | ExasolType::Varchar { .. } => Ok(DataType::Utf8),
-        ExasolType::Decimal { precision, scale } => Ok(DataType::Decimal128(*precision, *scale)),
-        ExasolType::Double => Ok(DataType::Float64),
-        ExasolType::Date => Ok(DataType::Date32),
-        ExasolType::Timestamp {
-            with_local_time_zone,
-        } => {
-            if *with_local_time_zone {
-                Ok(DataType::Timestamp(
-                    TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                ))
-            } else {
-                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-            }
-        }
-        ExasolType::IntervalYearToMonth => Ok(DataType::Int64), // Months as i64
-        ExasolType::IntervalDayToSecond { .. } => Ok(DataType::Int64), // Nanoseconds as i64
-        ExasolType::Geometry { .. } | ExasolType::Hashtype { .. } => Ok(DataType::Binary),
-    }
+    exasol_type_to_arrow_impl(exasol_type).map_err(ExportError::SchemaError)
 }
 
 /// Builds an Arrow schema from Exasol column metadata.

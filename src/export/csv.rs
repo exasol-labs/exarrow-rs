@@ -279,7 +279,6 @@ impl DataPipeReceiver {
 /// use std::path::Path;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// # let mut ws_transport = todo!();
 /// let rows = export_to_file(
 ///     &mut ws_transport,
 ///     ExportSource::Table {
@@ -408,7 +407,6 @@ pub async fn export_to_stream<T: TransportProtocol + ?Sized, W: AsyncWrite + Unp
 /// use exarrow_rs::query::export::ExportSource;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// # let mut ws_transport = todo!();
 /// let rows = export_to_list(
 ///     &mut ws_transport,
 ///     ExportSource::Query { sql: "SELECT id, name FROM users".to_string() },

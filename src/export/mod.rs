@@ -21,7 +21,6 @@
 //! use std::path::Path;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! # let mut ws_transport = todo!();
 //! // Export a table to a file
 //! let rows_exported = export_to_file(
 //!     &mut ws_transport,

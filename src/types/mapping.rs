@@ -102,10 +102,7 @@ impl TypeMapper {
                     ))
                 } else {
                     // Timestamp without timezone
-                    Ok(DataType::Timestamp(
-                        TimeUnit::Microsecond,
-                        None,
-                    ))
+                    Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
                 }
             }
 

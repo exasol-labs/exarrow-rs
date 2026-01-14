@@ -4,7 +4,14 @@
 //! into Arrow arrays with proper NULL handling.
 
 use crate::error::ConversionError;
-use crate::types::ExasolType;
+use crate::types::{
+    conversion::{
+        parse_date_to_days as parse_date_to_days_impl,
+        parse_decimal_to_i128 as parse_decimal_to_i128_impl,
+        parse_timestamp_to_micros as parse_timestamp_to_micros_impl,
+    },
+    ExasolType,
+};
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder,
     IntervalMonthDayNanoBuilder, StringBuilder, TimestampMicrosecondBuilder,
@@ -31,18 +38,9 @@ pub trait ArrayBuilder {
     fn finish(&mut self) -> Result<ArrayRef, ConversionError>;
 }
 
-/// Build an Arrow array from JSON values for a specific Exasol type.
-///
-/// # Arguments
-/// * `exasol_type` - The Exasol data type
-/// * `values` - Column of JSON values (one per row)
-/// * `column` - Column index for error reporting
-///
-/// # Returns
-/// An Arrow ArrayRef containing the converted values
 pub fn build_array(
     exasol_type: &ExasolType,
-    values: &[Value],
+    values: &[&Value],
     column: usize,
 ) -> Result<ArrayRef, ConversionError> {
     match exasol_type {
@@ -67,8 +65,7 @@ pub fn build_array(
     }
 }
 
-/// Build a Boolean array.
-fn build_boolean_array(values: &[Value], column: usize) -> Result<ArrayRef, ConversionError> {
+fn build_boolean_array(values: &[&Value], column: usize) -> Result<ArrayRef, ConversionError> {
     let mut builder = BooleanBuilder::with_capacity(values.len());
 
     for (row, value) in values.iter().enumerate() {
@@ -88,9 +85,7 @@ fn build_boolean_array(values: &[Value], column: usize) -> Result<ArrayRef, Conv
     Ok(Arc::new(builder.finish()))
 }
 
-/// Estimate average string length for capacity pre-allocation.
-/// Uses a sample of the first few non-null values.
-fn estimate_string_capacity(values: &[Value]) -> usize {
+fn estimate_string_capacity(values: &[&Value]) -> usize {
     const SAMPLE_SIZE: usize = 10;
     const DEFAULT_AVG_LEN: usize = 32;
 
@@ -113,8 +108,7 @@ fn estimate_string_capacity(values: &[Value]) -> usize {
     }
 }
 
-/// Build a String array with UTF-8 validation.
-fn build_string_array(values: &[Value], column: usize) -> Result<ArrayRef, ConversionError> {
+fn build_string_array(values: &[&Value], column: usize) -> Result<ArrayRef, ConversionError> {
     // Use better capacity estimation based on actual string lengths
     let estimated_bytes = estimate_string_capacity(values);
     let mut builder = StringBuilder::with_capacity(values.len(), estimated_bytes);
@@ -186,9 +180,8 @@ fn validate_decimal_precision(
     Ok(())
 }
 
-/// Build a Decimal128 array.
 fn build_decimal128_array(
-    values: &[Value],
+    values: &[&Value],
     precision: u8,
     scale: i8,
     column: usize,
@@ -217,11 +210,8 @@ fn parse_decimal_to_i128(
     row: usize,
     column: usize,
 ) -> Result<i128, ConversionError> {
-    let value_str = if let Some(s) = value.as_str() {
-        // Validate precision before conversion
-        validate_decimal_precision(s, precision, scale, row, column)?;
-        s
-    } else if let Some(n) = value.as_i64() {
+    // Handle non-string JSON values directly
+    if let Some(n) = value.as_i64() {
         return Ok((n as i128) * 10_i128.pow(scale as u32));
     } else if let Some(n) = value.as_f64() {
         // Convert float to decimal by multiplying by 10^scale
@@ -230,74 +220,31 @@ fn parse_decimal_to_i128(
             .to_string()
             .parse::<i128>()
             .map_err(|_| ConversionError::NumericOverflow { row, column });
-    } else {
-        return Err(ConversionError::ValueConversionFailed {
+    }
+
+    // Handle string values using shared implementation
+    let value_str = value
+        .as_str()
+        .ok_or_else(|| ConversionError::ValueConversionFailed {
             row,
             column,
             message: format!("Expected numeric value, got: {:?}", value),
-        });
-    };
-
-    // Parse string representation of decimal
-    // Format: "123.45" or "123"
-    let parts: Vec<&str> = value_str.split('.').collect();
-
-    let (integer_part, decimal_part) = match parts.len() {
-        1 => (parts[0], ""),
-        2 => (parts[0], parts[1]),
-        _ => {
-            return Err(ConversionError::ValueConversionFailed {
-                row,
-                column,
-                message: format!("Invalid decimal format: {}", value_str),
-            });
-        }
-    };
-
-    // Parse the integer part
-    let mut result: i128 =
-        integer_part
-            .parse()
-            .map_err(|_| ConversionError::ValueConversionFailed {
-                row,
-                column,
-                message: format!("Invalid integer part: {}", integer_part),
-            })?;
-
-    // Scale up by 10^scale
-    result = result
-        .checked_mul(10_i128.pow(scale as u32))
-        .ok_or(ConversionError::NumericOverflow { row, column })?;
-
-    // Add the decimal part
-    if !decimal_part.is_empty() {
-        let decimal_digits = decimal_part.len().min(scale as usize);
-        let decimal_value: i128 = decimal_part[..decimal_digits].parse().map_err(|_| {
-            ConversionError::ValueConversionFailed {
-                row,
-                column,
-                message: format!("Invalid decimal part: {}", decimal_part),
-            }
         })?;
 
-        // Scale the decimal part appropriately
-        let scale_diff = scale as usize - decimal_digits;
-        let scaled_decimal = decimal_value * 10_i128.pow(scale_diff as u32);
+    // Validate precision before conversion
+    validate_decimal_precision(value_str, precision, scale, row, column)?;
 
-        result = result
-            .checked_add(if integer_part.starts_with('-') {
-                -scaled_decimal
-            } else {
-                scaled_decimal
-            })
-            .ok_or(ConversionError::NumericOverflow { row, column })?;
-    }
-
-    Ok(result)
+    // Use shared decimal parsing implementation
+    parse_decimal_to_i128_impl(value_str, scale).map_err(|e| {
+        ConversionError::ValueConversionFailed {
+            row,
+            column,
+            message: e,
+        }
+    })
 }
 
-/// Build a Float64 array.
-fn build_double_array(values: &[Value], column: usize) -> Result<ArrayRef, ConversionError> {
+fn build_double_array(values: &[&Value], column: usize) -> Result<ArrayRef, ConversionError> {
     let mut builder = Float64Builder::with_capacity(values.len());
 
     for (row, value) in values.iter().enumerate() {
@@ -334,8 +281,7 @@ fn build_double_array(values: &[Value], column: usize) -> Result<ArrayRef, Conve
     Ok(Arc::new(builder.finish()))
 }
 
-/// Build a Date32 array (days since Unix epoch).
-fn build_date_array(values: &[Value], column: usize) -> Result<ArrayRef, ConversionError> {
+fn build_date_array(values: &[&Value], column: usize) -> Result<ArrayRef, ConversionError> {
     let mut builder = Date32Builder::with_capacity(values.len());
 
     for (row, value) in values.iter().enumerate() {
@@ -359,77 +305,15 @@ fn build_date_array(values: &[Value], column: usize) -> Result<ArrayRef, Convers
 
 /// Parse a date string to days since Unix epoch (1970-01-01).
 fn parse_date_to_days(date_str: &str, row: usize, column: usize) -> Result<i32, ConversionError> {
-    let parts: Vec<&str> = date_str.split('-').collect();
-    if parts.len() != 3 {
-        return Err(ConversionError::ValueConversionFailed {
-            row,
-            column,
-            message: format!("Invalid date format: {}", date_str),
-        });
-    }
-
-    let year: i32 = parts[0]
-        .parse()
-        .map_err(|_| ConversionError::ValueConversionFailed {
-            row,
-            column,
-            message: format!("Invalid year: {}", parts[0]),
-        })?;
-
-    let month: u32 = parts[1]
-        .parse()
-        .map_err(|_| ConversionError::ValueConversionFailed {
-            row,
-            column,
-            message: format!("Invalid month: {}", parts[1]),
-        })?;
-
-    let day: u32 = parts[2]
-        .parse()
-        .map_err(|_| ConversionError::ValueConversionFailed {
-            row,
-            column,
-            message: format!("Invalid day: {}", parts[2]),
-        })?;
-
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(ConversionError::ValueConversionFailed {
-            row,
-            column,
-            message: format!("Invalid date values: {}", date_str),
-        });
-    }
-
-    // Calculate days since Unix epoch
-    // Simple calculation (doesn't account for all leap years perfectly, but close enough)
-    let days_from_year =
-        (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-    let days_from_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => unreachable!(),
-    };
-
-    // Add leap day if after February and leap year
-    let is_leap_year = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_adjustment = if month > 2 && is_leap_year { 1 } else { 0 };
-
-    Ok(days_from_year + days_from_month + day as i32 - 1 + leap_adjustment)
+    parse_date_to_days_impl(date_str).map_err(|e| ConversionError::ValueConversionFailed {
+        row,
+        column,
+        message: e,
+    })
 }
 
-/// Build a Timestamp array (microseconds since Unix epoch).
 fn build_timestamp_array(
-    values: &[Value],
+    values: &[&Value],
     _with_local_time_zone: bool,
     column: usize,
 ) -> Result<ArrayRef, ConversionError> {
@@ -460,81 +344,17 @@ fn parse_timestamp_to_micros(
     row: usize,
     column: usize,
 ) -> Result<i64, ConversionError> {
-    // Split date and time
-    let parts: Vec<&str> = timestamp_str.split(' ').collect();
-    if parts.is_empty() {
-        return Err(ConversionError::ValueConversionFailed {
+    parse_timestamp_to_micros_impl(timestamp_str).map_err(|e| {
+        ConversionError::ValueConversionFailed {
             row,
             column,
-            message: format!("Invalid timestamp format: {}", timestamp_str),
-        });
-    }
-
-    // Parse date part
-    let days = parse_date_to_days(parts[0], row, column)?;
-    let mut micros = days as i64 * 86400 * 1_000_000;
-
-    // Parse time part if present
-    if parts.len() > 1 {
-        let time_parts: Vec<&str> = parts[1].split(':').collect();
-        if time_parts.len() >= 2 {
-            let hours: i64 =
-                time_parts[0]
-                    .parse()
-                    .map_err(|_| ConversionError::ValueConversionFailed {
-                        row,
-                        column,
-                        message: format!("Invalid hour: {}", time_parts[0]),
-                    })?;
-
-            let minutes: i64 =
-                time_parts[1]
-                    .parse()
-                    .map_err(|_| ConversionError::ValueConversionFailed {
-                        row,
-                        column,
-                        message: format!("Invalid minute: {}", time_parts[1]),
-                    })?;
-
-            micros += hours * 3600 * 1_000_000;
-            micros += minutes * 60 * 1_000_000;
-
-            if time_parts.len() >= 3 {
-                // Parse seconds and microseconds
-                let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
-                let seconds: i64 =
-                    sec_parts[0]
-                        .parse()
-                        .map_err(|_| ConversionError::ValueConversionFailed {
-                            row,
-                            column,
-                            message: format!("Invalid second: {}", sec_parts[0]),
-                        })?;
-
-                micros += seconds * 1_000_000;
-
-                if sec_parts.len() > 1 {
-                    // Parse fractional seconds (microseconds)
-                    let frac = sec_parts[1];
-                    let frac_micros = if frac.len() <= 6 {
-                        let padding = 6 - frac.len();
-                        let padded = format!("{}{}", frac, "0".repeat(padding));
-                        padded.parse::<i64>().unwrap_or(0)
-                    } else {
-                        frac[..6].parse::<i64>().unwrap_or(0)
-                    };
-                    micros += frac_micros;
-                }
-            }
+            message: e,
         }
-    }
-
-    Ok(micros)
+    })
 }
 
-/// Build an IntervalMonthDayNano array for INTERVAL YEAR TO MONTH.
 fn build_interval_year_to_month_array(
-    values: &[Value],
+    values: &[&Value],
     column: usize,
 ) -> Result<ArrayRef, ConversionError> {
     let mut builder = IntervalMonthDayNanoBuilder::with_capacity(values.len());
@@ -609,9 +429,8 @@ fn parse_interval_year_to_month(
     })
 }
 
-/// Build an IntervalMonthDayNano array for INTERVAL DAY TO SECOND.
 fn build_interval_day_to_second_array(
-    values: &[Value],
+    values: &[&Value],
     column: usize,
 ) -> Result<ArrayRef, ConversionError> {
     let mut builder = IntervalMonthDayNanoBuilder::with_capacity(values.len());
@@ -730,8 +549,7 @@ fn parse_interval_day_to_second(
     })
 }
 
-/// Build a Binary array for GEOMETRY and HASHTYPE.
-fn build_binary_array(values: &[Value], column: usize) -> Result<ArrayRef, ConversionError> {
+fn build_binary_array(values: &[&Value], column: usize) -> Result<ArrayRef, ConversionError> {
     // Estimate binary capacity: hex strings are 2 chars per byte
     // Sample up to 10 values to estimate average size
     const SAMPLE_SIZE: usize = 10;
@@ -792,10 +610,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Helper to convert owned values to references for testing
+    fn to_refs(values: &[Value]) -> Vec<&Value> {
+        values.iter().collect()
+    }
+
     #[test]
     fn test_build_boolean_array() {
         let values = vec![json!(true), json!(false), json!(null), json!(true)];
-        let array = build_boolean_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let array = build_boolean_array(&refs, 0).unwrap();
         assert_eq!(array.len(), 4);
         assert_eq!(array.null_count(), 1);
     }
@@ -803,7 +627,8 @@ mod tests {
     #[test]
     fn test_build_string_array() {
         let values = vec![json!("hello"), json!("world"), json!(null), json!("test")];
-        let array = build_string_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let array = build_string_array(&refs, 0).unwrap();
         assert_eq!(array.len(), 4);
         assert_eq!(array.null_count(), 1);
     }
@@ -811,7 +636,8 @@ mod tests {
     #[test]
     fn test_build_decimal128_array() {
         let values = vec![json!("123.45"), json!("678.90"), json!(null)];
-        let array = build_decimal128_array(&values, 10, 2, 0).unwrap();
+        let refs = to_refs(&values);
+        let array = build_decimal128_array(&refs, 10, 2, 0).unwrap();
         assert_eq!(array.len(), 3);
         assert_eq!(array.null_count(), 1);
     }
@@ -819,7 +645,8 @@ mod tests {
     #[test]
     fn test_build_double_array() {
         let values = vec![json!(1.5), json!(2.7), json!(null), json!("Infinity")];
-        let array = build_double_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let array = build_double_array(&refs, 0).unwrap();
         assert_eq!(array.len(), 4);
         assert_eq!(array.null_count(), 1);
     }
@@ -900,15 +727,18 @@ mod tests {
     fn test_invalid_conversions() {
         // Invalid boolean
         let values = vec![json!("not a bool")];
-        assert!(build_boolean_array(&values, 0).is_err());
+        let refs = to_refs(&values);
+        assert!(build_boolean_array(&refs, 0).is_err());
 
         // Invalid date
         let values = vec![json!("2024-13-01")]; // Invalid month
-        assert!(build_date_array(&values, 0).is_err());
+        let refs = to_refs(&values);
+        assert!(build_date_array(&refs, 0).is_err());
 
         // Invalid hex
         let values = vec![json!("zzz")];
-        assert!(build_binary_array(&values, 0).is_err());
+        let refs = to_refs(&values);
+        assert!(build_binary_array(&refs, 0).is_err());
     }
 
     #[test]
@@ -939,22 +769,44 @@ mod tests {
     fn test_decimal_precision_overflow() {
         // Test that precision overflow is detected
         let values = vec![json!("12345678901234567890")]; // 20 digits
-        let result = build_decimal128_array(&values, 10, 2, 0);
+        let refs = to_refs(&values);
+        let result = build_decimal128_array(&refs, 10, 2, 0);
         assert!(result.is_err());
 
         // Should succeed with sufficient precision
         let values = vec![json!("12345")]; // 5 digits
-        let result = build_decimal128_array(&values, 10, 2, 0);
+        let refs = to_refs(&values);
+        let result = build_decimal128_array(&refs, 10, 2, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_estimate_string_capacity() {
+        // Test with normal strings
         let values = vec![json!("hello"), json!("world"), json!("test")];
-        let capacity = estimate_string_capacity(&values);
+        let refs = to_refs(&values);
+        let capacity = estimate_string_capacity(&refs);
         // Average length is about 5, plus buffer, times 3 values
         assert!(capacity > 0);
         assert!(capacity >= 15); // At least the actual total length
+
+        // Test with empty values - should return 0
+        let empty_values: Vec<Value> = vec![];
+        let empty_refs = to_refs(&empty_values);
+        let empty_capacity = estimate_string_capacity(&empty_refs);
+        assert_eq!(empty_capacity, 0);
+
+        // Test with all nulls - should use default average
+        let null_values = vec![json!(null), json!(null), json!(null)];
+        let null_refs = to_refs(&null_values);
+        let null_capacity = estimate_string_capacity(&null_refs);
+        assert!(null_capacity > 0);
+
+        // Test with mixed nulls and strings
+        let mixed_values = vec![json!("hello"), json!(null), json!("world")];
+        let mixed_refs = to_refs(&mixed_values);
+        let mixed_capacity = estimate_string_capacity(&mixed_refs);
+        assert!(mixed_capacity > 0);
     }
 
     // ==========================================================================
@@ -964,33 +816,37 @@ mod tests {
     #[test]
     fn test_build_array_dispatches_to_boolean() {
         let values = vec![json!(true), json!(false)];
-        let result = build_array(&ExasolType::Boolean, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Boolean, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_char() {
         let values = vec![json!("abc"), json!("def")];
-        let result = build_array(&ExasolType::Char { size: 3 }, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Char { size: 3 }, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_varchar() {
         let values = vec![json!("hello"), json!("world")];
-        let result = build_array(&ExasolType::Varchar { size: 100 }, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Varchar { size: 100 }, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_decimal() {
         let values = vec![json!("123.45"), json!("678.90")];
+        let refs = to_refs(&values);
         let result = build_array(
             &ExasolType::Decimal {
                 precision: 10,
                 scale: 2,
             },
-            &values,
+            &refs,
             0,
         )
         .unwrap();
@@ -1000,25 +856,28 @@ mod tests {
     #[test]
     fn test_build_array_dispatches_to_double() {
         let values = vec![json!(1.5), json!(2.5)];
-        let result = build_array(&ExasolType::Double, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Double, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_date() {
         let values = vec![json!("2024-01-15"), json!("2024-06-20")];
-        let result = build_array(&ExasolType::Date, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Date, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_timestamp_without_tz() {
         let values = vec![json!("2024-01-15 10:30:00"), json!("2024-06-20 14:45:30")];
+        let refs = to_refs(&values);
         let result = build_array(
             &ExasolType::Timestamp {
                 with_local_time_zone: false,
             },
-            &values,
+            &refs,
             0,
         )
         .unwrap();
@@ -1028,11 +887,12 @@ mod tests {
     #[test]
     fn test_build_array_dispatches_to_timestamp_with_tz() {
         let values = vec![json!("2024-01-15 10:30:00"), json!("2024-06-20 14:45:30")];
+        let refs = to_refs(&values);
         let result = build_array(
             &ExasolType::Timestamp {
                 with_local_time_zone: true,
             },
-            &values,
+            &refs,
             0,
         )
         .unwrap();
@@ -1042,33 +902,33 @@ mod tests {
     #[test]
     fn test_build_array_dispatches_to_interval_year_to_month() {
         let values = vec![json!("+01-06"), json!("-02-03")];
-        let result = build_array(&ExasolType::IntervalYearToMonth, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::IntervalYearToMonth, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_interval_day_to_second() {
         let values = vec![json!("+01 12:30:45"), json!("-02 08:15:30")];
-        let result = build_array(
-            &ExasolType::IntervalDayToSecond { precision: 3 },
-            &values,
-            0,
-        )
-        .unwrap();
+        let refs = to_refs(&values);
+        let result =
+            build_array(&ExasolType::IntervalDayToSecond { precision: 3 }, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_geometry() {
         let values = vec![json!("48656c6c6f"), json!("576f726c64")];
-        let result = build_array(&ExasolType::Geometry { srid: Some(4326) }, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Geometry { srid: Some(4326) }, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_array_dispatches_to_hashtype() {
         let values = vec![json!("deadbeef"), json!("cafebabe")];
-        let result = build_array(&ExasolType::Hashtype { byte_size: 16 }, &values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_array(&ExasolType::Hashtype { byte_size: 16 }, &refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -1083,7 +943,8 @@ mod tests {
             json!("2023-06-20"),
             json!("1970-01-01"),
         ];
-        let result = build_date_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.null_count(), 0);
     }
@@ -1091,7 +952,8 @@ mod tests {
     #[test]
     fn test_build_date_array_with_null_values() {
         let values = vec![json!("2024-01-15"), json!(null), json!("2023-06-20")];
-        let result = build_date_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.null_count(), 1);
     }
@@ -1099,7 +961,8 @@ mod tests {
     #[test]
     fn test_build_date_array_invalid_format_not_string() {
         let values = vec![json!(12345)];
-        let result = build_date_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConversionError::ValueConversionFailed { message, .. } => {
@@ -1112,35 +975,40 @@ mod tests {
     #[test]
     fn test_build_date_array_invalid_date_format() {
         let values = vec![json!("2024/01/15")]; // Wrong separator
-        let result = build_date_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_build_date_array_invalid_month_out_of_range() {
         let values = vec![json!("2024-13-01")]; // Month 13
-        let result = build_date_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_build_date_array_invalid_day_out_of_range() {
         let values = vec![json!("2024-01-32")]; // Day 32
-        let result = build_date_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_build_date_array_invalid_month_zero() {
         let values = vec![json!("2024-00-15")]; // Month 0
-        let result = build_date_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_build_date_array_invalid_day_zero() {
         let values = vec![json!("2024-01-00")]; // Day 0
-        let result = build_date_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_date_array(&refs, 0);
         assert!(result.is_err());
     }
 
@@ -1323,7 +1191,8 @@ mod tests {
             json!("2024-01-15 10:30:00"),
             json!("2024-06-20 14:45:30.123456"),
         ];
-        let result = build_timestamp_array(&values, false, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_timestamp_array(&refs, false, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 0);
     }
@@ -1334,7 +1203,8 @@ mod tests {
             json!("2024-01-15 10:30:00"),
             json!("2024-06-20 14:45:30.123456"),
         ];
-        let result = build_timestamp_array(&values, true, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_timestamp_array(&refs, true, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 0);
     }
@@ -1346,7 +1216,8 @@ mod tests {
             json!(null),
             json!("2024-06-20 14:45:30"),
         ];
-        let result = build_timestamp_array(&values, false, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_timestamp_array(&refs, false, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.null_count(), 1);
     }
@@ -1355,14 +1226,16 @@ mod tests {
     fn test_build_timestamp_array_date_only() {
         // Test timestamp with only date part (no time)
         let values = vec![json!("2024-01-15")];
-        let result = build_timestamp_array(&values, false, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_timestamp_array(&refs, false, 0).unwrap();
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_build_timestamp_array_invalid_not_string() {
         let values = vec![json!(12345)];
-        let result = build_timestamp_array(&values, false, 0);
+        let refs = to_refs(&values);
+        let result = build_timestamp_array(&refs, false, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConversionError::ValueConversionFailed { message, .. } => {
@@ -1453,7 +1326,8 @@ mod tests {
     #[test]
     fn test_build_interval_year_to_month_array_positive() {
         let values = vec![json!("+01-06"), json!("+00-03")];
-        let result = build_interval_year_to_month_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_year_to_month_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 0);
     }
@@ -1461,7 +1335,8 @@ mod tests {
     #[test]
     fn test_build_interval_year_to_month_array_negative() {
         let values = vec![json!("-02-03"), json!("-00-11")];
-        let result = build_interval_year_to_month_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_year_to_month_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 0);
     }
@@ -1469,7 +1344,8 @@ mod tests {
     #[test]
     fn test_build_interval_year_to_month_array_with_nulls() {
         let values = vec![json!("+01-06"), json!(null), json!("-02-03")];
-        let result = build_interval_year_to_month_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_year_to_month_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.null_count(), 1);
     }
@@ -1477,7 +1353,8 @@ mod tests {
     #[test]
     fn test_build_interval_year_to_month_array_invalid_not_string() {
         let values = vec![json!(12345)];
-        let result = build_interval_year_to_month_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_interval_year_to_month_array(&refs, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConversionError::ValueConversionFailed { message, .. } => {
@@ -1547,7 +1424,8 @@ mod tests {
     #[test]
     fn test_build_interval_day_to_second_array_with_fractional_seconds() {
         let values = vec![json!("+01 12:30:45.123456789")];
-        let result = build_interval_day_to_second_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_day_to_second_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result.null_count(), 0);
     }
@@ -1555,7 +1433,8 @@ mod tests {
     #[test]
     fn test_build_interval_day_to_second_array_without_fractional_seconds() {
         let values = vec![json!("+01 12:30:45")];
-        let result = build_interval_day_to_second_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_day_to_second_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result.null_count(), 0);
     }
@@ -1563,7 +1442,8 @@ mod tests {
     #[test]
     fn test_build_interval_day_to_second_array_negative() {
         let values = vec![json!("-02 08:15:30.500000000")];
-        let result = build_interval_day_to_second_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_day_to_second_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result.null_count(), 0);
     }
@@ -1571,7 +1451,8 @@ mod tests {
     #[test]
     fn test_build_interval_day_to_second_array_with_nulls() {
         let values = vec![json!("+01 12:30:45"), json!(null), json!("-02 08:15:30")];
-        let result = build_interval_day_to_second_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_interval_day_to_second_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.null_count(), 1);
     }
@@ -1579,7 +1460,8 @@ mod tests {
     #[test]
     fn test_build_interval_day_to_second_array_invalid_not_string() {
         let values = vec![json!(12345)];
-        let result = build_interval_day_to_second_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_interval_day_to_second_array(&refs, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConversionError::ValueConversionFailed { message, .. } => {
@@ -1684,7 +1566,8 @@ mod tests {
     #[test]
     fn test_build_binary_array_valid_hex() {
         let values = vec![json!("48656c6c6f"), json!("576f726c64")];
-        let result = build_binary_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.null_count(), 0);
     }
@@ -1692,7 +1575,8 @@ mod tests {
     #[test]
     fn test_build_binary_array_with_null_values() {
         let values = vec![json!("48656c6c6f"), json!(null), json!("576f726c64")];
-        let result = build_binary_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result.null_count(), 1);
     }
@@ -1700,7 +1584,8 @@ mod tests {
     #[test]
     fn test_build_binary_array_empty_hex() {
         let values = vec![json!("")];
-        let result = build_binary_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result.null_count(), 0);
     }
@@ -1708,7 +1593,8 @@ mod tests {
     #[test]
     fn test_build_binary_array_invalid_not_string() {
         let values = vec![json!(12345)];
-        let result = build_binary_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConversionError::ValueConversionFailed { message, .. } => {
@@ -1721,14 +1607,16 @@ mod tests {
     #[test]
     fn test_build_binary_array_invalid_hex_odd_length() {
         let values = vec![json!("abc")]; // Odd length
-        let result = build_binary_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_build_binary_array_invalid_hex_chars() {
         let values = vec![json!("ghij")]; // Invalid hex chars
-        let result = build_binary_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0);
         assert!(result.is_err());
     }
 
@@ -1736,7 +1624,8 @@ mod tests {
     fn test_build_binary_array_capacity_estimation_with_samples() {
         // Create more than 10 values to test sampling
         let values: Vec<Value> = (0..15).map(|_| json!("deadbeef")).collect();
-        let result = build_binary_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 15);
     }
 
@@ -1744,70 +1633,49 @@ mod tests {
     fn test_build_binary_array_capacity_estimation_all_nulls() {
         // All null values for capacity estimation
         let values: Vec<Value> = (0..5).map(|_| json!(null)).collect();
-        let result = build_binary_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_binary_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 5);
         assert_eq!(result.null_count(), 5);
-    }
-
-    // ==========================================================================
-    // Additional edge case tests
-    // ==========================================================================
-
-    #[test]
-    fn test_estimate_string_capacity_empty_values() {
-        let values: Vec<Value> = vec![];
-        let capacity = estimate_string_capacity(&values);
-        // With no values, should return default estimate
-        assert_eq!(capacity, 0);
-    }
-
-    #[test]
-    fn test_estimate_string_capacity_all_nulls() {
-        let values = vec![json!(null), json!(null), json!(null)];
-        let capacity = estimate_string_capacity(&values);
-        // With no string values, should use default average
-        assert!(capacity > 0);
-    }
-
-    #[test]
-    fn test_estimate_string_capacity_mixed_nulls_and_strings() {
-        let values = vec![json!("hello"), json!(null), json!("world")];
-        let capacity = estimate_string_capacity(&values);
-        assert!(capacity > 0);
     }
 
     #[test]
     fn test_build_double_array_from_integer() {
         let values = vec![json!(42), json!(100)];
-        let result = build_double_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_double_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_build_double_array_from_string_numeric() {
         let values = vec![json!("3.14159")];
-        let result = build_double_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_double_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_build_double_array_neg_infinity() {
         let values = vec![json!("-Infinity")];
-        let result = build_double_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_double_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_build_double_array_nan() {
         let values = vec![json!("NaN")];
-        let result = build_double_array(&values, 0).unwrap();
+        let refs = to_refs(&values);
+        let result = build_double_array(&refs, 0).unwrap();
         assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_build_double_array_invalid_string() {
         let values = vec![json!("not a number")];
-        let result = build_double_array(&values, 0);
+        let refs = to_refs(&values);
+        let result = build_double_array(&refs, 0);
         assert!(result.is_err());
     }
 
