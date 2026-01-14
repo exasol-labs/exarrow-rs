@@ -38,11 +38,17 @@
 //! # }
 //! ```
 
+pub mod export;
+pub mod import;
 pub mod prepared;
 pub mod results;
 pub mod statement;
 
 // Re-export commonly used types
+pub use export::{Compression, DelimitMode, ExportQuery, ExportSource, RowSeparator};
+pub use import::{
+    Compression as ImportCompression, ImportQuery, RowSeparator as ImportRowSeparator, TrimMode,
+};
 pub use prepared::PreparedStatement;
 pub use results::{QueryMetadata, ResultSet, ResultSetIterator};
 pub use statement::{Parameter, Statement, StatementType};

@@ -53,6 +53,7 @@ pub mod statement;
 
 // Re-export commonly used types
 pub use connection::Connection;
+pub use connection::Session;
 pub use database::Database;
 pub use driver::Driver;
 pub use statement::{Parameter, Statement, StatementType};

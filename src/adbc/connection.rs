@@ -11,7 +11,7 @@
 use crate::adbc::Statement;
 use crate::connection::auth::AuthResponseData;
 use crate::connection::params::ConnectionParams;
-use crate::connection::session::{Session, SessionConfig, SessionState};
+use crate::connection::session::{Session as SessionInfo, SessionConfig, SessionState};
 use crate::error::{ConnectionError, ExasolError, QueryError};
 use crate::query::prepared::PreparedStatement;
 use crate::query::results::ResultSet;
@@ -21,10 +21,44 @@ use crate::transport::protocol::{
 };
 use crate::transport::WebSocketTransport;
 use arrow::array::RecordBatch;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+
+/// Session is a type alias for Connection.
+///
+/// This alias provides a more intuitive name for database sessions when
+/// performing import/export operations. Both `Session` and `Connection`
+/// can be used interchangeably.
+///
+/// # Example
+///
+/// ```no_run
+/// use exarrow_rs::adbc::Session;
+///
+/// // Session and Connection are the same type
+/// fn process_data(session: &mut Session) {
+///     // Use session for import/export operations
+/// }
+/// ```
+pub type Session = Connection;
+
+/// Global tokio runtime for blocking operations.
+///
+/// This runtime is lazily initialized on first use and is shared across
+/// all blocking import/export operations. It provides a way to call
+/// async methods from synchronous code.
+fn blocking_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime for blocking operations")
+    })
+}
 
 /// ADBC Connection to an Exasol database.
 ///
@@ -64,7 +98,7 @@ pub struct Connection {
     /// Transport layer for communication (owned by Connection)
     transport: Arc<Mutex<dyn TransportProtocol>>,
     /// Session information
-    session: Session,
+    session: SessionInfo,
     /// Connection parameters
     params: ConnectionParams,
 }
@@ -139,7 +173,7 @@ impl Connection {
         };
 
         // Create session (owned, not Arc)
-        let session = Session::new(
+        let session = SessionInfo::new(
             session_info.session_id.clone(),
             auth_response,
             session_config,
@@ -965,6 +999,1100 @@ impl Connection {
     }
 
     // ========================================================================
+    // Import/Export Methods
+    // ========================================================================
+
+    /// Import CSV data from a file into an Exasol table.
+    ///
+    /// This method reads CSV data from the specified file and imports it into
+    /// the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `file_path` - Path to the CSV file
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::CsvImportOptions;
+    /// use std::path::Path;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.import_csv_from_file(
+    ///     "users",
+    ///     Path::new("/path/to/users.csv"),
+    ///     CsvImportOptions::default()
+    /// ).await?;
+    /// println!("Imported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_csv_from_file(
+        &mut self,
+        table: &str,
+        file_path: &std::path::Path,
+        options: crate::import::csv::CsvImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::csv::import_from_file(execute_sql, table, file_path, options).await
+    }
+
+    /// Import CSV data from an async reader into an Exasol table.
+    ///
+    /// This method reads CSV data from an async reader and imports it into
+    /// the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `reader` - Async reader providing CSV data
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    pub async fn import_csv_from_stream<R>(
+        &mut self,
+        table: &str,
+        reader: R,
+        options: crate::import::csv::CsvImportOptions,
+    ) -> Result<u64, crate::import::ImportError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::csv::import_from_stream(execute_sql, table, reader, options).await
+    }
+
+    /// Import CSV data from an iterator into an Exasol table.
+    ///
+    /// This method converts iterator rows to CSV format and imports them into
+    /// the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `rows` - Iterator of rows, where each row is an iterator of field values
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::CsvImportOptions;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let data = vec![
+    ///     vec!["1", "John", "john@example.com"],
+    ///     vec!["2", "Jane", "jane@example.com"],
+    /// ];
+    ///
+    /// let rows = connection.import_csv_from_iter("users", data, CsvImportOptions::default()).await?;
+    /// println!("Imported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_csv_from_iter<I, T, S>(
+        &mut self,
+        table: &str,
+        rows: I,
+        options: crate::import::csv::CsvImportOptions,
+    ) -> Result<u64, crate::import::ImportError>
+    where
+        I: IntoIterator<Item = T> + Send + 'static,
+        T: IntoIterator<Item = S> + Send,
+        S: AsRef<str>,
+    {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::csv::import_from_iter(execute_sql, table, rows, options).await
+    }
+
+    /// Export data from an Exasol table or query to a CSV file.
+    ///
+    /// This method exports data from the specified source to a CSV file
+    /// using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `file_path` - Path to the output file
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::CsvExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    /// use std::path::Path;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.export_csv_to_file(
+    ///     ExportSource::Table {
+    ///         schema: None,
+    ///         name: "users".to_string(),
+    ///         columns: vec![],
+    ///     },
+    ///     Path::new("/tmp/users.csv"),
+    ///     CsvExportOptions::default()
+    /// ).await?;
+    /// println!("Exported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn export_csv_to_file(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        file_path: &std::path::Path,
+        options: crate::export::csv::CsvExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError> {
+        // Pass Exasol host/port from connection params to export options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let mut transport_guard = self.transport.lock().await;
+        crate::export::csv::export_to_file(&mut *transport_guard, source, file_path, options).await
+    }
+
+    /// Export data from an Exasol table or query to an async writer.
+    ///
+    /// This method exports data from the specified source to an async writer
+    /// using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `writer` - Async writer to write the CSV data to
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    pub async fn export_csv_to_stream<W>(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        writer: W,
+        options: crate::export::csv::CsvExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // Pass Exasol host/port from connection params to export options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let mut transport_guard = self.transport.lock().await;
+        crate::export::csv::export_to_stream(&mut *transport_guard, source, writer, options).await
+    }
+
+    /// Export data from an Exasol table or query to an in-memory list of rows.
+    ///
+    /// Each row is represented as a vector of string values.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// A vector of rows, where each row is a vector of column values.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::CsvExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.export_csv_to_list(
+    ///     ExportSource::Query { sql: "SELECT id, name FROM users".to_string() },
+    ///     CsvExportOptions::default().with_column_names(true)
+    /// ).await?;
+    ///
+    /// for row in rows {
+    ///     println!("{:?}", row);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn export_csv_to_list(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        options: crate::export::csv::CsvExportOptions,
+    ) -> Result<Vec<Vec<String>>, crate::export::csv::ExportError> {
+        // Pass Exasol host/port from connection params to export options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let mut transport_guard = self.transport.lock().await;
+        crate::export::csv::export_to_list(&mut *transport_guard, source, options).await
+    }
+
+    /// Import data from a Parquet file into an Exasol table.
+    ///
+    /// This method reads a Parquet file, converts the data to CSV format,
+    /// and imports it into the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `file_path` - Path to the Parquet file
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ParquetImportOptions;
+    /// use std::path::Path;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.import_from_parquet(
+    ///     "users",
+    ///     Path::new("/path/to/users.parquet"),
+    ///     ParquetImportOptions::default()
+    /// ).await?;
+    /// println!("Imported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_from_parquet(
+        &mut self,
+        table: &str,
+        file_path: &std::path::Path,
+        options: crate::import::parquet::ParquetImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .with_exasol_host(&self.params.host)
+            .with_exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::parquet::import_from_parquet(execute_sql, table, file_path, options).await
+    }
+
+    /// Export data from an Exasol table or query to a Parquet file.
+    ///
+    /// This method exports data from the specified source to a Parquet file.
+    /// The data is first received as CSV from Exasol, then converted to Parquet format.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `file_path` - Path to the output Parquet file
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::ParquetExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    /// use std::path::Path;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.export_to_parquet(
+    ///     ExportSource::Table {
+    ///         schema: None,
+    ///         name: "users".to_string(),
+    ///         columns: vec![],
+    ///     },
+    ///     Path::new("/tmp/users.parquet"),
+    ///     ParquetExportOptions::default()
+    /// ).await?;
+    /// println!("Exported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn export_to_parquet(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        file_path: &std::path::Path,
+        options: crate::export::parquet::ParquetExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError> {
+        // Pass Exasol host/port from connection params to export options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let mut transport_guard = self.transport.lock().await;
+        crate::export::parquet::export_to_parquet_via_transport(
+            &mut *transport_guard,
+            source,
+            file_path,
+            options,
+        )
+        .await
+    }
+
+    /// Import data from an Arrow RecordBatch into an Exasol table.
+    ///
+    /// This method converts the RecordBatch to CSV format and imports it
+    /// into the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `batch` - The RecordBatch to import
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ArrowImportOptions;
+    /// use arrow::record_batch::RecordBatch;
+    ///
+    /// # async fn example(connection: &mut Connection, batch: &RecordBatch) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.import_from_record_batch(
+    ///     "users",
+    ///     batch,
+    ///     ArrowImportOptions::default()
+    /// ).await?;
+    /// println!("Imported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_from_record_batch(
+        &mut self,
+        table: &str,
+        batch: &RecordBatch,
+        options: crate::import::arrow::ArrowImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::arrow::import_from_record_batch(execute_sql, table, batch, options).await
+    }
+
+    /// Import data from multiple Arrow RecordBatches into an Exasol table.
+    ///
+    /// This method converts each RecordBatch to CSV format and imports them
+    /// into the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `batches` - An iterator of RecordBatches to import
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    pub async fn import_from_record_batches<I>(
+        &mut self,
+        table: &str,
+        batches: I,
+        options: crate::import::arrow::ArrowImportOptions,
+    ) -> Result<u64, crate::import::ImportError>
+    where
+        I: IntoIterator<Item = RecordBatch>,
+    {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::arrow::import_from_record_batches(execute_sql, table, batches, options).await
+    }
+
+    /// Import data from an Arrow IPC file/stream into an Exasol table.
+    ///
+    /// This method reads Arrow IPC format data, converts it to CSV,
+    /// and imports it into the target table using Exasol's HTTP transport layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `reader` - An async reader containing Arrow IPC data
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ArrowImportOptions;
+    /// use tokio::fs::File;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let file = File::open("/path/to/data.arrow").await?;
+    /// let rows = connection.import_from_arrow_ipc(
+    ///     "users",
+    ///     file,
+    ///     ArrowImportOptions::default()
+    /// ).await?;
+    /// println!("Imported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_from_arrow_ipc<R>(
+        &mut self,
+        table: &str,
+        reader: R,
+        options: crate::import::arrow::ArrowImportOptions,
+    ) -> Result<u64, crate::import::ImportError>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send,
+    {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::arrow::import_from_arrow_ipc(execute_sql, table, reader, options).await
+    }
+
+    /// Export data from an Exasol table or query to Arrow RecordBatches.
+    ///
+    /// This method exports data from the specified source and converts it
+    /// to Arrow RecordBatches.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// A vector of RecordBatches on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::ArrowExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let batches = connection.export_to_record_batches(
+    ///     ExportSource::Query { sql: "SELECT * FROM users".to_string() },
+    ///     ArrowExportOptions::default()
+    /// ).await?;
+    ///
+    /// for batch in batches {
+    ///     println!("Batch with {} rows", batch.num_rows());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn export_to_record_batches(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        options: crate::export::arrow::ArrowExportOptions,
+    ) -> Result<Vec<RecordBatch>, crate::export::csv::ExportError> {
+        // Pass Exasol host/port from connection params to export options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let mut transport_guard = self.transport.lock().await;
+        crate::export::arrow::export_to_record_batches(&mut *transport_guard, source, options).await
+    }
+
+    /// Export data from an Exasol table or query to an Arrow IPC file.
+    ///
+    /// This method exports data from the specified source to an Arrow IPC file.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `file_path` - Path to the output Arrow IPC file
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::ArrowExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    /// use std::path::Path;
+    ///
+    /// # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rows = connection.export_to_arrow_ipc(
+    ///     ExportSource::Table {
+    ///         schema: None,
+    ///         name: "users".to_string(),
+    ///         columns: vec![],
+    ///     },
+    ///     Path::new("/tmp/users.arrow"),
+    ///     ArrowExportOptions::default()
+    /// ).await?;
+    /// println!("Exported {} rows", rows);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn export_to_arrow_ipc(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        file_path: &std::path::Path,
+        options: crate::export::arrow::ArrowExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError> {
+        // Pass Exasol host/port from connection params to export options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let mut transport_guard = self.transport.lock().await;
+        crate::export::arrow::export_to_arrow_ipc(&mut *transport_guard, source, file_path, options)
+            .await
+    }
+
+    // ========================================================================
+    // Blocking Import/Export Methods
+    // ========================================================================
+
+    /// Import CSV data from a file into an Exasol table (blocking).
+    ///
+    /// This is a synchronous wrapper around [`import_csv_from_file`](Self::import_csv_from_file)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `file_path` - Path to the CSV file
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::CsvImportOptions;
+    /// use std::path::Path;
+    ///
+    /// fn sync_import(connection: &mut Connection) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_import_csv_from_file(
+    ///         "users",
+    ///         Path::new("/path/to/users.csv"),
+    ///         CsvImportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_import_csv_from_file(
+        &mut self,
+        table: &str,
+        file_path: &std::path::Path,
+        options: crate::import::csv::CsvImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        blocking_runtime().block_on(self.import_csv_from_file(table, file_path, options))
+    }
+
+    /// Import data from a Parquet file into an Exasol table (blocking).
+    ///
+    /// This is a synchronous wrapper around [`import_from_parquet`](Self::import_from_parquet)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `file_path` - Path to the Parquet file
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ParquetImportOptions;
+    /// use std::path::Path;
+    ///
+    /// fn sync_import(connection: &mut Connection) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_import_from_parquet(
+    ///         "users",
+    ///         Path::new("/path/to/users.parquet"),
+    ///         ParquetImportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_import_from_parquet(
+        &mut self,
+        table: &str,
+        file_path: &std::path::Path,
+        options: crate::import::parquet::ParquetImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        blocking_runtime().block_on(self.import_from_parquet(table, file_path, options))
+    }
+
+    /// Import data from an Arrow RecordBatch into an Exasol table (blocking).
+    ///
+    /// This is a synchronous wrapper around [`import_from_record_batch`](Self::import_from_record_batch)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `batch` - The RecordBatch to import
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ArrowImportOptions;
+    /// use arrow::record_batch::RecordBatch;
+    ///
+    /// fn sync_import(connection: &mut Connection, batch: &RecordBatch) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_import_from_record_batch(
+    ///         "users",
+    ///         batch,
+    ///         ArrowImportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_import_from_record_batch(
+        &mut self,
+        table: &str,
+        batch: &RecordBatch,
+        options: crate::import::arrow::ArrowImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        blocking_runtime().block_on(self.import_from_record_batch(table, batch, options))
+    }
+
+    /// Import data from an Arrow IPC file into an Exasol table (blocking).
+    ///
+    /// This is a synchronous wrapper around [`import_from_arrow_ipc`](Self::import_from_arrow_ipc)
+    /// for use in non-async contexts.
+    ///
+    /// Note: This method requires a synchronous reader that implements `std::io::Read`.
+    /// The data will be read into memory before being imported.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `file_path` - Path to the Arrow IPC file
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ArrowImportOptions;
+    /// use std::path::Path;
+    ///
+    /// fn sync_import(connection: &mut Connection) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_import_from_arrow_ipc(
+    ///         "users",
+    ///         Path::new("/path/to/data.arrow"),
+    ///         ArrowImportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_import_from_arrow_ipc(
+        &mut self,
+        table: &str,
+        file_path: &std::path::Path,
+        options: crate::import::arrow::ArrowImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        blocking_runtime().block_on(async {
+            let file = tokio::fs::File::open(file_path)
+                .await
+                .map_err(crate::import::ImportError::IoError)?;
+            self.import_from_arrow_ipc(table, file, options).await
+        })
+    }
+
+    /// Export data from an Exasol table or query to a CSV file (blocking).
+    ///
+    /// This is a synchronous wrapper around [`export_csv_to_file`](Self::export_csv_to_file)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `file_path` - Path to the output file
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::CsvExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    /// use std::path::Path;
+    ///
+    /// fn sync_export(connection: &mut Connection) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_export_csv_to_file(
+    ///         ExportSource::Table {
+    ///             schema: None,
+    ///             name: "users".to_string(),
+    ///             columns: vec![],
+    ///         },
+    ///         Path::new("/tmp/users.csv"),
+    ///         CsvExportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_export_csv_to_file(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        file_path: &std::path::Path,
+        options: crate::export::csv::CsvExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError> {
+        blocking_runtime().block_on(self.export_csv_to_file(source, file_path, options))
+    }
+
+    /// Export data from an Exasol table or query to a Parquet file (blocking).
+    ///
+    /// This is a synchronous wrapper around [`export_to_parquet`](Self::export_to_parquet)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `file_path` - Path to the output Parquet file
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::ParquetExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    /// use std::path::Path;
+    ///
+    /// fn sync_export(connection: &mut Connection) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_export_to_parquet(
+    ///         ExportSource::Table {
+    ///             schema: None,
+    ///             name: "users".to_string(),
+    ///             columns: vec![],
+    ///         },
+    ///         Path::new("/tmp/users.parquet"),
+    ///         ParquetExportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_export_to_parquet(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        file_path: &std::path::Path,
+        options: crate::export::parquet::ParquetExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError> {
+        blocking_runtime().block_on(self.export_to_parquet(source, file_path, options))
+    }
+
+    /// Export data from an Exasol table or query to Arrow RecordBatches (blocking).
+    ///
+    /// This is a synchronous wrapper around [`export_to_record_batches`](Self::export_to_record_batches)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// A vector of RecordBatches on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::ArrowExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    ///
+    /// fn sync_export(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    ///     let batches = connection.blocking_export_to_record_batches(
+    ///         ExportSource::Query { sql: "SELECT * FROM users".to_string() },
+    ///         ArrowExportOptions::default()
+    ///     )?;
+    ///
+    ///     for batch in batches {
+    ///         println!("Batch with {} rows", batch.num_rows());
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn blocking_export_to_record_batches(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        options: crate::export::arrow::ArrowExportOptions,
+    ) -> Result<Vec<RecordBatch>, crate::export::csv::ExportError> {
+        blocking_runtime().block_on(self.export_to_record_batches(source, options))
+    }
+
+    /// Export data from an Exasol table or query to an Arrow IPC file (blocking).
+    ///
+    /// This is a synchronous wrapper around [`export_to_arrow_ipc`](Self::export_to_arrow_ipc)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The data source (table or query)
+    /// * `file_path` - Path to the output Arrow IPC file
+    /// * `options` - Export options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows exported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExportError` if the export fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::export::ArrowExportOptions;
+    /// use exarrow_rs::query::export::ExportSource;
+    /// use std::path::Path;
+    ///
+    /// fn sync_export(connection: &mut Connection) -> Result<u64, Box<dyn std::error::Error>> {
+    ///     let rows = connection.blocking_export_to_arrow_ipc(
+    ///         ExportSource::Table {
+    ///             schema: None,
+    ///             name: "users".to_string(),
+    ///             columns: vec![],
+    ///         },
+    ///         Path::new("/tmp/users.arrow"),
+    ///         ArrowExportOptions::default()
+    ///     )?;
+    ///     Ok(rows)
+    /// }
+    /// ```
+    pub fn blocking_export_to_arrow_ipc(
+        &mut self,
+        source: crate::query::export::ExportSource,
+        file_path: &std::path::Path,
+        options: crate::export::arrow::ArrowExportOptions,
+    ) -> Result<u64, crate::export::csv::ExportError> {
+        blocking_runtime().block_on(self.export_to_arrow_ipc(source, file_path, options))
+    }
+
+    // ========================================================================
     // Private Helper Methods
     // ========================================================================
 
@@ -1086,5 +2214,142 @@ mod tests {
         // by calling it without await
         // Note: We can't actually create a Connection without a database,
         // but we can verify the API compiles correctly
+    }
+}
+
+/// Blocking wrapper tests
+#[cfg(test)]
+mod blocking_tests {
+    use super::*;
+
+    #[test]
+    fn test_session_type_alias_exists() {
+        // Verify that Session is a type alias for Connection
+        fn takes_session(_session: &Session) {}
+        fn takes_connection(_connection: &Connection) {}
+
+        // This should compile, showing Session = Connection
+        fn verify_interchangeable<F1, F2>(f1: F1, f2: F2)
+        where
+            F1: Fn(&Session),
+            F2: Fn(&Connection),
+        {
+            let _ = (f1, f2);
+        }
+
+        verify_interchangeable(takes_session, takes_connection);
+    }
+
+    #[test]
+    fn test_blocking_runtime_exists() {
+        // Verify that blocking_runtime() function exists and returns a Runtime
+        let runtime = blocking_runtime();
+        // If this compiles, the runtime is valid
+        let _ = runtime.handle();
+    }
+
+    #[test]
+    fn test_connection_has_blocking_import_csv() {
+        // This test verifies the blocking_import_csv_from_file method exists
+        // by checking the method signature compiles
+        fn _check_method_exists(_conn: &mut Connection) {
+            // Method signature check - will fail to compile if method doesn't exist
+            let _: fn(
+                &mut Connection,
+                &str,
+                &std::path::Path,
+                crate::import::csv::CsvImportOptions,
+            ) -> Result<u64, crate::import::ImportError> =
+                Connection::blocking_import_csv_from_file;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_import_parquet() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                &str,
+                &std::path::Path,
+                crate::import::parquet::ParquetImportOptions,
+            ) -> Result<u64, crate::import::ImportError> = Connection::blocking_import_from_parquet;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_import_record_batch() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                &str,
+                &RecordBatch,
+                crate::import::arrow::ArrowImportOptions,
+            ) -> Result<u64, crate::import::ImportError> =
+                Connection::blocking_import_from_record_batch;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_import_arrow_ipc() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                &str,
+                &std::path::Path,
+                crate::import::arrow::ArrowImportOptions,
+            ) -> Result<u64, crate::import::ImportError> =
+                Connection::blocking_import_from_arrow_ipc;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_export_csv() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                crate::query::export::ExportSource,
+                &std::path::Path,
+                crate::export::csv::CsvExportOptions,
+            ) -> Result<u64, crate::export::csv::ExportError> =
+                Connection::blocking_export_csv_to_file;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_export_parquet() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                crate::query::export::ExportSource,
+                &std::path::Path,
+                crate::export::parquet::ParquetExportOptions,
+            ) -> Result<u64, crate::export::csv::ExportError> =
+                Connection::blocking_export_to_parquet;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_export_record_batches() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                crate::query::export::ExportSource,
+                crate::export::arrow::ArrowExportOptions,
+            ) -> Result<Vec<RecordBatch>, crate::export::csv::ExportError> =
+                Connection::blocking_export_to_record_batches;
+        }
+    }
+
+    #[test]
+    fn test_connection_has_blocking_export_arrow_ipc() {
+        fn _check_method_exists(_conn: &mut Connection) {
+            let _: fn(
+                &mut Connection,
+                crate::query::export::ExportSource,
+                &std::path::Path,
+                crate::export::arrow::ArrowExportOptions,
+            ) -> Result<u64, crate::export::csv::ExportError> =
+                Connection::blocking_export_to_arrow_ipc;
+        }
     }
 }

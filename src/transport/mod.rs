@@ -40,11 +40,16 @@
 //! ```
 
 pub mod deserialize;
+pub mod http_transport;
 pub mod messages;
 pub mod protocol;
 pub mod websocket;
 
 // Re-export commonly used types
+#[allow(deprecated)]
+pub use http_transport::{
+    DataPipe, HttpTransportClient, HttpTransportConnection, HttpTransportServer, TlsCertificate,
+};
 pub use messages::{ColumnInfo, DataType, ResultData, ResultSetHandle, SessionInfo};
 pub use protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult, TransportProtocol,
