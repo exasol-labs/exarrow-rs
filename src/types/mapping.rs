@@ -1,7 +1,7 @@
 //! Type mapping between Exasol and Apache Arrow data types.
 
 use crate::error::ConversionError;
-use arrow_schema::DataType;
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -97,13 +97,13 @@ impl TypeMapper {
                 if *with_local_time_zone {
                     // Timestamp with local timezone -> Timestamp with UTC timezone
                     Ok(DataType::Timestamp(
-                        arrow_schema::TimeUnit::Microsecond,
+                        TimeUnit::Microsecond,
                         Some("UTC".into()),
                     ))
                 } else {
                     // Timestamp without timezone
                     Ok(DataType::Timestamp(
-                        arrow_schema::TimeUnit::Microsecond,
+                        TimeUnit::Microsecond,
                         None,
                     ))
                 }
@@ -111,12 +111,12 @@ impl TypeMapper {
 
             ExasolType::IntervalYearToMonth => {
                 // Map to MonthDayNano interval (only using month component)
-                Ok(DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano))
+                Ok(DataType::Interval(IntervalUnit::MonthDayNano))
             }
 
             ExasolType::IntervalDayToSecond { .. } => {
                 // Map to MonthDayNano interval (using day and nanosecond components)
-                Ok(DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano))
+                Ok(DataType::Interval(IntervalUnit::MonthDayNano))
             }
 
             ExasolType::Geometry { .. } => {
@@ -286,7 +286,7 @@ mod tests {
         let arrow_type = TypeMapper::exasol_to_arrow(&exasol_type, true).unwrap();
         assert!(matches!(
             arrow_type,
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+            DataType::Timestamp(TimeUnit::Microsecond, None)
         ));
     }
 
@@ -298,7 +298,7 @@ mod tests {
         let arrow_type = TypeMapper::exasol_to_arrow(&exasol_type, true).unwrap();
         assert!(matches!(
             arrow_type,
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_))
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_))
         ));
     }
 
@@ -338,7 +338,7 @@ mod tests {
         let arrow_type = TypeMapper::exasol_to_arrow(&exasol_type, true).unwrap();
         assert!(matches!(
             arrow_type,
-            DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)
+            DataType::Interval(IntervalUnit::MonthDayNano)
         ));
     }
 }

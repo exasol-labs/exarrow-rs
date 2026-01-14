@@ -134,7 +134,7 @@
 //!
 //! ```no_run
 //! use exarrow_rs::*;
-//! use arrow_array::RecordBatch;
+//! use arrow::array::RecordBatch;
 //! use std::path::Path;
 //!
 //! # async fn example(connection: &mut Connection, batch: RecordBatch) -> Result<(), Box<dyn std::error::Error>> {

@@ -11,12 +11,11 @@ categories = ["database"]
 
 [lib]
 crate-type = ["lib", "cdylib"]
+doctest = false
 
 [dependencies]
-# Apache Arrow support
+# Apache Arrow support (arrow re-exports arrow-array, arrow-schema, etc.)
 arrow = "57.1.0"
-arrow-array = "57.1.0"
-arrow-schema = "57.1.0"
 
 # Async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }

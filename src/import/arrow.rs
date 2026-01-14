@@ -15,7 +15,7 @@
 //!
 //! ```no_run
 //! use exarrow_rs::import::arrow::{ArrowImportOptions, import_from_record_batch};
-//! use arrow_array::RecordBatch;
+//! use arrow::array::RecordBatch;
 //!
 //! # async fn example(batch: &RecordBatch) -> Result<(), Box<dyn std::error::Error>> {
 //! // Import from Arrow RecordBatch
@@ -26,14 +26,14 @@
 //! ```
 
 use super::ImportError;
-use arrow_array::cast::AsArray;
-use arrow_array::types::{
+use arrow::array::cast::AsArray;
+use arrow::array::types::{
     Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::DataType;
+use arrow::array::{Array, RecordBatch};
+use arrow::datatypes::DataType;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -357,9 +357,9 @@ impl<W: AsyncWrite + Unpin> ArrowToCsvWriter<W> {
         &self,
         array: &dyn Array,
         row_idx: usize,
-        unit: &arrow_schema::TimeUnit,
+        unit: &arrow::datatypes::TimeUnit,
     ) -> Result<String, ImportError> {
-        use arrow_schema::TimeUnit;
+        use arrow::datatypes::TimeUnit;
 
         let micros = match unit {
             TimeUnit::Second => {
@@ -396,7 +396,7 @@ impl<W: AsyncWrite + Unpin> ArrowToCsvWriter<W> {
     ) -> Result<String, ImportError> {
         let arr = array
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<arrow::array::Decimal128Array>()
             .ok_or_else(|| ImportError::ConversionError("Expected Decimal128Array".to_string()))?;
 
         let value = arr.value(row_idx);
@@ -588,9 +588,9 @@ impl<W: Write> SyncArrowToCsvWriter<W> {
         &self,
         array: &dyn Array,
         row_idx: usize,
-        unit: &arrow_schema::TimeUnit,
+        unit: &arrow::datatypes::TimeUnit,
     ) -> Result<String, ImportError> {
-        use arrow_schema::TimeUnit;
+        use arrow::datatypes::TimeUnit;
 
         let micros = match unit {
             TimeUnit::Second => {
@@ -627,7 +627,7 @@ impl<W: Write> SyncArrowToCsvWriter<W> {
     ) -> Result<String, ImportError> {
         let arr = array
             .as_any()
-            .downcast_ref::<arrow_array::Decimal128Array>()
+            .downcast_ref::<arrow::array::Decimal128Array>()
             .ok_or_else(|| ImportError::ConversionError("Expected Decimal128Array".to_string()))?;
 
         let value = arr.value(row_idx);
@@ -793,7 +793,7 @@ pub fn record_batch_to_csv(
 ///
 /// ```no_run
 /// use exarrow_rs::import::arrow::{ArrowImportOptions, import_from_record_batch};
-/// use arrow_array::RecordBatch;
+/// use arrow::array::RecordBatch;
 ///
 /// # async fn example(batch: &RecordBatch) -> Result<(), Box<dyn std::error::Error>> {
 /// // This would typically be called with a session's execute function
@@ -877,7 +877,7 @@ where
 ///
 /// ```no_run
 /// use exarrow_rs::import::arrow::{ArrowImportOptions, import_from_record_batches};
-/// use arrow_array::RecordBatch;
+/// use arrow::array::RecordBatch;
 ///
 /// # async fn example(batches: Vec<RecordBatch>) -> Result<(), Box<dyn std::error::Error>> {
 /// // This would typically be called with a session's execute function
@@ -1055,11 +1055,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{
+    use arrow::array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
         Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -1331,7 +1331,7 @@ mod tests {
     fn test_timestamp_array_conversion() {
         let schema = Schema::new(vec![Field::new(
             "ts",
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
             false,
         )]);
         let arr = TimestampMicrosecondArray::from(vec![0, 1_000_000, 86_400_000_000]);
@@ -1465,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_all_integer_types_conversion() {
-        use arrow_array::{
+        use arrow::array::{
             Int16Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
         };
 
@@ -1560,29 +1560,29 @@ mod tests {
 
     #[test]
     fn test_all_timestamp_units_conversion() {
-        use arrow_array::{
+        use arrow::array::{
             TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
         };
 
         let schema = Schema::new(vec![
             Field::new(
                 "ts_sec",
-                DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
                 false,
             ),
             Field::new(
                 "ts_ms",
-                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
                 false,
             ),
             Field::new(
                 "ts_us",
-                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new(
                 "ts_ns",
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 false,
             ),
         ]);
@@ -1614,7 +1614,7 @@ mod tests {
 
     #[test]
     fn test_string_types_conversion() {
-        use arrow_array::LargeStringArray;
+        use arrow::array::LargeStringArray;
 
         let schema = Schema::new(vec![
             Field::new("utf8", DataType::Utf8, true),
@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn test_binary_types_conversion() {
-        use arrow_array::LargeBinaryArray;
+        use arrow::array::LargeBinaryArray;
 
         let schema = Schema::new(vec![
             Field::new("bin", DataType::Binary, false),

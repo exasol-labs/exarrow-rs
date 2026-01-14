@@ -141,9 +141,9 @@ use adbc_core::options::{
     InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
 };
 use adbc_core::{Optionable, PartitionedResult};
+use arrow::array::{RecordBatch, RecordBatchReader};
 use arrow::compute::concat_batches;
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::Schema;
+use arrow::datatypes::Schema;
 use tokio::runtime::Runtime;
 
 use crate::adbc::Connection as ExaConnection;
@@ -628,7 +628,7 @@ impl VecRecordBatchReader {
 }
 
 impl Iterator for VecRecordBatchReader {
-    type Item = Result<RecordBatch, arrow_schema::ArrowError>;
+    type Item = Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.batches.next().map(Ok)
@@ -662,8 +662,8 @@ impl adbc_core::Connection for FfiConnection {
         _codes: Option<HashSet<InfoCode>>,
     ) -> AdbcResult<impl RecordBatchReader + Send> {
         // Return driver info as a RecordBatch
-        use arrow_array::builder::{StringBuilder, UInt32Builder};
-        use arrow_schema::{DataType, Field};
+        use arrow::array::builder::{StringBuilder, UInt32Builder};
+        use arrow::datatypes::{DataType, Field};
 
         // Build info schema
         let schema = Arc::new(Schema::new(vec![
@@ -728,8 +728,8 @@ impl adbc_core::Connection for FfiConnection {
     }
 
     fn get_table_types(&self) -> AdbcResult<impl RecordBatchReader + Send> {
-        use arrow_array::builder::StringBuilder;
-        use arrow_schema::{DataType, Field};
+        use arrow::array::builder::StringBuilder;
+        use arrow::datatypes::{DataType, Field};
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "table_type",
@@ -749,7 +749,7 @@ impl adbc_core::Connection for FfiConnection {
     }
 
     fn get_statistic_names(&self) -> AdbcResult<impl RecordBatchReader + Send> {
-        use arrow_schema::{DataType, Field};
+        use arrow::datatypes::{DataType, Field};
         let schema = Arc::new(Schema::new(vec![
             Field::new("statistic_name", DataType::Utf8, false),
             Field::new("statistic_key", DataType::Int16, false),

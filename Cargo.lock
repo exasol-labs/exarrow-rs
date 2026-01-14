@@ -669,8 +669,6 @@ dependencies = [
  "adbc_driver_manager",
  "adbc_ffi",
  "arrow",
- "arrow-array",
- "arrow-schema",
  "async-trait",
  "base64",
  "bytes",

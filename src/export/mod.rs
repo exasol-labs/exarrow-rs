@@ -43,7 +43,7 @@
 //!
 //! ```ignore
 //! use exarrow_rs::export::arrow::{ArrowExportOptions, CsvToArrowReader};
-//! use arrow_schema::{Schema, Field, DataType};
+//! use arrow::datatypes::{Schema, Field, DataType};
 //! use std::sync::Arc;
 //!
 //! // Create a schema

@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! use exarrow_rs::export::arrow::{ArrowExportOptions, CsvToArrowReader};
-//! use arrow_schema::{Schema, Field, DataType};
+//! use arrow::datatypes::{Schema, Field, DataType};
 //! use std::sync::Arc;
 //!
 //! // Create a schema
@@ -28,12 +28,12 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{
+use arrow::array::builder::{
     BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int64Builder, StringBuilder,
     TimestampMicrosecondBuilder,
 };
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -1602,8 +1602,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::StringArray::from(vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::StringArray::from(vec![
                     Some("a"),
                     Some("b"),
                     None,
@@ -1627,7 +1627,7 @@ mod tests {
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3]))],
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
         )
         .unwrap();
 
@@ -2000,7 +2000,7 @@ mod tests {
             let array = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<arrow_array::Int64Array>()
+                .downcast_ref::<arrow::array::Int64Array>()
                 .unwrap();
             for i in 0..array.len() {
                 all_values.push(array.value(i));
