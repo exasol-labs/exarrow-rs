@@ -30,9 +30,9 @@ tmp
 # Secrets
 .env
 
-# Spec-driven development
-specs/_archive
-
 # Exclude coding agents
 .claude/commands
 .claude/agents
+
+# Project specific
+.fastembed_cache
