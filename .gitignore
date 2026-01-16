@@ -31,8 +31,8 @@ tmp
 .env
 
 # Exclude coding agents
-.claude/commands
-.claude/agents
+.claude/
+.spox
 
 # Project specific
 .fastembed_cache
