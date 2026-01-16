@@ -1,0 +1,103 @@
+exarrow-rs
+Copyright 2024-2025 Marco Nätlitz
+
+This product includes software developed by third parties.
+
+================================================================================
+DIRECT DEPENDENCIES
+================================================================================
+
+Apache Arrow (arrow, parquet)
+  License: Apache-2.0
+  Copyright: Apache Software Foundation
+  https://github.com/apache/arrow-rs
+
+Apache Arrow ADBC (adbc_core, adbc_ffi, adbc_driver_manager)
+  License: Apache-2.0
+  Copyright: Apache Software Foundation
+  https://github.com/apache/arrow-adbc
+
+Tokio (tokio, bytes)
+  License: MIT
+  Copyright: Tokio Contributors
+  https://github.com/tokio-rs/tokio
+
+Hyper (hyper, hyper-util, http-body-util)
+  License: MIT
+  Copyright: Sean McArthur
+  https://github.com/hyperium/hyper
+
+tokio-tungstenite
+  License: MIT
+  Copyright: Daniel Abramov, Alexey Galakhov
+  https://github.com/snapview/tokio-tungstenite
+
+Serde (serde, serde_json)
+  License: Apache-2.0 OR MIT
+  Copyright: Erick Tryzelaar, David Tolnay
+  https://github.com/serde-rs/serde
+
+thiserror
+  License: Apache-2.0 OR MIT
+  Copyright: David Tolnay
+  https://github.com/dtolnay/thiserror
+
+async-trait
+  License: Apache-2.0 OR MIT
+  Copyright: David Tolnay
+  https://github.com/dtolnay/async-trait
+
+futures-util
+  License: Apache-2.0 OR MIT
+  Copyright: The Rust Project Developers
+  https://github.com/rust-lang/futures-rs
+
+native-tls
+  License: Apache-2.0 OR MIT
+  Copyright: Steven Fackler
+  https://github.com/sfackler/rust-native-tls
+
+Rustls (rustls, tokio-rustls, rcgen)
+  License: Apache-2.0 OR ISC OR MIT
+  Copyright: The Rustls Project
+  https://github.com/rustls/rustls
+
+RustCrypto (rsa, sha2)
+  License: Apache-2.0 OR MIT
+  Copyright: RustCrypto Developers
+  https://github.com/RustCrypto
+
+chrono
+  License: Apache-2.0 OR MIT
+  Copyright: The Chronotope Project
+  https://github.com/chronotope/chrono
+
+flate2
+  License: Apache-2.0 OR MIT
+  Copyright: Alex Crichton, Josh Triplett
+  https://github.com/rust-lang/flate2-rs
+
+bzip2
+  License: Apache-2.0 OR MIT
+  Copyright: Trifecta Tech Foundation
+  https://github.com/trifectatechfoundation/bzip2-rs
+
+base64
+  License: Apache-2.0 OR MIT
+  Copyright: Marshall Pierce
+  https://github.com/marshallpierce/rust-base64
+
+rand_core
+  License: Apache-2.0 OR MIT
+  Copyright: The Rand Project Developers
+  https://github.com/rust-random/rand
+
+hex
+  License: Apache-2.0 OR MIT
+  Copyright: KokaKiwi
+  https://github.com/KokaKiwi/rust-hex
+
+urlencoding
+  License: MIT
+  Copyright: Kornel, Bertram Truong
+  https://github.com/kornelski/rust_urlencoding

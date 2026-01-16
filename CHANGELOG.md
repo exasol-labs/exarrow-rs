@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.1]
+
+### Changed
+
+- Consolidated internal utilities and removed deprecated server mode
+- Optimized Arrow imports for reduced compile times
+
+### Documentation
+
+- Added NOTICE file with third-party license attributions
+- Improved README with navigation links and expanded import/export examples
+
+## [2.1.0]
+
+### Added
+
+- **Bulk Import/Export**: High-performance data transfer via HTTP transport
+  - CSV import from files, streams, iterators, and async callbacks
+  - CSV export to files, streams, and async callbacks
+  - Parquet import/export with compression support (Snappy, Gzip, Lz4, Zstd)
+  - Arrow IPC import/export for direct RecordBatch transfer
+- New examples: `import_export.rs` demonstrating all import/export features
+
+### Documentation
+
+- Added import/export specification (`specs/import-export/`)
+
 ## [2.0.0]
 
 ### Breaking Changes
