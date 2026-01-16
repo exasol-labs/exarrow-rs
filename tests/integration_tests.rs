@@ -74,8 +74,8 @@ mod common;
 use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    generate_test_schema_name, get_host, get_port, get_test_connection,
-    get_test_connection_string, get_user, is_exasol_available,
+    generate_test_schema_name, get_host, get_port, get_test_connection, get_test_connection_string,
+    get_user, is_exasol_available,
 };
 use exarrow_rs::adbc::Connection;
 
