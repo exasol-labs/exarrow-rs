@@ -12,6 +12,9 @@ use crate::transport::protocol::PreparedStatementHandle;
 ///
 /// PreparedStatement stores the server-side statement handle and parameter values.
 /// Execution is performed by Connection, not by PreparedStatement itself.
+///
+/// # Example
+///
 pub struct PreparedStatement {
     /// Server-side prepared statement handle
     handle: PreparedStatementHandle,

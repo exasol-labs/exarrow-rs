@@ -1,23 +1,22 @@
 [package]
 name = "exarrow-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 description = "ADBC-compatible driver for Exasol with Arrow data format support"
 keywords = ["exasol", "adbc", "arrow", "database", "driver"]
 categories = ["database"]
 
 [lib]
 crate-type = ["lib", "cdylib"]
+doctest = false
 
 [dependencies]
-# Apache Arrow support
+# Apache Arrow support (arrow re-exports arrow-array, arrow-schema, etc.)
 arrow = "57.1.0"
-arrow-array = "57.1.0"
-arrow-schema = "57.1.0"
 
 # Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
@@ -43,7 +42,7 @@ urlencoding = "2.1"
 hex = "0.4"
 
 # RSA encryption for Exasol authentication
-rsa = "0.9.10"
+rsa = "0.9"
 base64 = "0.22"
 # Use rand_core 0.6 for compatibility with rsa crate's CryptoRng trait
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -52,12 +51,41 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 adbc_core = { version = "0.21.0", optional = true }
 adbc_ffi = { version = "0.21.0", optional = true }
 
+# HTTP transport for import/export (hyper with HTTP server support)
+hyper = { version = "1.6", features = ["http1", "server"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# TLS certificate generation for secure import/export
+rcgen = "0.13"
+rustls = "0.23"
+tokio-rustls = "0.26"
+
+# Parquet file support
+parquet = { version = "57.1.0", features = ["async"] }
+
+# Compression support for CSV import/export
+flate2 = "1.1"
+bzip2 = "0.5"
+
+# SHA-256 fingerprint for TLS certificates
+sha2 = "0.10"
+
+# Date/time formatting for import/export
+chrono = "0.4"
+
+# Byte buffer utilities
+bytes = "1.10"
+
 [dev-dependencies]
 # Mocking for tests
 mockall = "0.14.0"
 # ADBC driver manager and core for integration testing
 adbc_driver_manager = "0.21"
 adbc_core = "0.21"
+tempfile = "3.24.0"
+# Environment variable loading for examples
+dotenvy = "0.15"
 
 [features]
 default = []

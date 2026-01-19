@@ -13,6 +13,9 @@ use std::str::FromStr;
 /// The `Database` type represents a database connection configuration and
 /// serves as a factory for creating `Connection` instances. It encapsulates
 /// the connection parameters and provides methods to establish connections.
+///
+/// # Example
+///
 #[derive(Debug, Clone)]
 pub struct Database {
     /// Connection parameters
@@ -27,6 +30,9 @@ impl Database {
     /// # Arguments
     ///
     /// * `params` - The connection parameters
+    ///
+    /// # Example
+    ///
     pub fn new(params: ConnectionParams) -> Self {
         // Reconstruct a safe connection string for display (without password)
         let connection_string = format!(
@@ -77,6 +83,9 @@ impl Database {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection fails.
+    ///
+    /// # Example
+    ///
     pub async fn connect(&self) -> Result<Connection, ConnectionError> {
         Connection::from_params(self.params.clone()).await
     }
@@ -93,6 +102,9 @@ impl Database {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection test fails.
+    ///
+    /// # Example
+    ///
     pub async fn test_connection(&self) -> Result<(), ConnectionError> {
         let connection = self.connect().await?;
         connection.close().await?;
@@ -117,6 +129,9 @@ impl FromStr for Database {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection string is invalid.
+    ///
+    /// # Example
+    ///
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let params = ConnectionParams::from_str(s)?;
         Ok(Self::new(params))

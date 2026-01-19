@@ -14,12 +14,41 @@
 //! - `prepared` - Prepared statement handling for parameterized queries
 //! - `results` - Result set iteration and metadata handling
 //!
+//! # Example
+//!
+//! ```no_run
+//! use exarrow_rs::adbc::Connection;
+//!
+//! # async fn example(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+//! // Create a statement (now synchronous)
+//! let mut stmt = connection.create_statement("SELECT * FROM users WHERE age > ?");
+//!
+//! // Bind parameters
+//! stmt.bind(0, 18)?;
+//!
+//! // Execute via Connection
+//! let result_set = connection.execute_statement(&stmt).await?;
+//!
+//! // Iterate over results
+//! for batch in result_set.into_iterator()? {
+//!     let batch = batch?;
+//!     println!("Batch rows: {}", batch.num_rows());
+//! }
+//! # Ok(())
+//! # }
+//! ```
 
+pub mod export;
+pub mod import;
 pub mod prepared;
 pub mod results;
 pub mod statement;
 
 // Re-export commonly used types
+pub use export::{Compression, DelimitMode, ExportQuery, ExportSource, RowSeparator};
+pub use import::{
+    Compression as ImportCompression, ImportQuery, RowSeparator as ImportRowSeparator, TrimMode,
+};
 pub use prepared::PreparedStatement;
 pub use results::{QueryMetadata, ResultSet, ResultSetIterator};
 pub use statement::{Parameter, Statement, StatementType};
