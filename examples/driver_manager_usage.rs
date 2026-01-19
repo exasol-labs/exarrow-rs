@@ -32,7 +32,7 @@
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
 use adbc_core::{Connection, Database, Driver, Statement};
 use adbc_driver_manager::ManagedDriver;
-use arrow_array::{Array, RecordBatchReader};
+use arrow::array::{Array, RecordBatchReader, StringArray, UInt32Array};
 use std::error::Error;
 use std::path::Path;
 
@@ -136,12 +136,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let info_name = batch.column(0);
                 let info_value = batch.column(1);
                 if let (Some(names), Some(values)) = (
-                    info_name
-                        .as_any()
-                        .downcast_ref::<arrow_array::UInt32Array>(),
-                    info_value
-                        .as_any()
-                        .downcast_ref::<arrow_array::StringArray>(),
+                    info_name.as_any().downcast_ref::<UInt32Array>(),
+                    info_value.as_any().downcast_ref::<StringArray>(),
                 ) {
                     for i in 0..names.len() {
                         if !values.is_null(i) {
