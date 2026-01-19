@@ -43,7 +43,7 @@ urlencoding = "2.1"
 hex = "0.4"
 
 # RSA encryption for Exasol authentication
-rsa = "0.9"
+rsa = "0.9.10"
 base64 = "0.22"
 # Use rand_core 0.6 for compatibility with rsa crate's CryptoRng trait
 rand_core = { version = "0.6", features = ["getrandom"] }
