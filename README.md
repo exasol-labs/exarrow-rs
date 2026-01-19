@@ -11,6 +11,7 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 [Installation](#installation) •
 [Quick Start](#quick-start) •
 [Connection](#connection) •
+[Import / Export](#import--export) •
 [Type Mapping](#type-mapping) •
 [Examples](#examples)
 
@@ -88,6 +89,55 @@ Exemplary connection string:
 
 ```
 exasol://myuser:mypass@exasol.example.com:8563/production?connection_timeout=60
+```
+
+## Import / Export
+
+High-performance bulk data transfer via HTTP transport. Supports streaming for large datasets.
+
+### Formats
+
+| Format    | Import | Export | Notes                         |
+|-----------|--------|--------|-------------------------------|
+| CSV       | Yes    | Yes    | Native Exasol format, fastest |
+| Parquet   | Yes    | Yes    | Columnar with compression     |
+| Arrow IPC | Yes    | Yes    | Direct RecordBatch transfer   |
+
+### CSV Import
+
+```rust
+use exarrow_rs::import::CsvImportOptions;
+
+let options = CsvImportOptions::default()
+    .column_separator(',')
+    .skip_rows(1);  // Skip header
+
+let rows = connection.import_csv_from_file(
+    "my_schema.my_table",
+    Path::new("/path/to/data.csv"),
+    options,
+).await?;
+```
+
+### Parquet
+
+```rust
+use exarrow_rs::import::ParquetImportOptions;
+use exarrow_rs::export::{ParquetExportOptions, ParquetCompression};
+
+// Import
+let rows = connection.import_from_parquet(
+    "my_table",
+    Path::new("/path/to/data.parquet"),
+    ParquetImportOptions::default().with_batch_size(1024),
+).await?;
+
+// Export with compression
+let rows = connection.export_to_parquet(
+    ExportSource::Table { schema: None, name: "my_table".into(), columns: vec![] },
+    Path::new("/tmp/export.parquet"),
+    ParquetExportOptions::default().with_compression(ParquetCompression::Snappy),
+).await?;
 ```
 
 ## Type Mapping
