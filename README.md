@@ -11,7 +11,6 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 [Installation](#installation) •
 [Quick Start](#quick-start) •
 [Connection](#connection) •
-[Import / Export](#import--export) •
 [Type Mapping](#type-mapping) •
 [Examples](#examples)
 
