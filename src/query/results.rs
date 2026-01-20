@@ -199,44 +199,53 @@ impl ResultSet {
                 batches,
                 complete,
             } => {
-                if *complete {
-                    return Ok(batches.clone());
-                }
+                let all_batches = if *complete {
+                    batches.clone()
+                } else {
+                    let mut all_batches = batches.clone();
 
-                let mut all_batches = batches.clone();
-
-                // Fetch remaining data
-                if let Some(handle_val) = handle {
-                    loop {
-                        let mut transport = self.transport.lock().await;
-                        let result_data = transport
-                            .fetch_results(*handle_val)
-                            .await
-                            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-
-                        if result_data.data.is_empty() {
-                            *complete = true;
-                            break;
-                        }
-
-                        let batch =
-                            Self::column_major_to_record_batch(&result_data, &metadata.schema)
+                    // Fetch remaining data
+                    if let Some(handle_val) = handle {
+                        loop {
+                            let mut transport = self.transport.lock().await;
+                            let result_data = transport
+                                .fetch_results(*handle_val)
+                                .await
                                 .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
-                        all_batches.push(batch);
+                            if result_data.data.is_empty() {
+                                *complete = true;
+                                break;
+                            }
 
-                        // Check if we've fetched everything
-                        if result_data.total_rows > 0
-                            && all_batches.iter().map(|b| b.num_rows()).sum::<usize>()
-                                >= result_data.total_rows as usize
-                        {
-                            *complete = true;
-                            break;
+                            let batch =
+                                Self::column_major_to_record_batch(&result_data, &metadata.schema)
+                                    .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+
+                            all_batches.push(batch);
+
+                            // Check if we've fetched everything
+                            if result_data.total_rows > 0
+                                && all_batches.iter().map(|b| b.num_rows()).sum::<usize>()
+                                    >= result_data.total_rows as usize
+                            {
+                                *complete = true;
+                                break;
+                            }
                         }
                     }
+
+                    *batches = all_batches.clone();
+                    all_batches
+                };
+
+                // Close the result set handle on the server to release resources
+                if let Some(handle_val) = handle.take() {
+                    let mut transport = self.transport.lock().await;
+                    // Ignore close errors - we've already fetched the data
+                    let _ = transport.close_result_set(handle_val).await;
                 }
 
-                *batches = all_batches.clone();
                 Ok(all_batches)
             }
             ResultSetInner::RowCount { .. } => Err(QueryError::NoResultSet(
