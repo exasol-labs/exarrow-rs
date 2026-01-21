@@ -39,8 +39,8 @@ mod common;
 use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
 use adbc_core::{Connection as AdbcConnection, Database, Driver, Statement};
 use adbc_driver_manager::ManagedDriver;
+use arrow::array::{Array, RecordBatchReader};
 use arrow::datatypes::DataType;
-use arrow_array::{Array, RecordBatchReader};
 use common::{get_host, get_password, get_port, get_user, is_exasol_available};
 use std::path::Path;
 
@@ -845,7 +845,9 @@ fn test_driver_manager_get_table_types() {
         let batch = batch_result.expect("Failed to read table types batch");
         if batch.num_rows() > 0 {
             let type_col = batch.column(0);
-            if let Some(string_array) = type_col.as_any().downcast_ref::<arrow_array::StringArray>()
+            if let Some(string_array) = type_col
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
             {
                 for i in 0..string_array.len() {
                     if !string_array.is_null(i) {

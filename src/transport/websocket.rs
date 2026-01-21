@@ -579,8 +579,8 @@ impl TransportProtocol for WebSocketTransport {
 
         // Close WebSocket connection with proper close handshake
         if let Some(mut ws_stream) = self.ws_stream.take() {
-            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
             use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
             // Send close frame with normal closure code
             let close_frame = CloseFrame {
@@ -591,10 +591,10 @@ impl TransportProtocol for WebSocketTransport {
 
             // Drain any remaining messages to complete the close handshake
             use futures_util::StreamExt;
-            while let Ok(Some(_)) = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                ws_stream.next()
-            ).await {}
+            while let Ok(Some(_)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws_stream.next()).await
+            {
+            }
         }
 
         self.state = ConnectionState::Closed;

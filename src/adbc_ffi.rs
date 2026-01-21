@@ -13,13 +13,6 @@
 //!
 //! ## Building the FFI Library
 //!
-//! ```bash
-//! # Build in release mode (recommended for production)
-//! cargo build --release --features ffi
-//!
-//! # Build in debug mode (for development)
-//! cargo build --features ffi
-//! ```
 //!
 //! ## Exported Symbol
 //!
@@ -33,9 +26,6 @@
 //!
 //! The driver accepts URIs in the following format:
 //!
-//! ```text
-//! exasol://[username[:password]@]host[:port][/schema]
-//! ```
 //!
 //! Examples:
 //! - `exasol://sys:exasol@localhost:8563`
@@ -44,31 +34,9 @@
 //!
 //! ## Using with ADBC Driver Manager (Rust)
 //!
-//! Load the driver with `ManagedDriver::load_dynamic_from_filename()`, create a database
-//! with `OptionDatabase::Uri` set to your connection string, then create connections and
-//! execute statements.
 //!
 //! ## Using with ADBC Driver Manager (Python)
 //!
-//! ```python
-//! import adbc_driver_manager
-//!
-//! # Load the exarrow driver
-//! with adbc_driver_manager.AdbcDriver(
-//!     "/path/to/libexarrow_rs.dylib",
-//!     entrypoint="ExarrowDriverInit"
-//! ) as driver:
-//!     with adbc_driver_manager.AdbcDatabase(
-//!         driver=driver,
-//!         uri="exasol://sys:exasol@localhost:8563"
-//!     ) as db:
-//!         with adbc_driver_manager.AdbcConnection(db) as conn:
-//!             with adbc_driver_manager.AdbcStatement(conn) as stmt:
-//!                 stmt.set_sql_query("SELECT 1 AS result")
-//!                 reader, _ = stmt.execute_query()
-//!                 table = reader.read_all()
-//!                 print(table.to_pandas())
-//! ```
 //!
 //! ## Supported ADBC Features
 //!
@@ -88,22 +56,6 @@
 //!
 //! To test the FFI driver with the ADBC driver manager:
 //!
-//! ```bash
-//! # First, build the FFI library
-//! cargo build --release --features ffi
-//!
-//! # Start Exasol Docker (if not already running)
-//! docker run -d --name exasol-test -p 8563:8563 --privileged exasol/docker-db:latest
-//!
-//! # Wait for database to be ready (1-2 minutes)
-//! docker logs exasol-test 2>&1 | grep -i "started"
-//!
-//! # Run the driver manager integration tests
-//! cargo test --test driver_manager_tests -- --ignored
-//!
-//! # Run with verbose output
-//! cargo test --test driver_manager_tests -- --ignored --nocapture
-//! ```
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -113,9 +65,9 @@ use adbc_core::options::{
     InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
 };
 use adbc_core::{Optionable, PartitionedResult};
+use arrow::array::{RecordBatch, RecordBatchReader};
 use arrow::compute::concat_batches;
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::Schema;
+use arrow::datatypes::Schema;
 use tokio::runtime::Runtime;
 
 use crate::adbc::Connection as ExaConnection;
@@ -146,6 +98,9 @@ fn to_adbc_error(err: impl std::error::Error) -> AdbcError {
 ///
 /// This wraps the internal `Driver` type to implement `adbc_core::Driver`.
 /// The driver is loaded via the `ExarrowDriverInit` entry point.
+///
+/// # Example
+///
 #[derive(Debug, Default)]
 pub struct FfiDriver;
 
@@ -178,7 +133,11 @@ impl adbc_core::Driver for FfiDriver {
 /// The primary option is `OptionDatabase::Uri` which should contain
 /// the Exasol connection string.
 ///
-/// Connection URI format: `exasol://[username[:password]@]host[:port][/schema]`
+/// # Connection URI Format
+///
+///
+/// # Example
+///
 pub struct FfiDatabase {
     /// URI for the connection (exasol://user:pass@host:port/schema)
     uri: Option<String>,
@@ -572,7 +531,7 @@ impl VecRecordBatchReader {
 }
 
 impl Iterator for VecRecordBatchReader {
-    type Item = Result<RecordBatch, arrow_schema::ArrowError>;
+    type Item = Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.batches.next().map(Ok)
@@ -606,8 +565,8 @@ impl adbc_core::Connection for FfiConnection {
         _codes: Option<HashSet<InfoCode>>,
     ) -> AdbcResult<impl RecordBatchReader + Send> {
         // Return driver info as a RecordBatch
-        use arrow_array::builder::{StringBuilder, UInt32Builder};
-        use arrow_schema::{DataType, Field};
+        use arrow::array::builder::{StringBuilder, UInt32Builder};
+        use arrow::datatypes::{DataType, Field};
 
         // Build info schema
         let schema = Arc::new(Schema::new(vec![
@@ -672,8 +631,8 @@ impl adbc_core::Connection for FfiConnection {
     }
 
     fn get_table_types(&self) -> AdbcResult<impl RecordBatchReader + Send> {
-        use arrow_array::builder::StringBuilder;
-        use arrow_schema::{DataType, Field};
+        use arrow::array::builder::StringBuilder;
+        use arrow::datatypes::{DataType, Field};
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "table_type",
@@ -693,7 +652,7 @@ impl adbc_core::Connection for FfiConnection {
     }
 
     fn get_statistic_names(&self) -> AdbcResult<impl RecordBatchReader + Send> {
-        use arrow_schema::{DataType, Field};
+        use arrow::datatypes::{DataType, Field};
         let schema = Arc::new(Schema::new(vec![
             Field::new("statistic_name", DataType::Utf8, false),
             Field::new("statistic_key", DataType::Int16, false),
@@ -744,6 +703,9 @@ impl adbc_core::Connection for FfiConnection {
 /// FFI-compatible ADBC Statement wrapper.
 ///
 /// Used to execute SQL queries and retrieve results as Arrow RecordBatches.
+///
+/// # Example
+///
 pub struct FfiStatement {
     /// Connection URI (for creating connections)
     uri: String,

@@ -69,6 +69,9 @@ impl FromStr for ConnectionParams {
 
     /// Parse a connection string in the format:
     /// `exasol://username[:password]@host[:port][/schema][?param=value&...]`
+    ///
+    /// # Examples
+    ///
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Parse the connection string
         let url = s.trim();

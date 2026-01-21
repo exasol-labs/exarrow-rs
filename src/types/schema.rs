@@ -2,7 +2,7 @@
 
 use crate::error::ConversionError;
 use crate::types::{ExasolType, TypeMapper};
-use arrow_schema::{Field, Schema};
+use arrow::datatypes::{Field, Schema};
 
 /// Column metadata from Exasol result set.
 #[derive(Debug, Clone)]

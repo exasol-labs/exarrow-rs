@@ -121,18 +121,13 @@ impl ArrowConverter {
             })
             .collect();
 
-        // Build Arrow arrays for each column
+        // Build Arrow arrays for each column - pass references directly without cloning
         let arrays: Result<Vec<_>, _> = self
             .column_types
             .iter()
             .enumerate()
             .map(|(col_idx, exasol_type)| {
-                // Convert &Value references to owned for the builder
-                let values: Vec<Value> = column_values[col_idx]
-                    .iter()
-                    .map(|v| (*v).clone())
-                    .collect();
-                build_array(exasol_type, &values, col_idx)
+                build_array(exasol_type, &column_values[col_idx], col_idx)
             })
             .collect();
 
@@ -195,12 +190,15 @@ impl ArrowConverter {
             }
         }
 
-        // Build Arrow arrays for each column
+        // Build Arrow arrays for each column - collect references from owned values
         let arrays: Result<Vec<_>, _> = self
             .column_types
             .iter()
             .enumerate()
-            .map(|(col_idx, exasol_type)| build_array(exasol_type, &columns[col_idx], col_idx))
+            .map(|(col_idx, exasol_type)| {
+                let refs: Vec<&Value> = columns[col_idx].iter().collect();
+                build_array(exasol_type, &refs, col_idx)
+            })
             .collect();
 
         let arrays = arrays?;

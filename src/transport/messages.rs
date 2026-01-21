@@ -835,11 +835,9 @@ impl From<i32> for ResultSetHandle {
 /// this struct stores data in **row-major format** after streaming deserialization.
 /// Access data as `data[row_idx][col_idx]`.
 ///
-/// For a query `SELECT id, name FROM users` returning 3 rows:
+/// # Example
 ///
-/// data[0] = [1, "Alice"]     // Row 0
-/// data[1] = [2, "Bob"]       // Row 1
-/// data[2] = [3, "Carol"]     // Row 2
+/// For a query `SELECT id, name FROM users` returning 3 rows:
 #[derive(Debug, Clone)]
 pub struct ResultData {
     /// Column metadata

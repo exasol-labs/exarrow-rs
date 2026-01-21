@@ -6,11 +6,19 @@
 //!
 //! # Column-Major (Exasol Wire Format)
 //!
-//! `[[col0_val0, col0_val1, col0_val2], [col1_val0, col1_val1, col1_val2]]`
+//! ```json
+//! [[col0_val0, col0_val1, col0_val2], [col1_val0, col1_val1, col1_val2]]
+//! ```
 //!
 //! # Row-Major (After Deserialization)
 //!
-//! Each inner Vec contains all column values for one row.
+//! ```rust,ignore
+//! vec![
+//!     vec![col0_val0, col1_val0],  // row 0
+//!     vec![col0_val1, col1_val1],  // row 1
+//!     vec![col0_val2, col1_val2],  // row 2
+//! ]
+//! ```
 
 use serde::de::{DeserializeSeed, Deserializer, SeqAccess, Visitor};
 use serde_json::Value;

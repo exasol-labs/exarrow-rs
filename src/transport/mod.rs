@@ -11,13 +11,42 @@
 //! - `messages` - Protocol message types
 //! - `websocket` - WebSocket transport implementation
 //!
+//! # Example
+//!
+//! ```no_run
+//! use exarrow_rs::transport::{
+//!     WebSocketTransport, TransportProtocol, ConnectionParams, Credentials
+//! };
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut transport = WebSocketTransport::new();
+//!
+//! // Connect
+//! let params = ConnectionParams::new("localhost".to_string(), 8563);
+//! transport.connect(&params).await?;
+//!
+//! // Authenticate
+//! let credentials = Credentials::new("sys".to_string(), "exasol".to_string());
+//! let session = transport.authenticate(&credentials).await?;
+//! println!("Connected to: {}", session.database_name);
+//!
+//! // Execute query
+//! let result = transport.execute_query("SELECT * FROM my_table").await?;
+//!
+//! // Close connection
+//! transport.close().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod deserialize;
+pub mod http_transport;
 pub mod messages;
 pub mod protocol;
 pub mod websocket;
 
 // Re-export commonly used types
+pub use http_transport::{DataPipe, HttpTransportClient, TlsCertificate};
 pub use messages::{ColumnInfo, DataType, ResultData, ResultSetHandle, SessionInfo};
 pub use protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult, TransportProtocol,

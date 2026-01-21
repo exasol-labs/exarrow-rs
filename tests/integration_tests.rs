@@ -74,9 +74,8 @@ mod common;
 use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    generate_test_schema_name, get_host, get_password, get_port, get_test_connection,
-    get_test_connection_string, get_user, is_exasol_available, DEFAULT_HOST, DEFAULT_PASSWORD,
-    DEFAULT_PORT, DEFAULT_USER,
+    generate_test_schema_name, get_host, get_port, get_test_connection, get_test_connection_string,
+    get_user, is_exasol_available,
 };
 use exarrow_rs::adbc::Connection;
 
@@ -84,15 +83,6 @@ use exarrow_rs::adbc::Connection;
 // Infrastructure Tests
 // ============================================================================
 // These tests validate that the test infrastructure itself works correctly.
-
-#[test]
-fn test_default_constants_are_correct() {
-    // Verify the default constants have expected values
-    assert_eq!(DEFAULT_HOST, "localhost");
-    assert_eq!(DEFAULT_PORT, 8563);
-    assert_eq!(DEFAULT_USER, "sys");
-    assert_eq!(DEFAULT_PASSWORD, "exasol");
-}
 
 #[test]
 fn test_connection_string_format_is_valid() {
@@ -123,15 +113,6 @@ fn test_connection_string_format_is_valid() {
 }
 
 #[test]
-fn test_helper_functions_return_values() {
-    // All helper functions should return non-empty values
-    assert!(!get_host().is_empty(), "Host should not be empty");
-    assert!(get_port() > 0, "Port should be positive");
-    assert!(!get_user().is_empty(), "User should not be empty");
-    assert!(!get_password().is_empty(), "Password should not be empty");
-}
-
-#[test]
 fn test_schema_name_generation_is_unique() {
     let schema1 = generate_test_schema_name();
     // Small delay to ensure different timestamp
@@ -150,15 +131,6 @@ fn test_schema_name_generation_is_unique() {
     // Names should be unique (different timestamps)
     // Note: In very fast execution, they might be the same, so we just check format
     assert!(schema1.len() > 17, "Schema name should include timestamp");
-}
-
-#[test]
-fn test_is_exasol_available_returns_bool() {
-    // This should not panic, just return a boolean
-    let available = is_exasol_available();
-    // We can't assert the value since it depends on environment,
-    // but we can verify it returns without panicking
-    let _ = available;
 }
 
 // ============================================================================

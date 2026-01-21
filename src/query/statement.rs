@@ -187,6 +187,9 @@ impl From<Vec<u8>> for Parameter {
 ///
 /// Statement holds SQL text, parameters, timeout, and statement type.
 /// Execution is performed by Connection, not by Statement itself.
+///
+/// # Example
+///
 pub struct Statement {
     /// SQL text (may contain parameter placeholders)
     sql: String,

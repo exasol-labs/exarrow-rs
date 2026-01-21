@@ -12,6 +12,9 @@ use std::str::FromStr;
 /// The `Driver` type represents the exarrow-rs driver and provides metadata
 /// about the driver implementation. It serves as the entry point for creating
 /// database connections.
+///
+/// # Example
+///
 #[derive(Debug, Clone)]
 pub struct Driver {
     /// Driver name
@@ -28,6 +31,9 @@ impl Driver {
     /// Create a new Driver instance.
     ///
     /// This initializes the driver with metadata from the library.
+    ///
+    /// # Example
+    ///
     pub fn new() -> Self {
         Self {
             name: "exarrow-rs".to_string(),
@@ -91,6 +97,9 @@ impl Driver {
     /// # Errors
     ///
     /// Returns `ConnectionError` if the connection string is invalid.
+    ///
+    /// # Example
+    ///
     pub fn open(&self, connection_string: &str) -> Result<Database, ConnectionError> {
         Database::from_str(connection_string)
     }
@@ -106,6 +115,9 @@ impl Driver {
     /// # Returns
     ///
     /// `true` if the connection string is valid, `false` otherwise.
+    ///
+    /// # Example
+    ///
     pub fn validate_connection_string(&self, connection_string: &str) -> bool {
         Database::from_str(connection_string).is_ok()
     }
