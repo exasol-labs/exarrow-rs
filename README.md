@@ -15,7 +15,7 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 [Type Mapping](#type-mapping) •
 [Examples](#examples)
 
-*Note: This is a side-project of mine and a prototype. Not officially supported by [Exasol](https://exasol.com). I
+*Disclaimer: This is a side-project of mine and a prototype. Not officially supported by [Exasol](https://exasol.com). I
 cannot guarantee the functionality or performance.*
 </div>
 
@@ -33,12 +33,11 @@ cargo build --release
 
 ### Adding to Your Project
 
-Add the dependency pointing to your local build or the git repository:
+Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-# From local path or from git
-exarrow-rs = { path = "../exarrow-rs" }
+exarrow-rs = { git = "https://github.com/marconae/exarrow-rs.git" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -159,6 +158,7 @@ let rows = connection.export_to_parquet(
 See [`examples/`](examples/) for runnable code:
 * [`basic_usage.rs`](examples/basic_usage.rs) - direct API: queries, transactions, metadata
 * [`driver_manager_usage.rs`](examples/driver_manager_usage.rs) - ADBC driver manager integration
+* [`import_export.rs`](examples/import_export.rs) - bulk data transfer
 
 ## License
 
