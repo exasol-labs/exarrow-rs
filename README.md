@@ -162,8 +162,8 @@ See [`examples/`](examples/) for runnable code:
 
 ## License
 
-See [LICENSE](LICENSE). See [NOTICE](NOTICE) for licenses of third-party libraries.
+Free and open-source under [MIT](LICENSE).
 
 ---
 
-Built with Rust 🦀 and ❤️ by [Marco Nätlitz](https://deliberate.codes)
+Build with Rust 🦀 and made with ❤️ by [marconae – blogging on deliberate.codes](https://deliberate.codes).
