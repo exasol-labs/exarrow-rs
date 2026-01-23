@@ -1,0 +1,13 @@
+# Generated data files
+data/
+
+# Benchmark results
+results/
+
+# Environment file with credentials
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+.venv/

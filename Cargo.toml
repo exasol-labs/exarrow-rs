@@ -77,6 +77,13 @@ chrono = "0.4"
 # Byte buffer utilities
 bytes = "1.10"
 
+# Benchmark dependencies (optional)
+fake = { version = "3.1", features = ["derive", "chrono"], optional = true }
+rand = { version = "0.8", optional = true }
+indicatif = { version = "0.17", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+
 [dev-dependencies]
 # Mocking for tests
 mockall = "0.14.0"
@@ -87,6 +94,17 @@ tempfile = "3.24.0"
 # Environment variable loading for examples
 dotenvy = "0.15"
 
+[[bin]]
+name = "generate_data"
+path = "benches/rust/generate_data.rs"
+required-features = ["benchmark"]
+
+[[bin]]
+name = "benchmark_exarrow"
+path = "benches/rust/benchmark_exarrow.rs"
+required-features = ["benchmark"]
+
 [features]
 default = []
 ffi = ["dep:adbc_core", "dep:adbc_ffi"]
+benchmark = ["dep:fake", "dep:rand", "dep:indicatif", "dep:clap", "dep:dotenvy"]
