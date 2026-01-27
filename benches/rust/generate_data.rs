@@ -205,7 +205,9 @@ fn write_csv(
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap()
                 .value(row);
-            let ts = DateTime::from_timestamp_micros(ts_micros).unwrap().naive_utc();
+            let ts = DateTime::from_timestamp_micros(ts_micros)
+                .unwrap()
+                .naive_utc();
             let is_active = batch
                 .column(6)
                 .as_any()
@@ -372,10 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Data generation complete!");
     println!("  Total rows: {}", total_rows);
-    println!(
-        "  CSV size: {:.2} MB",
-        csv_size as f64 / 1024.0 / 1024.0
-    );
+    println!("  CSV size: {:.2} MB", csv_size as f64 / 1024.0 / 1024.0);
     println!(
         "  Parquet size: {:.2} MB (compression ratio: {:.1}x)",
         parquet_size as f64 / 1024.0 / 1024.0,
