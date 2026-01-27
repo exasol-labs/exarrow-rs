@@ -1,35 +1,49 @@
 # exarrow-rs vs PyExasol Benchmark
 
-Performance comparison of import operations between **exarrow-rs** (Rust) and **PyExasol** (Python).
+Performance comparison of import and Polars streaming operations between **exarrow-rs** (Rust) and **PyExasol** (Python).
+
+## Benchmark Types
+
+| Operation | Rust (exarrow-rs) | Python (PyExasol) |
+|-----------|-------------------|-------------------|
+| CSV Import | `import-csv` | `import-csv` |
+| Parquet Import | `import-parquet` | `import-parquet` |
+| SELECT → Polars | `select-polars` | `select-polars` |
+| SELECT → Pandas | - | `select-pandas` |
 
 ## Prerequisites
 
-- Docker (for running Exasol database)
 - Rust (1.70+)
 - Python 3.9+
+- Access to an Exasol database (existing instance or Docker)
 
 ## Quick Start
 
-### 1. Start Exasol Database
+### 1. Configure Connection
+
+```bash
+cp .env.example .env
+# Edit .env with your Exasol connection settings
+```
+
+Configure your Exasol connection in `.env`:
+```
+EXASOL_HOST=your-exasol-host
+EXASOL_PORT=8563
+EXASOL_USER=your-user
+EXASOL_PASSWORD=your-password
+EXASOL_VALIDATE_CERT=false
+```
+
+**Optional: Start a local Exasol container for testing**
 
 ```bash
 ./scripts/setup_docker.sh
 ```
 
-This starts an Exasol Docker container with default credentials:
-- Host: `localhost`
-- Port: `8563`
-- User: `sys`
-- Password: `exasol`
+This starts an Exasol Docker container with default credentials (localhost:8563, sys/exasol).
 
-### 2. Configure Connection
-
-```bash
-cp .env.example .env
-# Edit .env if using different connection settings
-```
-
-### 3. Generate Test Data
+### 2. Generate Test Data
 
 ```bash
 # Generate 100MB test files (for quick testing)
@@ -43,46 +57,39 @@ Generated files are saved to `benches/data/`:
 - `benchmark_100mb.csv` / `benchmark_100mb.parquet`
 - `benchmark_1gb.csv` / `benchmark_1gb.parquet`
 
-### 4. Run Benchmarks
+### 3. Run Benchmarks
 
 ```bash
-# Run all benchmarks
+# Run all benchmarks (import + select-polars)
 ./scripts/run_benchmarks.sh
 
 # Or run individual benchmarks:
 
-# Python (PyExasol)
-cd python && python benchmark_pyexasol.py --format csv --size 100mb
+# Python CSV Import (PyExasol)
+python benches/python/benchmark.py --operation import-csv --size 100mb
 
-# Rust (exarrow-rs)
-cargo run --release --features benchmark --bin benchmark_exarrow -- --format csv --size 100mb
-```
+# Python Parquet Import (PyExasol)
+python benches/python/benchmark.py --operation import-parquet --size 100mb
 
-## Directory Structure
+# Python SELECT to Pandas (PyExasol)
+python benches/python/benchmark.py --operation select-pandas --size 100mb
 
-```
-benches/
-├── .env.example          # Connection config template
-├── .gitignore            # Ignore data/, results/, .env
-├── README.md             # This file
-├── data/                 # Generated test files (gitignored)
-├── results/              # Benchmark results (gitignored)
-├── python/
-│   ├── pyproject.toml
-│   └── benchmark_pyexasol.py
-├── rust/
-│   ├── generate_data.rs
-│   └── benchmark_exarrow.rs
-├── scripts/
-│   ├── run_benchmarks.sh
-│   └── setup_docker.sh
-└── shared/
-    └── schema.sql
+# Python SELECT to Polars (PyExasol)
+python benches/python/benchmark.py --operation select-polars --size 100mb
+
+# Rust CSV Import (exarrow-rs)
+cargo run --release --features benchmark --bin benchmark -- --operation import-csv --size 100mb
+
+# Rust Parquet Import (exarrow-rs)
+cargo run --release --features benchmark --bin benchmark -- --operation import-parquet --size 100mb
+
+# Rust SELECT to Polars (exarrow-rs)
+cargo run --release --features benchmark --bin benchmark -- --operation select-polars --size 100mb
 ```
 
 ## Test Data Schema
 
-Both benchmarks use the same table schema:
+All benchmarks use the same table schema:
 
 ```sql
 CREATE TABLE benchmark.benchmark_data (
@@ -120,34 +127,54 @@ Script variables:
 
 Example:
 ```bash
+# Run only CSV import benchmarks
+FORMATS="csv" ./scripts/run_benchmarks.sh
+
+# Run with larger data and more iterations
 SIZES="100mb 1gb" ITERATIONS=10 ./scripts/run_benchmarks.sh
+```
+
+## Command-Line Options
+
+### benchmark (exarrow-rs)
+
+```
+Usage: benchmark [OPTIONS] --operation <OPERATION>
+
+Options:
+      --operation <OPERATION>  Operation to benchmark [possible values: import-csv, import-parquet, select-polars]
+  -s, --size <SIZE>            Data size [default: 100mb]
+  -i, --iterations <N>         Benchmark iterations [default: 5]
+  -w, --warmup <N>             Warmup iterations [default: 1]
+      --data-dir <PATH>        Data directory [default: benches/data]
+  -o, --output <PATH>          Output JSON file
+```
+
+### benchmark.py (PyExasol)
+
+```
+Usage: benchmark.py [OPTIONS]
+
+Options:
+  --operation {import-csv,import-parquet,select-pandas,select-polars}  Operation to benchmark (required)
+  --size SIZE                  Data size [default: 100mb]
+  --iterations N               Benchmark iterations [default: 5]
+  --warmup N                   Warmup iterations [default: 1]
+  --data-dir PATH              Data directory
+  --output PATH                Output JSON file
 ```
 
 ## Result Format
 
 Results are saved as JSON files in `results/<timestamp>/`:
 
-```json
-{
-  "library": "exarrow-rs",
-  "format": "csv",
-  "size": "100mb",
-  "file_size_mb": 105.23,
-  "total_rows": 400000,
-  "iterations": 5,
-  "avg_time_secs": 2.345,
-  "throughput_mb_per_sec": 44.87,
-  "rows_per_sec": 170575
-}
-```
-
 ## Cleanup
 
 ```bash
-# Stop and remove Exasol container
-docker stop exasol-benchmark
-docker rm exasol-benchmark
-
 # Remove generated data
 rm -rf data/ results/
+
+# If using Docker: stop and remove container
+docker stop exasol-benchmark
+docker rm exasol-benchmark
 ```

@@ -1,11 +1,10 @@
 -- Benchmark table schema for exarrow-rs vs PyExasol comparison
 -- This schema is used by both the Rust and Python benchmarks
+-- Table is created once and recycled via TRUNCATE between benchmarks
 
 CREATE SCHEMA IF NOT EXISTS benchmark;
 
-DROP TABLE IF EXISTS benchmark.benchmark_data;
-
-CREATE TABLE benchmark.benchmark_data (
+CREATE TABLE IF NOT EXISTS benchmark.benchmark_data (
     id BIGINT,
     name VARCHAR(100),
     email VARCHAR(200),

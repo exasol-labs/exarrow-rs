@@ -38,7 +38,7 @@ echo ""
 # Build Rust binaries in release mode
 echo "Building Rust binaries..."
 cd "${PROJECT_ROOT}"
-cargo build --release --features benchmark --bin generate_data --bin benchmark_exarrow
+cargo build --release --features benchmark --bin generate_data --bin benchmark
 echo ""
 
 # Generate data if needed
@@ -66,31 +66,56 @@ pip install -q -e .
 cd "${BENCHES_DIR}"
 echo ""
 
-# Run benchmarks
+# Run IMPORT benchmarks first (to populate data for SELECT)
 for SIZE in ${SIZES}; do
     for FORMAT in ${FORMATS}; do
-        echo "=== Benchmark: ${FORMAT} ${SIZE} ==="
+        echo "=== Benchmark: ${FORMAT} ${SIZE} IMPORT ==="
 
-        # Python benchmark
-        echo "Running PyExasol benchmark..."
-        python "${BENCHES_DIR}/python/benchmark_pyexasol.py" \
-            --format "${FORMAT}" \
+        # Python import benchmark
+        echo "Running PyExasol import-${FORMAT} benchmark..."
+        python "${BENCHES_DIR}/python/benchmark.py" \
+            --operation "import-${FORMAT}" \
             --size "${SIZE}" \
             --iterations "${ITERATIONS}" \
             --warmup "${WARMUP}" \
-            --output "${RESULTS_DIR}/pyexasol_${FORMAT}_${SIZE}.json"
+            --output "${RESULTS_DIR}/pyexasol_${FORMAT}_${SIZE}_import.json"
 
-        # Rust benchmark
-        echo "Running exarrow-rs benchmark..."
-        cargo run --release --features benchmark --bin benchmark_exarrow -- \
-            --format "${FORMAT}" \
+        # Rust import benchmark
+        echo "Running exarrow-rs import-${FORMAT} benchmark..."
+        cargo run --release --features benchmark --bin benchmark -- \
+            --operation "import-${FORMAT}" \
             --size "${SIZE}" \
             --iterations "${ITERATIONS}" \
             --warmup "${WARMUP}" \
-            --output "${RESULTS_DIR}/exarrow_${FORMAT}_${SIZE}.json"
+            --output "${RESULTS_DIR}/exarrow_${FORMAT}_${SIZE}_import.json"
 
         echo ""
     done
+done
+
+# Run SELECT to Polars benchmarks (data should exist from import)
+for SIZE in ${SIZES}; do
+    echo "=== Benchmark: ${SIZE} SELECT-POLARS ==="
+
+    # Python SELECT to Polars benchmark
+    echo "Running PyExasol select-polars benchmark..."
+    python "${BENCHES_DIR}/python/benchmark.py" \
+        --operation select-polars \
+        --size "${SIZE}" \
+        --iterations "${ITERATIONS}" \
+        --warmup "${WARMUP}" \
+        --output "${RESULTS_DIR}/pyexasol_${SIZE}_select_polars.json"
+
+    # exarrow-rs SELECT to Polars benchmark
+    echo "Running exarrow-rs select-polars benchmark..."
+    cargo run --release --features benchmark --bin benchmark -- \
+        --operation select-polars \
+        --size "${SIZE}" \
+        --iterations "${ITERATIONS}" \
+        --warmup "${WARMUP}" \
+        --output "${RESULTS_DIR}/exarrow_${SIZE}_select_polars.json"
+
+    echo ""
 done
 
 # Deactivate Python venv
@@ -107,11 +132,14 @@ for FILE in "${RESULTS_DIR}"/*.json; do
 import sys, json
 data = json.load(sys.stdin)
 print(f\"  Library: {data.get('library', 'unknown')}\")
-print(f\"  Format: {data.get('format', 'unknown')}\")
+print(f\"  Operation: {data.get('operation', 'unknown')}\")
+if 'format' in data:
+    print(f\"  Format: {data.get('format', 'unknown')}\")
 print(f\"  Size: {data.get('size', 'unknown')}\")
 print(f\"  Rows: {data.get('total_rows', 0):,}\")
 print(f\"  Avg Time: {data.get('avg_time_secs', 0):.3f}s\")
-print(f\"  Throughput: {data.get('throughput_mb_per_sec', 0):.2f} MB/s\")
+if 'throughput_mb_per_sec' in data:
+    print(f\"  Throughput: {data.get('throughput_mb_per_sec', 0):.2f} MB/s\")
 print(f\"  Rows/sec: {data.get('rows_per_sec', 0):,.0f}\")
 "
         echo ""
