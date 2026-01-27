@@ -1,0 +1,14 @@
+[project]
+name = "benchmark-pyexasol"
+version = "0.1.0"
+description = "PyExasol benchmark for comparison with exarrow-rs"
+requires-python = ">=3.9"
+dependencies = [
+    "pyexasol[pandas]>=0.28.0",
+    "pyarrow>=14.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
