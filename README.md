@@ -15,8 +15,8 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 [Type Mapping](#type-mapping) •
 [Examples](#examples)
 
-*Disclaimer: This is a side-project of mine and a prototype. Not officially supported by [Exasol](https://exasol.com). I
-cannot guarantee the functionality or performance.*
+*Disclaimer: this driver is currently a **community-supported prototype** and not officially supported by Exasol. Exasol cannot guarantee the functionality and performance.*
+
 </div>
 
 ---
@@ -26,7 +26,7 @@ cannot guarantee the functionality or performance.*
 ### Building from Source
 
 ```bash
-git clone https://github.com/marconae/exarrow-rs.git
+git clone https://github.com/exasol-labso/exarrow-rs.git
 cd exarrow-rs
 cargo build --release
 ```
@@ -37,7 +37,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-exarrow-rs = { git = "https://github.com/marconae/exarrow-rs.git" }
+exarrow-rs = { git = "https://github.com/exasol-labs/exarrow-rs.git" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -162,8 +162,14 @@ See [`examples/`](examples/) for runnable code:
 
 ## License
 
-Free and open-source under [MIT](LICENSE).
+[MIT](LICENSE).
 
 ---
 
-Build with Rust 🦀 and made with ❤️ by [marconae – blogging on deliberate.codes](https://deliberate.codes).
+<div align="center">
+
+Build with Rust 🦀 and made with ❤️
+
+Started as a side-project by [marconae](https://github.com/marconae), maintained by [Exasol Labs](https://github.com/exasol-labs/).
+
+</div>

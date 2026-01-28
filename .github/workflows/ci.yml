@@ -57,6 +57,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  licenses:
+    name: License Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Check licenses
+        run: cargo deny check licenses
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
