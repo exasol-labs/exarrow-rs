@@ -2,7 +2,8 @@
 name = "exarrow-rs"
 version = "0.3.1"
 edition = "2021"
-license-file = "LICENSE"
+license = "MIT"
+authors = ["marconae"]
 description = "ADBC-compatible driver for Exasol with Arrow data format support"
 keywords = ["exasol", "adbc", "arrow", "database", "driver"]
 categories = ["database"]
@@ -19,7 +20,7 @@ arrow = "57.1.0"
 tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
 
 # WebSocket client
-tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -28,8 +29,8 @@ serde_json = "1.0"
 # Error handling
 thiserror = "2.0"
 
-# TLS support
-native-tls = "0.2"
+# Native root certificates for rustls
+rustls-native-certs = "0.8"
 
 # Async utilities
 futures-util = "0.3"
@@ -53,8 +54,8 @@ adbc_ffi = { version = "0.21.0", optional = true }
 
 # TLS certificate generation for secure import/export
 rcgen = "0.13"
-rustls = "0.23"
-tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Parquet file support
 parquet = { version = "57.1.0", features = ["async"] }
