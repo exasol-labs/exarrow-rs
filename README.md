@@ -26,7 +26,7 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 ### Building from Source
 
 ```bash
-git clone https://github.com/exasol-labso/exarrow-rs.git
+git clone https://github.com/exasol-labs/exarrow-rs.git
 cd exarrow-rs
 cargo build --release
 ```
