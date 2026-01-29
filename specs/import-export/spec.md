@@ -292,3 +292,86 @@ The system SHALL integrate import/export with the Session API.
 - **WHEN** user prefers synchronous API
 - **THEN** blocking wrapper methods are available
 - **AND** wrappers use tokio runtime internally
+
+### Requirement: Parallel CSV File Import
+
+The system SHALL support importing multiple CSV files in parallel into a single Exasol table
+by leveraging Exasol's native IMPORT parallelization with multiple FILE clauses in a single
+IMPORT statement. Each file SHALL have its own HTTP transport connection with a unique
+internal address obtained through the EXA tunneling handshake.
+
+#### Scenario: Import multiple CSV files in parallel
+
+- **WHEN** user calls import_csv_from_files with a list of CSV file paths
+- **THEN** system SHALL establish N parallel HTTP transport connections (one per file)
+- **AND** system SHALL perform EXA tunneling handshake on each connection to obtain unique internal addresses
+- **AND** system SHALL build IMPORT SQL with multiple FILE clauses referencing each internal address
+- **AND** system SHALL execute IMPORT SQL triggering Exasol to request data from all endpoints
+- **AND** system SHALL stream each file's data through its respective HTTP connection in parallel
+- **AND** system SHALL return total rows imported
+
+#### Scenario: Generated SQL uses multiple AT/FILE clauses
+
+- **WHEN** parallel import is initiated with N files
+- **THEN** generated SQL SHALL follow format: `FROM CSV AT 'addr1' FILE '001.csv' AT 'addr2' FILE '002.csv' ...`
+- **AND** each file SHALL have a unique internal address
+
+### Requirement: Parallel Parquet File Import
+
+The system SHALL support importing multiple Parquet files in parallel by converting each file
+to CSV format concurrently using tokio tasks, then streaming through parallel HTTP connections.
+
+#### Scenario: Import multiple Parquet files in parallel
+
+- **WHEN** user calls import_parquet_from_files with a list of Parquet file paths
+- **THEN** system SHALL convert all Parquet files to CSV format in parallel using tokio tasks
+- **AND** system SHALL establish N parallel HTTP transport connections
+- **AND** system SHALL stream converted CSV data through each connection
+- **AND** system SHALL return total rows imported
+
+#### Scenario: Parquet conversion is parallelized
+
+- **WHEN** multiple Parquet files are provided
+- **THEN** system SHALL convert files concurrently using spawn_blocking tasks
+- **AND** system SHALL NOT wait for one conversion to complete before starting another
+
+### Requirement: Single File Backward Compatibility
+
+The parallel import methods SHALL maintain backward compatibility with single-file imports
+by delegating to the existing optimized single-file path.
+
+#### Scenario: Single file delegates to existing implementation
+
+- **WHEN** user calls import_csv_from_files with a single file path
+- **THEN** system SHALL delegate to existing import_from_file implementation
+- **AND** behavior SHALL be identical to calling import_from_file directly
+
+#### Scenario: API accepts both single path and collection
+
+- **WHEN** user provides either PathBuf or Vec<PathBuf> to import method
+- **THEN** system SHALL accept both forms via IntoFileSources trait
+- **AND** single path SHALL be treated as collection of one
+
+### Requirement: Parallel Import Error Handling
+
+The system SHALL implement fail-fast error handling for parallel imports, aborting all
+operations immediately upon first failure to prevent partial data imports.
+
+#### Scenario: Fail-fast on connection error
+
+- **WHEN** any HTTP transport connection fails during parallel import
+- **THEN** system SHALL abort all remaining connection attempts immediately
+- **AND** system SHALL close all established connections gracefully
+- **AND** system SHALL return error with context about which connection failed
+
+#### Scenario: Fail-fast on streaming error
+
+- **WHEN** any file streaming fails during parallel import
+- **THEN** system SHALL abort all other streaming operations immediately
+- **AND** system SHALL return error indicating failed file index and path
+
+#### Scenario: Fail-fast on Parquet conversion error
+
+- **WHEN** any Parquet file fails to convert to CSV
+- **THEN** system SHALL abort all other conversion tasks immediately
+- **AND** system SHALL return error indicating which file failed conversion
