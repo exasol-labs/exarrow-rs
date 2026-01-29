@@ -899,13 +899,6 @@ impl DataPipe {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.rx.recv().await
     }
-
-    /// Closes the sender side of the pipe.
-    pub fn close_sender(&self) {
-        // Dropping the clone will decrement the reference count
-        // but we need to explicitly close
-        drop(self.tx.clone());
-    }
 }
 
 /// Encodes data using HTTP chunked transfer encoding.

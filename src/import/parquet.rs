@@ -588,9 +588,12 @@ where
         let _ = execute_sql(ddl).await;
     }
 
+    // Calculate connection count before transferring paths ownership
+    let num_files = paths.len();
+
     // Convert all Parquet files to CSV in parallel
     let csv_data_vec = convert_parquet_files_to_csv(
-        paths.clone(),
+        paths,
         options.batch_size,
         options.null_value.clone(),
         options.column_separator,
@@ -608,7 +611,7 @@ where
         &options.host,
         options.port,
         options.use_encryption,
-        paths.len(),
+        num_files,
     )
     .await?;
 

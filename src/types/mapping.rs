@@ -3,6 +3,7 @@
 use crate::error::ConversionError;
 use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Column name handling mode for DDL generation.
 ///
@@ -31,7 +32,6 @@ pub enum ColumnNameMode {
     /// Example: `my Column` becomes `MY_COLUMN`
     Sanitize,
 }
-use std::collections::HashMap;
 
 /// Exasol data type representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
