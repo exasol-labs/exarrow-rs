@@ -62,9 +62,7 @@ use exarrow_rs::query::export::ExportSource;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Helper to create a test schema and table for import/export tests
 async fn setup_import_export_table(conn: &mut Connection, schema_name: &str) {
@@ -97,9 +95,7 @@ async fn cleanup_schema(conn: &mut Connection, schema_name: &str) {
         .await;
 }
 
-// ============================================================================
 // Section 1: CSV Import Integration Tests
-// ============================================================================
 
 /// 11.1.1 Test import CSV into new table
 #[tokio::test]
@@ -359,9 +355,7 @@ async fn test_csv_import_from_stream() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 2: CSV Export Integration Tests
-// ============================================================================
 
 /// 11.2.1 Test export table to CSV file
 #[tokio::test]
@@ -648,9 +642,7 @@ async fn test_csv_export_to_stream() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 3: Parquet Integration Tests
-// ============================================================================
 
 /// 11.3.1 Test import Parquet file
 #[tokio::test]
@@ -878,9 +870,7 @@ async fn test_parquet_round_trip() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 4: Arrow Integration Tests
-// ============================================================================
 
 /// 11.4.1 Test import from RecordBatch
 #[tokio::test]
@@ -1209,9 +1199,7 @@ async fn test_arrow_round_trip() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 5: Edge Cases and Error Handling
-// ============================================================================
 
 /// Test CSV import with empty file
 #[tokio::test]
@@ -1395,9 +1383,7 @@ async fn test_large_dataset_import_export() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 6: Connection TLS Tests (WebSocket layer)
-// ============================================================================
 //
 // Note: These tests verify that import/export operations work correctly when
 // the main WebSocket connection uses TLS. The HTTP transport layer for
@@ -1581,6 +1567,425 @@ async fn test_tls_connection_round_trip() {
         .expect("COUNT query should succeed");
 
     assert!(!batches.is_empty(), "Should return count result");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section 7: Parallel Import Integration Tests
+
+/// 11.7.1 Test parallel CSV import with two files
+///
+/// Verifies that two CSV files can be imported in parallel into the same table,
+/// with the total rows being the sum of both files.
+#[tokio::test]
+#[ignore]
+async fn test_parallel_csv_import_two_files() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema and table
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    // Create two CSV files with test data
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path1 = temp_dir.path().join("data_part1.csv");
+    let csv_path2 = temp_dir.path().join("data_part2.csv");
+
+    std::fs::write(&csv_path1, "1,Alice,10.5\n2,Bob,20.5\n").expect("Failed to write CSV file 1");
+    std::fs::write(&csv_path2, "3,Charlie,30.5\n4,Diana,40.5\n5,Eve,50.5\n")
+        .expect("Failed to write CSV file 2");
+
+    // Import both files in parallel
+    let rows_imported = conn
+        .import_csv_from_files(
+            &format!("{}.test_data", schema_name),
+            vec![csv_path1, csv_path2],
+            CsvImportOptions::default().use_tls(false),
+        )
+        .await
+        .expect("Parallel CSV import should succeed");
+
+    assert_eq!(rows_imported, 5, "Should import 5 rows total (2 + 3)");
+
+    // Verify the data was imported correctly
+    let batches = conn
+        .query(&format!(
+            "SELECT id, name, amount FROM {}.test_data ORDER BY id",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 5, "Should have 5 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.7.2 Test parallel CSV import with five files
+///
+/// Verifies that five CSV files can be imported in parallel into the same table.
+#[tokio::test]
+#[ignore]
+async fn test_parallel_csv_import_five_files() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema and table
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    // Create five CSV files with test data
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mut paths = Vec::new();
+    let mut expected_rows = 0;
+
+    for i in 0..5 {
+        let csv_path = temp_dir.path().join(format!("data_part{}.csv", i));
+        let mut content = String::new();
+        for j in 0..3 {
+            let id = i * 3 + j + 1;
+            content.push_str(&format!("{},name_{},{}.5\n", id, id, id));
+        }
+        std::fs::write(&csv_path, &content).expect("Failed to write CSV file");
+        paths.push(csv_path);
+        expected_rows += 3;
+    }
+
+    // Import all files in parallel
+    let rows_imported = conn
+        .import_csv_from_files(
+            &format!("{}.test_data", schema_name),
+            paths,
+            CsvImportOptions::default().use_tls(false),
+        )
+        .await
+        .expect("Parallel CSV import should succeed");
+
+    assert_eq!(
+        rows_imported, expected_rows,
+        "Should import {} rows total",
+        expected_rows
+    );
+
+    // Verify the data was imported correctly
+    let batches = conn
+        .query(&format!(
+            "SELECT COUNT(*) AS cnt FROM {}.test_data",
+            schema_name
+        ))
+        .await
+        .expect("SELECT COUNT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.7.3 Test parallel CSV import with single file fallback
+///
+/// Verifies that when a single file is provided as a Vec, it delegates
+/// to the existing single-file import implementation.
+#[tokio::test]
+#[ignore]
+async fn test_parallel_csv_import_single_file_fallback() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema and table
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    // Create a single CSV file
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path = temp_dir.path().join("single_file.csv");
+
+    std::fs::write(&csv_path, "1,Alice,10.5\n2,Bob,20.5\n3,Charlie,30.5\n")
+        .expect("Failed to write CSV file");
+
+    // Import with single file in Vec (should use single-file path)
+    let rows_imported = conn
+        .import_csv_from_files(
+            &format!("{}.test_data", schema_name),
+            vec![csv_path],
+            CsvImportOptions::default().use_tls(false),
+        )
+        .await
+        .expect("Single file import via parallel API should succeed");
+
+    assert_eq!(rows_imported, 3, "Should import 3 rows");
+
+    // Verify the data was imported correctly
+    let batches = conn
+        .query(&format!(
+            "SELECT id, name, amount FROM {}.test_data ORDER BY id",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 3, "Should have 3 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.7.4 Test parallel Parquet import with two files
+///
+/// Verifies that two Parquet files can be imported in parallel into the same table,
+/// with each file being converted to CSV on-the-fly.
+#[tokio::test]
+#[ignore]
+async fn test_parallel_parquet_import_two_files() {
+    skip_if_no_exasol!();
+
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema and table
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    // Create two Parquet files with test data
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("amount", DataType::Float64, true),
+    ]));
+
+    // Create first Parquet file
+    let parquet_path1 = temp_dir.path().join("data_part1.parquet");
+    let id_array1 = Int64Array::from(vec![1, 2]);
+    let name_array1 = StringArray::from(vec!["Alice", "Bob"]);
+    let amount_array1 = Float64Array::from(vec![10.5, 20.5]);
+
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_array1),
+            Arc::new(name_array1),
+            Arc::new(amount_array1),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    let file1 = std::fs::File::create(&parquet_path1).expect("Failed to create parquet file");
+    let props1 = WriterProperties::builder().build();
+    let mut writer1 =
+        ArrowWriter::try_new(file1, schema.clone(), Some(props1)).expect("Failed to create writer");
+    writer1.write(&batch1).expect("Failed to write batch");
+    writer1.close().expect("Failed to close writer");
+
+    // Create second Parquet file
+    let parquet_path2 = temp_dir.path().join("data_part2.parquet");
+    let id_array2 = Int64Array::from(vec![3, 4, 5]);
+    let name_array2 = StringArray::from(vec!["Charlie", "Diana", "Eve"]);
+    let amount_array2 = Float64Array::from(vec![30.5, 40.5, 50.5]);
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_array2),
+            Arc::new(name_array2),
+            Arc::new(amount_array2),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    let file2 = std::fs::File::create(&parquet_path2).expect("Failed to create parquet file");
+    let props2 = WriterProperties::builder().build();
+    let mut writer2 =
+        ArrowWriter::try_new(file2, schema.clone(), Some(props2)).expect("Failed to create writer");
+    writer2.write(&batch2).expect("Failed to write batch");
+    writer2.close().expect("Failed to close writer");
+
+    // Import both Parquet files in parallel
+    let rows_imported = conn
+        .import_parquet_from_files(
+            &format!("{}.test_data", schema_name),
+            vec![parquet_path1, parquet_path2],
+            ParquetImportOptions::default(),
+        )
+        .await
+        .expect("Parallel Parquet import should succeed");
+
+    assert_eq!(rows_imported, 5, "Should import 5 rows total (2 + 3)");
+
+    // Verify the data was imported correctly
+    let batches = conn
+        .query(&format!(
+            "SELECT id, name, amount FROM {}.test_data ORDER BY id",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 5, "Should have 5 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.7.5 Test parallel Parquet import with mixed batch sizes
+///
+/// Verifies that Parquet files with different row counts can be imported in parallel.
+#[tokio::test]
+#[ignore]
+async fn test_parallel_parquet_import_mixed_batch_sizes() {
+    skip_if_no_exasol!();
+
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema and table
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("amount", DataType::Float64, true),
+    ]));
+
+    // Create three Parquet files with different row counts: 1, 5, 10
+    let row_counts = [1, 5, 10];
+    let mut paths = Vec::new();
+    let mut total_expected = 0;
+    let mut id_counter = 1;
+
+    for (file_idx, &row_count) in row_counts.iter().enumerate() {
+        let path = temp_dir
+            .path()
+            .join(format!("data_part{}.parquet", file_idx));
+
+        let ids: Vec<i64> = (id_counter..id_counter + row_count as i64).collect();
+        let names: Vec<String> = ids.iter().map(|id| format!("name_{}", id)).collect();
+        let amounts: Vec<f64> = ids.iter().map(|id| *id as f64 * 1.5).collect();
+
+        let id_array = Int64Array::from(ids);
+        let name_array = StringArray::from(names);
+        let amount_array = Float64Array::from(amounts);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(amount_array),
+            ],
+        )
+        .expect("Failed to create RecordBatch");
+
+        let file = std::fs::File::create(&path).expect("Failed to create parquet file");
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .expect("Failed to create writer");
+        writer.write(&batch).expect("Failed to write batch");
+        writer.close().expect("Failed to close writer");
+
+        paths.push(path);
+        total_expected += row_count;
+        id_counter += row_count as i64;
+    }
+
+    // Import all Parquet files in parallel
+    let rows_imported = conn
+        .import_parquet_from_files(
+            &format!("{}.test_data", schema_name),
+            paths,
+            ParquetImportOptions::default(),
+        )
+        .await
+        .expect("Parallel Parquet import should succeed");
+
+    assert_eq!(
+        rows_imported, total_expected as u64,
+        "Should import {} rows total",
+        total_expected
+    );
+
+    // Verify the data was imported correctly
+    let batches = conn
+        .query(&format!(
+            "SELECT COUNT(*) AS cnt FROM {}.test_data",
+            schema_name
+        ))
+        .await
+        .expect("SELECT COUNT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.7.6 Test that single PathBuf still works with import_csv_from_file
+///
+/// Verifies backward compatibility - the existing import_csv_from_file
+/// method should continue to work with a single PathBuf.
+#[tokio::test]
+#[ignore]
+async fn test_single_path_still_works() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema and table
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    // Create a single CSV file
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path = temp_dir.path().join("single.csv");
+
+    std::fs::write(&csv_path, "1,Alice,10.5\n2,Bob,20.5\n").expect("Failed to write CSV file");
+
+    // Import using the original single-file API
+    let rows_imported = conn
+        .import_csv_from_file(
+            &format!("{}.test_data", schema_name),
+            &csv_path,
+            CsvImportOptions::default().use_tls(false),
+        )
+        .await
+        .expect("Single file import should succeed");
+
+    assert_eq!(rows_imported, 2, "Should import 2 rows");
+
+    // Verify the data was imported correctly
+    let batches = conn
+        .query(&format!(
+            "SELECT id, name, amount FROM {}.test_data ORDER BY id",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 2, "Should have 2 rows");
 
     // Cleanup
     cleanup_schema(&mut conn, &schema_name).await;

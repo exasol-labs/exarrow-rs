@@ -167,42 +167,36 @@ impl ParquetExportOptions {
         Self::default()
     }
 
-    /// Set the batch size for reading CSV records.
     #[must_use]
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
     }
 
-    /// Set the compression type.
     #[must_use]
     pub fn with_compression(mut self, compression: ParquetCompression) -> Self {
         self.compression = compression;
         self
     }
 
-    /// Set whether CSV has column names header row.
     #[must_use]
     pub fn with_column_names(mut self, with_column_names: bool) -> Self {
         self.with_column_names = with_column_names;
         self
     }
 
-    /// Set the column separator for CSV parsing.
     #[must_use]
     pub fn with_column_separator(mut self, separator: char) -> Self {
         self.column_separator = separator;
         self
     }
 
-    /// Set the column delimiter for CSV parsing.
     #[must_use]
     pub fn with_column_delimiter(mut self, delimiter: char) -> Self {
         self.column_delimiter = delimiter;
         self
     }
 
-    /// Set the NULL value representation.
     #[must_use]
     pub fn with_null_value(mut self, null_value: impl Into<String>) -> Self {
         self.null_value = Some(null_value.into());

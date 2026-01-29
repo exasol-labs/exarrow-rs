@@ -46,38 +46,23 @@ pub mod types;
 #[cfg(feature = "ffi")]
 pub mod adbc_ffi;
 
-// =============================================================================
 // ADBC Interface Types
-// =============================================================================
-
 /// Re-export ADBC driver and connection types.
 pub use adbc::{Connection, Database, Driver, Statement};
 
-// =============================================================================
 // Arrow Conversion
-// =============================================================================
-
 /// Re-export Arrow conversion utilities.
 pub use arrow_conversion::ArrowConverter;
 
-// =============================================================================
 // Error Types
-// =============================================================================
-
 /// Re-export error types for convenient error handling.
 pub use error::{ConnectionError, ConversionError, ExasolError, QueryError};
 
-// =============================================================================
 // Type System
-// =============================================================================
-
 /// Re-export type mapping utilities.
 pub use types::{ExasolType, TypeMapper};
 
-// =============================================================================
 // Import Types
-// =============================================================================
-
 /// CSV import options and functions.
 ///
 /// The CSV import module provides functionality for importing data from CSV files,
@@ -108,10 +93,7 @@ pub use import::{
     ParquetImportOptions,
 };
 
-// =============================================================================
 // Export Types
-// =============================================================================
-
 /// CSV export options and functions.
 ///
 /// The export module provides functionality for exporting data from Exasol tables
@@ -143,10 +125,7 @@ pub use export::{
     ParquetExportOptions,
 };
 
-// =============================================================================
 // Query Builder Types
-// =============================================================================
-
 /// Query builder types for constructing IMPORT and EXPORT SQL statements.
 ///
 /// These types provide a builder pattern for constructing Exasol IMPORT and EXPORT
@@ -163,18 +142,12 @@ pub use query::import::{
     Compression as ImportCompression, ImportQuery, RowSeparator as ImportRowSeparator, TrimMode,
 };
 
-// =============================================================================
 // Query Execution Types
-// =============================================================================
-
 pub use query::statement::{Parameter, StatementType};
 /// Query execution and result handling types.
 pub use query::{PreparedStatement, QueryMetadata, ResultSet, ResultSetIterator};
 
-// =============================================================================
 // FFI Types (when ffi feature is enabled)
-// =============================================================================
-
 /// Re-export FFI types when ffi feature is enabled.
 #[cfg(feature = "ffi")]
 pub use adbc_ffi::{FfiConnection, FfiDatabase, FfiDriver, FfiStatement};

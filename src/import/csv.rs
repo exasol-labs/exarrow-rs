@@ -12,9 +12,11 @@ use flate2::write::GzEncoder;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 
-use crate::query::import::{Compression, ImportQuery, RowSeparator, TrimMode};
+use crate::query::import::{Compression, ImportFileEntry, ImportQuery, RowSeparator, TrimMode};
 use crate::transport::HttpTransportClient;
 
+use super::parallel::{stream_files_parallel, ParallelTransportPool};
+use super::source::IntoFileSources;
 use super::ImportError;
 
 /// Default buffer size for reading data (64KB).
@@ -99,84 +101,72 @@ impl CsvImportOptions {
         Self::default()
     }
 
-    /// Set the character encoding.
     #[must_use]
     pub fn encoding(mut self, encoding: &str) -> Self {
         self.encoding = encoding.to_string();
         self
     }
 
-    /// Set the column separator character.
     #[must_use]
     pub fn column_separator(mut self, sep: char) -> Self {
         self.column_separator = sep;
         self
     }
 
-    /// Set the column delimiter character.
     #[must_use]
     pub fn column_delimiter(mut self, delim: char) -> Self {
         self.column_delimiter = delim;
         self
     }
 
-    /// Set the row separator.
     #[must_use]
     pub fn row_separator(mut self, sep: RowSeparator) -> Self {
         self.row_separator = sep;
         self
     }
 
-    /// Set the number of header rows to skip.
     #[must_use]
     pub fn skip_rows(mut self, rows: u32) -> Self {
         self.skip_rows = rows;
         self
     }
 
-    /// Set a custom NULL value representation.
     #[must_use]
     pub fn null_value(mut self, val: &str) -> Self {
         self.null_value = Some(val.to_string());
         self
     }
 
-    /// Set the trim mode.
     #[must_use]
     pub fn trim_mode(mut self, mode: TrimMode) -> Self {
         self.trim_mode = mode;
         self
     }
 
-    /// Set the compression type.
     #[must_use]
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
     }
 
-    /// Set the reject limit.
     #[must_use]
     pub fn reject_limit(mut self, limit: u32) -> Self {
         self.reject_limit = Some(limit);
         self
     }
 
-    /// Enable or disable TLS encryption.
     #[must_use]
     pub fn use_tls(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
         self
     }
 
-    /// Set the target schema.
     #[must_use]
     pub fn schema(mut self, schema: &str) -> Self {
         self.schema = Some(schema.to_string());
         self
     }
 
-    /// Set the target columns.
     #[must_use]
     pub fn columns(mut self, columns: Vec<String>) -> Self {
         self.columns = Some(columns);
@@ -464,6 +454,178 @@ where
         },
     )
     .await
+}
+
+/// Import multiple CSV files in parallel.
+///
+/// This function reads CSV data from multiple files and imports them into
+/// the target table using parallel HTTP transport connections. Each file
+/// gets its own connection with a unique internal address from the EXA
+/// tunneling handshake.
+///
+/// For a single file, this function delegates to `import_from_file` for
+/// optimal single-file performance.
+///
+/// # Arguments
+///
+/// * `execute_sql` - Function to execute SQL statements. Takes SQL string and returns row count.
+/// * `table` - Name of the target table.
+/// * `file_paths` - File paths (accepts single path, Vec, array, or slice).
+/// * `options` - Import options.
+///
+/// # Returns
+///
+/// The number of rows imported on success.
+///
+/// # Errors
+///
+/// Returns `ImportError` if the import fails. Uses fail-fast semantics.
+///
+/// # Example
+///
+/// ```no_run
+/// use exarrow_rs::import::csv::{import_from_files, CsvImportOptions};
+/// use std::path::PathBuf;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let files = vec![
+///     PathBuf::from("/data/part1.csv"),
+///     PathBuf::from("/data/part2.csv"),
+///     PathBuf::from("/data/part3.csv"),
+/// ];
+///
+/// let options = CsvImportOptions::default()
+///     .exasol_host("localhost")
+///     .exasol_port(8563);
+///
+/// // let rows = import_from_files(execute_sql, "my_table", files, options).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn import_from_files<F, Fut, S>(
+    execute_sql: F,
+    table: &str,
+    file_paths: S,
+    options: CsvImportOptions,
+) -> Result<u64, ImportError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<u64, String>>,
+    S: IntoFileSources,
+{
+    let paths = file_paths.into_sources();
+
+    // Delegate to single-file implementation for one file
+    if paths.len() == 1 {
+        return import_from_file(execute_sql, table, &paths[0], options).await;
+    }
+
+    if paths.is_empty() {
+        return Err(ImportError::InvalidConfig(
+            "No files provided for import".to_string(),
+        ));
+    }
+
+    // Read all files and detect compression
+    let compression = options.compression;
+    let mut file_data_vec: Vec<Vec<u8>> = Vec::with_capacity(paths.len());
+
+    for path in &paths {
+        let detected_compression = detect_compression(path, compression);
+        let file_is_compressed = is_compressed_file(path);
+
+        // Read file
+        let data = std::fs::read(path)?;
+
+        // Apply compression if needed
+        let compressed_data = if file_is_compressed {
+            data
+        } else {
+            compress_data(&data, detected_compression)?
+        };
+
+        file_data_vec.push(compressed_data);
+    }
+
+    // Establish parallel connections
+    let pool =
+        ParallelTransportPool::connect(&options.host, options.port, options.use_tls, paths.len())
+            .await?;
+
+    // Build multi-file IMPORT SQL
+    let entries: Vec<ImportFileEntry> = pool
+        .file_entries()
+        .iter()
+        .map(|e| ImportFileEntry::new(e.address.clone(), e.file_name.clone(), e.public_key.clone()))
+        .collect();
+
+    let query = build_multi_file_query(table, &options, entries);
+    let sql = query.build();
+
+    // Get connections for streaming
+    let connections = pool.into_connections();
+
+    // Spawn parallel streaming task
+    let stream_handle = tokio::spawn(async move {
+        stream_files_parallel(connections, file_data_vec, compression).await
+    });
+
+    // Execute the IMPORT SQL in parallel
+    let sql_result = execute_sql(sql).await;
+
+    // Wait for streaming to complete
+    let stream_result = stream_handle.await;
+
+    // Handle results - check stream task first
+    match stream_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => {
+            return Err(ImportError::StreamError(format!(
+                "Stream task panicked: {e}"
+            )))
+        }
+    }
+
+    // Return the row count from SQL execution
+    sql_result.map_err(ImportError::SqlError)
+}
+
+/// Build an ImportQuery for multi-file import.
+fn build_multi_file_query(
+    table: &str,
+    options: &CsvImportOptions,
+    entries: Vec<ImportFileEntry>,
+) -> ImportQuery {
+    let mut query = ImportQuery::new(table).with_files(entries);
+
+    if let Some(ref schema) = options.schema {
+        query = query.schema(schema);
+    }
+
+    if let Some(ref columns) = options.columns {
+        let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
+        query = query.columns(cols);
+    }
+
+    query = query
+        .encoding(&options.encoding)
+        .column_separator(options.column_separator)
+        .column_delimiter(options.column_delimiter)
+        .row_separator(options.row_separator)
+        .skip(options.skip_rows)
+        .trim(options.trim_mode)
+        .compressed(options.compression);
+
+    if let Some(ref null_val) = options.null_value {
+        query = query.null_value(null_val);
+    }
+
+    if let Some(limit) = options.reject_limit {
+        query = query.reject_limit(limit);
+    }
+
+    query
 }
 
 /// Import CSV data from an async reader (stream).
@@ -1309,5 +1471,49 @@ mod tests {
             detect_compression(path, Compression::None),
             Compression::None
         );
+    }
+
+    // Tests for build_multi_file_query
+    #[test]
+    fn test_build_multi_file_query_basic() {
+        use crate::query::import::ImportFileEntry;
+
+        let options = CsvImportOptions::default();
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.6:8564".to_string(), "002.csv".to_string(), None),
+        ];
+
+        let query = build_multi_file_query("my_table", &options, entries);
+        let sql = query.build();
+
+        assert!(sql.contains("IMPORT INTO my_table"));
+        assert!(sql.contains("FROM CSV"));
+        assert!(sql.contains("AT 'http://10.0.0.5:8563' FILE '001.csv'"));
+        assert!(sql.contains("AT 'http://10.0.0.6:8564' FILE '002.csv'"));
+    }
+
+    #[test]
+    fn test_build_multi_file_query_with_options() {
+        use crate::query::import::ImportFileEntry;
+
+        let options = CsvImportOptions::default()
+            .schema("test_schema")
+            .columns(vec!["id".to_string(), "name".to_string()])
+            .skip_rows(1)
+            .compression(Compression::Gzip);
+
+        let entries = vec![ImportFileEntry::new(
+            "10.0.0.5:8563".to_string(),
+            "001.csv".to_string(),
+            None,
+        )];
+
+        let query = build_multi_file_query("data", &options, entries);
+        let sql = query.build();
+
+        assert!(sql.contains("IMPORT INTO test_schema.data (id, name)"));
+        assert!(sql.contains("SKIP = 1"));
+        assert!(sql.contains("FILE '001.csv.gz'"));
     }
 }

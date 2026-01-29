@@ -158,63 +158,54 @@ impl CsvExportOptions {
         Self::default()
     }
 
-    /// Sets the column separator character.
     #[must_use]
     pub fn column_separator(mut self, sep: char) -> Self {
         self.column_separator = sep;
         self
     }
 
-    /// Sets the column delimiter (quote) character.
     #[must_use]
     pub fn column_delimiter(mut self, delim: char) -> Self {
         self.column_delimiter = delim;
         self
     }
 
-    /// Sets the row separator.
     #[must_use]
     pub fn row_separator(mut self, sep: RowSeparator) -> Self {
         self.row_separator = sep;
         self
     }
 
-    /// Sets the character encoding.
     #[must_use]
     pub fn encoding(mut self, enc: &str) -> Self {
         self.encoding = enc.to_string();
         self
     }
 
-    /// Sets the NULL value representation.
     #[must_use]
     pub fn null_value(mut self, val: &str) -> Self {
         self.null_value = Some(val.to_string());
         self
     }
 
-    /// Sets the compression type.
     #[must_use]
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
     }
 
-    /// Sets whether to include column headers.
     #[must_use]
     pub fn with_column_names(mut self, include: bool) -> Self {
         self.with_column_names = include;
         self
     }
 
-    /// Sets whether to use TLS for the HTTP transport.
     #[must_use]
     pub fn use_tls(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
         self
     }
 
-    /// Sets the timeout in milliseconds.
     #[must_use]
     pub fn timeout_ms(mut self, timeout: u64) -> Self {
         self.timeout_ms = timeout;
