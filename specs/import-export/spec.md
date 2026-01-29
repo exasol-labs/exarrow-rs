@@ -375,3 +375,105 @@ operations immediately upon first failure to prevent partial data imports.
 - **WHEN** any Parquet file fails to convert to CSV
 - **THEN** system SHALL abort all other conversion tasks immediately
 - **AND** system SHALL return error indicating which file failed conversion
+
+### Requirement: Arrow Schema Inference from Parquet Files
+
+The system SHALL support inferring Arrow schemas from Parquet file metadata without reading the full data.
+
+#### Scenario: Infer schema from single Parquet file
+
+- **WHEN** user requests schema inference from a single Parquet file
+- **THEN** system SHALL read only the Parquet metadata (not data)
+- **AND** system SHALL return the Arrow schema with field names and types
+- **AND** system SHALL include nullability information for each field
+
+#### Scenario: Infer union schema from multiple Parquet files
+
+- **WHEN** user requests schema inference from multiple Parquet files
+- **THEN** system SHALL read metadata from all files
+- **AND** system SHALL compute a union schema that accommodates all files
+- **AND** system SHALL widen types when fields have different types across files
+- **AND** type widening SHALL follow these rules:
+  - Identical types remain unchanged
+  - DECIMAL types widen to max(precision), max(scale)
+  - VARCHAR types widen to max(size)
+  - DECIMAL + DOUBLE widens to DOUBLE
+  - Incompatible types fall back to VARCHAR(2000000)
+
+#### Scenario: Schema inference error handling
+
+- **WHEN** schema inference encounters an error
+- **THEN** system SHALL return SchemaInferenceError with file path context
+- **AND** system SHALL indicate whether the error was in reading metadata or type conversion
+
+### Requirement: Arrow to Exasol DDL Generation
+
+The system SHALL support generating Exasol CREATE TABLE DDL statements from inferred schemas.
+
+#### Scenario: Column name handling with Quoted mode
+
+- **WHEN** generating DDL with Quoted column name mode
+- **THEN** column names SHALL be wrapped in double quotes
+- **AND** internal double quotes in names SHALL be escaped by doubling
+- **AND** original column names SHALL be preserved exactly
+
+#### Scenario: Column name handling with Sanitize mode
+
+- **WHEN** generating DDL with Sanitize column name mode
+- **THEN** column names SHALL be converted to uppercase
+- **AND** invalid identifier characters SHALL be replaced with underscore
+- **AND** names starting with digits SHALL be prefixed with underscore
+- **AND** Exasol reserved words SHALL be quoted
+
+#### Scenario: DDL type generation
+
+- **WHEN** generating DDL column types
+- **THEN** ExasolType SHALL be converted to valid DDL syntax
+- **AND** BOOLEAN SHALL generate "BOOLEAN"
+- **AND** VARCHAR(n) SHALL generate "VARCHAR(n)"
+- **AND** DECIMAL(p,s) SHALL generate "DECIMAL(p,s)"
+- **AND** DOUBLE SHALL generate "DOUBLE"
+- **AND** DATE SHALL generate "DATE"
+- **AND** TIMESTAMP SHALL generate "TIMESTAMP" or "TIMESTAMP WITH LOCAL TIME ZONE"
+
+#### Scenario: Complete DDL statement generation
+
+- **WHEN** generating CREATE TABLE DDL
+- **THEN** output SHALL include "CREATE TABLE schema.table (" prefix
+- **AND** output SHALL include column definitions separated by commas
+- **AND** output SHALL include closing ");"
+- **AND** schema prefix SHALL be optional (omit if not provided)
+
+### Requirement: Auto Table Creation for Parquet Import
+
+The system SHALL support automatically creating target tables before Parquet import when enabled.
+
+#### Scenario: Auto-create table option enabled
+
+- **WHEN** importing Parquet with create_table_if_not_exists=true
+- **AND** target table does not exist
+- **THEN** system SHALL infer schema from Parquet file(s)
+- **AND** system SHALL generate CREATE TABLE DDL
+- **AND** system SHALL execute DDL before IMPORT statement
+- **AND** import SHALL proceed normally after table creation
+
+#### Scenario: Auto-create with existing table
+
+- **WHEN** importing Parquet with create_table_if_not_exists=true
+- **AND** target table already exists
+- **THEN** system SHALL skip DDL execution
+- **AND** import SHALL proceed normally using existing table schema
+
+#### Scenario: Auto-create option disabled (default)
+
+- **WHEN** importing Parquet with create_table_if_not_exists=false (default)
+- **THEN** system SHALL NOT attempt schema inference
+- **AND** system SHALL NOT execute any CREATE TABLE DDL
+- **AND** import SHALL assume table already exists
+
+#### Scenario: Multi-file auto-create
+
+- **WHEN** importing multiple Parquet files with create_table_if_not_exists=true
+- **THEN** system SHALL compute union schema from all files
+- **AND** system SHALL create table with widened types
+- **AND** all files SHALL be importable into the created table
