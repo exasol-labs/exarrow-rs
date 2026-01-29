@@ -162,7 +162,7 @@ See [`examples/`](examples/) for runnable code:
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). See [DISCLAIMER](DISCLAIMER) before using the code in this repository.
 
 ---
 
@@ -170,6 +170,6 @@ See [`examples/`](examples/) for runnable code:
 
 Build with Rust 🦀 and made with ❤️
 
-Started as a side-project by [marconae](https://github.com/marconae), maintained by [Exasol Labs](https://github.com/exasol-labs/).
+Started as an experiment by [marconae](https://github.com/marconae), maintained by [Exasol Labs](https://github.com/exasol-labs/).
 
 </div>
