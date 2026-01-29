@@ -63,7 +63,6 @@ pub struct ResultSet {
     /// Result type
     inner: ResultSetInner,
     /// Transport reference for fetching more data
-    #[allow(dead_code)]
     transport: Arc<Mutex<dyn TransportProtocol>>,
 }
 

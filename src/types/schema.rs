@@ -78,40 +78,6 @@ impl Default for SchemaBuilder {
     }
 }
 
-/// Helper to extract column metadata from Exasol WebSocket response.
-///
-/// This will be used by the Arrow converter to parse result set metadata.
-#[allow(dead_code)]
-pub fn extract_column_metadata_from_json(
-    columns: &[serde_json::Value],
-) -> Result<Vec<ColumnMetadata>, ConversionError> {
-    columns
-        .iter()
-        .map(|col| {
-            let name = col
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ConversionError::InvalidFormat("Missing column name".to_string()))?
-                .to_string();
-
-            let data_type: ExasolType =
-                serde_json::from_value(col.get("dataType").cloned().ok_or_else(|| {
-                    ConversionError::InvalidFormat("Missing dataType field".to_string())
-                })?)
-                .map_err(|e| ConversionError::InvalidFormat(format!("Invalid dataType: {}", e)))?;
-
-            // Exasol columns are nullable by default unless specified otherwise
-            let nullable = true;
-
-            Ok(ColumnMetadata {
-                name,
-                data_type,
-                nullable,
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,32 +116,6 @@ mod tests {
 
         assert!(!schema.field(0).is_nullable());
         assert!(schema.field(1).is_nullable());
-    }
-
-    #[test]
-    fn test_extract_column_metadata() {
-        let json = serde_json::json!([
-            {
-                "name": "id",
-                "dataType": {
-                    "type": "DECIMAL",
-                    "precision": 18,
-                    "scale": 0
-                }
-            },
-            {
-                "name": "name",
-                "dataType": {
-                    "type": "VARCHAR",
-                    "size": 100
-                }
-            }
-        ]);
-
-        let columns = extract_column_metadata_from_json(json.as_array().unwrap()).unwrap();
-        assert_eq!(columns.len(), 2);
-        assert_eq!(columns[0].name, "id");
-        assert_eq!(columns[1].name, "name");
     }
 
     #[test]

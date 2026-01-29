@@ -5,7 +5,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -123,7 +123,7 @@ async fn truncate_table(conn: &mut Connection) -> Result<(), Box<dyn std::error:
 
 async fn import_csv(
     conn: &mut Connection,
-    file_path: &PathBuf,
+    file_path: &Path,
 ) -> Result<(i64, f64), Box<dyn std::error::Error>> {
     truncate_table(conn).await?;
 
@@ -140,7 +140,7 @@ async fn import_csv(
 
 async fn import_parquet(
     conn: &mut Connection,
-    file_path: &PathBuf,
+    file_path: &Path,
 ) -> Result<(i64, f64), Box<dyn std::error::Error>> {
     truncate_table(conn).await?;
 
@@ -217,7 +217,7 @@ async fn select_to_polars(
 async fn run_import_benchmark(
     conn: &mut Connection,
     operation: &Operation,
-    file_path: &PathBuf,
+    file_path: &Path,
     iterations: usize,
     warmup: usize,
     file_size_mb: f64,

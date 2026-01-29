@@ -44,9 +44,7 @@ use arrow::datatypes::DataType;
 use common::{get_host, get_password, get_port, get_user, is_exasol_available};
 use std::path::Path;
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Get the path to the built shared library.
 ///
@@ -105,9 +103,7 @@ macro_rules! skip_if_no_library {
     };
 }
 
-// ============================================================================
 // Section 10.2 & 10.3: Driver Loading Tests
-// ============================================================================
 
 /// Test that the driver can be loaded via the driver manager.
 ///
@@ -159,9 +155,7 @@ fn test_driver_manager_wrong_entry_point_fails() {
     );
 }
 
-// ============================================================================
 // Section 10.4: Database Creation Tests
-// ============================================================================
 
 /// Test creating a database via the driver manager.
 #[test]
@@ -214,9 +208,7 @@ fn test_driver_manager_creates_database_with_options() {
     println!("Database created with URI option via driver manager");
 }
 
-// ============================================================================
 // Section 10.5: Connection Establishment Tests
-// ============================================================================
 
 /// Test establishing a connection via the driver manager.
 #[test]
@@ -255,9 +247,7 @@ fn test_driver_manager_establishes_connection() {
     );
 }
 
-// ============================================================================
 // Section 10.6: Query Execution Tests
-// ============================================================================
 
 /// Test executing a simple SELECT query via the driver manager.
 #[test]
@@ -341,9 +331,7 @@ fn test_driver_manager_executes_arithmetic() {
     println!("Arithmetic expressions executed successfully via driver manager");
 }
 
-// ============================================================================
 // Section 10.7: Result Retrieval Tests
-// ============================================================================
 
 /// Test retrieving results as Arrow RecordBatch via the driver manager.
 #[test]
@@ -529,9 +517,7 @@ fn test_driver_manager_validates_arrow_schema() {
     println!("Arrow schema validation passed via driver manager");
 }
 
-// ============================================================================
 // Section 10.8: Full Workflow Comparison Tests
-// ============================================================================
 
 /// Test that driver manager results match direct API results.
 ///

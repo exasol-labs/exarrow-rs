@@ -39,7 +39,9 @@
 
 pub mod arrow;
 pub mod csv;
+pub mod parallel;
 pub mod parquet;
+pub mod source;
 
 pub use arrow::{
     import_from_arrow_ipc, import_from_record_batch, import_from_record_batches,
@@ -47,11 +49,20 @@ pub use arrow::{
 };
 
 pub use csv::{
-    import_from_callback, import_from_file, import_from_iter, import_from_stream, CsvImportOptions,
-    DataPipeSender,
+    import_from_callback, import_from_file, import_from_files, import_from_iter,
+    import_from_stream, CsvImportOptions, DataPipeSender,
 };
 
-pub use parquet::{import_from_parquet, import_from_parquet_stream, ParquetImportOptions};
+pub use parquet::{
+    import_from_parquet, import_from_parquet_files, import_from_parquet_stream,
+    ParquetImportOptions,
+};
+
+// Re-export ColumnNameMode for convenient access
+pub use crate::types::ColumnNameMode;
+
+pub use parallel::{ImportFileEntry, ParallelTransportPool};
+pub use source::IntoFileSources;
 
 use thiserror::Error;
 
@@ -117,6 +128,18 @@ pub enum ImportError {
     /// Channel communication error
     #[error("Channel error: {0}")]
     ChannelError(String),
+
+    /// Parallel import error (connection, streaming, or conversion failure)
+    #[error("Parallel import error: {0}")]
+    ParallelImportError(String),
+
+    /// Schema inference failed (could not read metadata or convert types)
+    #[error("Schema inference failed: {0}")]
+    SchemaInferenceError(String),
+
+    /// Schema mismatch between multiple files
+    #[error("Schema mismatch between files: {0}")]
+    SchemaMismatchError(String),
 }
 
 impl From<::arrow::error::ArrowError> for ImportError {

@@ -106,28 +106,22 @@ fn execute_update(conn: &mut impl Connection, sql: &str) -> Result<Option<i64>, 
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Load the driver dynamically from the shared library
     let mut driver = load_driver()?;
 
-    // Create a database connection factory with the URI
     let uri = get_connection_uri();
     let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
     let db = driver.new_database_with_opts(opts)?;
 
-    // Establish a connection
     let mut conn = db.new_connection()?;
 
-    // Execute a simple query
     let (_rows, _cols) =
         execute_select(&mut conn, "SELECT 42 AS answer, 'Hello ADBC!' AS message")?;
 
-    // Query with multiple rows
     let (_rows, _cols) = execute_select(
         &mut conn,
         "SELECT LEVEL AS id, 'Row ' || LEVEL AS label FROM DUAL CONNECT BY LEVEL <= 5",
     )?;
 
-    // Get driver info
     {
         let mut reader = conn.get_info(None)?;
         for batch_result in reader.by_ref() {
@@ -149,7 +143,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // DDL/DML operations (create, insert, select, cleanup)
     let schema_name = format!(
         "DM_EXAMPLE_{}",
         std::time::SystemTime::now()
@@ -157,10 +150,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             .as_millis()
     );
 
-    // Create schema
     execute_update(&mut conn, &format!("CREATE SCHEMA {}", schema_name))?;
 
-    // Create table
     execute_update(
         &mut conn,
         &format!(
@@ -169,7 +160,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     )?;
 
-    // Insert rows
     execute_update(
         &mut conn,
         &format!(
@@ -178,7 +168,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     )?;
 
-    // Query the data
     let (_rows, _cols) = execute_select(
         &mut conn,
         &format!(
@@ -187,7 +176,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     )?;
 
-    // Cleanup
     execute_update(&mut conn, &format!("DROP SCHEMA {} CASCADE", schema_name))?;
 
     Ok(())

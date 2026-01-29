@@ -136,35 +136,30 @@ impl ArrowExportOptions {
         Self::default()
     }
 
-    /// Sets the batch size (number of rows per RecordBatch).
     #[must_use]
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
     }
 
-    /// Sets a custom NULL value representation.
     #[must_use]
     pub fn with_null_value(mut self, null_value: impl Into<String>) -> Self {
         self.null_value = Some(null_value.into());
         self
     }
 
-    /// Sets an explicit Arrow schema.
     #[must_use]
     pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
         self.schema = Some(schema);
         self
     }
 
-    /// Sets the column separator character.
     #[must_use]
     pub fn with_column_separator(mut self, sep: char) -> Self {
         self.column_separator = sep;
         self
     }
 
-    /// Sets the column delimiter character.
     #[must_use]
     pub fn with_column_delimiter(mut self, delim: char) -> Self {
         self.column_delimiter = delim;

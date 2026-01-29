@@ -292,3 +292,188 @@ The system SHALL integrate import/export with the Session API.
 - **WHEN** user prefers synchronous API
 - **THEN** blocking wrapper methods are available
 - **AND** wrappers use tokio runtime internally
+
+### Requirement: Parallel CSV File Import
+
+The system SHALL support importing multiple CSV files in parallel into a single Exasol table
+by leveraging Exasol's native IMPORT parallelization with multiple FILE clauses in a single
+IMPORT statement. Each file SHALL have its own HTTP transport connection with a unique
+internal address obtained through the EXA tunneling handshake.
+
+#### Scenario: Import multiple CSV files in parallel
+
+- **WHEN** user calls import_csv_from_files with a list of CSV file paths
+- **THEN** system SHALL establish N parallel HTTP transport connections (one per file)
+- **AND** system SHALL perform EXA tunneling handshake on each connection to obtain unique internal addresses
+- **AND** system SHALL build IMPORT SQL with multiple FILE clauses referencing each internal address
+- **AND** system SHALL execute IMPORT SQL triggering Exasol to request data from all endpoints
+- **AND** system SHALL stream each file's data through its respective HTTP connection in parallel
+- **AND** system SHALL return total rows imported
+
+#### Scenario: Generated SQL uses multiple AT/FILE clauses
+
+- **WHEN** parallel import is initiated with N files
+- **THEN** generated SQL SHALL follow format: `FROM CSV AT 'addr1' FILE '001.csv' AT 'addr2' FILE '002.csv' ...`
+- **AND** each file SHALL have a unique internal address
+
+### Requirement: Parallel Parquet File Import
+
+The system SHALL support importing multiple Parquet files in parallel by converting each file
+to CSV format concurrently using tokio tasks, then streaming through parallel HTTP connections.
+
+#### Scenario: Import multiple Parquet files in parallel
+
+- **WHEN** user calls import_parquet_from_files with a list of Parquet file paths
+- **THEN** system SHALL convert all Parquet files to CSV format in parallel using tokio tasks
+- **AND** system SHALL establish N parallel HTTP transport connections
+- **AND** system SHALL stream converted CSV data through each connection
+- **AND** system SHALL return total rows imported
+
+#### Scenario: Parquet conversion is parallelized
+
+- **WHEN** multiple Parquet files are provided
+- **THEN** system SHALL convert files concurrently using spawn_blocking tasks
+- **AND** system SHALL NOT wait for one conversion to complete before starting another
+
+### Requirement: Single File Backward Compatibility
+
+The parallel import methods SHALL maintain backward compatibility with single-file imports
+by delegating to the existing optimized single-file path.
+
+#### Scenario: Single file delegates to existing implementation
+
+- **WHEN** user calls import_csv_from_files with a single file path
+- **THEN** system SHALL delegate to existing import_from_file implementation
+- **AND** behavior SHALL be identical to calling import_from_file directly
+
+#### Scenario: API accepts both single path and collection
+
+- **WHEN** user provides either PathBuf or Vec<PathBuf> to import method
+- **THEN** system SHALL accept both forms via IntoFileSources trait
+- **AND** single path SHALL be treated as collection of one
+
+### Requirement: Parallel Import Error Handling
+
+The system SHALL implement fail-fast error handling for parallel imports, aborting all
+operations immediately upon first failure to prevent partial data imports.
+
+#### Scenario: Fail-fast on connection error
+
+- **WHEN** any HTTP transport connection fails during parallel import
+- **THEN** system SHALL abort all remaining connection attempts immediately
+- **AND** system SHALL close all established connections gracefully
+- **AND** system SHALL return error with context about which connection failed
+
+#### Scenario: Fail-fast on streaming error
+
+- **WHEN** any file streaming fails during parallel import
+- **THEN** system SHALL abort all other streaming operations immediately
+- **AND** system SHALL return error indicating failed file index and path
+
+#### Scenario: Fail-fast on Parquet conversion error
+
+- **WHEN** any Parquet file fails to convert to CSV
+- **THEN** system SHALL abort all other conversion tasks immediately
+- **AND** system SHALL return error indicating which file failed conversion
+
+### Requirement: Arrow Schema Inference from Parquet Files
+
+The system SHALL support inferring Arrow schemas from Parquet file metadata without reading the full data.
+
+#### Scenario: Infer schema from single Parquet file
+
+- **WHEN** user requests schema inference from a single Parquet file
+- **THEN** system SHALL read only the Parquet metadata (not data)
+- **AND** system SHALL return the Arrow schema with field names and types
+- **AND** system SHALL include nullability information for each field
+
+#### Scenario: Infer union schema from multiple Parquet files
+
+- **WHEN** user requests schema inference from multiple Parquet files
+- **THEN** system SHALL read metadata from all files
+- **AND** system SHALL compute a union schema that accommodates all files
+- **AND** system SHALL widen types when fields have different types across files
+- **AND** type widening SHALL follow these rules:
+  - Identical types remain unchanged
+  - DECIMAL types widen to max(precision), max(scale)
+  - VARCHAR types widen to max(size)
+  - DECIMAL + DOUBLE widens to DOUBLE
+  - Incompatible types fall back to VARCHAR(2000000)
+
+#### Scenario: Schema inference error handling
+
+- **WHEN** schema inference encounters an error
+- **THEN** system SHALL return SchemaInferenceError with file path context
+- **AND** system SHALL indicate whether the error was in reading metadata or type conversion
+
+### Requirement: Arrow to Exasol DDL Generation
+
+The system SHALL support generating Exasol CREATE TABLE DDL statements from inferred schemas.
+
+#### Scenario: Column name handling with Quoted mode
+
+- **WHEN** generating DDL with Quoted column name mode
+- **THEN** column names SHALL be wrapped in double quotes
+- **AND** internal double quotes in names SHALL be escaped by doubling
+- **AND** original column names SHALL be preserved exactly
+
+#### Scenario: Column name handling with Sanitize mode
+
+- **WHEN** generating DDL with Sanitize column name mode
+- **THEN** column names SHALL be converted to uppercase
+- **AND** invalid identifier characters SHALL be replaced with underscore
+- **AND** names starting with digits SHALL be prefixed with underscore
+- **AND** Exasol reserved words SHALL be quoted
+
+#### Scenario: DDL type generation
+
+- **WHEN** generating DDL column types
+- **THEN** ExasolType SHALL be converted to valid DDL syntax
+- **AND** BOOLEAN SHALL generate "BOOLEAN"
+- **AND** VARCHAR(n) SHALL generate "VARCHAR(n)"
+- **AND** DECIMAL(p,s) SHALL generate "DECIMAL(p,s)"
+- **AND** DOUBLE SHALL generate "DOUBLE"
+- **AND** DATE SHALL generate "DATE"
+- **AND** TIMESTAMP SHALL generate "TIMESTAMP" or "TIMESTAMP WITH LOCAL TIME ZONE"
+
+#### Scenario: Complete DDL statement generation
+
+- **WHEN** generating CREATE TABLE DDL
+- **THEN** output SHALL include "CREATE TABLE schema.table (" prefix
+- **AND** output SHALL include column definitions separated by commas
+- **AND** output SHALL include closing ");"
+- **AND** schema prefix SHALL be optional (omit if not provided)
+
+### Requirement: Auto Table Creation for Parquet Import
+
+The system SHALL support automatically creating target tables before Parquet import when enabled.
+
+#### Scenario: Auto-create table option enabled
+
+- **WHEN** importing Parquet with create_table_if_not_exists=true
+- **AND** target table does not exist
+- **THEN** system SHALL infer schema from Parquet file(s)
+- **AND** system SHALL generate CREATE TABLE DDL
+- **AND** system SHALL execute DDL before IMPORT statement
+- **AND** import SHALL proceed normally after table creation
+
+#### Scenario: Auto-create with existing table
+
+- **WHEN** importing Parquet with create_table_if_not_exists=true
+- **AND** target table already exists
+- **THEN** system SHALL skip DDL execution
+- **AND** import SHALL proceed normally using existing table schema
+
+#### Scenario: Auto-create option disabled (default)
+
+- **WHEN** importing Parquet with create_table_if_not_exists=false (default)
+- **THEN** system SHALL NOT attempt schema inference
+- **AND** system SHALL NOT execute any CREATE TABLE DDL
+- **AND** import SHALL assume table already exists
+
+#### Scenario: Multi-file auto-create
+
+- **WHEN** importing multiple Parquet files with create_table_if_not_exists=true
+- **THEN** system SHALL compute union schema from all files
+- **AND** system SHALL create table with widened types
+- **AND** all files SHALL be importable into the created table

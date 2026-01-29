@@ -102,49 +102,42 @@ impl ArrowImportOptions {
         Self::default()
     }
 
-    /// Set the target schema.
     #[must_use]
     pub fn schema(mut self, schema: impl Into<String>) -> Self {
         self.schema = Some(schema.into());
         self
     }
 
-    /// Set the columns to import.
     #[must_use]
     pub fn columns(mut self, columns: Vec<String>) -> Self {
         self.columns = Some(columns);
         self
     }
 
-    /// Set the batch size for chunked processing.
     #[must_use]
     pub fn batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
         self
     }
 
-    /// Set the null value string representation.
     #[must_use]
     pub fn null_value(mut self, value: impl Into<String>) -> Self {
         self.csv_options.null_value = value.into();
         self
     }
 
-    /// Set the column separator.
     #[must_use]
     pub fn column_separator(mut self, sep: char) -> Self {
         self.csv_options.column_separator = sep;
         self
     }
 
-    /// Set the column delimiter for quoting.
     #[must_use]
     pub fn column_delimiter(mut self, delim: char) -> Self {
         self.csv_options.column_delimiter = delim;
         self
     }
 
-    /// Enable TLS encryption for transport.
     #[must_use]
     pub fn with_encryption(mut self) -> Self {
         self.use_encryption = true;

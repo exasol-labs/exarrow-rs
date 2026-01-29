@@ -155,30 +155,50 @@ The system SHALL preserve type metadata in Arrow schemas.
 - **THEN** it SHALL provide access to original Exasol type names
 - **AND** it SHALL expose type mapping used for each column
 
-### Requirement: Exasol Type Limit Documentation
+### Requirement: Exasol Data Type Boundaries
 
-The system SHALL document Exasol's actual data type limits as defined in official documentation.
+The system SHALL enforce Exasol's documented data type limits when generating DDL or validating type mappings.
 
-#### Scenario: DECIMAL limits
+#### Scenario: VARCHAR type boundaries
 
-- **WHEN** documenting DECIMAL type limits
-- **THEN** documentation SHALL state precision range is 1-36 digits
-- **AND** documentation SHALL note this differs from Arrow Decimal128's 38-digit limit
+- **WHEN** mapping to Exasol VARCHAR
+- **THEN** the maximum length SHALL be 2,000,000 characters
+- **AND** values exceeding this limit SHALL be truncated or rejected based on configuration
 
-#### Scenario: TIMESTAMP limits
+#### Scenario: CHAR type boundaries
 
-- **WHEN** documenting TIMESTAMP type limits
-- **THEN** documentation SHALL state fractional seconds precision range is 0-9
-- **AND** documentation SHALL explain the mapping to Arrow TimeUnit
+- **WHEN** mapping to Exasol CHAR
+- **THEN** the maximum length SHALL be 2,000 characters
+- **AND** CHAR is fixed-width with space padding
 
-#### Scenario: String type limits
+#### Scenario: DECIMAL type boundaries
 
-- **WHEN** documenting string type limits
-- **THEN** documentation SHALL note VARCHAR maximum practical size
-- **AND** documentation SHALL note CHAR fixed-size semantics
+- **WHEN** mapping to Exasol DECIMAL(p, s)
+- **THEN** precision SHALL be in range 1-36
+- **AND** scale SHALL be in range 0-36
+- **AND** scale SHALL NOT exceed precision
 
-#### Scenario: INTERVAL limits
+#### Scenario: TIMESTAMP type boundaries
 
-- **WHEN** documenting INTERVAL type limits
-- **THEN** documentation SHALL state INTERVAL DAY TO SECOND precision range is 0-9 for fractional seconds
-- **AND** documentation SHALL note fixed 8-byte storage for both interval types
+- **WHEN** mapping to Exasol TIMESTAMP
+- **THEN** fractional seconds precision SHALL be in range 0-9
+- **AND** TIMESTAMP WITH LOCAL TIME ZONE SHALL be used for timezone-aware timestamps
+
+#### Scenario: Integer type mappings for DDL generation
+
+- **WHEN** mapping Arrow integer types to Exasol DDL
+- **THEN** Int8, Int16, Int32 SHALL map to DECIMAL(18,0)
+- **AND** Int64 SHALL map to DECIMAL(36,0)
+- **AND** UInt8, UInt16, UInt32 SHALL map to DECIMAL(18,0)
+- **AND** UInt64 SHALL map to DECIMAL(36,0)
+
+#### Scenario: Floating point type mappings for DDL generation
+
+- **WHEN** mapping Arrow floating point types to Exasol DDL
+- **THEN** Float32 and Float64 SHALL map to DOUBLE
+
+#### Scenario: INTERVAL type boundaries
+
+- **WHEN** mapping to Exasol INTERVAL types
+- **THEN** INTERVAL DAY TO SECOND fractional precision SHALL be in range 0-9
+- **AND** both INTERVAL types use fixed 8-byte storage

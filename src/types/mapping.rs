@@ -5,6 +5,34 @@ use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Column name handling mode for DDL generation.
+///
+/// Controls how column names from source schemas are transformed
+/// when generating Exasol CREATE TABLE DDL statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnNameMode {
+    /// Preserve original column names exactly, wrapped in double quotes.
+    ///
+    /// This mode:
+    /// - Wraps all names in double quotes
+    /// - Escapes internal double quotes by doubling them
+    /// - Preserves case sensitivity and special characters
+    ///
+    /// Example: `my Column` becomes `"my Column"`
+    #[default]
+    Quoted,
+
+    /// Sanitize column names to valid Exasol identifiers.
+    ///
+    /// This mode:
+    /// - Converts names to uppercase
+    /// - Replaces invalid identifier characters with underscores
+    /// - Prefixes names starting with digits with an underscore
+    ///
+    /// Example: `my Column` becomes `MY_COLUMN`
+    Sanitize,
+}
+
 /// Exasol data type representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "UPPERCASE")]
@@ -52,6 +80,46 @@ pub enum ExasolType {
     /// HASHTYPE type (for hash values)
     #[serde(rename = "HASHTYPE")]
     Hashtype { byte_size: usize },
+}
+
+impl ExasolType {
+    /// Convert this Exasol type to a DDL type string suitable for CREATE TABLE statements.
+    ///
+    /// # Returns
+    ///
+    /// A string representing the Exasol DDL type, e.g., "VARCHAR(100)", "DECIMAL(18,2)".
+    #[must_use]
+    pub fn to_ddl_type(&self) -> String {
+        match self {
+            ExasolType::Boolean => "BOOLEAN".to_string(),
+            ExasolType::Char { size } => format!("CHAR({size})"),
+            ExasolType::Varchar { size } => format!("VARCHAR({size})"),
+            ExasolType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
+            ExasolType::Double => "DOUBLE".to_string(),
+            ExasolType::Date => "DATE".to_string(),
+            ExasolType::Timestamp {
+                with_local_time_zone,
+            } => {
+                if *with_local_time_zone {
+                    "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
+                } else {
+                    "TIMESTAMP".to_string()
+                }
+            }
+            ExasolType::IntervalYearToMonth => "INTERVAL YEAR TO MONTH".to_string(),
+            ExasolType::IntervalDayToSecond { precision } => {
+                format!("INTERVAL DAY TO SECOND({precision})")
+            }
+            ExasolType::Geometry { srid } => {
+                if let Some(srid) = srid {
+                    format!("GEOMETRY({srid})")
+                } else {
+                    "GEOMETRY".to_string()
+                }
+            }
+            ExasolType::Hashtype { byte_size } => format!("HASHTYPE({} BYTE)", byte_size),
+        }
+    }
 }
 
 /// Type mapper for converting between Exasol and Arrow types.
@@ -155,6 +223,16 @@ impl TypeMapper {
             }),
 
             DataType::Int64 => Ok(ExasolType::Decimal {
+                precision: 36,
+                scale: 0,
+            }),
+
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Ok(ExasolType::Decimal {
+                precision: 18,
+                scale: 0,
+            }),
+
+            DataType::UInt64 => Ok(ExasolType::Decimal {
                 precision: 36,
                 scale: 0,
             }),
@@ -337,5 +415,128 @@ mod tests {
             arrow_type,
             DataType::Interval(IntervalUnit::MonthDayNano)
         ));
+    }
+
+    #[test]
+    fn test_uint_to_exasol_mapping() {
+        // UInt8, UInt16, UInt32 -> DECIMAL(18,0)
+        let uint8 = TypeMapper::arrow_to_exasol(&DataType::UInt8).unwrap();
+        assert_eq!(
+            uint8,
+            ExasolType::Decimal {
+                precision: 18,
+                scale: 0
+            }
+        );
+
+        let uint16 = TypeMapper::arrow_to_exasol(&DataType::UInt16).unwrap();
+        assert_eq!(
+            uint16,
+            ExasolType::Decimal {
+                precision: 18,
+                scale: 0
+            }
+        );
+
+        let uint32 = TypeMapper::arrow_to_exasol(&DataType::UInt32).unwrap();
+        assert_eq!(
+            uint32,
+            ExasolType::Decimal {
+                precision: 18,
+                scale: 0
+            }
+        );
+
+        // UInt64 -> DECIMAL(36,0)
+        let uint64 = TypeMapper::arrow_to_exasol(&DataType::UInt64).unwrap();
+        assert_eq!(
+            uint64,
+            ExasolType::Decimal {
+                precision: 36,
+                scale: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_to_ddl_type_boolean() {
+        let t = ExasolType::Boolean;
+        assert_eq!(t.to_ddl_type(), "BOOLEAN");
+    }
+
+    #[test]
+    fn test_to_ddl_type_char() {
+        let t = ExasolType::Char { size: 50 };
+        assert_eq!(t.to_ddl_type(), "CHAR(50)");
+    }
+
+    #[test]
+    fn test_to_ddl_type_varchar() {
+        let t = ExasolType::Varchar { size: 2000000 };
+        assert_eq!(t.to_ddl_type(), "VARCHAR(2000000)");
+    }
+
+    #[test]
+    fn test_to_ddl_type_decimal() {
+        let t = ExasolType::Decimal {
+            precision: 18,
+            scale: 2,
+        };
+        assert_eq!(t.to_ddl_type(), "DECIMAL(18,2)");
+    }
+
+    #[test]
+    fn test_to_ddl_type_double() {
+        let t = ExasolType::Double;
+        assert_eq!(t.to_ddl_type(), "DOUBLE");
+    }
+
+    #[test]
+    fn test_to_ddl_type_date() {
+        let t = ExasolType::Date;
+        assert_eq!(t.to_ddl_type(), "DATE");
+    }
+
+    #[test]
+    fn test_to_ddl_type_timestamp() {
+        let t = ExasolType::Timestamp {
+            with_local_time_zone: false,
+        };
+        assert_eq!(t.to_ddl_type(), "TIMESTAMP");
+
+        let t_tz = ExasolType::Timestamp {
+            with_local_time_zone: true,
+        };
+        assert_eq!(t_tz.to_ddl_type(), "TIMESTAMP WITH LOCAL TIME ZONE");
+    }
+
+    #[test]
+    fn test_to_ddl_type_interval() {
+        let t = ExasolType::IntervalYearToMonth;
+        assert_eq!(t.to_ddl_type(), "INTERVAL YEAR TO MONTH");
+
+        let t2 = ExasolType::IntervalDayToSecond { precision: 6 };
+        assert_eq!(t2.to_ddl_type(), "INTERVAL DAY TO SECOND(6)");
+    }
+
+    #[test]
+    fn test_to_ddl_type_geometry() {
+        let t = ExasolType::Geometry { srid: None };
+        assert_eq!(t.to_ddl_type(), "GEOMETRY");
+
+        let t_srid = ExasolType::Geometry { srid: Some(4326) };
+        assert_eq!(t_srid.to_ddl_type(), "GEOMETRY(4326)");
+    }
+
+    #[test]
+    fn test_to_ddl_type_hashtype() {
+        let t = ExasolType::Hashtype { byte_size: 16 };
+        assert_eq!(t.to_ddl_type(), "HASHTYPE(16 BYTE)");
+    }
+
+    #[test]
+    fn test_column_name_mode_default() {
+        let mode = ColumnNameMode::default();
+        assert_eq!(mode, ColumnNameMode::Quoted);
     }
 }
