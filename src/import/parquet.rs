@@ -22,9 +22,11 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::query::import::{ImportQuery, RowSeparator};
+use crate::query::import::{ImportFileEntry, ImportQuery, RowSeparator};
 use crate::transport::HttpTransportClient;
 
+use super::parallel::{convert_parquet_files_to_csv, stream_files_parallel, ParallelTransportPool};
+use super::source::IntoFileSources;
 use super::ImportError;
 
 /// Options for Parquet import operations.
@@ -453,6 +455,173 @@ where
 
     // Return the row count from SQL execution
     sql_result.map_err(ImportError::SqlError)
+}
+
+/// Imports data from multiple Parquet files in parallel into an Exasol table.
+///
+/// This function converts each Parquet file to CSV format concurrently using
+/// tokio spawn_blocking tasks, then streams the converted data through parallel
+/// HTTP transport connections.
+///
+/// For a single file, this function delegates to `import_from_parquet` for
+/// optimal single-file performance.
+///
+/// # Arguments
+///
+/// * `execute_sql` - Function to execute SQL statements. Takes SQL string and returns row count.
+/// * `table` - The target table name
+/// * `file_paths` - File paths (accepts single path, Vec, array, or slice)
+/// * `options` - Import options
+///
+/// # Returns
+///
+/// The number of rows imported on success.
+///
+/// # Errors
+///
+/// Returns `ImportError` if any conversion or import fails. Uses fail-fast semantics.
+///
+/// # Example
+///
+/// ```no_run
+/// use exarrow_rs::import::parquet::{import_from_parquet_files, ParquetImportOptions};
+/// use std::path::PathBuf;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let files = vec![
+///     PathBuf::from("/data/part1.parquet"),
+///     PathBuf::from("/data/part2.parquet"),
+///     PathBuf::from("/data/part3.parquet"),
+/// ];
+///
+/// let options = ParquetImportOptions::default()
+///     .with_exasol_host("localhost")
+///     .with_exasol_port(8563);
+///
+/// // let rows = import_from_parquet_files(execute_sql, "my_table", files, options).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn import_from_parquet_files<F, Fut, S>(
+    execute_sql: F,
+    table: &str,
+    file_paths: S,
+    options: ParquetImportOptions,
+) -> Result<u64, ImportError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<u64, String>>,
+    S: IntoFileSources,
+{
+    let paths = file_paths.into_sources();
+
+    // Delegate to single-file implementation for one file
+    if paths.len() == 1 {
+        return import_from_parquet(execute_sql, table, &paths[0], options).await;
+    }
+
+    if paths.is_empty() {
+        return Err(ImportError::InvalidConfig(
+            "No files provided for import".to_string(),
+        ));
+    }
+
+    // Convert all Parquet files to CSV in parallel
+    let csv_data_vec = convert_parquet_files_to_csv(
+        paths.clone(),
+        options.batch_size,
+        options.null_value.clone(),
+        options.column_separator,
+        options.column_delimiter,
+    )
+    .await?;
+
+    // Check for empty data
+    if csv_data_vec.iter().all(|d| d.is_empty()) {
+        return Ok(0);
+    }
+
+    // Establish parallel connections
+    let pool = ParallelTransportPool::connect(
+        &options.host,
+        options.port,
+        options.use_encryption,
+        paths.len(),
+    )
+    .await?;
+
+    // Build multi-file IMPORT SQL
+    let entries: Vec<ImportFileEntry> = pool
+        .file_entries()
+        .iter()
+        .map(|e| ImportFileEntry::new(e.address.clone(), e.file_name.clone(), e.public_key.clone()))
+        .collect();
+
+    let query = build_multi_file_parquet_query(table, &options, entries);
+    let sql = query.build();
+
+    // Get connections for streaming
+    let connections = pool.into_connections();
+
+    // Spawn parallel streaming task
+    let stream_handle = tokio::spawn(async move {
+        stream_files_parallel(
+            connections,
+            csv_data_vec,
+            crate::query::import::Compression::None,
+        )
+        .await
+    });
+
+    // Execute the IMPORT SQL in parallel
+    let sql_result = execute_sql(sql).await;
+
+    // Wait for streaming to complete
+    let stream_result = stream_handle.await;
+
+    // Handle results - check stream task first
+    match stream_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => {
+            return Err(ImportError::StreamError(format!(
+                "Stream task panicked: {e}"
+            )))
+        }
+    }
+
+    // Return the row count from SQL execution
+    sql_result.map_err(ImportError::SqlError)
+}
+
+/// Build an ImportQuery for multi-file Parquet import.
+fn build_multi_file_parquet_query(
+    table: &str,
+    options: &ParquetImportOptions,
+    entries: Vec<ImportFileEntry>,
+) -> ImportQuery {
+    let mut query = ImportQuery::new(table).with_files(entries);
+
+    if let Some(ref schema) = options.schema {
+        query = query.schema(schema);
+    }
+
+    if let Some(ref columns) = options.columns {
+        let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
+        query = query.columns(cols);
+    }
+
+    query = query
+        .encoding("UTF-8")
+        .column_separator(options.column_separator)
+        .column_delimiter(options.column_delimiter)
+        .row_separator(RowSeparator::LF);
+
+    if !options.null_value.is_empty() {
+        query = query.null_value(&options.null_value);
+    }
+
+    query
 }
 
 /// Converts an Arrow RecordBatch to CSV rows.

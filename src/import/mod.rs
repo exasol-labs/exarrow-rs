@@ -39,7 +39,9 @@
 
 pub mod arrow;
 pub mod csv;
+pub mod parallel;
 pub mod parquet;
+pub mod source;
 
 pub use arrow::{
     import_from_arrow_ipc, import_from_record_batch, import_from_record_batches,
@@ -47,11 +49,16 @@ pub use arrow::{
 };
 
 pub use csv::{
-    import_from_callback, import_from_file, import_from_iter, import_from_stream, CsvImportOptions,
-    DataPipeSender,
+    import_from_callback, import_from_file, import_from_files, import_from_iter, import_from_stream,
+    CsvImportOptions, DataPipeSender,
 };
 
-pub use parquet::{import_from_parquet, import_from_parquet_stream, ParquetImportOptions};
+pub use parquet::{
+    import_from_parquet, import_from_parquet_files, import_from_parquet_stream, ParquetImportOptions,
+};
+
+pub use parallel::{ImportFileEntry, ParallelTransportPool};
+pub use source::IntoFileSources;
 
 use thiserror::Error;
 
@@ -117,6 +124,10 @@ pub enum ImportError {
     /// Channel communication error
     #[error("Channel error: {0}")]
     ChannelError(String),
+
+    /// Parallel import error (connection, streaming, or conversion failure)
+    #[error("Parallel import error: {0}")]
+    ParallelImportError(String),
 }
 
 impl From<::arrow::error::ArrowError> for ImportError {
