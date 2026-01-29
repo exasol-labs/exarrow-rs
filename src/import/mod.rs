@@ -58,6 +58,9 @@ pub use parquet::{
     ParquetImportOptions,
 };
 
+// Re-export ColumnNameMode for convenient access
+pub use crate::types::ColumnNameMode;
+
 pub use parallel::{ImportFileEntry, ParallelTransportPool};
 pub use source::IntoFileSources;
 
@@ -129,6 +132,14 @@ pub enum ImportError {
     /// Parallel import error (connection, streaming, or conversion failure)
     #[error("Parallel import error: {0}")]
     ParallelImportError(String),
+
+    /// Schema inference failed (could not read metadata or convert types)
+    #[error("Schema inference failed: {0}")]
+    SchemaInferenceError(String),
+
+    /// Schema mismatch between multiple files
+    #[error("Schema mismatch between files: {0}")]
+    SchemaMismatchError(String),
 }
 
 impl From<::arrow::error::ArrowError> for ImportError {

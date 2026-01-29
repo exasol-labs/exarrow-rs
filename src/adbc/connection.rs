@@ -1179,12 +1179,15 @@ impl Connection {
             .with_exasol_port(self.params.port);
 
         let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
+        let execute_sql = |sql: String| {
+            let transport = Arc::clone(&transport);
+            async move {
+                let mut transport_guard = transport.lock().await;
+                match transport_guard.execute_query(&sql).await {
+                    Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                    Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         };
 
@@ -1242,12 +1245,15 @@ impl Connection {
             .with_exasol_port(self.params.port);
 
         let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
+        let execute_sql = |sql: String| {
+            let transport = Arc::clone(&transport);
+            async move {
+                let mut transport_guard = transport.lock().await;
+                match transport_guard.execute_query(&sql).await {
+                    Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                    Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         };
 

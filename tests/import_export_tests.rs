@@ -1991,3 +1991,345 @@ async fn test_single_path_still_works() {
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
 }
+
+// Section 9: Parquet Auto Table Creation Tests
+
+/// Test importing Parquet file with auto table creation (single file)
+#[tokio::test]
+#[ignore]
+async fn test_parquet_import_auto_create_table() {
+    skip_if_no_exasol!();
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use exarrow_rs::import::ColumnNameMode;
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema only (no table - let auto-create handle it)
+    conn.execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    // Create a Parquet file with test data
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("auto_create_test.parquet");
+
+    // Create Arrow schema and RecordBatch with various types
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Int64, false),
+        Field::new("user_name", DataType::Utf8, true),
+        Field::new("balance", DataType::Float64, true),
+        Field::new("active", DataType::Boolean, true),
+    ]));
+
+    let user_id_array = Int64Array::from(vec![1, 2, 3]);
+    let user_name_array = StringArray::from(vec![Some("Alice"), Some("Bob"), None]);
+    let balance_array = Float64Array::from(vec![Some(100.50), Some(200.75), Some(50.00)]);
+    let active_array = arrow::array::BooleanArray::from(vec![Some(true), Some(false), Some(true)]);
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(user_id_array),
+            Arc::new(user_name_array),
+            Arc::new(balance_array),
+            Arc::new(active_array),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    // Write Parquet file
+    let file = std::fs::File::create(&parquet_path).expect("Failed to create parquet file");
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .expect("Failed to create ArrowWriter");
+    writer.write(&batch).expect("Failed to write batch");
+    writer.close().expect("Failed to close writer");
+
+    // Import the Parquet file with auto table creation
+    let options = ParquetImportOptions::default()
+        .with_schema(&schema_name)
+        .with_create_table_if_not_exists(true)
+        .with_column_name_mode(ColumnNameMode::Quoted);
+
+    let rows_imported = conn
+        .import_from_parquet("auto_created_table", &parquet_path, options)
+        .await
+        .expect("Parquet import with auto-create should succeed");
+
+    assert_eq!(rows_imported, 3, "Should import 3 rows");
+
+    // Verify the table was created and data imported
+    let batches = conn
+        .query(&format!(
+            "SELECT \"user_id\", \"user_name\", \"balance\", \"active\" FROM {}.auto_created_table ORDER BY \"user_id\"",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 3, "Should have 3 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Test importing Parquet file with auto table creation using sanitized column names
+#[tokio::test]
+#[ignore]
+async fn test_parquet_import_auto_create_sanitized_names() {
+    skip_if_no_exasol!();
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use exarrow_rs::import::ColumnNameMode;
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema only
+    conn.execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    // Create a Parquet file with columns that have spaces and special chars
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("sanitize_test.parquet");
+
+    // Column names with spaces and special chars
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("User ID", DataType::Int64, false),
+        Field::new("First Name", DataType::Utf8, true),
+        Field::new("account-balance", DataType::Float64, true),
+    ]));
+
+    let id_array = Int64Array::from(vec![10, 20]);
+    let name_array = StringArray::from(vec!["Test1", "Test2"]);
+    let balance_array = Float64Array::from(vec![500.0, 600.0]);
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_array),
+            Arc::new(name_array),
+            Arc::new(balance_array),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    // Write Parquet file
+    let file = std::fs::File::create(&parquet_path).expect("Failed to create parquet file");
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .expect("Failed to create ArrowWriter");
+    writer.write(&batch).expect("Failed to write batch");
+    writer.close().expect("Failed to close writer");
+
+    // Import with sanitize mode (columns become uppercase with underscores)
+    let options = ParquetImportOptions::default()
+        .with_schema(&schema_name)
+        .with_create_table_if_not_exists(true)
+        .with_column_name_mode(ColumnNameMode::Sanitize);
+
+    let rows_imported = conn
+        .import_from_parquet("sanitized_table", &parquet_path, options)
+        .await
+        .expect("Parquet import with sanitized names should succeed");
+
+    assert_eq!(rows_imported, 2, "Should import 2 rows");
+
+    // Verify using sanitized column names (uppercase with underscores)
+    let batches = conn
+        .query(&format!(
+            "SELECT USER_ID, FIRST_NAME, ACCOUNT_BALANCE FROM {}.sanitized_table ORDER BY USER_ID",
+            schema_name
+        ))
+        .await
+        .expect("SELECT with sanitized names should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 2, "Should have 2 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Test importing multiple Parquet files with auto table creation (union schema)
+#[tokio::test]
+#[ignore]
+async fn test_parquet_import_auto_create_multi_file() {
+    skip_if_no_exasol!();
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use exarrow_rs::import::ColumnNameMode;
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::path::PathBuf;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema only
+    conn.execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+    // Create two Parquet files with the same schema
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Float64, true),
+    ]));
+
+    // File 1
+    let path1 = temp_dir.path().join("part1.parquet");
+    {
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .expect("Failed to create batch 1");
+
+        let file = std::fs::File::create(&path1).expect("Failed to create file 1");
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .expect("Failed to create writer 1");
+        writer.write(&batch1).expect("Failed to write batch 1");
+        writer.close().expect("Failed to close writer 1");
+    }
+
+    // File 2
+    let path2 = temp_dir.path().join("part2.parquet");
+    {
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3, 4, 5])),
+                Arc::new(Float64Array::from(vec![30.0, 40.0, 50.0])),
+            ],
+        )
+        .expect("Failed to create batch 2");
+
+        let file = std::fs::File::create(&path2).expect("Failed to create file 2");
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .expect("Failed to create writer 2");
+        writer.write(&batch2).expect("Failed to write batch 2");
+        writer.close().expect("Failed to close writer 2");
+    }
+
+    // Import multiple files with auto table creation
+    let files: Vec<PathBuf> = vec![path1, path2];
+    let options = ParquetImportOptions::default()
+        .with_schema(&schema_name)
+        .with_create_table_if_not_exists(true)
+        .with_column_name_mode(ColumnNameMode::Quoted);
+
+    let rows_imported = conn
+        .import_parquet_from_files("multi_file_table", files, options)
+        .await
+        .expect("Multi-file Parquet import with auto-create should succeed");
+
+    assert_eq!(rows_imported, 5, "Should import 5 rows total (2 + 3)");
+
+    // Verify all data was imported
+    let batches = conn
+        .query(&format!(
+            "SELECT \"id\", \"value\" FROM {}.multi_file_table ORDER BY \"id\"",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 5, "Should have 5 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Test importing Parquet when table already exists (auto-create should be no-op)
+#[tokio::test]
+#[ignore]
+async fn test_parquet_import_auto_create_existing_table() {
+    skip_if_no_exasol!();
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use exarrow_rs::import::ColumnNameMode;
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+
+    // Create schema AND table (table already exists)
+    setup_import_export_table(&mut conn, &schema_name).await;
+
+    // Create a Parquet file matching the existing table schema
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("existing_table_test.parquet");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("amount", DataType::Float64, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(StringArray::from(vec!["X", "Y"])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0])),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    let file = std::fs::File::create(&parquet_path).expect("Failed to create parquet file");
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .expect("Failed to create ArrowWriter");
+    writer.write(&batch).expect("Failed to write batch");
+    writer.close().expect("Failed to close writer");
+
+    // Import with auto-create enabled (should work even though table exists)
+    let options = ParquetImportOptions::default()
+        .with_schema(&schema_name)
+        .with_create_table_if_not_exists(true)
+        .with_column_name_mode(ColumnNameMode::Quoted);
+
+    let rows_imported = conn
+        .import_from_parquet("test_data", &parquet_path, options)
+        .await
+        .expect("Import into existing table should succeed");
+
+    assert_eq!(rows_imported, 2, "Should import 2 rows");
+
+    // Verify data was imported
+    let batches = conn
+        .query(&format!(
+            "SELECT id, name, amount FROM {}.test_data ORDER BY id",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    assert!(!batches.is_empty(), "Should return results");
+    assert_eq!(batches[0].num_rows(), 2, "Should have 2 rows");
+
+    // Cleanup
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
