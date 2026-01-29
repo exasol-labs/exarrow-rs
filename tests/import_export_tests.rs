@@ -62,9 +62,7 @@ use exarrow_rs::query::export::ExportSource;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-// ============================================================================
 // Helper Functions
-// ============================================================================
 
 /// Helper to create a test schema and table for import/export tests
 async fn setup_import_export_table(conn: &mut Connection, schema_name: &str) {
@@ -97,9 +95,7 @@ async fn cleanup_schema(conn: &mut Connection, schema_name: &str) {
         .await;
 }
 
-// ============================================================================
 // Section 1: CSV Import Integration Tests
-// ============================================================================
 
 /// 11.1.1 Test import CSV into new table
 #[tokio::test]
@@ -359,9 +355,7 @@ async fn test_csv_import_from_stream() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 2: CSV Export Integration Tests
-// ============================================================================
 
 /// 11.2.1 Test export table to CSV file
 #[tokio::test]
@@ -648,9 +642,7 @@ async fn test_csv_export_to_stream() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 3: Parquet Integration Tests
-// ============================================================================
 
 /// 11.3.1 Test import Parquet file
 #[tokio::test]
@@ -878,9 +870,7 @@ async fn test_parquet_round_trip() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 4: Arrow Integration Tests
-// ============================================================================
 
 /// 11.4.1 Test import from RecordBatch
 #[tokio::test]
@@ -1209,9 +1199,7 @@ async fn test_arrow_round_trip() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 5: Edge Cases and Error Handling
-// ============================================================================
 
 /// Test CSV import with empty file
 #[tokio::test]
@@ -1395,9 +1383,7 @@ async fn test_large_dataset_import_export() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 6: Connection TLS Tests (WebSocket layer)
-// ============================================================================
 //
 // Note: These tests verify that import/export operations work correctly when
 // the main WebSocket connection uses TLS. The HTTP transport layer for
@@ -1587,9 +1573,7 @@ async fn test_tls_connection_round_trip() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 7: Parallel Import Integration Tests
-// ============================================================================
 
 /// 11.7.1 Test parallel CSV import with two files
 ///

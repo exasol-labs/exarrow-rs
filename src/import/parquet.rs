@@ -79,49 +79,42 @@ impl ParquetImportOptions {
         Self::default()
     }
 
-    /// Set the target schema.
     #[must_use]
     pub fn with_schema(mut self, schema: impl Into<String>) -> Self {
         self.schema = Some(schema.into());
         self
     }
 
-    /// Set the columns to import.
     #[must_use]
     pub fn with_columns(mut self, columns: Vec<String>) -> Self {
         self.columns = Some(columns);
         self
     }
 
-    /// Set the batch size for reading Parquet records.
     #[must_use]
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
     }
 
-    /// Set the NULL value representation.
     #[must_use]
     pub fn with_null_value(mut self, null_value: impl Into<String>) -> Self {
         self.null_value = null_value.into();
         self
     }
 
-    /// Set the column separator.
     #[must_use]
     pub fn with_column_separator(mut self, separator: char) -> Self {
         self.column_separator = separator;
         self
     }
 
-    /// Set the column delimiter.
     #[must_use]
     pub fn with_column_delimiter(mut self, delimiter: char) -> Self {
         self.column_delimiter = delimiter;
         self
     }
 
-    /// Enable or disable encryption for HTTP transport.
     #[must_use]
     pub fn with_encryption(mut self, use_encryption: bool) -> Self {
         self.use_encryption = use_encryption;

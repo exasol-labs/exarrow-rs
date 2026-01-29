@@ -101,84 +101,72 @@ impl CsvImportOptions {
         Self::default()
     }
 
-    /// Set the character encoding.
     #[must_use]
     pub fn encoding(mut self, encoding: &str) -> Self {
         self.encoding = encoding.to_string();
         self
     }
 
-    /// Set the column separator character.
     #[must_use]
     pub fn column_separator(mut self, sep: char) -> Self {
         self.column_separator = sep;
         self
     }
 
-    /// Set the column delimiter character.
     #[must_use]
     pub fn column_delimiter(mut self, delim: char) -> Self {
         self.column_delimiter = delim;
         self
     }
 
-    /// Set the row separator.
     #[must_use]
     pub fn row_separator(mut self, sep: RowSeparator) -> Self {
         self.row_separator = sep;
         self
     }
 
-    /// Set the number of header rows to skip.
     #[must_use]
     pub fn skip_rows(mut self, rows: u32) -> Self {
         self.skip_rows = rows;
         self
     }
 
-    /// Set a custom NULL value representation.
     #[must_use]
     pub fn null_value(mut self, val: &str) -> Self {
         self.null_value = Some(val.to_string());
         self
     }
 
-    /// Set the trim mode.
     #[must_use]
     pub fn trim_mode(mut self, mode: TrimMode) -> Self {
         self.trim_mode = mode;
         self
     }
 
-    /// Set the compression type.
     #[must_use]
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
     }
 
-    /// Set the reject limit.
     #[must_use]
     pub fn reject_limit(mut self, limit: u32) -> Self {
         self.reject_limit = Some(limit);
         self
     }
 
-    /// Enable or disable TLS encryption.
     #[must_use]
     pub fn use_tls(mut self, use_tls: bool) -> Self {
         self.use_tls = use_tls;
         self
     }
 
-    /// Set the target schema.
     #[must_use]
     pub fn schema(mut self, schema: &str) -> Self {
         self.schema = Some(schema.to_string());
         self
     }
 
-    /// Set the target columns.
     #[must_use]
     pub fn columns(mut self, columns: Vec<String>) -> Self {
         self.columns = Some(columns);

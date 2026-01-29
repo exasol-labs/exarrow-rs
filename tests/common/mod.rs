@@ -57,9 +57,7 @@ use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-// ============================================================================
 // Connection Constants with Default Values
-// ============================================================================
 
 /// Default host for Exasol database connection.
 pub const DEFAULT_HOST: &str = "localhost";
@@ -73,9 +71,7 @@ pub const DEFAULT_USER: &str = "sys";
 /// Default password for Exasol database connection.
 pub const DEFAULT_PASSWORD: &str = "exasol";
 
-// ============================================================================
 // Environment Variable Names
-// ============================================================================
 
 /// Environment variable name for overriding the Exasol host.
 const ENV_EXASOL_HOST: &str = "EXASOL_HOST";
@@ -89,9 +85,7 @@ const ENV_EXASOL_USER: &str = "EXASOL_USER";
 /// Environment variable name for overriding the Exasol password.
 const ENV_EXASOL_PASSWORD: &str = "EXASOL_PASSWORD";
 
-// ============================================================================
 // Configuration Helpers
-// ============================================================================
 
 /// Get the Exasol host from environment or use default.
 ///
@@ -182,9 +176,7 @@ pub async fn get_test_connection() -> Result<Connection, exarrow_rs::error::Exas
     Ok(database.connect().await?)
 }
 
-// ============================================================================
 // Exasol Availability Check
-// ============================================================================
 
 /// Check if Exasol is available at the configured host and port.
 ///
