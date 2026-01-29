@@ -548,13 +548,9 @@ where
     }
 
     // Establish parallel connections
-    let pool = ParallelTransportPool::connect(
-        &options.host,
-        options.port,
-        options.use_tls,
-        paths.len(),
-    )
-    .await?;
+    let pool =
+        ParallelTransportPool::connect(&options.host, options.port, options.use_tls, paths.len())
+            .await?;
 
     // Build multi-file IMPORT SQL
     let entries: Vec<ImportFileEntry> = pool
@@ -1507,9 +1503,11 @@ mod tests {
             .skip_rows(1)
             .compression(Compression::Gzip);
 
-        let entries = vec![
-            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
-        ];
+        let entries = vec![ImportFileEntry::new(
+            "10.0.0.5:8563".to_string(),
+            "001.csv".to_string(),
+            None,
+        )];
 
         let query = build_multi_file_query("data", &options, entries);
         let sql = query.build();

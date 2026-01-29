@@ -104,9 +104,7 @@ impl ParallelTransportPool {
                 HttpTransportClient::connect(&host, port, use_tls)
                     .await
                     .map_err(|e| {
-                        ImportError::HttpTransportError(format!(
-                            "Failed to connect to Exasol: {e}"
-                        ))
+                        ImportError::HttpTransportError(format!("Failed to connect to Exasol: {e}"))
                     })
             });
             connect_handles.push(handle);
@@ -126,10 +124,7 @@ impl ParallelTransportPool {
                     ))
                 })?
                 .map_err(|e| {
-                    ImportError::ParallelImportError(format!(
-                        "Connection {} failed: {e}",
-                        idx
-                    ))
+                    ImportError::ParallelImportError(format!("Connection {} failed: {e}", idx))
                 })?;
 
             // Generate file entry with unique file name
@@ -228,15 +223,9 @@ pub async fn stream_files_parallel(
 
             // Stream data in chunks
             for chunk in data.chunks(CHUNK_SIZE) {
-                client
-                    .write_chunked_body(chunk)
-                    .await
-                    .map_err(|e| {
-                        ImportError::ParallelImportError(format!(
-                            "File {} streaming failed: {e}",
-                            idx
-                        ))
-                    })?;
+                client.write_chunked_body(chunk).await.map_err(|e| {
+                    ImportError::ParallelImportError(format!("File {} streaming failed: {e}", idx))
+                })?;
             }
 
             // Send final chunk
@@ -260,9 +249,7 @@ pub async fn stream_files_parallel(
             .map_err(|e| {
                 ImportError::ParallelImportError(format!("Stream task {} panicked: {e}", idx))
             })?
-            .map_err(|e| {
-                ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx))
-            })?;
+            .map_err(|e| ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx)))?;
     }
 
     Ok(())
@@ -378,10 +365,7 @@ pub async fn convert_parquet_files_to_csv(
         let csv_data = handle
             .await
             .map_err(|e| {
-                ImportError::ParallelImportError(format!(
-                    "Conversion task {} panicked: {e}",
-                    idx
-                ))
+                ImportError::ParallelImportError(format!("Conversion task {} panicked: {e}", idx))
             })?
             .map_err(|e| {
                 ImportError::ParallelImportError(format!("Conversion {} failed: {e}", idx))
@@ -411,11 +395,7 @@ mod tests {
 
     #[test]
     fn test_import_file_entry_no_tls() {
-        let entry = ImportFileEntry::new(
-            "10.0.0.5:8563".to_string(),
-            "002.csv".to_string(),
-            None,
-        );
+        let entry = ImportFileEntry::new("10.0.0.5:8563".to_string(), "002.csv".to_string(), None);
 
         assert_eq!(entry.address, "10.0.0.5:8563");
         assert_eq!(entry.file_name, "002.csv");

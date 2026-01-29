@@ -49,12 +49,13 @@ pub use arrow::{
 };
 
 pub use csv::{
-    import_from_callback, import_from_file, import_from_files, import_from_iter, import_from_stream,
-    CsvImportOptions, DataPipeSender,
+    import_from_callback, import_from_file, import_from_files, import_from_iter,
+    import_from_stream, CsvImportOptions, DataPipeSender,
 };
 
 pub use parquet::{
-    import_from_parquet, import_from_parquet_files, import_from_parquet_stream, ParquetImportOptions,
+    import_from_parquet, import_from_parquet_files, import_from_parquet_stream,
+    ParquetImportOptions,
 };
 
 pub use parallel::{ImportFileEntry, ParallelTransportPool};
