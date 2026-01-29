@@ -349,6 +349,210 @@ async fn example_export_parquet(
     Ok(())
 }
 
+/// (c.1) Import multiple CSV files in parallel.
+///
+/// This demonstrates importing multiple CSV files simultaneously using Exasol's
+/// native IMPORT parallelization with multiple FILE clauses.
+async fn example_parallel_csv_import(
+    conn: &mut Connection,
+    _config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    println!("\n=== (c.1) Parallel CSV Import ===");
+
+    // Create a separate table for parallel import demo
+    let _ = conn
+        .execute_update(&format!("DROP TABLE {}.parallel_users", SCHEMA))
+        .await;
+
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.parallel_users (
+            id INTEGER,
+            name VARCHAR(100),
+            email VARCHAR(200),
+            age INTEGER
+        )",
+        SCHEMA
+    ))
+    .await?;
+
+    // Create multiple CSV files
+    let csv_path1 = Path::new(TEMP_DIR).join("users_part1.csv");
+    let csv_path2 = Path::new(TEMP_DIR).join("users_part2.csv");
+    let csv_path3 = Path::new(TEMP_DIR).join("users_part3.csv");
+
+    fs::write(
+        &csv_path1,
+        "1,Alice,alice@example.com,30
+2,Bob,bob@example.com,25",
+    )?;
+
+    fs::write(
+        &csv_path2,
+        "3,Charlie,charlie@example.com,35
+4,Diana,diana@example.com,28
+5,Eve,eve@example.com,32",
+    )?;
+
+    fs::write(
+        &csv_path3,
+        "6,Frank,frank@example.com,40
+7,Grace,grace@example.com,45",
+    )?;
+
+    println!(
+        "Created 3 CSV files: {} rows total",
+        2 + 3 + 2
+    );
+
+    // Import all files in parallel
+    let options = CsvImportOptions::default();
+    let paths = vec![
+        csv_path1.clone(),
+        csv_path2.clone(),
+        csv_path3.clone(),
+    ];
+
+    let rows = conn
+        .import_csv_from_files(&format!("{}.parallel_users", SCHEMA), paths, options)
+        .await?;
+
+    println!("Imported {} rows from 3 CSV files in parallel", rows);
+
+    // Verify the import
+    let results = conn
+        .query(&format!("SELECT COUNT(*) FROM {}.parallel_users", SCHEMA))
+        .await?;
+    println!(
+        "Verification: Table contains {} batches of results",
+        results.len()
+    );
+
+    Ok(())
+}
+
+/// (c.2) Import multiple Parquet files in parallel.
+///
+/// This demonstrates importing multiple Parquet files simultaneously.
+/// Each file is converted to CSV on-the-fly and streamed through parallel HTTP connections.
+async fn example_parallel_parquet_import(
+    conn: &mut Connection,
+    _config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    println!("\n=== (c.2) Parallel Parquet Import ===");
+
+    // Create a separate table for parallel Parquet import demo
+    let _ = conn
+        .execute_update(&format!("DROP TABLE {}.parallel_parquet_users", SCHEMA))
+        .await;
+
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.parallel_parquet_users (
+            id INTEGER,
+            name VARCHAR(100),
+            email VARCHAR(200),
+            age INTEGER
+        )",
+        SCHEMA
+    ))
+    .await?;
+
+    // Define Arrow schema
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("email", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]));
+
+    // Create first Parquet file
+    let parquet_path1 = Path::new(TEMP_DIR).join("users_part1.parquet");
+    {
+        let ids = Int32Array::from(vec![100, 101, 102]);
+        let names = StringArray::from(vec!["Henry", "Ivy", "Jack"]);
+        let emails = StringArray::from(vec![
+            "henry@example.com",
+            "ivy@example.com",
+            "jack@example.com",
+        ]);
+        let ages = Int32Array::from(vec![50, 35, 42]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(emails),
+                Arc::new(ages),
+            ],
+        )?;
+
+        let file = fs::File::create(&parquet_path1)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    // Create second Parquet file
+    let parquet_path2 = Path::new(TEMP_DIR).join("users_part2.parquet");
+    {
+        let ids = Int32Array::from(vec![103, 104]);
+        let names = StringArray::from(vec!["Kate", "Leo"]);
+        let emails = StringArray::from(vec!["kate@example.com", "leo@example.com"]);
+        let ages = Int32Array::from(vec![28, 33]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(emails),
+                Arc::new(ages),
+            ],
+        )?;
+
+        let file = fs::File::create(&parquet_path2)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    println!("Created 2 Parquet files: {} rows total", 3 + 2);
+
+    // Import all Parquet files in parallel
+    let options = ParquetImportOptions::default();
+    let paths = vec![parquet_path1.clone(), parquet_path2.clone()];
+
+    let rows = conn
+        .import_parquet_from_files(
+            &format!("{}.parallel_parquet_users", SCHEMA),
+            paths,
+            options,
+        )
+        .await?;
+
+    println!("Imported {} rows from 2 Parquet files in parallel", rows);
+
+    // Verify the import
+    let results = conn
+        .query(&format!(
+            "SELECT COUNT(*) FROM {}.parallel_parquet_users",
+            SCHEMA
+        ))
+        .await?;
+    println!(
+        "Verification: Table contains {} batches of results",
+        results.len()
+    );
+
+    Ok(())
+}
+
 // =============================================================================
 // MAIN
 // =============================================================================
@@ -421,6 +625,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // (b.2) Export to Parquet
         if let Err(e) = example_export_parquet(&mut conn, &config).await {
             eprintln!("Parquet export failed: {}", e);
+        }
+
+        // (c.1) Parallel CSV Import
+        if let Err(e) = example_parallel_csv_import(&mut conn, &config).await {
+            eprintln!("Parallel CSV import failed: {}", e);
+        }
+
+        // (c.2) Parallel Parquet Import
+        if let Err(e) = example_parallel_parquet_import(&mut conn, &config).await {
+            eprintln!("Parallel Parquet import failed: {}", e);
         }
 
         Ok::<(), Box<dyn Error>>(())
