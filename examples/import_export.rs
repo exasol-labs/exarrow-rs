@@ -66,10 +66,6 @@ impl Config {
     }
 }
 
-// =============================================================================
-// HELPER FUNCTIONS
-// =============================================================================
-
 /// Establishes a connection to the Exasol database.
 async fn connect(config: &Config) -> Result<Connection, Box<dyn Error>> {
     let driver = Driver::new();
@@ -84,15 +80,12 @@ async fn connect(config: &Config) -> Result<Connection, Box<dyn Error>> {
 
 /// Sets up the example schema and tables.
 async fn setup(conn: &mut Connection) -> Result<(), Box<dyn Error>> {
-    // Create temp directory
     fs::create_dir_all(TEMP_DIR)?;
 
-    // Create schema (ignore error if exists)
     let _ = conn
         .execute_update(&format!("CREATE SCHEMA {}", SCHEMA))
         .await;
 
-    // Create a sample table for imports
     let _ = conn
         .execute_update(&format!("DROP TABLE {}.users", SCHEMA))
         .await;
@@ -108,7 +101,6 @@ async fn setup(conn: &mut Connection) -> Result<(), Box<dyn Error>> {
     ))
     .await?;
 
-    // Create a table with sample data for exports
     let _ = conn
         .execute_update(&format!("DROP TABLE {}.products", SCHEMA))
         .await;
@@ -124,7 +116,6 @@ async fn setup(conn: &mut Connection) -> Result<(), Box<dyn Error>> {
     ))
     .await?;
 
-    // Insert sample data for export tests
     conn.execute_update(&format!(
         "INSERT INTO {}.products VALUES
             (1, 'Widget', 19.99, 100),
@@ -175,7 +166,6 @@ fn create_sample_parquet() -> Result<std::path::PathBuf, Box<dyn Error>> {
 
     let parquet_path = Path::new(TEMP_DIR).join("sample_users.parquet");
 
-    // Define schema
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, false),
@@ -183,7 +173,6 @@ fn create_sample_parquet() -> Result<std::path::PathBuf, Box<dyn Error>> {
         Field::new("age", DataType::Int32, false),
     ]));
 
-    // Create arrays
     let ids = Int32Array::from(vec![10, 11, 12, 13, 14]);
     let names = StringArray::from(vec!["Frank", "Grace", "Henry", "Ivy", "Jack"]);
     let emails = StringArray::from(vec![
@@ -195,7 +184,6 @@ fn create_sample_parquet() -> Result<std::path::PathBuf, Box<dyn Error>> {
     ]);
     let ages = Int32Array::from(vec![40, 45, 50, 35, 42]);
 
-    // Create record batch
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -206,7 +194,6 @@ fn create_sample_parquet() -> Result<std::path::PathBuf, Box<dyn Error>> {
         ],
     )?;
 
-    // Write to Parquet file
     let file = fs::File::create(&parquet_path)?;
     let mut writer = ArrowWriter::try_new(file, schema, None)?;
     writer.write(&batch)?;
@@ -216,20 +203,15 @@ fn create_sample_parquet() -> Result<std::path::PathBuf, Box<dyn Error>> {
     Ok(parquet_path)
 }
 
-// =============================================================================
-// EXAMPLE FUNCTIONS
-// =============================================================================
-
-/// (a.1) Import data from a Parquet file.
+/// Import data from a Parquet file.
 async fn example_import_parquet(
     conn: &mut Connection,
     _config: &Config,
 ) -> Result<(), Box<dyn Error>> {
-    println!("\n=== (a.1) Import from Parquet ===");
+    println!("\n=== Import from Parquet ===");
 
     let parquet_path = create_sample_parquet()?;
 
-    // The Connection automatically passes its host/port to import options
     // Note: Table name already includes schema, so no need to set .with_schema()
     let options = ParquetImportOptions::default();
 
@@ -239,7 +221,6 @@ async fn example_import_parquet(
 
     println!("Imported {} rows from Parquet file", rows);
 
-    // Verify the import
     let results = conn
         .query(&format!(
             "SELECT COUNT(*) FROM {}.users WHERE id >= 10",
@@ -251,13 +232,12 @@ async fn example_import_parquet(
     Ok(())
 }
 
-/// (a.2) Import data from a CSV file.
+/// Import data from a CSV file.
 async fn example_import_csv(conn: &mut Connection, _config: &Config) -> Result<(), Box<dyn Error>> {
-    println!("\n=== (a.2) Import from CSV ===");
+    println!("\n=== Import from CSV ===");
 
     let csv_path = create_sample_csv()?;
 
-    // The Connection automatically passes its host/port to import options
     // Note: Table name already includes schema, so no need to set .schema()
     let options = CsvImportOptions::default();
 
@@ -267,7 +247,6 @@ async fn example_import_csv(conn: &mut Connection, _config: &Config) -> Result<(
 
     println!("Imported {} rows from CSV file", rows);
 
-    // Verify the import
     let results = conn
         .query(&format!(
             "SELECT COUNT(*) FROM {}.users WHERE id < 10",
@@ -279,9 +258,9 @@ async fn example_import_csv(conn: &mut Connection, _config: &Config) -> Result<(
     Ok(())
 }
 
-/// (b.1) Export data to a CSV file.
+/// Export data to a CSV file.
 async fn example_export_csv(conn: &mut Connection, _config: &Config) -> Result<(), Box<dyn Error>> {
-    println!("\n=== (b.1) Export to CSV ===");
+    println!("\n=== Export to CSV ===");
 
     let csv_path = Path::new(TEMP_DIR).join("exported_products.csv");
 
@@ -291,26 +270,24 @@ async fn example_export_csv(conn: &mut Connection, _config: &Config) -> Result<(
         columns: vec![],
     };
 
-    // The Connection automatically passes its host/port to export options
     let options = CsvExportOptions::default().with_column_names(true);
 
     let rows = conn.export_csv_to_file(source, &csv_path, options).await?;
 
     println!("Exported {} rows to CSV file: {}", rows, csv_path.display());
 
-    // Show file contents
     let content = fs::read_to_string(&csv_path)?;
     println!("CSV contents:\n{}", content);
 
     Ok(())
 }
 
-/// (b.2) Export data to a Parquet file.
+/// Export data to a Parquet file.
 async fn example_export_parquet(
     conn: &mut Connection,
     _config: &Config,
 ) -> Result<(), Box<dyn Error>> {
-    println!("\n=== (b.2) Export to Parquet ===");
+    println!("\n=== Export to Parquet ===");
 
     let parquet_path = Path::new(TEMP_DIR).join("exported_products.parquet");
 
@@ -321,7 +298,6 @@ async fn example_export_parquet(
         ),
     };
 
-    // The Connection automatically passes its host/port to export options
     let options = ParquetExportOptions::default();
 
     let rows = conn
@@ -334,7 +310,6 @@ async fn example_export_parquet(
         parquet_path.display()
     );
 
-    // Verify by reading the Parquet file
     let file = fs::File::open(&parquet_path)?;
     let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(file, 1024)?;
 
@@ -349,9 +324,192 @@ async fn example_export_parquet(
     Ok(())
 }
 
-// =============================================================================
-// MAIN
-// =============================================================================
+/// Import multiple CSV files in parallel.
+///
+/// This demonstrates importing multiple CSV files simultaneously using Exasol's
+/// native IMPORT parallelization with multiple FILE clauses.
+async fn example_parallel_csv_import(
+    conn: &mut Connection,
+    _config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    println!("\n=== Parallel CSV Import ===");
+
+    let _ = conn
+        .execute_update(&format!("DROP TABLE {}.parallel_users", SCHEMA))
+        .await;
+
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.parallel_users (
+            id INTEGER,
+            name VARCHAR(100),
+            email VARCHAR(200),
+            age INTEGER
+        )",
+        SCHEMA
+    ))
+    .await?;
+
+    let csv_path1 = Path::new(TEMP_DIR).join("users_part1.csv");
+    let csv_path2 = Path::new(TEMP_DIR).join("users_part2.csv");
+    let csv_path3 = Path::new(TEMP_DIR).join("users_part3.csv");
+
+    fs::write(
+        &csv_path1,
+        "1,Alice,alice@example.com,30
+2,Bob,bob@example.com,25",
+    )?;
+
+    fs::write(
+        &csv_path2,
+        "3,Charlie,charlie@example.com,35
+4,Diana,diana@example.com,28
+5,Eve,eve@example.com,32",
+    )?;
+
+    fs::write(
+        &csv_path3,
+        "6,Frank,frank@example.com,40
+7,Grace,grace@example.com,45",
+    )?;
+
+    println!("Created 3 CSV files: {} rows total", 2 + 3 + 2);
+
+    let options = CsvImportOptions::default();
+    let paths = vec![csv_path1.clone(), csv_path2.clone(), csv_path3.clone()];
+
+    let rows = conn
+        .import_csv_from_files(&format!("{}.parallel_users", SCHEMA), paths, options)
+        .await?;
+
+    println!("Imported {} rows from 3 CSV files in parallel", rows);
+
+    let results = conn
+        .query(&format!("SELECT COUNT(*) FROM {}.parallel_users", SCHEMA))
+        .await?;
+    println!(
+        "Verification: Table contains {} batches of results",
+        results.len()
+    );
+
+    Ok(())
+}
+
+/// Import multiple Parquet files in parallel.
+///
+/// This demonstrates importing multiple Parquet files simultaneously.
+/// Each file is converted to CSV on-the-fly and streamed through parallel HTTP connections.
+async fn example_parallel_parquet_import(
+    conn: &mut Connection,
+    _config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    println!("\n=== Parallel Parquet Import ===");
+
+    let _ = conn
+        .execute_update(&format!("DROP TABLE {}.parallel_parquet_users", SCHEMA))
+        .await;
+
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.parallel_parquet_users (
+            id INTEGER,
+            name VARCHAR(100),
+            email VARCHAR(200),
+            age INTEGER
+        )",
+        SCHEMA
+    ))
+    .await?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("email", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]));
+
+    let parquet_path1 = Path::new(TEMP_DIR).join("users_part1.parquet");
+    {
+        let ids = Int32Array::from(vec![100, 101, 102]);
+        let names = StringArray::from(vec!["Henry", "Ivy", "Jack"]);
+        let emails = StringArray::from(vec![
+            "henry@example.com",
+            "ivy@example.com",
+            "jack@example.com",
+        ]);
+        let ages = Int32Array::from(vec![50, 35, 42]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(emails),
+                Arc::new(ages),
+            ],
+        )?;
+
+        let file = fs::File::create(&parquet_path1)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    let parquet_path2 = Path::new(TEMP_DIR).join("users_part2.parquet");
+    {
+        let ids = Int32Array::from(vec![103, 104]);
+        let names = StringArray::from(vec!["Kate", "Leo"]);
+        let emails = StringArray::from(vec!["kate@example.com", "leo@example.com"]);
+        let ages = Int32Array::from(vec![28, 33]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(emails),
+                Arc::new(ages),
+            ],
+        )?;
+
+        let file = fs::File::create(&parquet_path2)?;
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    println!("Created 2 Parquet files: {} rows total", 3 + 2);
+
+    let options = ParquetImportOptions::default();
+    let paths = vec![parquet_path1.clone(), parquet_path2.clone()];
+
+    let rows = conn
+        .import_parquet_from_files(
+            &format!("{}.parallel_parquet_users", SCHEMA),
+            paths,
+            options,
+        )
+        .await?;
+
+    println!("Imported {} rows from 2 Parquet files in parallel", rows);
+
+    let results = conn
+        .query(&format!(
+            "SELECT COUNT(*) FROM {}.parallel_parquet_users",
+            SCHEMA
+        ))
+        .await?;
+    println!(
+        "Verification: Table contains {} batches of results",
+        results.len()
+    );
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -399,28 +557,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Setup
     setup(&mut conn).await?;
 
-    // Run examples
     // Note: HTTP transport uses client mode - the client connects to Exasol
-
     let results = async {
-        // (a.1) Import from Parquet
         if let Err(e) = example_import_parquet(&mut conn, &config).await {
             eprintln!("Parquet import failed: {}", e);
         }
 
-        // (a.2) Import from CSV
         if let Err(e) = example_import_csv(&mut conn, &config).await {
             eprintln!("CSV import failed: {}", e);
         }
 
-        // (b.1) Export to CSV
         if let Err(e) = example_export_csv(&mut conn, &config).await {
             eprintln!("CSV export failed: {}", e);
         }
 
-        // (b.2) Export to Parquet
         if let Err(e) = example_export_parquet(&mut conn, &config).await {
             eprintln!("Parquet export failed: {}", e);
+        }
+
+        if let Err(e) = example_parallel_csv_import(&mut conn, &config).await {
+            eprintln!("Parallel CSV import failed: {}", e);
+        }
+
+        if let Err(e) = example_parallel_parquet_import(&mut conn, &config).await {
+            eprintln!("Parallel Parquet import failed: {}", e);
         }
 
         Ok::<(), Box<dyn Error>>(())

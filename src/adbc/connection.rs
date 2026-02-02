@@ -1082,6 +1082,70 @@ impl Connection {
         crate::export::csv::export_to_list(&mut *transport_guard, source, options).await
     }
 
+    /// Import multiple CSV files in parallel into an Exasol table.
+    ///
+    /// This method reads CSV data from multiple files and imports them into
+    /// the target table using parallel HTTP transport connections. Each file
+    /// gets its own connection with a unique internal address.
+    ///
+    /// For a single file, this method delegates to `import_csv_from_file`.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `paths` - File paths (accepts single path, Vec, array, or slice)
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails. Uses fail-fast semantics.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::CsvImportOptions;
+    /// use std::path::PathBuf;
+    ///
+    /// # async fn example(conn: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let files = vec![
+    ///     PathBuf::from("/data/part1.csv"),
+    ///     PathBuf::from("/data/part2.csv"),
+    /// ];
+    ///
+    /// let options = CsvImportOptions::default();
+    /// let rows = conn.import_csv_from_files("my_table", files, options).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_csv_from_files<S: crate::import::IntoFileSources>(
+        &mut self,
+        table: &str,
+        paths: S,
+        options: crate::import::csv::CsvImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .exasol_host(&self.params.host)
+            .exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::csv::import_from_files(execute_sql, table, paths, options).await
+    }
+
     /// Import data from a Parquet file into an Exasol table.
     ///
     /// This method reads a Parquet file, converts the data to CSV format,
@@ -1125,6 +1189,69 @@ impl Connection {
         };
 
         crate::import::parquet::import_from_parquet(execute_sql, table, file_path, options).await
+    }
+
+    /// Import multiple Parquet files in parallel into an Exasol table.
+    ///
+    /// This method converts each Parquet file to CSV format concurrently,
+    /// then streams the data through parallel HTTP transport connections.
+    ///
+    /// For a single file, this method delegates to `import_from_parquet`.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `paths` - File paths (accepts single path, Vec, array, or slice)
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails. Uses fail-fast semantics.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use exarrow_rs::adbc::Connection;
+    /// use exarrow_rs::import::ParquetImportOptions;
+    /// use std::path::PathBuf;
+    ///
+    /// # async fn example(conn: &mut Connection) -> Result<(), Box<dyn std::error::Error>> {
+    /// let files = vec![
+    ///     PathBuf::from("/data/part1.parquet"),
+    ///     PathBuf::from("/data/part2.parquet"),
+    /// ];
+    ///
+    /// let options = ParquetImportOptions::default();
+    /// let rows = conn.import_parquet_from_files("my_table", files, options).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn import_parquet_from_files<S: crate::import::IntoFileSources>(
+        &mut self,
+        table: &str,
+        paths: S,
+        options: crate::import::parquet::ParquetImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        // Pass Exasol host/port from connection params to import options
+        let options = options
+            .with_exasol_host(&self.params.host)
+            .with_exasol_port(self.params.port);
+
+        let transport = Arc::clone(&self.transport);
+        let execute_sql = |sql: String| async move {
+            let mut transport_guard = transport.lock().await;
+            match transport_guard.execute_query(&sql).await {
+                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        crate::import::parquet::import_from_parquet_files(execute_sql, table, paths, options).await
     }
 
     /// Export data from an Exasol table or query to a Parquet file.
@@ -1411,6 +1538,33 @@ impl Connection {
         blocking_runtime().block_on(self.import_csv_from_file(table, file_path, options))
     }
 
+    /// Import multiple CSV files in parallel into an Exasol table (blocking).
+    ///
+    /// This is a synchronous wrapper around [`import_csv_from_files`](Self::import_csv_from_files)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `paths` - File paths (accepts single path, Vec, array, or slice)
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    pub fn blocking_import_csv_from_files<S: crate::import::IntoFileSources>(
+        &mut self,
+        table: &str,
+        paths: S,
+        options: crate::import::csv::CsvImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        blocking_runtime().block_on(self.import_csv_from_files(table, paths, options))
+    }
+
     /// Import data from a Parquet file into an Exasol table (blocking).
     ///
     /// This is a synchronous wrapper around [`import_from_parquet`](Self::import_from_parquet)
@@ -1439,6 +1593,33 @@ impl Connection {
         options: crate::import::parquet::ParquetImportOptions,
     ) -> Result<u64, crate::import::ImportError> {
         blocking_runtime().block_on(self.import_from_parquet(table, file_path, options))
+    }
+
+    /// Import multiple Parquet files in parallel into an Exasol table (blocking).
+    ///
+    /// This is a synchronous wrapper around [`import_parquet_from_files`](Self::import_parquet_from_files)
+    /// for use in non-async contexts.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - Name of the target table
+    /// * `paths` - File paths (accepts single path, Vec, array, or slice)
+    /// * `options` - Import options
+    ///
+    /// # Returns
+    ///
+    /// The number of rows imported on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImportError` if the import fails.
+    pub fn blocking_import_parquet_from_files<S: crate::import::IntoFileSources>(
+        &mut self,
+        table: &str,
+        paths: S,
+        options: crate::import::parquet::ParquetImportOptions,
+    ) -> Result<u64, crate::import::ImportError> {
+        blocking_runtime().block_on(self.import_parquet_from_files(table, paths, options))
     }
 
     /// Import data from an Arrow RecordBatch into an Exasol table (blocking).

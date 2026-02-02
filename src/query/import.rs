@@ -78,10 +78,58 @@ impl TrimMode {
     }
 }
 
+/// Entry for a single file in a multi-file IMPORT statement.
+///
+/// Used with `ImportQuery::with_files()` to build IMPORT statements
+/// that reference multiple FILE clauses for parallel import.
+#[derive(Debug, Clone)]
+pub struct ImportFileEntry {
+    /// Internal address from EXA handshake (format: "host:port")
+    pub address: String,
+    /// File name for this entry (e.g., "001.csv", "002.csv")
+    pub file_name: String,
+    /// Optional public key fingerprint for TLS
+    pub public_key: Option<String>,
+}
+
+impl ImportFileEntry {
+    /// Create a new import file entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` - Internal address from EXA handshake
+    /// * `file_name` - File name for this entry
+    /// * `public_key` - Optional public key fingerprint for TLS
+    pub fn new(address: String, file_name: String, public_key: Option<String>) -> Self {
+        Self {
+            address,
+            file_name,
+            public_key,
+        }
+    }
+}
+
 /// Builder for constructing Exasol IMPORT SQL statements.
 ///
 /// The ImportQuery builder allows you to configure all aspects of an IMPORT statement
 /// including the target table, columns, CSV format options, and error handling.
+///
+/// # Multi-file Import
+///
+/// For parallel imports, use `with_files()` instead of `at_address()` and `file_name()`:
+///
+/// ```rust
+/// use exarrow_rs::query::import::{ImportQuery, ImportFileEntry};
+///
+/// let entries = vec![
+///     ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+///     ImportFileEntry::new("10.0.0.6:8563".to_string(), "002.csv".to_string(), None),
+/// ];
+///
+/// let query = ImportQuery::new("my_table")
+///     .with_files(entries)
+///     .build();
+/// ```
 #[derive(Debug, Clone)]
 pub struct ImportQuery {
     /// Target table name (required)
@@ -90,12 +138,14 @@ pub struct ImportQuery {
     schema: Option<String>,
     /// Columns to import into (optional, imports all if not specified)
     columns: Option<Vec<String>>,
-    /// HTTP address for the CSV source (e.g., "192.168.1.1:8080")
+    /// HTTP address for the CSV source (e.g., "192.168.1.1:8080") - single file mode
     address: Option<String>,
-    /// SHA-256 fingerprint for TLS public key verification
+    /// SHA-256 fingerprint for TLS public key verification - single file mode
     public_key: Option<String>,
-    /// File name (default "001.csv")
+    /// File name (default "001.csv") - single file mode
     file_name: String,
+    /// Multiple file entries for parallel import
+    file_entries: Option<Vec<ImportFileEntry>>,
     /// Column separator character (default ',')
     column_separator: char,
     /// Column delimiter character for quoting (default '"')
@@ -130,6 +180,7 @@ impl ImportQuery {
             address: None,
             public_key: None,
             file_name: "001.csv".to_string(),
+            file_entries: None,
             column_separator: ',',
             column_delimiter: '"',
             row_separator: RowSeparator::default(),
@@ -274,6 +325,23 @@ impl ImportQuery {
         self
     }
 
+    /// Set multiple file entries for parallel import.
+    ///
+    /// This method enables multi-file IMPORT statements where each file
+    /// has its own AT/FILE clause with a unique internal address.
+    ///
+    /// # Arguments
+    /// * `entries` - Vector of file entries with addresses and file names
+    ///
+    /// # Note
+    ///
+    /// When using `with_files()`, the `at_address()` and `file_name()` methods
+    /// are ignored and should not be called.
+    pub fn with_files(mut self, entries: Vec<ImportFileEntry>) -> Self {
+        self.file_entries = Some(entries);
+        self
+    }
+
     /// Get the configured file name with appropriate extension for compression.
     fn get_file_name(&self) -> String {
         // If compression is set and file_name doesn't already have the right extension
@@ -310,32 +378,63 @@ impl ImportQuery {
             sql.push(')');
         }
 
-        // FROM CSV AT clause
-        sql.push_str("\nFROM CSV AT '");
+        // FROM CSV clause - either multi-file or single-file mode
+        if let Some(ref entries) = self.file_entries {
+            // Multi-file mode: FROM CSV AT 'addr1' FILE '001.csv' AT 'addr2' FILE '002.csv' ...
+            sql.push_str("\nFROM CSV");
 
-        // Use https:// if public_key is set, otherwise http://
-        if self.public_key.is_some() {
-            sql.push_str("https://");
+            for entry in entries {
+                sql.push_str(" AT '");
+
+                // Use https:// if public_key is set, otherwise http://
+                if entry.public_key.is_some() {
+                    sql.push_str("https://");
+                } else {
+                    sql.push_str("http://");
+                }
+                sql.push_str(&entry.address);
+                sql.push('\'');
+
+                // PUBLIC KEY clause for this entry
+                if let Some(ref pk) = entry.public_key {
+                    sql.push_str(" PUBLIC KEY '");
+                    sql.push_str(pk);
+                    sql.push('\'');
+                }
+
+                // FILE clause for this entry
+                sql.push_str(" FILE '");
+                sql.push_str(&self.get_file_name_for(&entry.file_name));
+                sql.push('\'');
+            }
         } else {
-            sql.push_str("http://");
-        }
+            // Single-file mode: FROM CSV AT 'addr' FILE '001.csv'
+            sql.push_str("\nFROM CSV AT '");
 
-        if let Some(ref addr) = self.address {
-            sql.push_str(addr);
-        }
-        sql.push('\'');
+            // Use https:// if public_key is set, otherwise http://
+            if self.public_key.is_some() {
+                sql.push_str("https://");
+            } else {
+                sql.push_str("http://");
+            }
 
-        // PUBLIC KEY clause
-        if let Some(ref pk) = self.public_key {
-            sql.push_str(" PUBLIC KEY '");
-            sql.push_str(pk);
+            if let Some(ref addr) = self.address {
+                sql.push_str(addr);
+            }
+            sql.push('\'');
+
+            // PUBLIC KEY clause
+            if let Some(ref pk) = self.public_key {
+                sql.push_str(" PUBLIC KEY '");
+                sql.push_str(pk);
+                sql.push('\'');
+            }
+
+            // FILE clause
+            sql.push_str("\nFILE '");
+            sql.push_str(&self.get_file_name());
             sql.push('\'');
         }
-
-        // FILE clause
-        sql.push_str("\nFILE '");
-        sql.push_str(&self.get_file_name());
-        sql.push('\'');
 
         // Format options
         sql.push_str("\nENCODING = '");
@@ -381,6 +480,17 @@ impl ImportQuery {
         }
 
         sql
+    }
+
+    /// Get file name with compression extension for multi-file entries.
+    fn get_file_name_for(&self, base_name: &str) -> String {
+        let base = base_name
+            .trim_end_matches(".csv")
+            .trim_end_matches(".gz")
+            .trim_end_matches(".bz2")
+            .trim_end_matches(".csv");
+
+        format!("{}{}", base, self.compression.extension())
     }
 }
 
@@ -527,6 +637,125 @@ mod tests {
         assert_eq!(RowSeparator::default(), RowSeparator::LF);
         assert_eq!(Compression::default(), Compression::None);
         assert_eq!(TrimMode::default(), TrimMode::None);
+    }
+
+    #[test]
+    fn test_import_file_entry() {
+        let entry = ImportFileEntry::new(
+            "10.0.0.5:8563".to_string(),
+            "001.csv".to_string(),
+            Some("sha256//abc123".to_string()),
+        );
+
+        assert_eq!(entry.address, "10.0.0.5:8563");
+        assert_eq!(entry.file_name, "001.csv");
+        assert_eq!(entry.public_key, Some("sha256//abc123".to_string()));
+    }
+
+    #[test]
+    fn test_multi_file_import_basic() {
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.6:8564".to_string(), "002.csv".to_string(), None),
+        ];
+
+        let sql = ImportQuery::new("my_table").with_files(entries).build();
+
+        assert!(sql.contains("IMPORT INTO my_table"));
+        assert!(sql.contains("FROM CSV"));
+        assert!(sql.contains("AT 'http://10.0.0.5:8563' FILE '001.csv'"));
+        assert!(sql.contains("AT 'http://10.0.0.6:8564' FILE '002.csv'"));
+    }
+
+    #[test]
+    fn test_multi_file_import_with_tls() {
+        let entries = vec![
+            ImportFileEntry::new(
+                "10.0.0.5:8563".to_string(),
+                "001.csv".to_string(),
+                Some("sha256//fingerprint1".to_string()),
+            ),
+            ImportFileEntry::new(
+                "10.0.0.6:8564".to_string(),
+                "002.csv".to_string(),
+                Some("sha256//fingerprint2".to_string()),
+            ),
+        ];
+
+        let sql = ImportQuery::new("secure_table").with_files(entries).build();
+
+        assert!(sql.contains("AT 'https://10.0.0.5:8563' PUBLIC KEY 'sha256//fingerprint1'"));
+        assert!(sql.contains("AT 'https://10.0.0.6:8564' PUBLIC KEY 'sha256//fingerprint2'"));
+    }
+
+    #[test]
+    fn test_multi_file_import_with_compression() {
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.6:8564".to_string(), "002.csv".to_string(), None),
+        ];
+
+        let sql = ImportQuery::new("compressed_table")
+            .with_files(entries)
+            .compressed(Compression::Gzip)
+            .build();
+
+        assert!(sql.contains("FILE '001.csv.gz'"));
+        assert!(sql.contains("FILE '002.csv.gz'"));
+    }
+
+    #[test]
+    fn test_multi_file_import_three_files() {
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.6:8564".to_string(), "002.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.7:8565".to_string(), "003.csv".to_string(), None),
+        ];
+
+        let sql = ImportQuery::new("data").with_files(entries).build();
+
+        assert!(sql.contains("AT 'http://10.0.0.5:8563' FILE '001.csv'"));
+        assert!(sql.contains("AT 'http://10.0.0.6:8564' FILE '002.csv'"));
+        assert!(sql.contains("AT 'http://10.0.0.7:8565' FILE '003.csv'"));
+    }
+
+    #[test]
+    fn test_multi_file_import_with_schema_and_columns() {
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.6:8564".to_string(), "002.csv".to_string(), None),
+        ];
+
+        let sql = ImportQuery::new("my_table")
+            .schema("my_schema")
+            .columns(vec!["id", "name", "value"])
+            .with_files(entries)
+            .build();
+
+        assert!(sql.contains("IMPORT INTO my_schema.my_table (id, name, value)"));
+    }
+
+    #[test]
+    fn test_multi_file_import_with_all_options() {
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new("10.0.0.6:8564".to_string(), "002.csv".to_string(), None),
+        ];
+
+        let sql = ImportQuery::new("data")
+            .with_files(entries)
+            .encoding("ISO-8859-1")
+            .column_separator(';')
+            .skip(1)
+            .null_value("NULL")
+            .reject_limit(100)
+            .build();
+
+        assert!(sql.contains("ENCODING = 'ISO-8859-1'"));
+        assert!(sql.contains("COLUMN SEPARATOR = ';'"));
+        assert!(sql.contains("SKIP = 1"));
+        assert!(sql.contains("NULL = 'NULL'"));
+        assert!(sql.contains("REJECT LIMIT 100"));
     }
 
     #[test]

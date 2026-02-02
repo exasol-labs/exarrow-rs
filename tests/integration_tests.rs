@@ -79,9 +79,7 @@ use common::{
 };
 use exarrow_rs::adbc::Connection;
 
-// ============================================================================
 // Infrastructure Tests
-// ============================================================================
 // These tests validate that the test infrastructure itself works correctly.
 
 #[test]
@@ -133,9 +131,7 @@ fn test_schema_name_generation_is_unique() {
     assert!(schema1.len() > 17, "Schema name should include timestamp");
 }
 
-// ============================================================================
 // Connection Infrastructure Tests (require Exasol)
-// ============================================================================
 
 #[tokio::test]
 async fn test_connection_helper_works_when_exasol_available() {
@@ -175,9 +171,7 @@ async fn test_is_exasol_available_detects_running_instance() {
     );
 }
 
-// ============================================================================
 // Section 2: Connection Integration Tests
-// ============================================================================
 // Tests for connection establishment, failure handling, and resource management.
 
 /// 2.1 Test successful connection to Exasol with valid credentials
@@ -286,9 +280,7 @@ async fn test_connection_health_check() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 3: Basic Query Integration Tests
-// ============================================================================
 // Tests for SELECT queries, Arrow RecordBatch validation, and data retrieval.
 
 /// 3.1 Test SELECT from DUAL returns correct results
@@ -418,9 +410,7 @@ async fn test_string_data_and_utf8() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 4: DDL Integration Tests
-// ============================================================================
 // Tests for CREATE/DROP SCHEMA and TABLE operations.
 
 /// 4.1 Test CREATE SCHEMA for test isolation
@@ -613,9 +603,7 @@ async fn test_drop_schema() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 5: DML Integration Tests
-// ============================================================================
 // Tests for INSERT, SELECT, UPDATE, and DELETE operations.
 
 /// Helper to create a test schema and table for DML tests
@@ -859,9 +847,7 @@ async fn test_delete_row() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 6: Transaction Integration Tests
-// ============================================================================
 // Tests for transaction begin, commit, rollback, and auto-commit behavior.
 
 /// 6.1 Test explicit transaction begin
@@ -1063,9 +1049,7 @@ async fn test_auto_commit_behavior() {
     conn2.close().await.expect("Failed to close connection 2");
 }
 
-// ============================================================================
 // Section 7: Arrow Conversion Validation
-// ============================================================================
 // Tests for verifying correct conversion of Exasol types to Arrow types.
 
 /// 7.1 Test INTEGER type conversion to Arrow Int64
@@ -1435,9 +1419,7 @@ async fn test_date_timestamp_conversion() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Additional Arrow Validation Tests
-// ============================================================================
 
 /// Test BOOLEAN type conversion
 #[tokio::test]
@@ -1682,9 +1664,7 @@ async fn test_empty_result_set() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// ============================================================================
 // Section 8: Prepared Statement Integration Tests
-// ============================================================================
 // Tests for prepared statement lifecycle, parameter binding, and execution.
 
 /// 8.1 Test creating and closing a prepared statement
