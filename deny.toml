@@ -19,5 +19,8 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "Unicode-3.0",
-    "OpenSSL",  # Required by aws-lc-sys (inherited from OpenSSL fork history)
 ]
+
+[[licenses.exceptions]]
+name = "aws-lc-sys"
+allow = ["OpenSSL"]  # Inherited from OpenSSL fork history
