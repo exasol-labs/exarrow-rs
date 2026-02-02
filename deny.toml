@@ -1,10 +1,5 @@
 [advisories]
 ignore = [
-    # RUSTSEC-2023-0071 (CVE-2023-49092) is a timing side-channel attack (Marvin Attack)
-    # that affects PKCS#1 v1.5 DECRYPTION. This codebase only uses ENCRYPTION
-    # (encrypting passwords with the server's public key), so the vulnerability
-    # does not apply. The server performs decryption, not this client.
-    { id = "RUSTSEC-2023-0071", reason = "Only encryption is used, not decryption - Marvin Attack does not apply" },
     # paste is unmaintained but not vulnerable. It's a transitive dependency from
     # parquet (Apache Arrow) - we can't control it. Track: https://github.com/apache/arrow-rs/issues
     { id = "RUSTSEC-2024-0436", reason = "Transitive dep from parquet, unmaintained but not vulnerable" },
@@ -24,4 +19,5 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "Unicode-3.0",
+    "OpenSSL",  # Required by aws-lc-sys (inherited from OpenSSL fork history)
 ]

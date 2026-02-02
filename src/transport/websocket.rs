@@ -6,12 +6,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aws_lc_rs::rsa::{Pkcs1PublicEncryptingKey, PublicEncryptingKey};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use rand_core::OsRng;
-use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use rustls::pki_types::CertificateDer;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -150,22 +148,132 @@ impl WebSocketTransport {
     /// The password is encrypted using the server's public key and then
     /// base64-encoded for transmission.
     fn encrypt_password(password: &str, public_key_pem: &str) -> Result<String, TransportError> {
-        // Parse the RSA public key from PEM format
-        let public_key = RsaPublicKey::from_pkcs1_pem(public_key_pem).map_err(|e| {
+        // Parse PEM to DER (strip headers and base64-decode)
+        let der_bytes = Self::pem_to_der(public_key_pem).map_err(|e| {
+            TransportError::ProtocolError(format!("Failed to parse RSA public key PEM: {}", e))
+        })?;
+
+        // Load RSA public key from DER
+        let public_key = PublicEncryptingKey::from_der(&der_bytes).map_err(|e| {
             TransportError::ProtocolError(format!("Failed to parse RSA public key: {}", e))
         })?;
 
-        // Encrypt the password using PKCS#1 v1.5 padding
-        // Use OsRng from rand_core 0.6 for compatibility with rsa crate's CryptoRng trait
-        let mut rng = OsRng;
-        let encrypted = public_key
-            .encrypt(&mut rng, Pkcs1v15Encrypt, password.as_bytes())
+        // Create PKCS#1 v1.5 encryptor
+        let pkcs1_key = Pkcs1PublicEncryptingKey::new(public_key).map_err(|e| {
+            TransportError::ProtocolError(format!("Failed to create PKCS1 key: {}", e))
+        })?;
+
+        // Encrypt the password
+        let mut ciphertext = vec![0u8; pkcs1_key.ciphertext_size()];
+        let ciphertext = pkcs1_key
+            .encrypt(password.as_bytes(), &mut ciphertext)
             .map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to encrypt password: {}", e))
             })?;
 
         // Base64-encode the encrypted password
-        Ok(STANDARD.encode(&encrypted))
+        Ok(STANDARD.encode(ciphertext))
+    }
+
+    /// Convert PKCS#1 PEM to SPKI DER format.
+    ///
+    /// Exasol sends RSA public keys in PKCS#1 PEM format (`BEGIN RSA PUBLIC KEY`).
+    /// aws-lc-rs expects SPKI (SubjectPublicKeyInfo) DER format, so we:
+    /// 1. Strip PEM headers and base64-decode to get PKCS#1 DER
+    /// 2. Wrap the PKCS#1 DER in SPKI structure
+    fn pem_to_der(pem: &str) -> Result<Vec<u8>, &'static str> {
+        // Find the base64 content between PEM headers
+        let start_marker = "-----BEGIN RSA PUBLIC KEY-----";
+        let end_marker = "-----END RSA PUBLIC KEY-----";
+
+        let start = pem.find(start_marker).ok_or("Missing PEM start marker")? + start_marker.len();
+        let end = pem.find(end_marker).ok_or("Missing PEM end marker")?;
+
+        // Extract and decode base64 content to get PKCS#1 DER
+        let base64_content: String = pem[start..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        let pkcs1_der = STANDARD
+            .decode(&base64_content)
+            .map_err(|_| "Invalid base64 in PEM")?;
+
+        // Convert PKCS#1 DER to SPKI DER
+        Ok(Self::pkcs1_to_spki(&pkcs1_der))
+    }
+
+    /// Convert PKCS#1 RSAPublicKey DER to SPKI SubjectPublicKeyInfo DER.
+    ///
+    /// SPKI format wraps the PKCS#1 key with an algorithm identifier:
+    /// ```asn1
+    /// SubjectPublicKeyInfo ::= SEQUENCE {
+    ///   algorithm AlgorithmIdentifier,
+    ///   subjectPublicKey BIT STRING
+    /// }
+    /// AlgorithmIdentifier ::= SEQUENCE {
+    ///   algorithm OBJECT IDENTIFIER,  -- 1.2.840.113549.1.1.1 (rsaEncryption)
+    ///   parameters ANY DEFINED BY algorithm OPTIONAL  -- NULL for RSA
+    /// }
+    /// ```
+    fn pkcs1_to_spki(pkcs1_der: &[u8]) -> Vec<u8> {
+        // RSA algorithm identifier: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
+        // OID 1.2.840.113549.1.1.1 (rsaEncryption) encoded as:
+        // 06 09 2A 86 48 86 F7 0D 01 01 01 (OID tag, length, value)
+        // 05 00 (NULL tag, zero length)
+        let algorithm_identifier: &[u8] = &[
+            0x30, 0x0D, // SEQUENCE, length 13
+            0x06, 0x09, // OID, length 9
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, // 1.2.840.113549.1.1.1
+            0x05, 0x00, // NULL
+        ];
+
+        // BIT STRING header: tag (0x03) + length + unused bits (0x00)
+        // The bit string contains the PKCS#1 key prefixed with 0x00 (no unused bits)
+        let bit_string_content_len = pkcs1_der.len() + 1; // +1 for the unused bits byte
+
+        // Calculate lengths for DER encoding
+        let bit_string_len = Self::der_length_bytes(bit_string_content_len);
+        let total_content_len =
+            algorithm_identifier.len() + 1 + bit_string_len.len() + bit_string_content_len;
+        let sequence_len = Self::der_length_bytes(total_content_len);
+
+        // Build SPKI DER
+        let mut spki = Vec::with_capacity(1 + sequence_len.len() + total_content_len);
+
+        // Outer SEQUENCE
+        spki.push(0x30); // SEQUENCE tag
+        spki.extend_from_slice(&sequence_len);
+
+        // Algorithm identifier
+        spki.extend_from_slice(algorithm_identifier);
+
+        // BIT STRING containing PKCS#1 key
+        spki.push(0x03); // BIT STRING tag
+        spki.extend_from_slice(&bit_string_len);
+        spki.push(0x00); // No unused bits
+        spki.extend_from_slice(pkcs1_der);
+
+        spki
+    }
+
+    /// Encode a length value in DER format.
+    fn der_length_bytes(len: usize) -> Vec<u8> {
+        if len < 128 {
+            vec![len as u8]
+        } else if len < 256 {
+            vec![0x81, len as u8]
+        } else if len < 65536 {
+            vec![0x82, (len >> 8) as u8, (len & 0xFF) as u8]
+        } else {
+            // For very large lengths (unlikely for RSA keys)
+            vec![
+                0x83,
+                (len >> 16) as u8,
+                ((len >> 8) & 0xFF) as u8,
+                (len & 0xFF) as u8,
+            ]
+        }
     }
 }
 
