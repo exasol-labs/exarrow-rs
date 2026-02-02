@@ -85,7 +85,7 @@ fn generate_batch(rng: &mut StdRng, start_id: i64, count: usize) -> RecordBatch 
     let ages: Vec<i32> = (0..count).map(|_| rng.gen_range(18..80)).collect();
 
     let salaries: Vec<i128> = (0..count)
-        .map(|_| rng.gen_range(30_000_00i128..500_000_00i128)) // cents
+        .map(|_| rng.gen_range(3_000_000_i128..50_000_000_i128)) // cents
         .collect();
 
     let timestamps: Vec<i64> = (0..count)

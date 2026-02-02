@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::query::import::{ImportFileEntry, ImportQuery, RowSeparator};
 use crate::transport::HttpTransportClient;
+use crate::types::{infer_schema_from_parquet, infer_schema_from_parquet_files, ColumnNameMode};
 
 use super::parallel::{convert_parquet_files_to_csv, stream_files_parallel, ParallelTransportPool};
 use super::source::IntoFileSources;
@@ -54,6 +55,24 @@ pub struct ParquetImportOptions {
     /// Exasol port for HTTP transport connection.
     /// This is typically the same port as the WebSocket connection.
     pub port: u16,
+
+    /// If true, create the target table before import if it doesn't exist.
+    ///
+    /// When enabled, the system will:
+    /// 1. Infer the schema from the Parquet file(s)
+    /// 2. Generate CREATE TABLE DDL
+    /// 3. Execute the DDL (table may already exist, which is fine)
+    /// 4. Proceed with the import
+    ///
+    /// Default: false
+    pub create_table_if_not_exists: bool,
+
+    /// Column name handling mode for auto-created tables.
+    ///
+    /// Only used when `create_table_if_not_exists` is true.
+    /// - `Quoted`: Preserve original column names (default)
+    /// - `Sanitize`: Convert to uppercase, replace invalid chars
+    pub column_name_mode: ColumnNameMode,
 }
 
 impl Default for ParquetImportOptions {
@@ -68,6 +87,8 @@ impl Default for ParquetImportOptions {
             use_encryption: false,
             host: String::new(),
             port: 0,
+            create_table_if_not_exists: false,
+            column_name_mode: ColumnNameMode::default(),
         }
     }
 }
@@ -138,6 +159,33 @@ impl ParquetImportOptions {
         self.port = port;
         self
     }
+
+    /// Enable automatic table creation before import.
+    ///
+    /// When enabled, the system will infer the schema from the Parquet file(s)
+    /// and create the target table if it doesn't exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `create` - Whether to create the table automatically
+    #[must_use]
+    pub fn with_create_table_if_not_exists(mut self, create: bool) -> Self {
+        self.create_table_if_not_exists = create;
+        self
+    }
+
+    /// Set the column name handling mode for auto-created tables.
+    ///
+    /// Only applies when `create_table_if_not_exists` is true.
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - How to handle column names in DDL generation
+    #[must_use]
+    pub fn with_column_name_mode(mut self, mode: ColumnNameMode) -> Self {
+        self.column_name_mode = mode;
+        self
+    }
 }
 
 /// Imports data from a Parquet file into an Exasol table.
@@ -151,6 +199,7 @@ impl ParquetImportOptions {
 /// # Arguments
 ///
 /// * `execute_sql` - Function to execute SQL statements. Takes SQL string and returns row count.
+///   Must be callable multiple times if `create_table_if_not_exists` is enabled.
 /// * `table` - The target table name
 /// * `file_path` - Path to the Parquet file
 /// * `options` - Import options
@@ -166,16 +215,27 @@ impl ParquetImportOptions {
 /// - Parquet parsing fails
 /// - Data conversion fails
 /// - HTTP transport fails
+/// - Schema inference fails (when `create_table_if_not_exists` is enabled)
 pub async fn import_from_parquet<F, Fut>(
-    execute_sql: F,
+    mut execute_sql: F,
     table: &str,
     file_path: &Path,
     options: ParquetImportOptions,
 ) -> Result<u64, ImportError>
 where
-    F: FnOnce(String) -> Fut,
+    F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<u64, String>>,
 {
+    // Auto-create table if enabled
+    if options.create_table_if_not_exists {
+        let inferred_schema = infer_schema_from_parquet(file_path, options.column_name_mode)?;
+        let ddl = inferred_schema.to_ddl(table, options.schema.as_deref());
+
+        // Execute CREATE TABLE - ignore errors if table already exists
+        // Exasol returns an error if table exists, which is fine
+        let _ = execute_sql(ddl).await;
+    }
+
     // Read the Parquet file and convert to CSV
     let file = std::fs::File::open(file_path)?;
 
@@ -496,13 +556,13 @@ where
 /// # }
 /// ```
 pub async fn import_from_parquet_files<F, Fut, S>(
-    execute_sql: F,
+    mut execute_sql: F,
     table: &str,
     file_paths: S,
     options: ParquetImportOptions,
 ) -> Result<u64, ImportError>
 where
-    F: FnOnce(String) -> Fut,
+    F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<u64, String>>,
     S: IntoFileSources,
 {
@@ -519,9 +579,21 @@ where
         ));
     }
 
+    // Auto-create table if enabled (for multi-file, infer union schema)
+    if options.create_table_if_not_exists {
+        let inferred_schema = infer_schema_from_parquet_files(&paths, options.column_name_mode)?;
+        let ddl = inferred_schema.to_ddl(table, options.schema.as_deref());
+
+        // Execute CREATE TABLE - ignore errors if table already exists
+        let _ = execute_sql(ddl).await;
+    }
+
+    // Calculate connection count before transferring paths ownership
+    let num_files = paths.len();
+
     // Convert all Parquet files to CSV in parallel
     let csv_data_vec = convert_parquet_files_to_csv(
-        paths.clone(),
+        paths,
         options.batch_size,
         options.null_value.clone(),
         options.column_separator,
@@ -539,7 +611,7 @@ where
         &options.host,
         options.port,
         options.use_encryption,
-        paths.len(),
+        num_files,
     )
     .await?;
 

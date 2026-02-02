@@ -126,30 +126,26 @@ impl Connection {
             ..Default::default()
         };
 
+        // Extract session_id once to avoid double clone
+        let session_id = session_info.session_id.clone();
+
         // Convert SessionInfo to AuthResponseData
         let auth_response = AuthResponseData {
-            session_id: session_info.session_id.clone(),
+            session_id: session_id.clone(),
             protocol_version: session_info.protocol_version,
-            release_version: session_info.release_version.clone(),
-            database_name: session_info.database_name.clone(),
-            product_name: session_info.product_name.clone(),
+            release_version: session_info.release_version,
+            database_name: session_info.database_name,
+            product_name: session_info.product_name,
             max_data_message_size: session_info.max_data_message_size,
             max_identifier_length: 128,    // Default value
             max_varchar_length: 2_000_000, // Default value
             identifier_quote_string: "\"".to_string(),
-            time_zone: session_info
-                .time_zone
-                .clone()
-                .unwrap_or_else(|| "UTC".to_string()),
+            time_zone: session_info.time_zone.unwrap_or_else(|| "UTC".to_string()),
             time_zone_behavior: "INVALID TIMESTAMP TO DOUBLE".to_string(),
         };
 
         // Create session (owned, not Arc)
-        let session = SessionInfo::new(
-            session_info.session_id.clone(),
-            auth_response,
-            session_config,
-        );
+        let session = SessionInfo::new(session_id, auth_response, session_config);
 
         // Set schema if specified
         if let Some(schema) = &params.schema {
@@ -837,6 +833,37 @@ impl Connection {
     // Import/Export Methods
     // ========================================================================
 
+    /// Creates an SQL executor closure for import/export operations.
+    ///
+    /// This is a helper method that creates a closure which can execute SQL
+    /// statements and return the row count. The closure captures a cloned
+    /// reference to the transport, allowing it to be called multiple times
+    /// (e.g., for parallel file imports).
+    ///
+    /// # Returns
+    ///
+    /// A closure that takes an SQL string and returns a Future resolving to
+    /// either the affected row count or an error string.
+    fn make_sql_executor(
+        &self,
+    ) -> impl Fn(
+        String,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send>> {
+        let transport = Arc::clone(&self.transport);
+        move |sql: String| {
+            let transport = Arc::clone(&transport);
+            Box::pin(async move {
+                let mut transport_guard = transport.lock().await;
+                match transport_guard.execute_query(&sql).await {
+                    Ok(QueryResult::RowCount { count }) => Ok(count as u64),
+                    Ok(QueryResult::ResultSet { .. }) => Ok(0),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+        }
+    }
+
     /// Import CSV data from a file into an Exasol table.
     ///
     /// This method reads CSV data from the specified file and imports it into
@@ -869,17 +896,8 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::csv::import_from_file(execute_sql, table, file_path, options).await
+        crate::import::csv::import_from_file(self.make_sql_executor(), table, file_path, options)
+            .await
     }
 
     /// Import CSV data from an async reader into an Exasol table.
@@ -914,17 +932,8 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::csv::import_from_stream(execute_sql, table, reader, options).await
+        crate::import::csv::import_from_stream(self.make_sql_executor(), table, reader, options)
+            .await
     }
 
     /// Import CSV data from an iterator into an Exasol table.
@@ -964,17 +973,7 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::csv::import_from_iter(execute_sql, table, rows, options).await
+        crate::import::csv::import_from_iter(self.make_sql_executor(), table, rows, options).await
     }
 
     /// Export data from an Exasol table or query to a CSV file.
@@ -1133,17 +1132,7 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::csv::import_from_files(execute_sql, table, paths, options).await
+        crate::import::csv::import_from_files(self.make_sql_executor(), table, paths, options).await
     }
 
     /// Import data from a Parquet file into an Exasol table.
@@ -1178,17 +1167,13 @@ impl Connection {
             .with_exasol_host(&self.params.host)
             .with_exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::parquet::import_from_parquet(execute_sql, table, file_path, options).await
+        crate::import::parquet::import_from_parquet(
+            self.make_sql_executor(),
+            table,
+            file_path,
+            options,
+        )
+        .await
     }
 
     /// Import multiple Parquet files in parallel into an Exasol table.
@@ -1241,17 +1226,13 @@ impl Connection {
             .with_exasol_host(&self.params.host)
             .with_exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::parquet::import_from_parquet_files(execute_sql, table, paths, options).await
+        crate::import::parquet::import_from_parquet_files(
+            self.make_sql_executor(),
+            table,
+            paths,
+            options,
+        )
+        .await
     }
 
     /// Export data from an Exasol table or query to a Parquet file.
@@ -1328,17 +1309,13 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::arrow::import_from_record_batch(execute_sql, table, batch, options).await
+        crate::import::arrow::import_from_record_batch(
+            self.make_sql_executor(),
+            table,
+            batch,
+            options,
+        )
+        .await
     }
 
     /// Import data from multiple Arrow RecordBatches into an Exasol table.
@@ -1373,17 +1350,13 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::arrow::import_from_record_batches(execute_sql, table, batches, options).await
+        crate::import::arrow::import_from_record_batches(
+            self.make_sql_executor(),
+            table,
+            batches,
+            options,
+        )
+        .await
     }
 
     /// Import data from an Arrow IPC file/stream into an Exasol table.
@@ -1421,17 +1394,13 @@ impl Connection {
             .exasol_host(&self.params.host)
             .exasol_port(self.params.port);
 
-        let transport = Arc::clone(&self.transport);
-        let execute_sql = |sql: String| async move {
-            let mut transport_guard = transport.lock().await;
-            match transport_guard.execute_query(&sql).await {
-                Ok(QueryResult::RowCount { count }) => Ok(count as u64),
-                Ok(QueryResult::ResultSet { .. }) => Ok(0),
-                Err(e) => Err(e.to_string()),
-            }
-        };
-
-        crate::import::arrow::import_from_arrow_ipc(execute_sql, table, reader, options).await
+        crate::import::arrow::import_from_arrow_ipc(
+            self.make_sql_executor(),
+            table,
+            reader,
+            options,
+        )
+        .await
     }
 
     /// Export data from an Exasol table or query to Arrow RecordBatches.
