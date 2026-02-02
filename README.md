@@ -170,6 +170,6 @@ See [`examples/`](examples/) for runnable code:
 
 Build with Rust 🦀 and made with ❤️
 
-Started as an experiment by [marconae](https://github.com/marconae), maintained by [Exasol Labs](https://github.com/exasol-labs/).
+Based on a prototype by [marconae](https://github.com/marconae), maintained by [Exasol Labs](https://github.com/exasol-labs/).
 
 </div>
