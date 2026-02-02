@@ -15,8 +15,6 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 [Type Mapping](#type-mapping) •
 [Examples](#examples)
 
-*Disclaimer: this driver is currently a **community-supported prototype** and not officially supported by Exasol. Exasol cannot guarantee the functionality and performance.*
-
 </div>
 
 ---
@@ -160,9 +158,11 @@ See [`examples/`](examples/) for runnable code:
 * [`driver_manager_usage.rs`](examples/driver_manager_usage.rs) - ADBC driver manager integration
 * [`import_export.rs`](examples/import_export.rs) - bulk data transfer
 
-## License
+## Disclaimer & License
 
-[MIT](LICENSE). See [DISCLAIMER](DISCLAIMER) before using the code in this repository.
+This driver is **community-supported**. Exasol cannot guarantee the functionality and performance. Read [DISCLAIMER](DISCLAIMER) before using it.
+
+Licensed under [MIT](LICENSE). 
 
 ---
 
