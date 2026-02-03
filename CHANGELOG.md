@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2
+
+- Added documentation in [docs/](docs/)
+
 ## 0.5.0
 
 - Schema inference for Parquet imports
