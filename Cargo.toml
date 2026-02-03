@@ -3,8 +3,12 @@ name = "exarrow-rs"
 version = "0.5.1"
 edition = "2021"
 license = "MIT"
-authors = ["Exasol Labs"]
+authors = ["Exasol Labs <labs@exasol.com>"]
 description = "ADBC-compatible driver for Exasol with Arrow data format support"
+repository = "https://github.com/exasol-labs/exarrow-rs"
+homepage = "https://github.com/exasol-labs/exarrow-rs"
+documentation = "https://docs.rs/exarrow-rs"
+readme = "README.md"
 keywords = ["exasol", "adbc", "arrow", "database", "driver"]
 categories = ["database"]
 
