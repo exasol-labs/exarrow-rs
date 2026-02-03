@@ -2,42 +2,23 @@
 
 ![exarrow-rs logo](assets/exarrow-logo.svg)
 
+[![Crates.io](https://img.shields.io/crates/v/exarrow-rs.svg)](https://crates.io/crates/exarrow-rs)
+[![Documentation](https://docs.rs/exarrow-rs/badge.svg)](https://docs.rs/exarrow-rs)
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
-[![CI](https://github.com/marconae/exarrow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/marconae/exarrow-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/exasol-labs/exarrow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/exarrow-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 ADBC-compatible driver for Exasol with Apache Arrow data format support.
-
-[Installation](#installation) •
-[Quick Start](#quick-start) •
-[Connection](#connection) •
-[Import / Export](#import--export) •
-[Type Mapping](#type-mapping) •
-[Examples](#examples)
 
 </div>
 
 ---
 
-## Installation
-
-### Building from Source
+## Add to your project
 
 ```bash
-git clone https://github.com/exasol-labs/exarrow-rs.git
-cd exarrow-rs
-cargo build --release
-```
-
-### Adding to Your Project
-
-Add the dependency to your `Cargo.toml`:
-
-```toml
-[dependencies]
-exarrow-rs = { git = "https://github.com/exasol-labs/exarrow-rs.git" }
-
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+cargo add exarrow-rs
+cargo add tokio --features rt-multi-thread,macros
 ```
 
 ## Quick Start
@@ -51,118 +32,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = driver.open("exasol://user:pwd@localhost:8563/my_schema")?;
     let mut connection = database.connect().await?;
 
-    // Query returns Arrow RecordBatches
-    let results = connection.query("SELECT * FROM customers WHERE age > 25").await?;
+    let results = connection.query("SELECT * FROM customers").await?;
     for batch in results {
         println!("Got {} rows", batch.num_rows());
     }
-
-    // Parameterized queries
-    let mut stmt = connection.create_statement("SELECT * FROM orders WHERE id = ?");
-    stmt.bind(0, 12345)?;
-    let results = connection.execute_statement(&stmt).await?;
-
-    // Transactions
-    connection.begin_transaction().await?;
-    connection.execute_update("INSERT INTO logs VALUES (1, 'test')").await?;
-    connection.commit().await?;
 
     connection.close().await?;
     Ok(())
 }
 ```
 
-## Connection
+---
 
-**Format:** `exasol://[user[:password]@]host[:port][/schema][?params]`
+## Documentation
 
-| Parameter            | Default | Description                  |
-|----------------------|---------|------------------------------|
-| `tls`                | `true`  | Enable TLS/SSL               |
-| `connection_timeout` | `30`    | Connection timeout (seconds) |
-| `query_timeout`      | `300`   | Query timeout (seconds)      |
+See [**docs/**](docs/index.md) for comprehensive documentation:
 
-Exemplary connection string:
+- [Connection](docs/connection.md) - Connection strings, TLS, timeouts
+- [Queries](docs/queries.md) - Query execution and transactions
+- [Prepared Statements](docs/prepared-statements.md) - Parameter binding
+- [Import / Export](docs/import-export.md) - Bulk data transfer
+  - [Parallel Import](docs/import-export.md#parallel-import)
+  - [Schema Inference](docs/import-export.md#auto-table-creation)
+- [Type Mapping](docs/type-mapping.md) - Exasol to Arrow conversions
+- [Driver Manager](docs/driver-manager.md) - ADBC integration ([Python](docs/driver-manager.md#python-adbc-driver-manager), [Polars](docs/driver-manager.md#python-polars), [Go](docs/driver-manager.md#other-languages), [Java](docs/driver-manager.md#other-languages))
 
-```
-exasol://myuser:mypass@exasol.example.com:8563/production?connection_timeout=60
-```
+---
 
-## Import / Export
+## License
 
-High-performance bulk data transfer via HTTP transport. Supports streaming for large datasets.
-
-### Formats
-
-| Format    | Import | Export | Notes                         |
-|-----------|--------|--------|-------------------------------|
-| CSV       | Yes    | Yes    | Native Exasol format, fastest |
-| Parquet   | Yes    | Yes    | Columnar with compression     |
-| Arrow IPC | Yes    | Yes    | Direct RecordBatch transfer   |
-
-### CSV Import
-
-```rust
-use exarrow_rs::import::CsvImportOptions;
-
-let options = CsvImportOptions::default()
-    .column_separator(',')
-    .skip_rows(1);  // Skip header
-
-let rows = connection.import_csv_from_file(
-    "my_schema.my_table",
-    Path::new("/path/to/data.csv"),
-    options,
-).await?;
-```
-
-### Parquet
-
-```rust
-use exarrow_rs::import::ParquetImportOptions;
-use exarrow_rs::export::{ParquetExportOptions, ParquetCompression};
-
-// Import
-let rows = connection.import_from_parquet(
-    "my_table",
-    Path::new("/path/to/data.parquet"),
-    ParquetImportOptions::default().with_batch_size(1024),
-).await?;
-
-// Export with compression
-let rows = connection.export_to_parquet(
-    ExportSource::Table { schema: None, name: "my_table".into(), columns: vec![] },
-    Path::new("/tmp/export.parquet"),
-    ParquetExportOptions::default().with_compression(ParquetCompression::Snappy),
-).await?;
-```
-
-## Type Mapping
-
-| Exasol                   | Arrow                    | Notes                  |
-|--------------------------|--------------------------|------------------------|
-| `BOOLEAN`                | `Boolean`                |                        |
-| `CHAR`, `VARCHAR`        | `Utf8`                   |                        |
-| `DECIMAL(p, s)`          | `Decimal128(p, s)`       | Precision 1-36         |
-| `DOUBLE`                 | `Float64`                |                        |
-| `DATE`                   | `Date32`                 |                        |
-| `TIMESTAMP`              | `Timestamp(Microsecond)` | 0-9 fractional digits  |
-| `INTERVAL YEAR TO MONTH` | `Interval(MonthDayNano)` |                        |
-| `INTERVAL DAY TO SECOND` | `Interval(MonthDayNano)` | 0-9 fractional seconds |
-| `GEOMETRY`               | `Binary`                 | WKB format             |
-
-## Examples
-
-See [`examples/`](examples/) for runnable code:
-* [`basic_usage.rs`](examples/basic_usage.rs) - direct API: queries, transactions, metadata
-* [`driver_manager_usage.rs`](examples/driver_manager_usage.rs) - ADBC driver manager integration
-* [`import_export.rs`](examples/import_export.rs) - bulk data transfer
-
-## Disclaimer & License
-
-This driver is **community-supported**. Exasol cannot guarantee the functionality and performance. Read [DISCLAIMER](DISCLAIMER) before using it.
-
-Licensed under [MIT](LICENSE). 
+Community-supported. See [DISCLAIMER](DISCLAIMER). Licensed under [MIT](LICENSE).
 
 ---
 
@@ -170,6 +69,6 @@ Licensed under [MIT](LICENSE).
 
 Build with Rust 🦀 and made with ❤️
 
-Based on a prototype by [marconae](https://github.com/marconae), maintained by [Exasol Labs](https://github.com/exasol-labs/).
+Based on a prototype by [marconae](https://github.com/marconae), now maintained by [Exasol Labs](https://github.com/exasol-labs/).
 
 </div>
