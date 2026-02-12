@@ -96,9 +96,9 @@ pytestmark = [skip_no_library, skip_no_exasol]
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture(scope="module")
 def conn():
-    """Provide a live ADBC connection, closing it after the test."""
+    """Provide a live ADBC connection shared across all tests in this module."""
     connection = adbc_driver_manager.dbapi.connect(
         driver=LIB_PATH,
         entrypoint="ExarrowDriverInit",
@@ -135,7 +135,10 @@ def test_schema(conn):
 
 def test_connect(conn):
     """Driver loads and a connection is established."""
-    assert conn is not None
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    assert cursor.fetchone()[0] == 1
+    cursor.close()
 
 
 def test_select_literal(conn):
