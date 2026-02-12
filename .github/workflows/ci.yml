@@ -153,6 +153,17 @@ jobs:
           cargo llvm-cov --no-report --features ffi --test driver_manager_tests -- --ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov-integration.info
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: pip install adbc-driver-manager pyarrow pytest polars
+
+      - name: Run Python integration tests
+        run: pytest tests/python/test_driver_integration.py -v
+
       - name: Stop Exasol container
         if: always()
         run: |
