@@ -96,14 +96,32 @@ pytestmark = [skip_no_library, skip_no_exasol]
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
+@pytest.fixture(scope="module")
 def conn():
-    """Provide a live ADBC connection, closing it after the test."""
-    connection = adbc_driver_manager.dbapi.connect(
-        driver=LIB_PATH,
-        entrypoint="ExarrowDriverInit",
-        db_kwargs={"uri": _get_uri()},
-    )
+    """Provide a live ADBC connection shared across all tests in this module.
+
+    The ADBC driver manager connection is lazy (no WebSocket is opened until the
+    first statement/cursor is created).  On CI the Exasol container may still be
+    recovering from the Rust integration tests, so we eagerly open the connection
+    here with a retry loop.
+    """
+    max_attempts = 10
+    for attempt in range(max_attempts):
+        connection = adbc_driver_manager.dbapi.connect(
+            driver=LIB_PATH,
+            entrypoint="ExarrowDriverInit",
+            db_kwargs={"uri": _get_uri()},
+        )
+        try:
+            cur = connection.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            break
+        except Exception:
+            connection.close()
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(2)
     yield connection
     connection.close()
 
@@ -135,7 +153,10 @@ def test_schema(conn):
 
 def test_connect(conn):
     """Driver loads and a connection is established."""
-    assert conn is not None
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1")
+    assert cursor.fetchone()[0] == 1
+    cursor.close()
 
 
 def test_select_literal(conn):
