@@ -1,0 +1,2 @@
+adbc-driver-manager
+pyarrow
