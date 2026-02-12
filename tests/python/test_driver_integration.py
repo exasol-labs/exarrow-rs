@@ -221,6 +221,23 @@ def test_execute_ddl_dml(conn, test_schema):
     assert table.num_columns == 2
 
 
+def test_session_reuse_across_cursors(conn):
+    """Multiple cursors on the same connection share one Exasol session."""
+    cursor1 = conn.cursor()
+    cursor1.execute("SELECT CAST(CURRENT_SESSION AS VARCHAR(40)) AS SID")
+    session1 = cursor1.fetchone()[0]
+    cursor1.close()
+
+    cursor2 = conn.cursor()
+    cursor2.execute("SELECT CAST(CURRENT_SESSION AS VARCHAR(40)) AS SID")
+    session2 = cursor2.fetchone()[0]
+    cursor2.close()
+
+    assert session1 == session2, (
+        f"Expected same session but got {session1} vs {session2}"
+    )
+
+
 def test_fetch_polars(conn):
     """Optional: fetch results as a Polars DataFrame."""
     polars = pytest.importorskip("polars")

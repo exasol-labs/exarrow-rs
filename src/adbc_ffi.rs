@@ -69,6 +69,7 @@ use arrow::array::{RecordBatch, RecordBatchReader};
 use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 use crate::adbc::Connection as ExaConnection;
 use crate::error::ExasolError;
@@ -362,8 +363,8 @@ impl adbc_core::Database for FfiDatabase {
 pub struct FfiConnection {
     /// Connection URI
     uri: String,
-    /// The actual connection (lazily initialized)
-    inner: Option<ExaConnection>,
+    /// The actual connection (lazily initialized), shared with statements
+    inner: Option<Arc<Mutex<ExaConnection>>>,
     /// Pre-init options
     options: std::collections::HashMap<String, OptionValue>,
     /// Auto-commit mode
@@ -384,7 +385,7 @@ impl FfiConnection {
     }
 
     /// Ensure the connection is established.
-    fn ensure_connected(&mut self) -> AdbcResult<&mut ExaConnection> {
+    fn ensure_connected(&mut self) -> AdbcResult<Arc<Mutex<ExaConnection>>> {
         if self.inner.is_none() {
             let uri = self.uri.clone();
             let conn = get_runtime()
@@ -393,9 +394,9 @@ impl FfiConnection {
                     ExaConnection::from_params(params).await
                 })
                 .map_err(to_adbc_error)?;
-            self.inner = Some(conn);
+            self.inner = Some(Arc::new(Mutex::new(conn)));
         }
-        Ok(self.inner.as_mut().unwrap())
+        Ok(Arc::clone(self.inner.as_ref().unwrap()))
     }
 }
 
@@ -548,8 +549,8 @@ impl adbc_core::Connection for FfiConnection {
     type StatementType = FfiStatement;
 
     fn new_statement(&mut self) -> AdbcResult<Self::StatementType> {
-        self.ensure_connected()?;
-        Ok(FfiStatement::new(self.uri.clone()))
+        let conn = self.ensure_connected()?;
+        Ok(FfiStatement::with_connection(Some(conn), self.uri.clone()))
     }
 
     fn cancel(&mut self) -> AdbcResult<()> {
@@ -674,14 +675,22 @@ impl adbc_core::Connection for FfiConnection {
     }
 
     fn commit(&mut self) -> AdbcResult<()> {
-        let conn = self.ensure_connected()?;
-        get_runtime().block_on(conn.commit()).map_err(to_adbc_error)
+        let conn_arc = self.ensure_connected()?;
+        get_runtime()
+            .block_on(async {
+                let mut conn = conn_arc.lock().await;
+                conn.commit().await
+            })
+            .map_err(to_adbc_error)
     }
 
     fn rollback(&mut self) -> AdbcResult<()> {
-        let conn = self.ensure_connected()?;
+        let conn_arc = self.ensure_connected()?;
         get_runtime()
-            .block_on(conn.rollback())
+            .block_on(async {
+                let mut conn = conn_arc.lock().await;
+                conn.rollback().await
+            })
             .map_err(to_adbc_error)
     }
 
@@ -707,7 +716,9 @@ impl adbc_core::Connection for FfiConnection {
 /// # Example
 ///
 pub struct FfiStatement {
-    /// Connection URI (for creating connections)
+    /// Shared connection handle from the parent FfiConnection
+    conn: Option<Arc<Mutex<ExaConnection>>>,
+    /// Connection URI (fallback for ephemeral connections)
     uri: String,
     /// SQL query
     sql: Option<String>,
@@ -719,8 +730,20 @@ pub struct FfiStatement {
 }
 
 impl FfiStatement {
+    #[cfg(test)]
     fn new(uri: String) -> Self {
         Self {
+            conn: None,
+            uri,
+            sql: None,
+            bound_data: None,
+            options: std::collections::HashMap::new(),
+        }
+    }
+
+    fn with_connection(conn: Option<Arc<Mutex<ExaConnection>>>, uri: String) -> Self {
+        Self {
+            conn,
             uri,
             sql: None,
             bound_data: None,
@@ -843,19 +866,30 @@ impl adbc_core::Statement for FfiStatement {
             AdbcError::with_message_and_status("SQL query not set", AdbcStatus::InvalidState)
         })?;
 
-        // Create a connection and execute
-        let uri = self.uri.clone();
         let sql = sql.clone();
 
-        let result = get_runtime().block_on(async {
-            let params: crate::connection::ConnectionParams = uri.parse()?;
-            let mut conn = ExaConnection::from_params(params).await?;
-            let batches = conn.query(&sql).await?;
-            conn.close().await?;
-            Ok::<_, ExasolError>(batches)
-        });
-
-        let batches = result.map_err(to_adbc_error)?;
+        let batches = if let Some(ref conn_arc) = self.conn {
+            // Reuse the shared connection
+            let conn_arc = Arc::clone(conn_arc);
+            get_runtime()
+                .block_on(async {
+                    let mut conn = conn_arc.lock().await;
+                    conn.query(&sql).await
+                })
+                .map_err(to_adbc_error)?
+        } else {
+            // Fallback: ephemeral connection (no parent connection available)
+            let uri = self.uri.clone();
+            get_runtime()
+                .block_on(async {
+                    let params: crate::connection::ConnectionParams = uri.parse()?;
+                    let mut conn = ExaConnection::from_params(params).await?;
+                    let batches = conn.query(&sql).await?;
+                    conn.close().await?;
+                    Ok::<_, ExasolError>(batches)
+                })
+                .map_err(to_adbc_error)?
+        };
 
         // Determine schema from first batch or create empty schema
         let schema = if batches.is_empty() {
@@ -872,19 +906,31 @@ impl adbc_core::Statement for FfiStatement {
             AdbcError::with_message_and_status("SQL query not set", AdbcStatus::InvalidState)
         })?;
 
-        // Create a connection and execute
-        let uri = self.uri.clone();
         let sql = sql.clone();
 
-        let result = get_runtime().block_on(async {
-            let params: crate::connection::ConnectionParams = uri.parse()?;
-            let mut conn = ExaConnection::from_params(params).await?;
-            let count = conn.execute_update(&sql).await?;
-            conn.close().await?;
-            Ok::<_, ExasolError>(count)
-        });
+        let count = if let Some(ref conn_arc) = self.conn {
+            // Reuse the shared connection
+            let conn_arc = Arc::clone(conn_arc);
+            get_runtime()
+                .block_on(async {
+                    let mut conn = conn_arc.lock().await;
+                    conn.execute_update(&sql).await
+                })
+                .map_err(to_adbc_error)?
+        } else {
+            // Fallback: ephemeral connection (no parent connection available)
+            let uri = self.uri.clone();
+            get_runtime()
+                .block_on(async {
+                    let params: crate::connection::ConnectionParams = uri.parse()?;
+                    let mut conn = ExaConnection::from_params(params).await?;
+                    let count = conn.execute_update(&sql).await?;
+                    conn.close().await?;
+                    Ok::<_, ExasolError>(count)
+                })
+                .map_err(to_adbc_error)?
+        };
 
-        let count = result.map_err(to_adbc_error)?;
         Ok(Some(count))
     }
 

@@ -68,6 +68,23 @@ The system SHALL provide an ADBC-compliant statement interface for query executi
 - **THEN** it SHALL bind parameters safely to prevent SQL injection
 - **AND** it SHALL support Exasol's parameter binding syntax
 
+### Requirement: Connection Session Identity
+
+Multiple statements created from the same connection SHALL share a single database session. Statement execution SHALL NOT establish new connections to the database.
+
+#### Scenario: Session reuse across statements
+
+- **WHEN** two statements are created from the same connection
+- **AND** each executes `SELECT CURRENT_SESSION`
+- **THEN** both SHALL return the same Exasol session identifier
+
+#### Scenario: No connection-per-statement
+
+- **WHEN** a statement is executed
+- **THEN** it SHALL use the connection's existing WebSocket transport
+- **AND** it SHALL NOT open a new WebSocket connection
+- **AND** it SHALL NOT perform a new TLS handshake or authentication
+
 ### Requirement: Result Set Handling
 
 The system SHALL return query results in Arrow format per ADBC specification.
