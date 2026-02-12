@@ -28,7 +28,7 @@ import adbc_driver_manager
 
 driver = adbc_driver_manager.AdbcDriver(
     "/path/to/libexarrow_rs.so",
-    entrypoint="AdbcDriverInit"
+    entrypoint="ExarrowDriverInit"
 )
 
 database = driver.database()
@@ -56,7 +56,7 @@ df = pl.read_database_uri(
     engine="adbc",
     engine_options={
         "driver": "/path/to/libexarrow_rs.so",
-        "entrypoint": "AdbcDriverInit",
+        "entrypoint": "ExarrowDriverInit",
     },
 )
 
@@ -72,7 +72,7 @@ import polars as pl
 # Set up the connection once
 driver = adbc_driver_manager.AdbcDriver(
     "/path/to/libexarrow_rs.so",
-    entrypoint="AdbcDriverInit"
+    entrypoint="ExarrowDriverInit"
 )
 database = driver.database()
 database.set_option("uri", "exasol://user:password@localhost:8563")
@@ -104,7 +104,7 @@ The FFI exports all standard ADBC entry points:
 
 | Function | Description |
 |----------|-------------|
-| `AdbcDriverInit` | Initialize the driver |
+| `ExarrowDriverInit` | Initialize the driver |
 | `AdbcDatabaseNew` | Create a new database handle |
 | `AdbcDatabaseSetOption` | Set database options (URI, etc.) |
 | `AdbcDatabaseInit` | Initialize database with options |
