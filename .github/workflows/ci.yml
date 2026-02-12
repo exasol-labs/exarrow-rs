@@ -129,28 +129,42 @@ jobs:
             --name exasol-test \
             --privileged \
             -p 8563:8563 \
-            exasol/docker-db:latest
+            exasol/docker-db:2025.2.0
 
           echo "Waiting for Exasol to be ready..."
-          for i in {1..60}; do
-            if docker logs exasol-test 2>&1 | grep -q "All stages finished."; then
-              echo "Exasol is ready!"
+          for i in $(seq 1 120); do
+            if ! docker ps --format '{{.Names}}' | grep -q '^exasol-test$'; then
+              echo "ERROR: Container stopped unexpectedly"
+              docker logs exasol-test 2>&1 | tail -30
+              exit 1
+            fi
+
+            if docker exec exasol-test /bin/bash -c \
+              "echo 'SELECT 1;' | /usr/opt/EXASuite-*/EXASolution-*/bin/Console/exaplus \
+               -c localhost:8563 -u sys -p exasol -q" 2>/dev/null | grep -q "1"; then
+              echo "Exasol is ready! (attempt $i)"
               break
             fi
-            echo "Waiting... ($i/60)"
-            sleep 10
-          done
 
-          # Additional wait for database to be fully operational
-          sleep 30
+            if [ "$i" -eq 120 ]; then
+              echo "ERROR: Exasol did not become ready after 10 minutes"
+              docker logs exasol-test 2>&1 | tail -50
+              exit 1
+            fi
+
+            printf "."
+            sleep 5
+          done
 
       - name: Build with FFI
         run: cargo build --release --features ffi
 
       - name: Run integration tests with coverage
+        env:
+          REQUIRE_EXASOL: "1"
         run: |
-          cargo llvm-cov --no-report --features ffi --test integration_tests -- --ignored --test-threads=1
-          cargo llvm-cov --no-report --features ffi --test driver_manager_tests -- --ignored --test-threads=1
+          cargo llvm-cov --no-report --features ffi --test integration_tests -- --test-threads=1
+          cargo llvm-cov --no-report --features ffi --test driver_manager_tests -- --include-ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov-integration.info
 
       - name: Set up Python

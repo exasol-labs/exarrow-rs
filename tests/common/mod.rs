@@ -172,8 +172,25 @@ pub fn get_test_connection_string() -> String {
 pub async fn get_test_connection() -> Result<Connection, exarrow_rs::error::ExasolError> {
     let driver = Driver::new();
     let conn_string = get_test_connection_string();
-    let database = driver.open(&conn_string)?;
-    Ok(database.connect().await?)
+
+    let mut last_error = None;
+    for attempt in 1..=5u32 {
+        let database = driver.open(&conn_string)?;
+        match database.connect().await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                eprintln!("Connection attempt {}/5 failed: {}", attempt, e);
+                last_error = Some(e);
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    Err(exarrow_rs::error::ExasolError::Connection(
+        last_error.unwrap(),
+    ))
 }
 
 // Exasol Availability Check
@@ -236,6 +253,13 @@ pub fn is_exasol_available() -> bool {
 macro_rules! skip_if_no_exasol {
     () => {
         if !$crate::common::is_exasol_available() {
+            if std::env::var("REQUIRE_EXASOL").is_ok() {
+                panic!(
+                    "REQUIRE_EXASOL is set but Exasol is not available at {}:{}",
+                    $crate::common::get_host(),
+                    $crate::common::get_port()
+                );
+            }
             eprintln!(
                 "Skipping test: Exasol not available at {}:{}",
                 $crate::common::get_host(),
