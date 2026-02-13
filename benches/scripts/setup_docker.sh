@@ -22,6 +22,7 @@ else
         --name "${CONTAINER_NAME}" \
         -p "${EXASOL_PORT}:8563" \
         --privileged \
+        --shm-size=1g \
         "${EXASOL_IMAGE}"
 fi
 

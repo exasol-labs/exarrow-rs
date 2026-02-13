@@ -128,6 +128,7 @@ jobs:
           docker run -d \
             --name exasol-test \
             --privileged \
+            --shm-size=1g \
             -p 8563:8563 \
             exasol/docker-db:2025.2.0
 
