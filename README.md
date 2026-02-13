@@ -61,7 +61,7 @@ See [**docs/**](docs/index.md) for comprehensive documentation:
 
 ## License
 
-Community-supported. See [DISCLAIMER](DISCLAIMER). Licensed under [MIT](LICENSE).
+Community-supported. Licensed under [MIT](LICENSE).
 
 ---
 
