@@ -1,5 +1,8 @@
 #!/bin/bash
-# Wait for an Exasol container to be fully ready (TCP + TLS + auth + SQL).
+# Wait for an Exasol container to be fully ready using the Rust health check probe.
+# The probe connects via WebSocket from the host — same path the driver uses.
+# No docker exec, exaplus, or container-internal dependencies needed.
+#
 # Usage: ./scripts/wait_for_exasol.sh [container_name] [max_attempts]
 set -e
 
@@ -12,21 +15,28 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
   exit 1
 fi
 
-# Locate exaplus inside the container (path varies across Exasol image versions)
-EXAPLUS_PATH=$(docker exec "$CONTAINER_NAME" bash -c \
-  'find /opt /usr/opt -name exaplus -type f 2>/dev/null | head -1')
+# Locate or build the health check binary
+HEALTH_CHECK=""
+for candidate in \
+    target/release/examples/health_check \
+    target/debug/examples/health_check; do
+  if [ -x "$candidate" ]; then
+    HEALTH_CHECK="$candidate"
+    break
+  fi
+done
 
-if [ -z "$EXAPLUS_PATH" ]; then
-  echo "ERROR: Could not find exaplus binary inside container '$CONTAINER_NAME'"
-  echo "Health check cannot proceed without exaplus."
-  docker exec "$CONTAINER_NAME" bash -c 'ls -R /opt/ /usr/opt/ 2>/dev/null' | head -40
-  exit 1
+if [ -z "$HEALTH_CHECK" ]; then
+  echo "Health check binary not found, building..."
+  cargo build --example health_check
+  HEALTH_CHECK="target/debug/examples/health_check"
 fi
 
-echo "Found exaplus at: $EXAPLUS_PATH"
+echo "Using health check: $HEALTH_CHECK"
 echo "Waiting for Exasol container '$CONTAINER_NAME' to be ready..."
 
 for i in $(seq 1 "$MAX_ATTEMPTS"); do
+  # Verify container is still running
   if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo ""
     echo "ERROR: Container '$CONTAINER_NAME' stopped unexpectedly"
@@ -34,12 +44,7 @@ for i in $(seq 1 "$MAX_ATTEMPTS"); do
     exit 1
   fi
 
-  if docker exec "$CONTAINER_NAME" bash -c "
-    echo 'SELECT 1;' | \"$EXAPLUS_PATH\" \
-      -c localhost:8563 -u sys -p exasol \
-      -jdbcparam 'validateservercertificate=0' -q
-  " 2>/dev/null | grep -q "1"; then
-    echo ""
+  if "$HEALTH_CHECK" 2>/dev/null; then
     echo "Exasol is ready! (attempt $i)"
     exit 0
   fi

@@ -131,11 +131,11 @@ jobs:
             -p 8563:8563 \
             exasol/docker-db:2025.2.0
 
-      - name: Wait for Exasol to be ready
-        run: ./scripts/wait_for_exasol.sh exasol-test 120
-
       - name: Build with FFI
         run: cargo build --release --features ffi
+
+      - name: Wait for Exasol to be ready
+        run: ./scripts/wait_for_exasol.sh exasol-test 120
 
       - name: Run integration tests with coverage
         env:
