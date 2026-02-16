@@ -722,6 +722,76 @@ fn test_driver_manager_execute_update() {
     println!("execute_update operations successful via driver manager");
 }
 
+/// Test that multiple statements from the same connection reuse the same Exasol session.
+///
+/// This validates the "Connection Session Identity" requirement: each statement
+/// should execute on the parent connection's existing WebSocket session rather
+/// than opening a new one.
+#[test]
+#[ignore]
+fn test_driver_manager_reuses_session_across_statements() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    // Statement 1: get session ID (cast to VARCHAR so Arrow returns Utf8)
+    let session_id_1 = {
+        let mut stmt = conn.new_statement().expect("Failed to create statement 1");
+        stmt.set_sql_query("SELECT CAST(CURRENT_SESSION AS VARCHAR(40)) AS SID")
+            .expect("Failed to set SQL query");
+        let mut reader = stmt.execute().expect("Failed to execute statement 1");
+        let batch = reader.next().unwrap().expect("Failed to read batch");
+        let col = batch.column(0);
+        let string_array = col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("Expected string array for CURRENT_SESSION");
+        string_array.value(0).to_string()
+    };
+
+    // Statement 2: get session ID
+    let session_id_2 = {
+        let mut stmt = conn.new_statement().expect("Failed to create statement 2");
+        stmt.set_sql_query("SELECT CAST(CURRENT_SESSION AS VARCHAR(40)) AS SID")
+            .expect("Failed to set SQL query");
+        let mut reader = stmt.execute().expect("Failed to execute statement 2");
+        let batch = reader.next().unwrap().expect("Failed to read batch");
+        let col = batch.column(0);
+        let string_array = col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("Expected string array for CURRENT_SESSION");
+        string_array.value(0).to_string()
+    };
+
+    assert_eq!(
+        session_id_1, session_id_2,
+        "Expected same session but got {} vs {} — statements are creating new connections",
+        session_id_1, session_id_2
+    );
+
+    println!(
+        "Session reuse verified: both statements used session {}",
+        session_id_1
+    );
+}
+
 /// Test get_info via driver manager.
 #[test]
 

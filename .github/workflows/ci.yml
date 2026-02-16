@@ -128,30 +128,34 @@ jobs:
           docker run -d \
             --name exasol-test \
             --privileged \
+            --shm-size=1g \
             -p 8563:8563 \
-            exasol/docker-db:latest
-
-          echo "Waiting for Exasol to be ready..."
-          for i in {1..60}; do
-            if docker logs exasol-test 2>&1 | grep -q "All stages finished."; then
-              echo "Exasol is ready!"
-              break
-            fi
-            echo "Waiting... ($i/60)"
-            sleep 10
-          done
-
-          # Additional wait for database to be fully operational
-          sleep 30
+            exasol/docker-db:2025.2.0
 
       - name: Build with FFI
         run: cargo build --release --features ffi
 
+      - name: Wait for Exasol to be ready
+        run: ./scripts/wait_for_exasol.sh exasol-test 120
+
       - name: Run integration tests with coverage
+        env:
+          REQUIRE_EXASOL: "1"
         run: |
-          cargo llvm-cov --no-report --features ffi --test integration_tests -- --ignored --test-threads=1
-          cargo llvm-cov --no-report --features ffi --test driver_manager_tests -- --ignored --test-threads=1
+          cargo llvm-cov --no-report --features ffi --test integration_tests -- --test-threads=1
+          cargo llvm-cov --no-report --features ffi --test driver_manager_tests -- --include-ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov-integration.info
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: pip install adbc-driver-manager pyarrow pytest polars
+
+      - name: Run Python integration tests
+        run: pytest tests/python/test_driver_integration.py -v
 
       - name: Stop Exasol container
         if: always()

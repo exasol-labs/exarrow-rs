@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3
+
+- Fixed FFI statements opening a new WebSocket per query instead of reusing the connection session
+- Added Python usage examples for ADBC driver manager integration
+- Updated driver manager documentation examples
+
 ## 0.5.2
 
 - Added documentation in [docs/](docs/)
