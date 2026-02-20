@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.0
+
+- CSV schema inference for automatic table creation on CSV imports
+- Added schema inference examples for CSV and Parquet formats
+
 ## 0.5.3
 
 - Fixed FFI statements opening a new WebSocket per query instead of reusing the connection session
