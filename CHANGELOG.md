@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- Fixed `import_from_parquet` and `import_from_parquet_files` hanging when `create_table_if_not_exists` is enabled and the CREATE TABLE DDL fails for reasons other than "table already exists" (e.g., nonexistent schema)
+
 ## 0.6.0
 
 - CSV schema inference for automatic table creation on CSV imports

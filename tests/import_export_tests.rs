@@ -2333,3 +2333,64 @@ async fn test_parquet_import_auto_create_existing_table() {
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
 }
+
+/// Test that parquet import with auto-create targeting nonexistent schema returns error
+#[tokio::test]
+#[ignore]
+async fn test_parquet_import_auto_create_nonexistent_schema_returns_error() {
+    skip_if_no_exasol!();
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use exarrow_rs::import::ColumnNameMode;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("test_data.parquet");
+
+    // Create a simple Parquet file
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let id_array = arrow::array::Int32Array::from(vec![1, 2]);
+    let name_array = arrow::array::StringArray::from(vec![Some("a"), Some("b")]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(id_array), Arc::new(name_array)],
+    )
+    .expect("Failed to create RecordBatch");
+
+    let file = std::fs::File::create(&parquet_path).expect("Failed to create file");
+    let props = WriterProperties::builder().build();
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("Failed to create writer");
+    writer.write(&batch).expect("Failed to write batch");
+    writer.close().expect("Failed to close writer");
+
+    let options = ParquetImportOptions::default()
+        .with_create_table_if_not_exists(true)
+        .with_column_name_mode(ColumnNameMode::Quoted);
+
+    let result = conn
+        .import_from_parquet(
+            "NONEXISTENT_SCHEMA_12345.test_table",
+            &parquet_path,
+            options,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Should return error for nonexistent schema"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("SQL execution failed"),
+        "Error should be SqlError, got: {}",
+        err_msg
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}

@@ -30,6 +30,9 @@ use super::parallel::{convert_parquet_files_to_csv, stream_files_parallel, Paral
 use super::source::IntoFileSources;
 use super::ImportError;
 
+/// Error substring used to detect idempotent DDL failures (table already exists).
+const DDL_ALREADY_EXISTS_MARKER: &str = "already exists";
+
 /// Options for Parquet import operations.
 #[derive(Debug, Clone)]
 pub struct ParquetImportOptions {
@@ -231,9 +234,11 @@ where
         let inferred_schema = infer_schema_from_parquet(file_path, options.column_name_mode)?;
         let ddl = inferred_schema.to_ddl(table, options.schema.as_deref());
 
-        // Execute CREATE TABLE - ignore errors if table already exists
-        // Exasol returns an error if table exists, which is fine
-        let _ = execute_sql(ddl).await;
+        if let Err(e) = execute_sql(ddl).await {
+            if !e.to_lowercase().contains(DDL_ALREADY_EXISTS_MARKER) {
+                return Err(ImportError::SqlError(e));
+            }
+        }
     }
 
     // Read the Parquet file and convert to CSV
@@ -584,8 +589,11 @@ where
         let inferred_schema = infer_schema_from_parquet_files(&paths, options.column_name_mode)?;
         let ddl = inferred_schema.to_ddl(table, options.schema.as_deref());
 
-        // Execute CREATE TABLE - ignore errors if table already exists
-        let _ = execute_sql(ddl).await;
+        if let Err(e) = execute_sql(ddl).await {
+            if !e.to_lowercase().contains(DDL_ALREADY_EXISTS_MARKER) {
+                return Err(ImportError::SqlError(e));
+            }
+        }
     }
 
     // Calculate connection count before transferring paths ownership
@@ -1467,5 +1475,147 @@ mod tests {
         assert_eq!(rows[0], "\"hello, world\"");
         assert_eq!(rows[1], "\"say \"\"hi\"\"\"");
         assert_eq!(rows[2], "\"line1\nline2\"");
+    }
+
+    /// Helper to create a temporary Parquet file for DDL error handling tests.
+    fn create_test_parquet_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let path = dir.join(name);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec![Some("a"), Some("b")]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .expect("Failed to create RecordBatch");
+
+        let file = std::fs::File::create(&path).expect("Failed to create file");
+        let props = WriterProperties::builder().build();
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(props)).expect("Failed to create writer");
+        writer.write(&batch).expect("Failed to write batch");
+        writer.close().expect("Failed to close writer");
+
+        path
+    }
+
+    #[tokio::test]
+    async fn test_import_from_parquet_propagates_ddl_error() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let parquet_path = create_test_parquet_file(temp_dir.path(), "test.parquet");
+
+        let options = ParquetImportOptions::default()
+            .with_create_table_if_not_exists(true)
+            .with_exasol_host("localhost")
+            .with_exasol_port(1);
+
+        // The closure returns an error that does NOT contain "already exists"
+        let execute_sql = |_sql: String| async {
+            Err::<u64, String>("schema NONEXISTENT_SCHEMA does not exist".to_string())
+        };
+
+        let result = import_from_parquet(execute_sql, "test_table", &parquet_path, options).await;
+
+        assert!(result.is_err(), "Should return an error");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("SQL execution failed"),
+            "Error should be SqlError, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("NONEXISTENT_SCHEMA"),
+            "Error should contain original message, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_from_parquet_ignores_already_exists_error() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let parquet_path = create_test_parquet_file(temp_dir.path(), "test.parquet");
+
+        let options = ParquetImportOptions::default()
+            .with_create_table_if_not_exists(true)
+            .with_exasol_host("localhost")
+            .with_exasol_port(1);
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let execute_sql = {
+            let call_count = call_count.clone();
+            move |_sql: String| {
+                let count = call_count.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        Err("object TEST_TABLE already exists".to_string())
+                    } else {
+                        Ok(0u64)
+                    }
+                }
+            }
+        };
+
+        let result = import_from_parquet(execute_sql, "test_table", &parquet_path, options).await;
+
+        // The function should NOT have returned SqlError (the DDL error was ignored).
+        // It will fail at HTTP transport since there's no real Exasol, but that's fine.
+        match &result {
+            Err(ImportError::SqlError(_)) => {
+                panic!("DDL 'already exists' error should have been ignored, but got SqlError");
+            }
+            _ => {
+                // Any other result is acceptable: either Ok (unlikely without real Exasol)
+                // or a transport/connection error (expected since no real Exasol is running)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_import_from_parquet_files_propagates_ddl_error() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        // Create at least 2 files to exercise the multi-file path (not single-file delegation)
+        let parquet_path1 = create_test_parquet_file(temp_dir.path(), "test1.parquet");
+        let parquet_path2 = create_test_parquet_file(temp_dir.path(), "test2.parquet");
+
+        let options = ParquetImportOptions::default()
+            .with_create_table_if_not_exists(true)
+            .with_exasol_host("localhost")
+            .with_exasol_port(1);
+
+        // The closure returns an error that does NOT contain "already exists"
+        let execute_sql = |_sql: String| async {
+            Err::<u64, String>("schema NONEXISTENT_SCHEMA does not exist".to_string())
+        };
+
+        let result = import_from_parquet_files(
+            execute_sql,
+            "test_table",
+            vec![parquet_path1, parquet_path2],
+            options,
+        )
+        .await;
+
+        assert!(result.is_err(), "Should return an error");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("SQL execution failed"),
+            "Error should be SqlError, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("NONEXISTENT_SCHEMA"),
+            "Error should contain original message, got: {}",
+            err_msg
+        );
     }
 }
