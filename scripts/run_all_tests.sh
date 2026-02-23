@@ -180,7 +180,7 @@ stage_container() {
     echo "Starting new Exasol container (tag: $EXASOL_TAG)..."
     local docker_args=(
       -d --name "$CONTAINER_NAME" --privileged
-      --shm-size=1g -p 8563:8563
+      --shm-size=2g -e COSLWD_ENABLED=1 -p 8563:8563
     )
     # On ARM Mac, run x86 Exasol image under QEMU
     if [[ "$OS" == "Darwin" && "$ARCH" == "arm64" ]]; then

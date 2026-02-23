@@ -74,8 +74,8 @@ Auto table creation infers Arrow schemas from Parquet file metadata without read
 ### Scenario: Auto-create with existing table
 
 * *GIVEN* the target table already exists in Exasol
-* *WHEN* importing Parquet with create_table_if_not_exists=true and target table already exists
-* *THEN* system SHALL skip DDL execution
+* *WHEN* importing Parquet with `create_table_if_not_exists=true` and target table already exists
+* *THEN* system SHALL ignore the "table already exists" DDL error
 * *AND* import SHALL proceed normally using existing table schema
 
 ### Scenario: Auto-create option disabled (default)
@@ -92,3 +92,30 @@ Auto table creation infers Arrow schemas from Parquet file metadata without read
 * *THEN* system SHALL compute union schema from all files
 * *AND* system SHALL create table with widened types
 * *AND* all files SHALL be importable into the created table
+
+### Scenario: Auto-create table fails due to nonexistent schema
+
+* *GIVEN* a Parquet file exists on disk
+* *AND* `create_table_if_not_exists` is enabled
+* *AND* the schema portion of the target table name does not exist in Exasol
+* *WHEN* user calls `import_from_parquet` with the qualified table name
+* *THEN* the system SHALL return an `ImportError::SqlError` containing the database error message
+* *AND* the system SHALL NOT proceed to HTTP transport setup
+
+### Scenario: Auto-create table fails due to nonexistent schema (multi-file)
+
+* *GIVEN* multiple Parquet files exist on disk
+* *AND* `create_table_if_not_exists` is enabled
+* *AND* the schema portion of the target table name does not exist in Exasol
+* *WHEN* user calls `import_from_parquet_files` with the qualified table name
+* *THEN* the system SHALL return an `ImportError::SqlError` containing the database error message
+* *AND* the system SHALL NOT proceed to HTTP transport setup
+
+### Scenario: Auto-create table fails due to other DDL errors
+
+* *GIVEN* a Parquet file exists on disk
+* *AND* `create_table_if_not_exists` is enabled
+* *AND* the CREATE TABLE DDL fails for a reason other than "table already exists"
+* *WHEN* user calls `import_from_parquet` with the target table name
+* *THEN* the system SHALL return an `ImportError::SqlError` containing the database error message
+* *AND* the system SHALL NOT proceed to HTTP transport setup
