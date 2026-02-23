@@ -130,6 +130,7 @@ jobs:
             --privileged \
             --shm-size=1g \
             -p 8563:8563 \
+            -e COSLWD_ENABLED=1 \
             exasol/docker-db:2025.2.0
 
       - name: Build with FFI
