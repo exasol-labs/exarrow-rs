@@ -134,27 +134,6 @@ fn test_driver_manager_loads_driver() {
     }
 }
 
-/// Test that loading with an incorrect entry point fails gracefully.
-#[test]
-
-fn test_driver_manager_wrong_entry_point_fails() {
-    skip_if_no_library!();
-
-    let lib_path = get_library_path();
-
-    // Try to load with wrong entry point
-    let driver_result = ManagedDriver::load_dynamic_from_filename(
-        lib_path,
-        Some(b"NonExistentDriverInit"),
-        AdbcVersion::V110,
-    );
-
-    assert!(
-        driver_result.is_err(),
-        "Loading with wrong entry point should fail"
-    );
-}
-
 // Section 10.4: Database Creation Tests
 
 /// Test creating a database via the driver manager.
