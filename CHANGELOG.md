@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.3
+
+- Updated `bytes` (1.11.0 → 1.11.1) and `time` (0.3.45 → 0.3.47) to fix security vulnerabilities
+
 ## 0.6.2
 
 - Upgraded ADBC dependency from 0.21 to 0.22 (includes Windows build fix)
