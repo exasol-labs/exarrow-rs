@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2
+
+- Upgraded ADBC dependency from 0.21 to 0.22 (includes Windows build fix)
+- Removed outdated driver manager test
+
 ## 0.6.1
 
 - Fixed `import_from_parquet` and `import_from_parquet_files` hanging when `create_table_if_not_exists` is enabled and the CREATE TABLE DDL fails for reasons other than "table already exists" (e.g., nonexistent schema)
