@@ -6,7 +6,7 @@ ADBC-compatible driver for Exasol with Apache Arrow data format support.
 
 ## Documentation
 
-- [Connection](connection.md) - Connection strings, TLS, and timeout configuration
+- [Setup & Connect](setup-and-connect.md) - Docker setup, connection strings, parameters, and TLS configuration
 - [Queries](queries.md) - Query execution, results, and transactions
 - [Prepared Statements](prepared-statements.md) - Parameter binding and prepared statements
 - [Import / Export](import-export.md) - CSV, Parquet, and Arrow bulk data transfer

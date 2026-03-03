@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 See [**docs/**](docs/index.md) for comprehensive documentation:
 
-- [Connection](docs/connection.md) - Connection strings, TLS, timeouts
+- [Setup & Connect](docs/setup-and-connect.md) - Docker setup, connection strings, parameters, and TLS configuration
 - [Queries](docs/queries.md) - Query execution and transactions
 - [Prepared Statements](docs/prepared-statements.md) - Parameter binding
 - [Import / Export](docs/import-export.md) - Bulk data transfer
@@ -69,6 +69,6 @@ Community-supported. Licensed under [MIT](LICENSE).
 
 Build with Rust 🦀 and made with ❤️
 
-Based on a prototype by [marconae](https://github.com/marconae), now maintained by [Exasol Labs](https://github.com/exasol-labs/).
+Based on a prototype by [marconae](https://github.com/marconae), now maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
 
 </div>
