@@ -15,6 +15,15 @@ The system implements the Exasol WebSocket API protocol as defined in https://gi
 * *THEN* it SHALL establish a WebSocket connection to the specified host and port
 * *AND* it SHALL use secure WebSocket (wss://) when TLS is enabled
 * *AND* it SHALL handle connection timeouts gracefully
+* *AND* it SHALL configure the WebSocket with no frame size limit and no message size limit
+
+### Scenario: Large result set transfer via WebSocket
+
+* *GIVEN* an authenticated WebSocket session exists
+* *AND* a table contains enough data to produce a response exceeding 16 MiB
+* *WHEN* executing a SELECT query that returns the full result set
+* *THEN* the system SHALL receive the complete response without frame size errors
+* *AND* the system SHALL return all rows as Arrow RecordBatches
 
 ### Scenario: Protocol handshake
 
