@@ -233,11 +233,20 @@ jobs:
           body: ${{ steps.changelog.outputs.body }}
 
       - name: Install Rust toolchain
-        if: steps.check.outputs.exists == 'false'
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check if version is on crates.io
+        id: crate
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if curl -sf "https://crates.io/api/v1/crates/exarrow-rs/$VERSION" | grep -q '"num"'; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to crates.io
-        if: steps.check.outputs.exists == 'false'
+        if: steps.crate.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
         run: cargo publish
