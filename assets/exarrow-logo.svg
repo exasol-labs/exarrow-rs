@@ -48,7 +48,7 @@
 
   <!-- Text: exarrow-rs with white outline for dark mode -->
   <!-- White stroke layer (behind) -->
-  <text x="20" y="128" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="none" stroke="white" stroke-width="4" stroke-linejoin="round" text-anchor="start">exarrow-rs</text>
+  <text x="20" y="128" font-family="Inter, sans-serif" font-size="20" font-weight="bold" fill="none" stroke="white" stroke-width="4" stroke-linejoin="round" text-anchor="start">exarrow-rs</text>
   <!-- Main text layer (on top) -->
-  <text x="20" y="128" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#333" text-anchor="start">exarrow-rs</text>
+  <text x="20" y="128" font-family="Inter, sans-serif" font-size="20" font-weight="bold" fill="#333" text-anchor="start">exarrow-rs</text>
 </svg>
