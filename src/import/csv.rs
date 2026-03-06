@@ -829,9 +829,7 @@ where
     // Create the stream future — runs cooperatively on the same task via select!
     // (no tokio::spawn needed, avoiding worker thread dependencies that cause
     // deadlocks under block_on or constrained environments)
-    let stream_future = async move {
-        stream_fn(client, compression).await
-    };
+    let stream_future = async move { stream_fn(client, compression).await };
     tokio::pin!(stream_future);
 
     // Run SQL execution and data streaming concurrently on the same task.
