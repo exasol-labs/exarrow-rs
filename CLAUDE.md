@@ -66,3 +66,9 @@ Specifications live in `specs/` using a `specs/<domain>/<feature>/spec.md` struc
 - TLS enabled by default; production Exasol requires it
 - Never log or expose connection passwords
 - Integration tests require running Exasol instance
+
+## Changelog
+
+- `CHANGELOG.md` must be updated with every version bump
+- Format: `## <version>` header followed by bullet points describing changes
+- Entries should be concise, user-facing descriptions (not internal implementation details)
