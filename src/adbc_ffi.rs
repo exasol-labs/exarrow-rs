@@ -1721,11 +1721,24 @@ impl FfiStatement {
         }
 
         let import_options = crate::import::arrow::ArrowImportOptions::default();
+        // Spawn the import as a proper tokio task rather than driving it directly
+        // on the block_on thread. import_csv_internal uses tokio::spawn internally
+        // for the HTTP stream task, and that spawned task needs to run concurrently
+        // with the SQL execution. When driven directly by block_on, the block_on
+        // thread's scheduling can prevent the spawned task from making progress,
+        // causing a deadlock. Spawning the entire operation ensures all inner tasks
+        // run on proper worker threads.
         let row_count = get_runtime()
             .block_on(async {
-                let mut conn = conn_arc.lock().await;
-                conn.import_from_record_batch(&qualified_name, &batch, import_options)
-                    .await
+                tokio::spawn(async move {
+                    let mut conn = conn_arc.lock().await;
+                    conn.import_from_record_batch(&qualified_name, &batch, import_options)
+                        .await
+                })
+                .await
+                .map_err(|e| {
+                    crate::import::ImportError::StreamError(format!("Task panicked: {e}"))
+                })?
             })
             .map_err(to_adbc_error)?;
 
