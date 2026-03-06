@@ -855,6 +855,12 @@ where
     // This triggers Exasol to send the HTTP GET request through the tunnel
     let sql_result = execute_sql(sql).await;
 
+    // If SQL failed, abort the stream task — Exasol will never send the HTTP GET,
+    // so the stream task would hang forever waiting for it.
+    if sql_result.is_err() {
+        stream_handle.abort();
+    }
+
     // Wait for the stream task to complete
     let stream_result = stream_handle.await;
 
@@ -862,6 +868,9 @@ where
     match stream_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
+        Err(e) if e.is_cancelled() => {
+            // Task was cancelled due to SQL failure — fall through to return the SQL error
+        }
         Err(e) => {
             return Err(ImportError::StreamError(format!(
                 "Stream task panicked: {e}"

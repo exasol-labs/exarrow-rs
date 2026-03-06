@@ -105,9 +105,20 @@ fn quote_identifier(name: &str) -> String {
 }
 
 /// Build a fully-qualified, properly-quoted table name.
+///
+/// If `schema` is provided, it is quoted separately and prepended.
+/// If `schema` is None but `table` contains a dot, the first dot is treated
+/// as a schema/table separator so that `"SCHEMA.TABLE"` becomes `"SCHEMA"."TABLE"`
+/// rather than a single quoted identifier containing a literal dot.
 fn build_qualified_table_name(schema: Option<&str>, table: &str) -> String {
     if let Some(schema) = schema {
         format!("{}.{}", quote_identifier(schema), quote_identifier(table))
+    } else if let Some((schema_part, table_part)) = table.split_once('.') {
+        format!(
+            "{}.{}",
+            quote_identifier(schema_part),
+            quote_identifier(table_part)
+        )
     } else {
         quote_identifier(table)
     }
