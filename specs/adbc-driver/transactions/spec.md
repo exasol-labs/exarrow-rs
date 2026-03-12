@@ -8,7 +8,6 @@ Exasol supports transactions through the `autocommit` session attribute. When au
 
 ## Scenarios
 
-<!-- DELTA:CHANGED -->
 ### Scenario: Autocommit enabled by default
 
 * *GIVEN* a new ADBC connection to Exasol
@@ -49,4 +48,3 @@ Exasol supports transactions through the `autocommit` session attribute. When au
 * *THEN* the driver SHALL send a `setAttributes` command to update autocommit on the server
 * *AND* if switching from manual to auto mode and a transaction is active, the driver SHALL commit it first
 * *AND* if switching from manual to auto mode and no transaction is active, the driver SHALL skip the commit
-<!-- /DELTA:CHANGED -->

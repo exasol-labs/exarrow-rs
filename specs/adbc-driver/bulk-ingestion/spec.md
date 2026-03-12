@@ -8,7 +8,6 @@ Bulk ingestion is triggered through the ADBC Statement interface by setting `Ing
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: Append to existing table
 
 * *GIVEN* an ADBC statement with `IngestTargetTable` set to an existing table name
@@ -82,4 +81,3 @@ Bulk ingestion is triggered through the ADBC Statement interface by setting `Ing
 * *WHEN* the statement is executed
 * *THEN* the driver SHALL return an error with status `NotImplemented`
 * *AND* the error message SHALL indicate that Exasol does not support temporary tables
-<!-- /DELTA:NEW -->

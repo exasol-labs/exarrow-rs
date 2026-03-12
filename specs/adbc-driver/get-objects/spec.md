@@ -8,7 +8,6 @@ Exasol uses a single synthetic catalog named "EXA" since it has no multi-catalog
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: GetObjects at catalog depth
 
 * *GIVEN* an active ADBC connection to Exasol
@@ -48,4 +47,3 @@ Exasol uses a single synthetic catalog named "EXA" since it has no multi-catalog
 * *THEN* the driver SHALL apply the filters to restrict returned metadata
 * *AND* the catalog filter SHALL match against the synthetic "EXA" catalog name
 * *AND* schema, table, and column filters SHALL be applied as SQL `LIKE` patterns where supported
-<!-- /DELTA:NEW -->

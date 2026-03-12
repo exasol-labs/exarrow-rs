@@ -8,7 +8,6 @@ Table schema is retrieved by querying `SYS.EXA_ALL_COLUMNS` for the specified ta
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: Get schema of existing table
 
 * *GIVEN* an active ADBC connection to Exasol
@@ -32,4 +31,3 @@ Table schema is retrieved by querying `SYS.EXA_ALL_COLUMNS` for the specified ta
 * *WHEN* `get_table_schema` is called with a table name that does not exist
 * *THEN* the driver SHALL return an error with status `NotFound`
 * *AND* the error message SHALL indicate the table was not found
-<!-- /DELTA:NEW -->

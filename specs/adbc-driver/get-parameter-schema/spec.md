@@ -8,7 +8,6 @@ When a statement is prepared via the Exasol WebSocket protocol, the `CreatePrepa
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: Get parameter schema after prepare
 
 * *GIVEN* an ADBC statement has been prepared with a SQL query containing parameters
@@ -22,4 +21,3 @@ When a statement is prepared via the Exasol WebSocket protocol, the `CreatePrepa
 * *WHEN* `get_parameter_schema` is called
 * *THEN* the driver SHALL return an error with status `InvalidState`
 * *AND* the error message SHALL indicate that the statement must be prepared first
-<!-- /DELTA:NEW -->
