@@ -36,13 +36,18 @@
 
 mod common;
 
-use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
-use adbc_core::{Connection as AdbcConnection, Database, Driver, Statement};
+use adbc_core::options::{
+    AdbcVersion, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+};
+use adbc_core::{Connection as AdbcConnection, Database, Driver, Optionable, Statement};
 use adbc_driver_manager::ManagedDriver;
-use arrow::array::{Array, RecordBatchReader};
-use arrow::datatypes::DataType;
+use arrow::array::{
+    Array, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
+};
+use arrow::datatypes::{DataType, Field, Schema};
 use common::{get_host, get_password, get_port, get_user, is_exasol_available};
 use std::path::Path;
+use std::sync::Arc;
 
 // Helper Functions
 
@@ -503,28 +508,35 @@ fn test_driver_manager_validates_arrow_schema() {
 /// This is the key verification test - it ensures that using the driver
 /// through the FFI/driver manager produces the same results as using
 /// the direct Rust API.
-#[tokio::test]
+#[test]
 
-async fn test_driver_manager_matches_direct_api() {
+fn test_driver_manager_matches_direct_api() {
     skip_if_no_library!();
     skip_if_no_exasol!();
 
-    // First, get results via direct API
-    let mut direct_conn = common::get_test_connection()
-        .await
-        .expect("Failed to connect via direct API");
+    // Run the direct API part in an explicit runtime (not #[tokio::test] to avoid nested runtime)
+    let direct_batches = {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        rt.block_on(async {
+            let mut direct_conn = common::get_test_connection()
+                .await
+                .expect("Failed to connect via direct API");
 
-    let direct_batches = direct_conn
-        .query("SELECT 42 AS answer, 'test' AS label")
-        .await
-        .expect("Failed to query via direct API");
+            let direct_batches = direct_conn
+                .query("SELECT 42 AS answer, 'test' AS label")
+                .await
+                .expect("Failed to query via direct API");
 
-    direct_conn
-        .close()
-        .await
-        .expect("Failed to close direct connection");
+            direct_conn
+                .close()
+                .await
+                .expect("Failed to close direct connection");
 
-    // Now, get results via driver manager
+            direct_batches
+        })
+    };
+
+    // Now, get results via driver manager (synchronous - uses FFI runtime internally)
     let lib_path = get_library_path();
 
     let mut driver = ManagedDriver::load_dynamic_from_filename(
@@ -707,7 +719,7 @@ fn test_driver_manager_execute_update() {
 /// should execute on the parent connection's existing WebSocket session rather
 /// than opening a new one.
 #[test]
-#[ignore]
+
 fn test_driver_manager_reuses_session_across_statements() {
     skip_if_no_library!();
     skip_if_no_exasol!();
@@ -908,4 +920,1179 @@ fn test_driver_manager_get_table_types() {
         "get_table_types returned: {:?} via driver manager",
         table_types
     );
+}
+
+// Bulk Ingestion Tests
+
+fn make_test_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+
+fn test_bulk_ingest_create() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = format!(
+        "TEST_INGEST_CREATE_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create schema
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Bulk ingest with Create mode
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String(format!("{}.INGEST_TABLE", schema_name)),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.mode".to_string()),
+            OptionValue::String("adbc.ingest.mode.create".to_string()),
+        )
+        .unwrap();
+
+        let batch = make_test_batch();
+        stmt.bind(batch).unwrap();
+        let result = stmt.execute_update();
+        assert!(
+            result.is_ok(),
+            "Bulk ingest create should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // Verify data
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "SELECT COUNT(*) AS cnt FROM {}.INGEST_TABLE",
+            schema_name
+        ))
+        .unwrap();
+        let mut reader = stmt.execute().expect("Failed to execute query");
+        let batch = reader.next().unwrap().expect("Failed to read batch");
+        let col = batch.column(0);
+        assert!(batch.num_rows() > 0);
+        println!(
+            "Bulk ingest create: verified data in table, count column type: {:?}",
+            col.data_type()
+        );
+    }
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
+}
+
+#[test]
+
+fn test_bulk_ingest_append() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = format!(
+        "TEST_INGEST_APPEND_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create schema and table
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "CREATE TABLE {}.APPEND_TABLE (\"id\" DECIMAL(18,0) NOT NULL, \"name\" VARCHAR(2000000))",
+            schema_name
+        ))
+        .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Bulk ingest with Append mode (default)
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String(format!("{}.APPEND_TABLE", schema_name)),
+        )
+        .unwrap();
+
+        let batch = make_test_batch();
+        stmt.bind(batch).unwrap();
+        let result = stmt.execute_update();
+        assert!(
+            result.is_ok(),
+            "Bulk ingest append should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
+}
+
+#[test]
+
+fn test_bulk_ingest_replace() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = format!(
+        "TEST_INGEST_REPLACE_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create schema and initial table with data
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Create and ingest first
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String(format!("{}.REPLACE_TABLE", schema_name)),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.mode".to_string()),
+            OptionValue::String("adbc.ingest.mode.create".to_string()),
+        )
+        .unwrap();
+        stmt.bind(make_test_batch()).unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Replace with new data
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String(format!("{}.REPLACE_TABLE", schema_name)),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.mode".to_string()),
+            OptionValue::String("adbc.ingest.mode.replace".to_string()),
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["replaced"])),
+            ],
+        )
+        .unwrap();
+        stmt.bind(batch).unwrap();
+        let result = stmt.execute_update();
+        assert!(
+            result.is_ok(),
+            "Bulk ingest replace should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
+}
+
+#[test]
+
+fn test_bulk_ingest_create_append() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = format!(
+        "TEST_INGEST_CRAPPEND_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create schema
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // First create_append: creates table
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String(format!("{}.CA_TABLE", schema_name)),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.mode".to_string()),
+            OptionValue::String("adbc.ingest.mode.create_append".to_string()),
+        )
+        .unwrap();
+        stmt.bind(make_test_batch()).unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Second create_append: appends to existing table
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String(format!("{}.CA_TABLE", schema_name)),
+        )
+        .unwrap();
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.mode".to_string()),
+            OptionValue::String("adbc.ingest.mode.create_append".to_string()),
+        )
+        .unwrap();
+        stmt.bind(make_test_batch()).unwrap();
+        let result = stmt.execute_update();
+        assert!(
+            result.is_ok(),
+            "Second create_append should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
+}
+
+// Transaction Tests
+
+#[test]
+
+fn test_transaction_commit() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = format!(
+        "TEST_TXN_COMMIT_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create schema and table with autocommit on (default)
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "CREATE TABLE {}.TXN_TABLE (id INTEGER, name VARCHAR(100))",
+            schema_name
+        ))
+        .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Disable autocommit
+    conn.set_option(OptionConnection::AutoCommit, "false".into())
+        .unwrap();
+
+    // Insert data
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "INSERT INTO {}.TXN_TABLE VALUES (1, 'committed')",
+            schema_name
+        ))
+        .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Commit
+    conn.commit().unwrap();
+
+    // Re-enable autocommit
+    conn.set_option(OptionConnection::AutoCommit, "true".into())
+        .unwrap();
+
+    // Verify data persisted
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "SELECT COUNT(*) AS cnt FROM {}.TXN_TABLE",
+            schema_name
+        ))
+        .unwrap();
+        let mut reader = stmt.execute().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert!(batch.num_rows() > 0, "Committed data should be visible");
+    }
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
+}
+
+#[test]
+
+fn test_transaction_rollback() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = format!(
+        "TEST_TXN_ROLLBACK_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create schema and table with autocommit on
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "CREATE TABLE {}.TXN_TABLE (id INTEGER, name VARCHAR(100))",
+            schema_name
+        ))
+        .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Disable autocommit
+    conn.set_option(OptionConnection::AutoCommit, "false".into())
+        .unwrap();
+
+    // Insert data
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "INSERT INTO {}.TXN_TABLE VALUES (1, 'will_rollback')",
+            schema_name
+        ))
+        .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // Rollback
+    conn.rollback().unwrap();
+
+    // Re-enable autocommit
+    conn.set_option(OptionConnection::AutoCommit, "true".into())
+        .unwrap();
+
+    // Verify data was rolled back
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "SELECT COUNT(*) AS cnt FROM {}.TXN_TABLE WHERE name = 'will_rollback'",
+            schema_name
+        ))
+        .unwrap();
+        let mut reader = stmt.execute().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>();
+        if let Some(arr) = col {
+            assert_eq!(arr.value(0), 0, "Rolled back data should not be visible");
+        }
+    }
+
+    // Cleanup
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
+}
+
+#[test]
+
+fn test_autocommit_default() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let conn = db.new_connection().expect("Failed to create connection");
+
+    let auto_commit = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .unwrap();
+    assert_eq!(auto_commit, "true", "AutoCommit should default to true");
+}
+
+#[test]
+
+fn test_autocommit_toggle() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let lib_path = get_library_path();
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        lib_path,
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+
+    let uri = get_test_uri();
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    // Ensure connection is established
+    {
+        let _stmt = conn.new_statement().expect("Failed to create statement");
+    }
+
+    // Default should be true
+    let auto_commit = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .unwrap();
+    assert_eq!(auto_commit, "true");
+
+    // Toggle to false
+    conn.set_option(OptionConnection::AutoCommit, "false".into())
+        .unwrap();
+    let auto_commit = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .unwrap();
+    assert_eq!(auto_commit, "false");
+
+    // Toggle back to true
+    conn.set_option(OptionConnection::AutoCommit, "true".into())
+        .unwrap();
+    let auto_commit = conn
+        .get_option_string(OptionConnection::AutoCommit)
+        .unwrap();
+    assert_eq!(auto_commit, "true");
+}
+
+// GetObjects Tests
+
+/// Helper macro to set up a driver manager connection.
+macro_rules! setup_driver_manager_conn {
+    ($driver:ident, $db:ident, $conn:ident) => {
+        let lib_path = get_library_path();
+        let mut $driver = ManagedDriver::load_dynamic_from_filename(
+            lib_path,
+            Some(b"ExarrowDriverInit"),
+            AdbcVersion::V110,
+        )
+        .expect("Failed to load driver");
+
+        let uri = get_test_uri();
+        let opts = vec![(OptionDatabase::Uri, OptionValue::String(uri))];
+        let $db = $driver
+            .new_database_with_opts(opts)
+            .expect("Failed to create database");
+
+        let mut $conn = $db.new_connection().expect("Failed to create connection");
+
+        // Ensure connection is established
+        {
+            let _stmt = $conn.new_statement().expect("Failed to create statement");
+        }
+    };
+}
+
+/// Combined test for get_objects at all depth levels via driver manager.
+///
+/// Creates a dedicated test schema with a table so that the test does not
+/// depend on system schemas (which may not appear in EXA_ALL_SCHEMAS on a
+/// fresh CI container).
+#[test]
+fn test_driver_manager_get_objects() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+
+    let schema_name = format!(
+        "TEST_GET_OBJECTS_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    // Create test schema and table
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
+            .unwrap();
+        stmt.execute_update().unwrap();
+    }
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!(
+            "CREATE TABLE {}.TEST_TABLE (ID INT, NAME VARCHAR(100))",
+            schema_name
+        ))
+        .unwrap();
+        stmt.execute_update().unwrap();
+    }
+
+    // --- Test Catalogs depth ---
+    {
+        let mut reader = conn
+            .get_objects(ObjectDepth::Catalogs, None, None, None, None, None)
+            .expect("get_objects(Catalogs) should succeed");
+
+        let mut total_rows = 0;
+        let mut catalog_names = Vec::new();
+        let mut schemas_all_null = true;
+
+        for batch_result in reader.by_ref() {
+            let batch: RecordBatch = batch_result.expect("Failed to read batch");
+            total_rows += batch.num_rows();
+
+            let catalog_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("catalog_name should be StringArray");
+
+            for i in 0..catalog_col.len() {
+                if !catalog_col.is_null(i) {
+                    catalog_names.push(catalog_col.value(i).to_string());
+                }
+            }
+
+            let schemas_col = batch.column(1);
+            for i in 0..batch.num_rows() {
+                if !schemas_col.is_null(i) {
+                    schemas_all_null = false;
+                }
+            }
+        }
+
+        assert_eq!(total_rows, 1, "Should return exactly 1 catalog row");
+        assert_eq!(catalog_names, vec!["EXA"], "Catalog name should be 'EXA'");
+        assert!(
+            schemas_all_null,
+            "catalog_db_schemas should be null at Catalogs depth"
+        );
+    }
+
+    // --- Test Schemas depth ---
+    {
+        let mut reader = conn
+            .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
+            .expect("get_objects(Schemas) should succeed");
+
+        let mut found_catalog = false;
+        let mut schema_names = Vec::new();
+
+        for batch_result in reader.by_ref() {
+            let batch: RecordBatch = batch_result.expect("Failed to read batch");
+
+            let catalog_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("catalog_name should be StringArray");
+
+            let schemas_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("catalog_db_schemas should be ListArray");
+
+            for i in 0..batch.num_rows() {
+                if !catalog_col.is_null(i) && catalog_col.value(i) == "EXA" {
+                    found_catalog = true;
+
+                    let schema_list = schemas_col.value(i);
+                    let schema_structs = schema_list
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("Schema list values should be StructArray");
+
+                    let name_col = schema_structs
+                        .column_by_name("db_schema_name")
+                        .expect("Schema struct should have db_schema_name")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("db_schema_name should be StringArray");
+
+                    for j in 0..schema_structs.len() {
+                        if !name_col.is_null(j) {
+                            schema_names.push(name_col.value(j).to_string());
+                        }
+
+                        if let Some(tables_col) = schema_structs.column_by_name("db_schema_tables")
+                        {
+                            assert!(
+                                tables_col.is_null(j),
+                                "db_schema_tables should be null at Schemas depth"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(found_catalog, "Should find catalog 'EXA'");
+        assert!(
+            !schema_names.is_empty(),
+            "Should return at least one schema"
+        );
+        assert!(
+            schema_names.contains(&schema_name),
+            "Should contain test schema '{}', got: {:?}",
+            schema_name,
+            schema_names
+        );
+    }
+
+    // --- Test Tables depth ---
+    {
+        let mut reader = conn
+            .get_objects(
+                ObjectDepth::Tables,
+                None,
+                Some(schema_name.as_str()),
+                None,
+                None,
+                None,
+            )
+            .expect("get_objects(Tables) should succeed");
+
+        let mut table_names = Vec::new();
+        let mut table_types = Vec::new();
+
+        for batch_result in reader.by_ref() {
+            let batch: RecordBatch = batch_result.expect("Failed to read batch");
+
+            let schemas_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("catalog_db_schemas should be ListArray");
+
+            for i in 0..batch.num_rows() {
+                if schemas_col.is_null(i) {
+                    continue;
+                }
+
+                let schema_list = schemas_col.value(i);
+                let schema_structs = schema_list
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("Schema list values should be StructArray");
+
+                let tables_list_col = schema_structs
+                    .column_by_name("db_schema_tables")
+                    .expect("Schema struct should have db_schema_tables");
+
+                let tables_list = tables_list_col
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("db_schema_tables should be ListArray");
+
+                for j in 0..schema_structs.len() {
+                    if tables_list.is_null(j) {
+                        continue;
+                    }
+
+                    let table_array = tables_list.value(j);
+                    let table_structs = table_array
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("Table list values should be StructArray");
+
+                    let name_col = table_structs
+                        .column_by_name("table_name")
+                        .expect("Table struct should have table_name")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("table_name should be StringArray");
+
+                    let type_col = table_structs
+                        .column_by_name("table_type")
+                        .expect("Table struct should have table_type")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("table_type should be StringArray");
+
+                    for k in 0..table_structs.len() {
+                        if !name_col.is_null(k) {
+                            table_names.push(name_col.value(k).to_string());
+                        }
+                        if !type_col.is_null(k) {
+                            let tt = type_col.value(k).to_string();
+                            if !table_types.contains(&tt) {
+                                table_types.push(tt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            table_names.contains(&"TEST_TABLE".to_string()),
+            "Should find TEST_TABLE, got: {:?}",
+            table_names
+        );
+        assert!(
+            table_types.contains(&"TABLE".to_string()),
+            "Should have TABLE type, got: {:?}",
+            table_types
+        );
+    }
+
+    // --- Test All depth ---
+    {
+        let mut reader = conn
+            .get_objects(
+                ObjectDepth::All,
+                None,
+                Some(schema_name.as_str()),
+                None,
+                None,
+                None,
+            )
+            .expect("get_objects(All) should succeed");
+
+        let mut found_columns = false;
+        let mut column_names = Vec::new();
+
+        for batch_result in reader.by_ref() {
+            let batch: RecordBatch = batch_result.expect("Failed to read batch");
+
+            let schemas_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("catalog_db_schemas should be ListArray");
+
+            for i in 0..batch.num_rows() {
+                if schemas_col.is_null(i) {
+                    continue;
+                }
+
+                let schema_list = schemas_col.value(i);
+                let schema_structs = schema_list
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("Schema list values should be StructArray");
+
+                let tables_list_col = schema_structs
+                    .column_by_name("db_schema_tables")
+                    .expect("Schema struct should have db_schema_tables");
+
+                let tables_list = tables_list_col
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("db_schema_tables should be ListArray");
+
+                for j in 0..schema_structs.len() {
+                    if tables_list.is_null(j) {
+                        continue;
+                    }
+
+                    let table_array = tables_list.value(j);
+                    let table_structs = table_array
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("Table list values should be StructArray");
+
+                    let columns_list_col = table_structs
+                        .column_by_name("table_columns")
+                        .expect("Table struct should have table_columns");
+
+                    let columns_list = columns_list_col
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .expect("table_columns should be ListArray");
+
+                    for k in 0..table_structs.len() {
+                        if columns_list.is_null(k) {
+                            continue;
+                        }
+
+                        let col_array = columns_list.value(k);
+                        let col_structs = col_array
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .expect("Column list values should be StructArray");
+
+                        if col_structs.len() > 0 {
+                            found_columns = true;
+
+                            let col_name = col_structs
+                                .column_by_name("column_name")
+                                .expect("Column struct should have column_name")
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .expect("column_name should be StringArray");
+
+                            for idx in 0..col_name.len() {
+                                if !col_name.is_null(idx) {
+                                    column_names.push(col_name.value(idx).to_string());
+                                }
+                            }
+
+                            let ordinal = col_structs
+                                .column_by_name("ordinal_position")
+                                .expect("Column struct should have ordinal_position");
+                            assert!(!ordinal.is_empty(), "ordinal_position should not be empty");
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_columns,
+            "Should find columns at All depth for test schema"
+        );
+        assert!(
+            column_names.contains(&"ID".to_string()),
+            "Should find column ID, got: {:?}",
+            column_names
+        );
+        assert!(
+            column_names.contains(&"NAME".to_string()),
+            "Should find column NAME, got: {:?}",
+            column_names
+        );
+    }
+
+    // --- Test schema filter ---
+    {
+        let mut reader = conn
+            .get_objects(
+                ObjectDepth::Schemas,
+                None,
+                Some(schema_name.as_str()),
+                None,
+                None,
+                None,
+            )
+            .expect("get_objects with schema filter should succeed");
+
+        let mut schema_names = Vec::new();
+
+        for batch_result in reader.by_ref() {
+            let batch: RecordBatch = batch_result.expect("Failed to read batch");
+
+            let schemas_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("catalog_db_schemas should be ListArray");
+
+            for i in 0..batch.num_rows() {
+                if schemas_col.is_null(i) {
+                    continue;
+                }
+
+                let schema_list = schemas_col.value(i);
+                let schema_structs = schema_list
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("Schema list values should be StructArray");
+
+                let name_col = schema_structs
+                    .column_by_name("db_schema_name")
+                    .expect("Schema struct should have db_schema_name")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("db_schema_name should be StringArray");
+
+                for j in 0..schema_structs.len() {
+                    if !name_col.is_null(j) {
+                        schema_names.push(name_col.value(j).to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !schema_names.is_empty(),
+            "Should return at least one schema matching filter"
+        );
+
+        for name in &schema_names {
+            assert_eq!(
+                name, &schema_name,
+                "All returned schemas should match the filter '{}', got: {}",
+                schema_name, name
+            );
+        }
+    }
+
+    // --- Test table_type filter (VIEW only) ---
+    {
+        let mut reader = conn
+            .get_objects(
+                ObjectDepth::Tables,
+                None,
+                Some(schema_name.as_str()),
+                None,
+                Some(vec!["VIEW"]),
+                None,
+            )
+            .expect("get_objects with table_type filter should succeed");
+
+        for batch_result in reader.by_ref() {
+            let batch: RecordBatch = batch_result.expect("Failed to read batch");
+
+            let schemas_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("catalog_db_schemas should be ListArray");
+
+            for i in 0..batch.num_rows() {
+                if schemas_col.is_null(i) {
+                    continue;
+                }
+
+                let schema_list = schemas_col.value(i);
+                let schema_structs = schema_list
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("Schema list values should be StructArray");
+
+                let tables_list_col = schema_structs
+                    .column_by_name("db_schema_tables")
+                    .expect("Schema struct should have db_schema_tables");
+
+                let tables_list = tables_list_col
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .expect("db_schema_tables should be ListArray");
+
+                for j in 0..schema_structs.len() {
+                    if tables_list.is_null(j) {
+                        continue;
+                    }
+
+                    let table_array = tables_list.value(j);
+                    let table_structs = table_array
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("Table list values should be StructArray");
+
+                    let type_col = table_structs
+                        .column_by_name("table_type")
+                        .expect("Table struct should have table_type")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("table_type should be StringArray");
+
+                    for k in 0..table_structs.len() {
+                        if !type_col.is_null(k) {
+                            let tt = type_col.value(k).to_string();
+                            assert_eq!(
+                                tt, "VIEW",
+                                "All returned tables should be VIEW when filtered, got: {}",
+                                tt
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup: drop test schema
+    {
+        let mut stmt = conn.new_statement().expect("Failed to create statement");
+        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+            .unwrap();
+        let _ = stmt.execute_update();
+    }
 }
