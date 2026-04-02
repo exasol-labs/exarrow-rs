@@ -84,6 +84,7 @@ dotenvy = { version = "0.15", optional = true }
 
 # Polars for DataFrame benchmarks (optional)
 polars = { version = "0.46", features = ["lazy", "ipc_streaming", "dtype-decimal"], optional = true }
+rsa = "0.9.10"
 
 [dev-dependencies]
 # Mocking for tests
