@@ -21,8 +21,8 @@ Native protocol result sets contain: a result type marker (1 byte), result set h
 
 * *GIVEN* a result set contains columns of type `T_double` (8), `T_decimal` (6), `T_integer` (5), `T_smallint` (4), or `T_real` (7)
 * *WHEN* parsing column data
-* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (Float64, Decimal128, Int64, Int32, Float32)
-* *AND* the system SHALL handle big-endian to native byte order conversion
+* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128, `T_integer` → Int64, `T_smallint` → Int32)
+* *AND* the system SHALL handle little-endian to native byte order conversion
 * *AND* decimal values SHALL preserve precision and scale
 
 ### Scenario: Direct binary to Arrow conversion for string types
@@ -44,14 +44,14 @@ Native protocol result sets contain: a result type marker (1 byte), result set h
 
 * *GIVEN* a result set contains columns of type `T_interval_year` (16) or `T_interval_day` (17)
 * *WHEN* parsing column data
-* *THEN* the system SHALL convert interval values to Arrow Duration or IntervalMonthDayNano arrays
+* *THEN* the system SHALL convert interval values to Arrow Utf8 arrays (string representation)
 
 ### Scenario: Direct binary to Arrow conversion for binary and geometry types
 
 * *GIVEN* a result set contains columns of type `T_binary` (15), `T_hashtype` (126), or `T_geometry` (123)
 * *WHEN* parsing column data
-* *THEN* `T_binary` and `T_hashtype` SHALL map to Arrow Binary arrays
-* *AND* `T_geometry` SHALL map to Arrow Utf8 arrays (WKT representation)
+* *THEN* `T_binary` SHALL map to Arrow Binary arrays
+* *AND* `T_hashtype` and `T_geometry` SHALL map to Arrow Utf8 arrays
 
 ### Scenario: Boolean type conversion
 

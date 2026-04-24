@@ -20,7 +20,7 @@ Protocol version 14+ requires ChaCha20 encryption (RC4 is deprecated). ChaCha20 
 * *GIVEN* ChaCha20 send and receive keys have been generated
 * *AND* the server's RSA public key and random phrase are available
 * *WHEN* exchanging encryption keys with the server
-* *THEN* the system SHALL RSA-encrypt each key using the server's public key with PKCS#1 v1.5 padding
+* *THEN* the system SHALL RSA-encrypt each key using the server's public key via Exasol's raw RSA modular exponentiation scheme (no PKCS#1 padding)
 * *AND* the system SHALL send `ATTR_CLIENT_SEND_KEY`, `ATTR_CLIENT_RECEIVE_KEY`, and `ATTR_CLIENT_KEYS_LEN` via `CMD_SET_ATTRIBUTES`
 
 ### Scenario: Encrypted message sending

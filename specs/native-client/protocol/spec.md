@@ -1,6 +1,6 @@
 # Feature: Native TCP Protocol
 
-The system implements Exasol's native binary TCP protocol as a high-performance alternative to the WebSocket JSON protocol. The native protocol uses binary message framing with 21-byte headers, big-endian byte ordering, and protocol version negotiation starting at v14. All commands are serialized as binary attribute sets, and responses are parsed from binary frames into structured Rust types.
+The system implements Exasol's native binary TCP protocol as a high-performance alternative to the WebSocket JSON protocol. The native protocol uses binary message framing with 21-byte headers, little-endian byte ordering, and protocol version negotiation starting at v14. All commands are serialized as binary attribute sets, and responses are parsed from binary frames into structured Rust types.
 
 ## Background
 
@@ -30,7 +30,7 @@ The native TCP protocol connects to the same Exasol port (8563) as the WebSocket
 * *GIVEN* a TCP connection is established and TLS negotiation is complete
 * *WHEN* performing the login handshake
 * *THEN* the system SHALL send a login packet containing: magic (4 bytes), message length (4 bytes), protocol version (4 bytes), change date (4 bytes), and connection attributes
-* *AND* all multi-byte integers SHALL be encoded in big-endian byte order
+* *AND* all multi-byte integers SHALL be encoded in little-endian byte order
 * *AND* the system SHALL receive the server's response containing `ATTR_PUBLIC_KEY`, `ATTR_RANDOM_PHRASE`, and `ATTR_PROTOCOL_VERSION`
 
 ### Scenario: Binary message framing
@@ -38,7 +38,7 @@ The native TCP protocol connects to the same Exasol port (8563) as the WebSocket
 * *GIVEN* an authenticated native TCP session exists
 * *WHEN* sending a command to Exasol
 * *THEN* the system SHALL prefix each message with a 21-byte header containing: message length (4 bytes), command type (1 byte), serial number (4 bytes), number of attributes (4 bytes), attribute data length (4 bytes), and number of result parts (4 bytes)
-* *AND* all multi-byte values in the header SHALL be big-endian
+* *AND* all multi-byte values in the header SHALL be little-endian
 
 ### Scenario: Execute SQL command
 

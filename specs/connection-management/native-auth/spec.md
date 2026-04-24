@@ -1,14 +1,13 @@
-# Feature: Auth and Security
+# Feature: Native Auth
 
-Connection parameters are required for Exasol connectivity and SHALL be validated before use. Authentication mechanisms SHALL operate securely, with credentials protected in memory and never exposed through logging. TLS is enabled by default for production Exasol connections.
+Defines the authentication mechanisms specific to the Exasol native TCP protocol, including key exchange and password encryption for the native login handshake.
 
 ## Background
 
-All authentication credentials are protected in memory and zeroed on drop. The native TCP protocol adds ChaCha20 session encryption on top of the existing RSA password encryption.
+The native TCP protocol uses a distinct authentication flow from the WebSocket protocol. Passwords are encrypted using Exasol's raw RSA modular exponentiation scheme (without PKCS#1 padding), and a ChaCha20 session key is established for encrypting all subsequent messages.
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: ChaCha20 key exchange during native protocol login
 
 * *GIVEN* a native TCP connection is established to Exasol
@@ -22,6 +21,5 @@ All authentication credentials are protected in memory and zeroed on drop. The n
 * *GIVEN* a native TCP login handshake is in progress
 * *AND* the server has responded with `ATTR_PUBLIC_KEY` and `ATTR_RANDOM_PHRASE`
 * *WHEN* authenticating with username and password
-* *THEN* the system SHALL encrypt the password using RSA PKCS#1 v1.5 with the server's public key and random phrase
+* *THEN* the system SHALL encrypt the password using Exasol's raw RSA modular exponentiation scheme (no PKCS#1 padding) with the server's public key and random phrase
 * *AND* the system SHALL send the encrypted password via `ATTR_ENCODED_PASSWORD` (34)
-<!-- /DELTA:NEW -->
