@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.1
+
+- Fixed `query_timeout` connection parameter being ignored — `create_statement()` now applies the configured timeout to every statement instead of using the hardcoded 120s default
+
 ## 0.12.0
 
 - **Native Parquet import on Exasol 2025.1.11+**: When connected to Exasol 2025.1.11 or newer, `import_from_parquet`, `import_from_parquet_stream`, and `import_parquet_from_files` now serve raw Parquet bytes to the server via HTTP range requests instead of converting to CSV. This eliminates client-side CPU cost and reduces wire-bytes by 5–30x for typed columnar data.
