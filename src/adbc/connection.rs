@@ -241,7 +241,9 @@ impl Connection {
     /// # Example
     ///
     pub fn create_statement(&self, sql: impl Into<String>) -> Statement {
-        Statement::new(sql)
+        let mut stmt = Statement::new(sql);
+        stmt.set_timeout(self.params.query_timeout.as_millis() as u64);
+        stmt
     }
 
     // ========================================================================
