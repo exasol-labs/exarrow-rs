@@ -63,3 +63,10 @@ Statements are pure data objects created via `Connection::create_statement()` an
 * *GIVEN* an active database connection exists
 * *WHEN* result metadata is requested
 * *THEN* it SHALL provide row count, column count, and schema information
+
+### Scenario: Statement inherits connection query timeout
+
+* *GIVEN* a connection is configured with a `query_timeout`
+* *WHEN* `create_statement()` is called on that connection
+* *THEN* the returned Statement SHALL use the connection's configured `query_timeout` as its execution timeout
+* *AND* the Statement SHALL NOT use a hardcoded timeout independent of the connection's configuration
