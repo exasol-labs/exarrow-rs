@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.2
+
+- Security: upgraded `rustls-webpki` 0.103.11 → 0.103.13 (fixes RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 — name constraint and CRL parsing vulnerabilities in TLS certificate validation)
+- Security: upgraded `rand` 0.8.5 → 0.8.6 and `rand` 0.9.2 → 0.9.3 (fixes RUSTSEC-2026-0097 — unsoundness with custom logger)
+
 ## 0.12.1
 
 - Fixed `query_timeout` connection parameter being ignored — `create_statement()` now applies the configured timeout to every statement instead of using the hardcoded 120s default
