@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.3
+
+- Fix: `?` characters inside SQL string literals, double-quoted identifiers, and comments are no longer treated as bind-parameter placeholders.
+- Fix: multi-value `WHERE col IN (...)` predicates now correctly return all matching rows over the native TCP transport (confirmed working; regression tests added).
+
 ## 0.12.2
 
 - Security: upgraded `rustls-webpki` 0.103.11 → 0.103.13 (fixes RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 — name constraint and CRL parsing vulnerabilities in TLS certificate validation)
