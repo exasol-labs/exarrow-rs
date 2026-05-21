@@ -183,6 +183,85 @@ impl From<Vec<u8>> for Parameter {
     }
 }
 
+/// Lexer state for placeholder scanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    Normal,
+    SingleQuoted,
+    DoubleQuoted,
+    LineComment,
+    BlockComment,
+}
+
+/// Return byte offsets of every `?` that is a positional placeholder.
+///
+/// A `?` only counts when the scanner is in the `Normal` state — `?`
+/// characters inside string literals (`'...'`), double-quoted identifiers
+/// (`"..."`), line comments (`-- ...\n`) or block comments (`/* ... */`)
+/// are ignored. Doubled quotes (`''` and `""`) inside the matching string
+/// state are treated as escapes (stay in that state).
+///
+/// The scanner is byte-safe for UTF-8 input by driving off `char_indices()`
+/// (multi-byte characters in literals are passed through transparently).
+/// Unterminated literals and unterminated block comments do not panic — the
+/// scanner simply stops emitting placeholders for the remainder of input.
+fn scan_placeholders(sql: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut state = ScanState::Normal;
+    let bytes = sql.as_bytes();
+    let mut iter = sql.char_indices();
+
+    while let Some((i, c)) = iter.next() {
+        match state {
+            ScanState::Normal => match c {
+                '?' => positions.push(i),
+                '\'' => state = ScanState::SingleQuoted,
+                '"' => state = ScanState::DoubleQuoted,
+                '-' if bytes.get(i + 1) == Some(&b'-') => {
+                    iter.next();
+                    state = ScanState::LineComment;
+                }
+                '/' if bytes.get(i + 1) == Some(&b'*') => {
+                    iter.next();
+                    state = ScanState::BlockComment;
+                }
+                _ => {}
+            },
+            ScanState::SingleQuoted => {
+                if c == '\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        iter.next();
+                    } else {
+                        state = ScanState::Normal;
+                    }
+                }
+            }
+            ScanState::DoubleQuoted => {
+                if c == '"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
+                        iter.next();
+                    } else {
+                        state = ScanState::Normal;
+                    }
+                }
+            }
+            ScanState::LineComment => {
+                if c == '\n' {
+                    state = ScanState::Normal;
+                }
+            }
+            ScanState::BlockComment => {
+                if c == '*' && bytes.get(i + 1) == Some(&b'/') {
+                    iter.next();
+                    state = ScanState::Normal;
+                }
+            }
+        }
+    }
+
+    positions
+}
+
 /// SQL statement as a pure data container.
 ///
 /// Statement holds SQL text, parameters, timeout, and statement type.
@@ -273,20 +352,22 @@ impl Statement {
 
     /// Build the final SQL with parameters substituted.
     ///
-    /// This is used internally by Connection when executing statements.
+    /// Scans for real `?` placeholders (skipping those inside string literals
+    /// and comments), then substitutes right-to-left so that earlier byte
+    /// offsets stay valid after each replacement.
     pub fn build_sql(&self) -> Result<String, QueryError> {
+        let positions = scan_placeholders(&self.sql);
+
+        if positions.len() > self.parameters.len() {
+            return Err(QueryError::ParameterBindingError {
+                index: self.parameters.len(),
+                message: "Not enough parameters bound".to_string(),
+            });
+        }
+
         let mut sql = self.sql.clone();
-        let mut param_index = 0;
 
-        // Replace '?' placeholders with parameter values
-        while let Some(pos) = sql.find('?') {
-            if param_index >= self.parameters.len() {
-                return Err(QueryError::ParameterBindingError {
-                    index: param_index,
-                    message: "Not enough parameters bound".to_string(),
-                });
-            }
-
+        for (param_index, &pos) in positions.iter().enumerate().rev() {
             let param = self.parameters[param_index].as_ref().ok_or_else(|| {
                 QueryError::ParameterBindingError {
                     index: param_index,
@@ -296,7 +377,6 @@ impl Statement {
 
             let literal = param.to_sql_literal()?;
             sql.replace_range(pos..pos + 1, &literal);
-            param_index += 1;
         }
 
         Ok(sql)
@@ -474,5 +554,209 @@ mod tests {
         let stmt = Statement::new("SELECT 1");
         let display = format!("{}", stmt);
         assert!(display.contains("SELECT 1"));
+    }
+
+    // --- build_sql tests (task 2.4) ---
+
+    #[test]
+    fn build_sql_substitutes_question_mark_in_normal_text() {
+        let mut stmt = Statement::new("SELECT ?");
+        stmt.bind(0, 42i64).unwrap();
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 42");
+    }
+
+    #[test]
+    fn build_sql_does_not_substitute_question_mark_in_single_quoted_string() {
+        // The '?' inside the string literal must not be touched; no params needed.
+        let stmt = Statement::new("SELECT 'a?b' AS v");
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 'a?b' AS v");
+    }
+
+    #[test]
+    fn build_sql_does_not_substitute_question_mark_in_double_quoted_identifier() {
+        let stmt = Statement::new("SELECT 1 AS \"col?name\"");
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 1 AS \"col?name\"");
+    }
+
+    #[test]
+    fn build_sql_does_not_substitute_question_mark_in_line_comment() {
+        // The '?' after -- is in a comment; only the trailing real '?' counts.
+        let mut stmt = Statement::new("SELECT 1 -- has ?\n WHERE x = ?");
+        stmt.bind(0, 7i64).unwrap();
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 1 -- has ?\n WHERE x = 7");
+    }
+
+    #[test]
+    fn build_sql_does_not_substitute_question_mark_in_block_comment() {
+        let mut stmt = Statement::new("SELECT /* what? */ ?");
+        stmt.bind(0, 99i64).unwrap();
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT /* what? */ 99");
+    }
+
+    #[test]
+    fn build_sql_mixed_placeholder_and_literal_question_mark() {
+        // Only the unquoted '?' after the comma should be replaced.
+        let mut stmt = Statement::new("SELECT 'a?b', ?");
+        stmt.bind(0, 5i64).unwrap();
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 'a?b', 5");
+    }
+
+    #[test]
+    fn build_sql_escaped_single_quote_in_string_with_question_mark_stays_literal() {
+        // 'O''Reilly?' — the '?' inside is protected by the surrounding literal.
+        let stmt = Statement::new("SELECT 'O''Reilly?'");
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 'O''Reilly?'");
+    }
+
+    #[test]
+    fn build_sql_empty_sql_with_no_params_returns_empty_string() {
+        let stmt = Statement::new("");
+        assert_eq!(stmt.build_sql().unwrap(), "");
+    }
+
+    #[test]
+    fn build_sql_sql_ending_mid_string_literal_does_not_panic() {
+        // Unterminated literal — no placeholder found, no params needed.
+        let stmt = Statement::new("SELECT 'unclosed");
+        assert_eq!(stmt.build_sql().unwrap(), "SELECT 'unclosed");
+    }
+
+    #[test]
+    fn build_sql_round_trip_select_by_id() {
+        let mut stmt = Statement::new("SELECT * FROM users WHERE id = ?");
+        stmt.bind(0, 42i64).unwrap();
+        assert_eq!(
+            stmt.build_sql().unwrap(),
+            "SELECT * FROM users WHERE id = 42"
+        );
+    }
+
+    #[test]
+    fn build_sql_not_enough_parameters_returns_error() {
+        let stmt = Statement::new("SELECT ?, ?");
+        // Only zero params bound → two placeholders but zero bound → error.
+        let err = stmt.build_sql().unwrap_err();
+        assert!(matches!(err, QueryError::ParameterBindingError { .. }));
+    }
+
+    #[test]
+    fn build_sql_parameter_not_bound_returns_error() {
+        let mut stmt = Statement::new("SELECT ?, ?");
+        // Bind only index 1 (skipping 0) — index 0 remains None.
+        stmt.bind(1, 99i64).unwrap();
+        let err = stmt.build_sql().unwrap_err();
+        assert!(matches!(
+            err,
+            QueryError::ParameterBindingError { index: 0, .. }
+        ));
+    }
+
+    // --- scan_placeholders smoke tests (full coverage lives in task 2.4) ---
+
+    #[test]
+    fn scan_placeholders_empty_sql() {
+        assert_eq!(scan_placeholders(""), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn scan_placeholders_returns_byte_offsets_in_normal_text() {
+        // "SELECT ? , ?" → '?' at byte offset 7 and 11.
+        let positions = scan_placeholders("SELECT ? , ?");
+        assert_eq!(positions, vec![7, 11]);
+    }
+
+    #[test]
+    fn scan_placeholders_ignores_question_mark_in_single_quoted_string() {
+        // "SELECT 'a?b' AS v" → no placeholders.
+        assert!(scan_placeholders("SELECT 'a?b' AS v").is_empty());
+    }
+
+    #[test]
+    fn scan_placeholders_ignores_question_mark_in_double_quoted_identifier() {
+        assert!(scan_placeholders("SELECT 1 AS \"col?name\"").is_empty());
+    }
+
+    #[test]
+    fn scan_placeholders_ignores_question_mark_in_line_comment() {
+        // -- comment ?\n then real placeholder
+        let sql = "SELECT 1 -- has ?\n WHERE x = ?";
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions.len(), 1, "got {:?}", positions);
+        assert_eq!(&sql[positions[0]..positions[0] + 1], "?");
+        // The real `?` is the last char.
+        assert_eq!(positions[0], sql.len() - 1);
+    }
+
+    #[test]
+    fn scan_placeholders_ignores_question_mark_in_block_comment() {
+        let sql = "SELECT /* what? */ ?";
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(&sql[positions[0]..positions[0] + 1], "?");
+    }
+
+    #[test]
+    fn scan_placeholders_handles_escaped_single_quote() {
+        // 'O''Reilly?' — escaped quote keeps us inside SingleQuoted, so the
+        // '?' inside is ignored. The final '?' after the string is recorded.
+        let sql = "SELECT 'O''Reilly?' = ?";
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0], sql.len() - 1);
+    }
+
+    #[test]
+    fn scan_placeholders_handles_escaped_double_quote() {
+        let sql = "SELECT \"a\"\"b?\" = ?";
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0], sql.len() - 1);
+    }
+
+    #[test]
+    fn scan_placeholders_unterminated_string_does_not_panic() {
+        // No closing quote — must not panic and must not record any '?'
+        // inside the unterminated literal.
+        let positions = scan_placeholders("SELECT 'a?b");
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn scan_placeholders_unterminated_block_comment_does_not_panic() {
+        let positions = scan_placeholders("SELECT /* what? AND ? then EOF");
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn scan_placeholders_utf8_multibyte_offsets_are_byte_safe() {
+        // "ä" is two bytes (0xC3 0xA4) in UTF-8. The '?' after "ä" sits at
+        // byte offset 2. We must NOT panic and must record byte offset 2.
+        let sql = "ä?";
+        assert_eq!(sql.len(), 3);
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions, vec![2]);
+        assert_eq!(&sql[positions[0]..positions[0] + 1], "?");
+    }
+
+    #[test]
+    fn scan_placeholders_consecutive_question_marks() {
+        let positions = scan_placeholders("??");
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    #[test]
+    fn scan_placeholders_block_comment_inside_string_is_ignored() {
+        // The "/*" appears inside a string literal, so we never enter
+        // BlockComment. The trailing '?' after the string is a placeholder.
+        let sql = "SELECT '/* ?  */', ?";
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions, vec![sql.len() - 1]);
+    }
+
+    #[test]
+    fn scan_placeholders_line_comment_inside_string_is_ignored() {
+        let sql = "SELECT '-- still in string ?', ?";
+        let positions = scan_placeholders(sql);
+        assert_eq!(positions, vec![sql.len() - 1]);
     }
 }
