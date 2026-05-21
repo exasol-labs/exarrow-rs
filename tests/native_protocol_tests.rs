@@ -233,6 +233,114 @@ async fn test_native_large_result_set() {
     conn.close().await.expect("Failed to close");
 }
 
+/// Verify that both the native and WebSocket transports return identical results
+/// for a multi-value IN predicate — row count and actual values must agree.
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn test_in_list_multi_value_native_matches_websocket() {
+    skip_if_no_exasol!();
+
+    use arrow::array::{Array, StringArray};
+
+    let mut native_conn = get_test_connection_with_transport("native")
+        .await
+        .expect("Failed to connect via native transport");
+
+    let mut ws_conn = get_test_connection_with_transport("websocket")
+        .await
+        .expect("Failed to connect via websocket transport");
+
+    let schema = generate_test_schema_name();
+
+    // Set up table via the native connection.
+    native_conn
+        .execute_update(&format!("CREATE SCHEMA {}", schema))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    native_conn
+        .execute_update(&format!("CREATE TABLE {}.fruits (k VARCHAR(50))", schema))
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    native_conn
+        .execute_update(&format!(
+            "INSERT INTO {}.fruits VALUES ('apple'), ('banana'), ('cherry')",
+            schema
+        ))
+        .await
+        .expect("INSERT should succeed");
+
+    let sql = format!(
+        "SELECT k FROM {}.fruits WHERE k IN ('apple','banana') ORDER BY k",
+        schema
+    );
+
+    let native_batches = native_conn
+        .query(&sql)
+        .await
+        .expect("Native query should succeed");
+
+    let ws_batches = ws_conn
+        .query(&sql)
+        .await
+        .expect("WebSocket query should succeed");
+
+    // Cleanup before assertions so a failure does not leave state behind.
+    let _ = native_conn
+        .execute_update(&format!("DROP SCHEMA {} CASCADE", schema))
+        .await;
+
+    let native_rows: usize = native_batches.iter().map(|b| b.num_rows()).sum();
+    let ws_rows: usize = ws_batches.iter().map(|b| b.num_rows()).sum();
+
+    assert_eq!(native_rows, 2, "Native transport should return 2 rows");
+    assert_eq!(ws_rows, 2, "WebSocket transport should return 2 rows");
+
+    let mut native_values: Vec<String> = Vec::new();
+    for batch in &native_batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("k column should be StringArray (native)");
+        for i in 0..col.len() {
+            native_values.push(col.value(i).to_string());
+        }
+    }
+
+    let mut ws_values: Vec<String> = Vec::new();
+    for batch in &ws_batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("k column should be StringArray (websocket)");
+        for i in 0..col.len() {
+            ws_values.push(col.value(i).to_string());
+        }
+    }
+
+    assert_eq!(
+        native_values, ws_values,
+        "Native and WebSocket transports must return identical rows"
+    );
+    assert_eq!(
+        native_values,
+        vec!["apple", "banana"],
+        "Rows should be apple and banana in order"
+    );
+
+    native_conn
+        .close()
+        .await
+        .expect("Failed to close native connection");
+    ws_conn
+        .close()
+        .await
+        .expect("Failed to close websocket connection");
+}
+
 /// Verify that a DECIMAL(10,4) column is returned as Arrow Decimal128, not Float64,
 /// and that the numeric value round-trips without precision loss.
 #[tokio::test]

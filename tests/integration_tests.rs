@@ -71,7 +71,7 @@
 // Declare the common module for shared test utilities
 mod common;
 
-use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
+use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
     generate_test_schema_name, get_host, get_port, get_test_connection, get_test_connection_string,
@@ -2248,4 +2248,328 @@ async fn test_uri_schema_activation_failure_returns_error() {
         "error should reference the schema activation failure, got: {}",
         error_msg
     );
+}
+
+// Section 10: Placeholder scanning and IN-clause integration tests
+//
+// These tests verify that `?` inside string literals, comments, and double-quoted
+// identifiers is NOT treated as a parameter placeholder, and that multi-value
+// IN predicates return the correct rows.
+
+/// 10.1 A `?` inside a SQL string literal must not be treated as a placeholder.
+#[tokio::test]
+async fn test_literal_question_mark_in_string() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query("SELECT 'a?b' AS v")
+        .await
+        .expect("Query with literal ? in string should succeed");
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("Column should be StringArray");
+
+    assert_eq!(
+        col.value(0),
+        "a?b",
+        "Literal ? in string must pass through unchanged"
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 10.2 A `?` inside a line comment or block comment must not be treated as a placeholder.
+#[tokio::test]
+async fn test_question_mark_in_line_and_block_comments() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    // Line comment: the ? after -- must be ignored
+    let batches = conn
+        .query("SELECT 1 -- has ?\n")
+        .await
+        .expect("Query with ? in line comment should succeed");
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].num_rows(),
+        1,
+        "Line-comment query should return 1 row"
+    );
+
+    // Block comment: the ? inside /* ... */ must be ignored
+    let batches = conn
+        .query("SELECT /* what? */ 1")
+        .await
+        .expect("Query with ? in block comment should succeed");
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].num_rows(),
+        1,
+        "Block-comment query should return 1 row"
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 10.3 A `?` inside a double-quoted identifier must not be treated as a placeholder.
+#[tokio::test]
+async fn test_question_mark_in_double_quoted_identifier() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(r#"SELECT 1 AS "col?name""#)
+        .await
+        .expect("Query with ? in double-quoted identifier should succeed");
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].num_rows(),
+        1,
+        "Double-quoted identifier query should return 1 row"
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 10.4 A `?` in a string literal must not consume a bound parameter; only the real
+/// `?` placeholder outside the literal must be substituted.
+#[tokio::test]
+async fn test_mixed_placeholder_and_literal_question_mark() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let mut prepared = conn
+        .prepare("SELECT 'a?b' AS lit, ? AS bound")
+        .await
+        .expect("Failed to prepare statement");
+
+    assert_eq!(
+        prepared.parameter_count(),
+        1,
+        "Only the real ? should count as a parameter"
+    );
+
+    prepared.bind(0, "hello").expect("Failed to bind parameter");
+
+    let results = conn
+        .execute_prepared(&prepared)
+        .await
+        .expect("Failed to execute prepared statement");
+
+    let batches = results.fetch_all().await.expect("Failed to fetch results");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(batches[0].num_columns(), 2);
+
+    let lit_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("lit column should be StringArray");
+    assert_eq!(lit_col.value(0), "a?b", "Literal column should be 'a?b'");
+
+    let bound_col = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("bound column should be StringArray");
+    assert_eq!(
+        bound_col.value(0),
+        "hello",
+        "Bound column should be 'hello'"
+    );
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Helper: create a temp schema with a single VARCHAR column and insert apple/banana/cherry.
+async fn setup_in_list_test_table(conn: &mut exarrow_rs::adbc::Connection, schema: &str) {
+    conn.execute_update(&format!("CREATE SCHEMA {}", schema))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    conn.execute_update(&format!("CREATE TABLE {}.fruits (k VARCHAR(50))", schema))
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    conn.execute_update(&format!(
+        "INSERT INTO {}.fruits VALUES ('apple'), ('banana'), ('cherry')",
+        schema
+    ))
+    .await
+    .expect("INSERT should succeed");
+}
+
+/// 10.5 Multi-value IN predicate must return the correct COUNT.
+#[tokio::test]
+async fn test_in_list_multi_value_count() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema = generate_test_schema_name();
+
+    setup_in_list_test_table(&mut conn, &schema).await;
+
+    let batches = conn
+        .query(&format!(
+            "SELECT COUNT(*) AS cnt FROM {}.fruits WHERE k IN ('apple','banana')",
+            schema
+        ))
+        .await
+        .expect("COUNT query should succeed");
+
+    cleanup_schema(&mut conn, &schema).await;
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    let cnt_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("COUNT(*) should map to Decimal128Array");
+
+    assert_eq!(
+        cnt_col.value(0),
+        2,
+        "IN ('apple','banana') should match 2 rows"
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 10.6 Multi-value IN predicate must return the correct rows and values.
+#[tokio::test]
+async fn test_in_list_multi_value_rows() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema = generate_test_schema_name();
+
+    setup_in_list_test_table(&mut conn, &schema).await;
+
+    let batches = conn
+        .query(&format!(
+            "SELECT k FROM {}.fruits WHERE k IN ('apple','banana') ORDER BY k",
+            schema
+        ))
+        .await
+        .expect("SELECT query should succeed");
+
+    cleanup_schema(&mut conn, &schema).await;
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "Should return exactly 2 rows");
+
+    // Collect values across all batches
+    let mut values: Vec<String> = Vec::new();
+    for batch in &batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("k column should be StringArray");
+        for i in 0..col.len() {
+            values.push(col.value(i).to_string());
+        }
+    }
+
+    assert_eq!(
+        values,
+        vec!["apple", "banana"],
+        "Rows should be apple and banana in order"
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 10.7 Single-value IN predicate must still return the correct row (regression guard).
+#[tokio::test]
+async fn test_in_list_single_value_still_works() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema = generate_test_schema_name();
+
+    setup_in_list_test_table(&mut conn, &schema).await;
+
+    let batches = conn
+        .query(&format!(
+            "SELECT k FROM {}.fruits WHERE k IN ('apple') ORDER BY k",
+            schema
+        ))
+        .await
+        .expect("SELECT query should succeed");
+
+    cleanup_schema(&mut conn, &schema).await;
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "Single-value IN should return exactly 1 row");
+
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("k column should be StringArray");
+    assert_eq!(col.value(0), "apple", "Row value should be apple");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 10.8 End-to-end: execute_statement with a mixed literal-? + real placeholder through
+/// Connection::execute_statement, which calls Statement::build_sql → scan_placeholders.
+/// This exercises the scanner against a live connection (not just unit tests).
+#[tokio::test]
+async fn test_build_sql_scanner_end_to_end_via_execute_statement() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let mut stmt = conn.create_statement("SELECT 'a?b' AS lit, ? AS bound");
+    stmt.bind(0, exarrow_rs::Parameter::String("hello".to_string()))
+        .expect("Failed to bind parameter");
+
+    let result = conn
+        .execute_statement(&stmt)
+        .await
+        .expect("execute_statement should succeed");
+
+    let batches = result.fetch_all().await.expect("Failed to fetch results");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(batches[0].num_columns(), 2);
+
+    let lit_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("lit column should be StringArray");
+    assert_eq!(lit_col.value(0), "a?b");
+
+    let bound_col = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("bound column should be StringArray");
+    assert_eq!(bound_col.value(0), "hello");
+
+    conn.close().await.expect("Failed to close connection");
 }

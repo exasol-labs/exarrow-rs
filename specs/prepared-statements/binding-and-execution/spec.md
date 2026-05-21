@@ -31,6 +31,7 @@ The system implements Exasol's native prepared statement protocol for secure par
 * *THEN* it SHALL validate value types match expected parameter types
 * *AND* it SHALL convert Rust types to Exasol wire format
 * *AND* it SHALL send parameters separately from SQL text
+* *AND* it MUST count only `?` characters that occur outside single-quoted string literals, double-quoted identifiers, line comments (`-- ...`), and block comments (`/* ... */`) when determining the positional placeholder index
 
 ### Scenario: NULL parameter binding
 
@@ -84,3 +85,10 @@ The system implements Exasol's native prepared statement protocol for secure par
 * *THEN* the driver SHALL prepare the statement if not already prepared
 * *AND* the driver SHALL extract parameter values from the bound RecordBatch
 * *AND* the driver SHALL return the result set as Arrow RecordBatches
+
+### Scenario: Prepared statement with question mark inside a string literal
+
+* *GIVEN* a connection to Exasol is established
+* *WHEN* preparing a statement whose SQL text contains `?` inside a single-quoted string literal (for example `SELECT 'a?b'`)
+* *THEN* the system MUST report zero positional parameters
+* *AND* the system MUST NOT include the embedded `?` in the parameter count returned by parameter metadata
