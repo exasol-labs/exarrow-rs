@@ -96,3 +96,29 @@ Native protocol result sets contain: a result type marker (1 byte), result set h
 * *GIVEN* a statement that produces no result is executed
 * *WHEN* the server responds with `R_Empty` (-2)
 * *THEN* the system SHALL return an empty result without error
+
+### Scenario: Multi-value IN-list predicate returns correct row count
+
+* *GIVEN* an authenticated native TCP session exists
+* *AND* a table `T` exists with a single `VARCHAR` column `k` populated with the rows `'apple'`, `'banana'`, and `'cherry'`
+* *WHEN* executing the SQL text `SELECT COUNT(*) FROM T WHERE k IN ('apple','banana')` over the native TCP transport
+* *THEN* the system MUST parse the returned `R_RESULTSET` such that the single row containing the COUNT value is included in the resulting `RecordBatch`
+* *AND* the system SHALL surface the COUNT value as `2` to the caller
+* *AND* the behavior of the native transport SHALL match the behavior of the WebSocket transport for the identical SQL text
+
+### Scenario: Multi-value IN-list predicate yields the matching rows
+
+* *GIVEN* an authenticated native TCP session exists
+* *AND* a table `T` exists with a single `VARCHAR` column `k` populated with the rows `'apple'`, `'banana'`, and `'cherry'`
+* *WHEN* executing the SQL text `SELECT k FROM T WHERE k IN ('apple','banana') ORDER BY k` over the native TCP transport
+* *THEN* the system MUST return a `RecordBatch` whose row count equals `2`
+* *AND* the returned `RecordBatch` SHALL contain the values `'apple'` and `'banana'` in column `k`
+* *AND* the result MUST match the rows returned by the WebSocket transport for the identical SQL text
+
+### Scenario: Single-value IN-list predicate continues to behave correctly
+
+* *GIVEN* an authenticated native TCP session exists
+* *AND* a table `T` exists with a single `VARCHAR` column `k` populated with the rows `'apple'`, `'banana'`, and `'cherry'`
+* *WHEN* executing the SQL text `SELECT COUNT(*) FROM T WHERE k IN ('apple')` over the native TCP transport
+* *THEN* the system SHALL return a `RecordBatch` containing the COUNT value `1`
+* *AND* the existing single-value IN-list path MUST remain unaffected by the multi-value fix
