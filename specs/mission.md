@@ -49,7 +49,7 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 | Language | Rust (2021 edition) | Systems-level performance, memory safety |
 | Async runtime | Tokio 1.42 | Multi-threaded async I/O |
 | WebSocket | tokio-tungstenite 0.28 (optional) | Exasol WebSocket transport with TLS (opt-in fallback) |
-| Arrow | arrow 57.1 / parquet 57.1 | Columnar data format and Parquet I/O |
+| Arrow | arrow 58 / parquet 58 | Columnar data format and Parquet I/O |
 | TLS | rustls 0.23 / rcgen 0.13 | Connection encryption and ad-hoc certificate generation for HTTP tunnels |
 | Crypto | aws-lc-rs 1 | RSA encryption for Exasol password authentication |
 | Stream cipher | chacha20 0.9 / cipher 0.4 | ChaCha20 encryption for native TCP protocol |
