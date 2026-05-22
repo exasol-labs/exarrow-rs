@@ -85,3 +85,31 @@ Treat bug #18 as not reproducible against the current codebase. Do not apply any
 ### Consequences
 
 The wire-format analysis confirmed that `parse_response` takes the legacy branch for these queries and `parse_result_set_at` decodes `handle=-3 (SMALL_RESULTSET)`, `total_rows=2`, `rows_received=2` and all string values correctly. The most likely explanation for the original user report is that the failure occurred against a pre-0.12.x version or was caused by the placeholder-scanner bug (#17) mangling SQL containing literal `?` characters. Integration tests 4.5–4.8 are present in the codebase as regression guards regardless.
+
+---
+
+## ADR-004: Encode the Arrow/Parquet version invariant as a permanent spec scenario
+
+**Date:** 2026-05-22
+**Plan:** `fix-thrift-cve-upgrade-arrow-58`
+**Status:** Accepted
+
+### Context
+
+The arrow/parquet 57→58 upgrade was driven by a security advisory against the `thrift 0.17.0` transitive dependency. Without a machine-readable invariant in the spec library, a future dependency bump could silently re-introduce `thrift` or revert to a 57.x arrow sub-crate — neither would be caught until a human read `Cargo.lock` manually. The existing `code-quality/core` feature already houses build-output invariants (clippy, test outcomes), making it the natural home for a lockfile-level assertion.
+
+### Decision
+
+Add a new scenario under `code-quality/core` — "Arrow and Parquet dependencies resolve to version 58 or above with no duplicate sub-crate versions" — that asserts `arrow >= 58.0.0`, `parquet >= 58.0.0`, and no simultaneous 57.x/58.x `arrow-array`/`arrow-schema` duplication. Back the scenario with an integration test (`test_arrow_parquet_resolve_to_58_or_above_with_unified_sub_crates`) that reads `Cargo.lock` at test time.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Encode as a `code-quality/core` scenario + integration test | ✓ Chosen — survives plan completion; future agents see the invariant during `speq search`; automated regression signal |
+| Treat as a one-time dependency bump with no spec change | ✗ Rejected — a future crate addition could silently re-introduce `thrift` with no automated detection |
+| Add a scenario under a new `dependencies/security` domain | ✗ Rejected — only one lockfile-level invariant exists today; a new domain for one scenario is premature organisation |
+
+### Consequences
+
+The CVE-free property is codified in the spec library and verified by CI on every test run. Future dependency upgrades that would reintroduce a 57.x sub-crate duplication or regress the minimum arrow/parquet version will be caught automatically. The scenario must be updated (version floor raised) when the project upgrades past 58.x.

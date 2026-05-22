@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.4
+
+- Dependency upgrade: `arrow` and `parquet` 57.x → 58.x; arrow sub-crates unified to a single 58.x version in `Cargo.lock` (fixes a duplicate-version resolver conflict with `adbc_core 0.23.0`).
+- **Note:** `thrift 0.17.0` (Memory Allocation with Excessive Size Value CVE) remains a transitive dependency of `parquet 58.3.0`. It will be removed once `parquet 59.x` ships (upstream PR apache/arrow-rs#9962, merged 2026-05-13, not yet released).
+
 ## 0.12.3
 
 - Fix: `?` characters inside SQL string literals, double-quoted identifiers, and comments are no longer treated as bind-parameter placeholders.
