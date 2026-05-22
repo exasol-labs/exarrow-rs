@@ -1,6 +1,6 @@
 [package]
 name = "exarrow-rs"
-version = "0.12.3"
+version = "0.12.4"
 edition = "2021"
 license = "MIT"
 authors = ["Exasol Labs <labs@exasol.com>"]
@@ -22,7 +22,7 @@ doctest = false
 
 [dependencies]
 # Apache Arrow support (arrow re-exports arrow-array, arrow-schema, etc.)
-arrow = "57.1.0"
+arrow = "58"
 
 # Async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
@@ -69,7 +69,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 # Parquet file support
-parquet = { version = "57.1.0", features = ["async"] }
+parquet = { version = "58", features = ["async"] }
 
 # Compression support for CSV import/export
 flate2 = "1.1"
