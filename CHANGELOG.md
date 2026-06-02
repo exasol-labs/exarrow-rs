@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.4
+
+- Security: CVE-2026-43868 (GHSA-2f9f-gq7v-9h6m) acknowledged — Apache Thrift `thrift` crate ≤ 0.22.0 (Memory Allocation with Excessive Size Value, CVSS 5.3 Medium). The `thrift` 0.17.0 crate is a transitive dependency via `parquet`; no patched version exists on crates.io for the Rust ecosystem and no dependency change can remove it. Users parsing untrusted Parquet files in hostile environments should be aware of this residual risk.
+
 ## 0.12.3
 
 - Fix: `?` characters inside SQL string literals, double-quoted identifiers, and comments are no longer treated as bind-parameter placeholders.
