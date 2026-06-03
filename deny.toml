@@ -3,6 +3,15 @@ ignore = [
     # paste is unmaintained but not vulnerable. It's a transitive dependency from
     # parquet (Apache Arrow) - we can't control it. Track: https://github.com/apache/arrow-rs/issues
     { id = "RUSTSEC-2024-0436", reason = "Transitive dep from parquet, unmaintained but not vulnerable" },
+    # CVE-2026-43868 / GHSA-2f9f-gq7v-9h6m: Apache Thrift memory allocation with excessive size
+    # value (CWE-789, CVSS 5.3 Medium). The fix is in Apache Thrift v0.23.0 (THRIFT-5871), but:
+    # (a) thrift 0.23.0 has never been published to crates.io (latest: 0.17.0);
+    # (b) a [patch.crates-io] from git tag v0.23.0 is rejected by Cargo because parquet requires
+    #     thrift ^0.17 and 0.23.0 is semver-incompatible with that constraint;
+    # (c) parquet 59.x removes thrift entirely (apache/arrow-rs#9962, merged 2026-05-13) but has
+    #     not been released, and adbc_core 0.23.0 caps at arrow-schema <59, blocking that upgrade.
+    # Re-evaluate when parquet 59.x is released AND adbc_core supports arrow 59.x.
+    { id = "GHSA-2f9f-gq7v-9h6m", reason = "thrift fix (v0.23.0/THRIFT-5871) not on crates.io; [patch] blocked by ^0.17 semver; parquet 59.x (removes thrift) not yet released" },
 ]
 
 [licenses]

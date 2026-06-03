@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.5
+
+- Dependency: `arrow` and `parquet` upgraded 57.x → 58.x; all `arrow-*` sub-crates unified to a single 58.x version in `Cargo.lock` (resolves a duplicate-version conflict with `adbc_core 0.23.0` under the `ffi` feature).
+- Security: CVE-2026-43868 (GHSA-2f9f-gq7v-9h6m) — Apache Thrift `thrift` 0.17.0 (Memory Allocation with Excessive Size Value, CVSS 5.3 Medium) remains a transitive dependency of `parquet 58.x`. The upstream fix (THRIFT-5871, tag v0.23.0) has not been published to crates.io, and a `[patch.crates-io]` override is blocked by `parquet`'s `^0.17` semver constraint. The advisory is formally suppressed in `deny.toml` with rationale. Re-evaluate when `parquet 59.x` is released (removes thrift entirely; upstream apache/arrow-rs#9962 merged 2026-05-13).
+
 ## 0.12.4
 
 - Security: CVE-2026-43868 (GHSA-2f9f-gq7v-9h6m) acknowledged — Apache Thrift `thrift` crate ≤ 0.22.0 (Memory Allocation with Excessive Size Value, CVSS 5.3 Medium). The `thrift` 0.17.0 crate is a transitive dependency via `parquet`; no patched version exists on crates.io for the Rust ecosystem and no dependency change can remove it. Users parsing untrusted Parquet files in hostile environments should be aware of this residual risk.

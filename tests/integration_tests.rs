@@ -2573,3 +2573,61 @@ async fn test_build_sql_scanner_end_to_end_via_execute_statement() {
 
     conn.close().await.expect("Failed to close connection");
 }
+
+#[test]
+fn test_arrow_parquet_resolve_to_58_or_above_with_unified_sub_crates() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let lockfile = std::fs::read_to_string(format!("{manifest_dir}/Cargo.lock"))
+        .expect("Cargo.lock must be readable");
+
+    let lines: Vec<&str> = lockfile.lines().collect();
+
+    let arrow_version = lines
+        .windows(2)
+        .find(|w| w[0] == "name = \"arrow\"")
+        .and_then(|w| w[1].strip_prefix("version = \""))
+        .and_then(|v| v.strip_suffix('"'))
+        .expect("arrow version not found in Cargo.lock");
+
+    let parquet_version = lines
+        .windows(2)
+        .find(|w| w[0] == "name = \"parquet\"")
+        .and_then(|w| w[1].strip_prefix("version = \""))
+        .and_then(|v| v.strip_suffix('"'))
+        .expect("parquet version not found in Cargo.lock");
+
+    let arrow_major: u32 = arrow_version
+        .split('.')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("arrow major version must be numeric");
+    let parquet_major: u32 = parquet_version
+        .split('.')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("parquet major version must be numeric");
+
+    assert!(
+        arrow_major >= 58,
+        "arrow must resolve to >= 58.x, got {arrow_version}"
+    );
+    assert!(
+        parquet_major >= 58,
+        "parquet must resolve to >= 58.x, got {parquet_version}"
+    );
+
+    // Verify no duplicate arrow-array at both 57.x and 58.x (adbc_core unification).
+    // Each [[package]] block in Cargo.lock has "name = ..." on one line and "version = ..." on the
+    // next, so windows(2) correctly counts all arrow-array packages regardless of blank-line breaks.
+    let arrow_array_57_count = lines
+        .windows(2)
+        .filter(|w| w[0] == "name = \"arrow-array\"" && w[1].starts_with("version = \"57."))
+        .count();
+
+    assert_eq!(
+        arrow_array_57_count, 0,
+        "arrow-array must not resolve to a 57.x version alongside 58.x (adbc_core unification required)"
+    );
+}
