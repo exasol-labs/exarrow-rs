@@ -36,6 +36,19 @@ use tokio::time::timeout;
 ///
 pub type Session = Connection;
 
+/// Classify a `set_schema` (`OPEN SCHEMA`) failure as a missing-schema error.
+///
+/// A schema named in the connection URI is a *best-effort default*. When that
+/// schema does not yet exist the server reports a "schema ... not found" error,
+/// which we deliberately swallow during connect so the connection stays open
+/// (see [`Connection::connect_with_transport`]). Any other failure is fatal.
+///
+/// Returns `true` only when the error message indicates the schema was not
+/// found; all other errors return `false`.
+fn schema_open_error_is_missing_schema(err: &QueryError) -> bool {
+    err.to_string().to_ascii_lowercase().contains("not found")
+}
+
 fn blocking_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -185,25 +198,36 @@ impl Connection {
             params,
         };
 
-        // If the URI carried a schema, activate it server-side so unqualified
-        // queries work without a follow-up `set_schema()` call. On failure we
-        // must close the transport (we are already authenticated server-side)
-        // before propagating the error — returning a half-open `Connection`
-        // whose session state silently disagrees with the URI is worse than a
-        // clear error.
+        // A schema named in the connection URI is a *best-effort default*: we
+        // OPEN it so unqualified queries resolve against it. A schema that does
+        // not yet exist must NOT fail the connection — tools such as dbt create
+        // their target schema after connecting and fully qualify every relation,
+        // so a not-yet-existing default schema is a normal state, not a corrupt
+        // one. We therefore swallow "schema not found" and leave the session
+        // with no active schema (the schema can be OPENed later, once it exists).
+        //
+        // Any other failure (auth, transport, permissions) still indicates a
+        // genuinely broken connection: we close the transport — we are already
+        // authenticated server-side — and propagate a clear error rather than
+        // return a half-open `Connection`.
         if let Some(schema_name) = schema {
             if let Err(query_err) = connection.set_schema(schema_name.clone()).await {
-                let host = connection.params.host.clone();
-                let port = connection.params.port;
-                let _ = connection.shutdown().await;
-                return Err(ConnectionError::ConnectionFailed {
-                    host,
-                    port,
-                    message: format!(
-                        "failed to activate schema '{}' from connection URI: {}",
-                        schema_name, query_err
-                    ),
-                });
+                let schema_missing = schema_open_error_is_missing_schema(&query_err);
+                if !schema_missing {
+                    let host = connection.params.host.clone();
+                    let port = connection.params.port;
+                    let _ = connection.shutdown().await;
+                    return Err(ConnectionError::ConnectionFailed {
+                        host,
+                        port,
+                        message: format!(
+                            "failed to activate schema '{}' from connection URI: {}",
+                            schema_name, query_err
+                        ),
+                    });
+                }
+                // Schema does not exist yet: keep the connection open with no
+                // active schema. Fully qualified names continue to work.
             }
         }
 
@@ -2063,6 +2087,35 @@ mod tests {
         // by calling it without await
         // Note: We can't actually create a Connection without a database,
         // but we can verify the API compiles correctly
+    }
+
+    /// Regression test for the best-effort URI-schema fix.
+    ///
+    /// A schema named in the connection URI that does not yet exist must NOT
+    /// fail the connection: the server reports a "schema ... not found" error
+    /// (real Exasol message format), which `connect_with_transport` swallows so
+    /// the connection stays open. Every other failure must remain fatal.
+    #[test]
+    fn schema_open_error_missing_schema_is_recognized() {
+        // Real Exasol-style "OPEN SCHEMA" failure for a non-existent schema.
+        let missing = QueryError::ExecutionFailed(
+            "Protocol error: schema FOO not found [line 1, column 13] (SQL state: 42000)"
+                .to_string(),
+        );
+        assert!(
+            schema_open_error_is_missing_schema(&missing),
+            "a 'schema ... not found' error must be classified as missing-schema (swallowed)"
+        );
+    }
+
+    #[test]
+    fn schema_open_error_unrelated_is_fatal() {
+        // An unrelated failure (e.g. permissions) must stay fatal.
+        let unrelated = QueryError::ExecutionFailed("insufficient privileges".to_string());
+        assert!(
+            !schema_open_error_is_missing_schema(&unrelated),
+            "an unrelated error must NOT be classified as missing-schema (stays fatal)"
+        );
     }
 }
 
