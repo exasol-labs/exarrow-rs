@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.5
+
+- Fix: a schema named in the connection URI is now a best-effort default. If the schema does not yet exist, `connect()` keeps the connection open (with no active schema) instead of failing, so tools that create their target schema after connecting (e.g. dbt) can bootstrap it. Other `OPEN SCHEMA` failures (auth, permissions, transport) remain fatal. This refines the 0.11.0 behavior, where any schema-activation failure aborted the connection.
+
 ## 0.12.4
 
 - Dependency upgrade: `arrow` and `parquet` 57.x → 58.x; arrow sub-crates unified to a single 58.x version in `Cargo.lock` (fixes a duplicate-version resolver conflict with `adbc_core 0.23.0`).
