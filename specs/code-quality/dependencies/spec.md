@@ -17,8 +17,6 @@ explicit evaluation before merging.
 `cargo deny check advisories` MUST be a required gate in CI and MUST run on
 every pull request and push to `main`.
 
-<!-- DELTA:NEW -->
-
 ## Scenarios
 
 ### Scenario: Advisory suppression documents rationale
@@ -67,5 +65,3 @@ every pull request and push to `main`.
 * *THEN* the check MUST exit with code 0
 * *AND* the suppression MUST reference `GHSA-2f9f-gq7v-9h6m`
 * *AND* the suppression `reason` MUST state that `thrift 0.23.0` is not on crates.io, that `^0.17` blocks a patch override, and that re-evaluation is triggered when `parquet 59.x` is released or `adbc_core` supports `arrow-schema >=59`
-
-<!-- /DELTA:NEW -->
