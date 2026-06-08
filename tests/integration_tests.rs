@@ -449,6 +449,47 @@ async fn test_create_schema() {
     conn.close().await.expect("Failed to close connection");
 }
 
+/// Best-effort URI-schema regression (live behavior).
+///
+/// Connecting with a URI schema that does NOT yet exist must succeed: the
+/// "schema ... not found" failure from the implicit `OPEN SCHEMA` is swallowed
+/// and the connection stays open with no active schema. Tools such as dbt rely
+/// on this so they can create their target schema after connecting.
+///
+/// Documents the live behavior; run with `--ignored` against a real Exasol.
+#[tokio::test]
+#[ignore]
+async fn test_connect_with_nonexistent_uri_schema_succeeds() {
+    skip_if_no_exasol!();
+
+    let schema_name = generate_test_schema_name();
+
+    // Connect requesting a default schema that does not exist yet.
+    let conn = Connection::builder()
+        .host(&get_host())
+        .port(get_port())
+        .username(&get_user())
+        .password(&common::get_password())
+        .schema(&schema_name)
+        .use_tls(false)
+        .connect()
+        .await;
+
+    assert!(
+        conn.is_ok(),
+        "Connecting with a non-existent URI schema should succeed (best-effort default), got: {:?}",
+        conn.err()
+    );
+
+    let conn = conn.unwrap();
+    assert!(
+        !conn.is_closed().await,
+        "Connection should stay open even though the URI schema does not exist"
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}
+
 /// 4.2 Test CREATE TABLE with various column types
 #[tokio::test]
 async fn test_create_table_various_types() {
