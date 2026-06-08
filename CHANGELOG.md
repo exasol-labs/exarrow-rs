@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.6
+
+- Security: GHSA-2f9f-gq7v-9h6m (CVE-2026-43868, Apache Thrift CWE-789, CVSS 5.3 Medium) formally suppressed in `deny.toml`. No patch is available on crates.io (`thrift 0.23.0` unpublished; `parquet ^0.17` blocks `[patch.crates-io]` override; `parquet 59.x`, which removes thrift, not yet released). Re-evaluate when `parquet 59.x` ships or `adbc_core` supports `arrow-schema >=59`.
+- CI: `cargo deny check advisories` added as a required gate in the `licenses` job, alongside the existing license check.
+- Dependencies: `Cargo.lock` refreshed via `cargo update`; includes patch and minor bumps across transitive dependencies, all within their declared semver constraints.
+
 ## 0.12.5
 
 - Fix: a schema named in the connection URI is now a best-effort default. If the schema does not yet exist, `connect()` keeps the connection open (with no active schema) instead of failing, so tools that create their target schema after connecting (e.g. dbt) can bootstrap it. Other `OPEN SCHEMA` failures (auth, permissions, transport) remain fatal. This refines the 0.11.0 behavior, where any schema-activation failure aborted the connection.
