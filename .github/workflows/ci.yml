@@ -85,6 +85,9 @@ jobs:
       - name: Check licenses
         run: cargo deny check licenses
 
+      - name: Check advisories
+        run: cargo deny check advisories
+
   unit-tests:
     name: Unit Tests
     needs: [build]
