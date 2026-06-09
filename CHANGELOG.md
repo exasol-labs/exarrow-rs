@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.7
+
+- Fix: zero-row result sets now carry their column schema. `ResultSet::from_transport_result` previously produced an empty batch list for a result with no rows, so the schema (built from the result set's column metadata, which Exasol always returns) was lost. Consumers that read the schema from the first batch — notably the ADBC `RecordBatchReader` used by dbt Fusion for `SELECT ... WHERE FALSE LIMIT 0` schema probes — saw zero columns. An empty result set now yields a single zero-row batch carrying the schema. Affected dbt Fusion snapshots, contracts, unit tests, and `get_columns_in_query`.
+
 ## 0.12.6
 
 - Security: GHSA-2f9f-gq7v-9h6m (CVE-2026-43868, Apache Thrift CWE-789, CVSS 5.3 Medium) formally suppressed in `deny.toml`. No patch is available on crates.io (`thrift 0.23.0` unpublished; `parquet ^0.17` blocks `[patch.crates-io]` override; `parquet 59.x`, which removes thrift, not yet released). Re-evaluate when `parquet 59.x` ships or `adbc_core` supports `arrow-schema >=59`.
