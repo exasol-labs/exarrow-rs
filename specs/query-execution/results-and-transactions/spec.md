@@ -30,6 +30,7 @@ Query results are retrieved efficiently with support for both small single-fetch
 * *THEN* it SHALL provide column names and types
 * *AND* it SHALL provide row count (if available)
 * *AND* it SHALL provide Arrow schema
+* *AND* the Arrow schema SHALL be available regardless of how many rows the result set contains, including zero rows
 
 ### Scenario: Explicit transaction begin
 
@@ -93,3 +94,12 @@ Query results are retrieved efficiently with support for both small single-fetch
 * *WHEN* EXPLAIN is used
 * *THEN* it SHALL return query execution plan information
 * *AND* it SHALL format plan data appropriately for display
+
+### Scenario: Zero-row result set preserves schema
+
+* *GIVEN* a query has been executed
+* *WHEN* the query returns a result set with zero rows
+* *THEN* it SHALL yield exactly one Arrow RecordBatch
+* *AND* that RecordBatch SHALL have a row count of zero
+* *AND* that RecordBatch SHALL carry the full column schema (column names and Arrow data types) derived from the result set's column metadata
+* *AND* it SHALL NOT return an empty batch list that drops the schema

@@ -56,7 +56,8 @@ Statements are pure data objects created via `Connection::create_statement()` an
 
 * *GIVEN* an active database connection exists
 * *WHEN* a query returns no rows
-* *THEN* it SHALL return an empty RecordBatch with correct schema
+* *THEN* it SHALL return exactly one Arrow RecordBatch with zero rows
+* *AND* that RecordBatch SHALL carry the correct column schema (column names and Arrow data types)
 
 ### Scenario: Result set metadata
 
@@ -70,3 +71,10 @@ Statements are pure data objects created via `Connection::create_statement()` an
 * *WHEN* `create_statement()` is called on that connection
 * *THEN* the returned Statement SHALL use the connection's configured `query_timeout` as its execution timeout
 * *AND* the Statement SHALL NOT use a hardcoded timeout independent of the connection's configuration
+
+### Scenario: Empty result schema surfaced via RecordBatchReader
+
+* *GIVEN* an ADBC statement is executed whose query returns zero rows (for example a `SELECT ... WHERE FALSE LIMIT 0` schema probe)
+* *WHEN* the resulting RecordBatchReader's schema is read from its first batch
+* *THEN* the RecordBatchReader SHALL surface the full column schema (column names and Arrow data types)
+* *AND* it SHALL NOT fall back to an empty schema with zero columns
