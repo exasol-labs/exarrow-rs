@@ -142,3 +142,59 @@ Add a suppression entry for GHSA-2f9f-gq7v-9h6m to `deny.toml` with a structured
 ### Consequences
 
 The advisory is formally closed in Dependabot with a traceable rationale. Future maintainers have a concrete re-evaluation trigger. The `cargo deny check advisories` CI gate ensures any new unacknowledged advisory blocks merge automatically. When `parquet 59.x` is released or `adbc_core` lifts the `arrow-schema <59` cap, the suppression entry should be removed and a clean `cargo update` attempted.
+
+---
+
+## ADR-006: Zero-row result sets carry their column schema
+
+**Date:** 2026-06-09
+**Plan:** `fix-zero-row-result-schema`
+**Status:** Accepted
+
+### Context
+
+`ResultSet::from_transport_result` built the Arrow schema from the result set's column metadata (always present, even with no rows) but then produced an empty `Vec<RecordBatch>` whenever the first data payload had zero rows. The schema lived only on `QueryMetadata`, so any consumer that reads the schema from the batches lost the columns. The ADBC FFI layer (`FfiStatement::execute`) does exactly this: with no batches it falls back to `Schema::empty()`. dbt Fusion derives a query's column schema via `get_empty_subquery_sql` (`SELECT * FROM (...) WHERE FALSE LIMIT 0`); the empty schema made it see zero columns, breaking snapshots (`get_snapshot_get_time_data_type` indexing `[0]` on an empty list), contract validation (`get_assert_columns_equivalent`), unit tests, and `get_columns_in_query`. `payload_to_record_batch`/`column_major_to_record_batch` already build a correct zero-row batch from the schema, so the bug was purely the empty-list short-circuit.
+
+### Decision
+
+In `from_transport_result`, always emit one batch for a result set: when the payload is empty, build a zero-row batch from the authoritative column schema (new `empty_record_batch` helper) instead of returning `Vec::new()`. A result set always has columns, so it always yields at least one schema-carrying batch.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Emit a zero-row batch built from the column schema | ✓ Chosen — fixes the deficiency at its source; schema is conveyed uniformly regardless of row count or downstream consumer |
+| Fix only the ADBC `execute()` fallback to reuse `QueryMetadata.schema` | ✗ Rejected — leaves the empty-batch-list footgun for every other consumer (`fetch_all`, iterators) |
+| Work around it downstream (e.g. dbt `LIMIT 1` probe) | ✗ Rejected — a band-aid in every consumer for a driver-layer defect; an empty result set legitimately has columns |
+
+### Consequences
+
+Empty result sets behave like every other ADBC driver's: the schema survives zero rows. dbt Fusion schema introspection (snapshots, contracts, unit tests, `get_columns_in_query`) works against Exasol without consumer-side workarounds. Regression test `test_empty_result_set_preserves_schema` guards it.
+
+---
+
+## ADR-007: A URI-specified schema is a best-effort default, not a connect-time requirement
+
+**Date:** 2026-06-08
+**Plan:** `change-uri-schema-best-effort`
+**Status:** Accepted
+
+### Context
+
+In 0.11.0 a schema named in the connection URI was opened eagerly after login via `OPEN SCHEMA`, and ANY failure of that implicit activation aborted the connection: `connect_with_transport` closed the transport and returned `ConnectionError::ConnectionFailed`. The spec encoded this as a hard requirement ("if the server-side schema activation fails, `connect()` MUST return a `ConnectionError`"). This breaks tools such as dbt, which connect first and create their target schema afterwards while fully qualifying every relation. At connect time the schema does not exist yet, so the connection failed before the tool could create it -- a normal bootstrap state was treated as fatal.
+
+### Decision
+
+Treat a URI-specified schema as a best-effort default. During `connect_with_transport`, if the implicit `set_schema` (`OPEN SCHEMA`) fails, classify the failure: if it is a missing-schema error, swallow it and leave the session open with no active schema (the schema can be `OPEN`ed later, once it exists); if it is any other failure, keep the existing fatal behavior -- close the transport and return `ConnectionError::ConnectionFailed`. Classification is performed by a small free function `schema_open_error_is_missing_schema(&QueryError) -> bool` that inspects the lowercased error message for "not found".
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Best-effort default: swallow missing-schema, keep other failures fatal | Chosen -- unblocks dbt-style bootstrap while preserving the safety guarantee that a genuinely broken connection never returns a half-open `Connection` |
+| Keep any schema-activation failure fatal (0.11.0 behavior) | Rejected -- treats a normal not-yet-existing default schema as a corrupt connection; blocks dbt and similar tools |
+| Eagerly `CREATE SCHEMA` the missing schema during connect | Rejected -- the driver must not silently perform DDL or assume create permissions on the user's behalf; schema creation is the application's decision |
+
+### Consequences
+
+dbt and similar tools can connect against a not-yet-existing default schema and create it afterwards; fully qualified relations continue to resolve, and the caller may activate the schema later via `set_schema()`. Non-missing failures (auth, permissions, transport) still close the transport and return a clear error, so no half-open connection is ever leaked. The missing-schema classification is message-based (substring "not found" on the lowercased error text), which is a known brittleness: if Exasol changes its "schema ... not found" wording, a missing schema could be misclassified as fatal (or vice versa). The behavior is guarded by unit tests `schema_open_error_missing_schema_is_recognized` and `schema_open_error_unrelated_is_fatal`, and by the ignored live integration test `test_connect_with_nonexistent_uri_schema_succeeds`.

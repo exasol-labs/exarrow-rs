@@ -111,12 +111,19 @@ impl ResultSet {
 
                 let num_rows_received = data.data.num_rows() as i64;
 
-                let batches = if data.data.is_empty() {
-                    Vec::new()
+                // A result set always carries column metadata, even with zero rows.
+                // Emit one (possibly empty) batch built from that schema so consumers
+                // that read the schema from the first batch (e.g. ADBC's
+                // RecordBatchReader, used by dbt Fusion for `WHERE FALSE LIMIT 0`
+                // schema probes) still receive the columns. Returning an empty Vec
+                // here would drop the schema for zero-row results.
+                let batch = if data.data.is_empty() {
+                    Self::empty_record_batch(&schema)
                 } else {
-                    vec![Self::payload_to_record_batch(&data, &schema)
-                        .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?]
-                };
+                    Self::payload_to_record_batch(&data, &schema)
+                }
+                .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+                let batches = vec![batch];
 
                 let complete = handle.is_none() || data.total_rows == num_rows_received;
 
@@ -315,6 +322,23 @@ impl ResultSet {
             ResultPayload::Arrow(batch) => Ok(batch.clone()),
             ResultPayload::Json(_) => Self::column_major_to_record_batch(data, schema),
         }
+    }
+
+    /// Build a zero-row RecordBatch that carries the given schema.
+    ///
+    /// Used for empty result sets so the column schema is still conveyed to
+    /// consumers that read it from the first batch (the schema itself comes
+    /// from the result set's column metadata, which is present even with no
+    /// rows).
+    fn empty_record_batch(schema: &Arc<Schema>) -> Result<RecordBatch, ConversionError> {
+        use arrow::array::{new_empty_array, Array};
+        let arrays: Vec<Arc<dyn Array>> = schema
+            .fields()
+            .iter()
+            .map(|field| new_empty_array(field.data_type()))
+            .collect();
+        RecordBatch::try_new(Arc::clone(schema), arrays)
+            .map_err(|e| ConversionError::ArrowError(e.to_string()))
     }
 
     /// Convert row-major JSON result data to RecordBatch.
@@ -872,6 +896,67 @@ mod tests {
         assert_eq!(metadata.column_count, 2);
         assert_eq!(metadata.total_rows, Some(2));
         assert_eq!(metadata.column_names(), vec!["id", "name"]);
+    }
+
+    #[tokio::test]
+    async fn test_empty_result_set_preserves_schema() {
+        // A zero-row result set must still convey its columns: ADBC consumers
+        // read the schema from the first batch, so an empty Vec would drop it
+        // (regression test for `WHERE FALSE LIMIT 0` schema probes).
+        let mock_transport = MockTransport::new();
+        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(mock_transport));
+
+        let data = ResultData {
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: DataType {
+                        type_name: "DECIMAL".to_string(),
+                        precision: Some(18),
+                        scale: Some(0),
+                        size: None,
+                        character_set: None,
+                        with_local_time_zone: None,
+                        fraction: None,
+                    },
+                },
+                ColumnInfo {
+                    name: "name".to_string(),
+                    data_type: DataType {
+                        type_name: "VARCHAR".to_string(),
+                        precision: None,
+                        scale: None,
+                        size: Some(100),
+                        character_set: Some("UTF8".to_string()),
+                        with_local_time_zone: None,
+                        fraction: None,
+                    },
+                },
+            ],
+            data: ResultPayload::Json(vec![]),
+            total_rows: 0,
+        };
+
+        let result = TransportQueryResult::ResultSet { handle: None, data };
+        let result_set = ResultSet::from_transport_result(result, transport).unwrap();
+
+        let batches = result_set.fetch_all().await.unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "empty result set must yield one schema-carrying batch"
+        );
+        assert_eq!(batches[0].num_rows(), 0);
+        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
     }
 
     #[tokio::test]
