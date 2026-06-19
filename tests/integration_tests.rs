@@ -78,6 +78,7 @@ use common::{
     get_user, is_exasol_available,
 };
 use exarrow_rs::adbc::Connection;
+use exarrow_rs::{Parameter, QueryError};
 
 // Infrastructure Tests
 // These tests validate that the test infrastructure itself works correctly.
@@ -2670,4 +2671,261 @@ fn test_arrow_parquet_resolve_to_58_or_above_with_unified_sub_crates() {
         arrow_array_57_count, 0,
         "arrow-array must not appear at a 57.x version alongside 58.x"
     );
+}
+
+// Section 11: Batch Prepared Statement Integration Tests
+//
+// These tests verify multi-row (batch) prepared statement execution via
+// `Connection::execute_batch_update` and `Connection::execute_batch`.
+
+/// 11.1 Batch INSERT: execute several rows in one call and verify the affected-row count
+/// and the actual rows stored in the table.
+#[tokio::test]
+async fn test_execute_batch_update() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let schema_name = generate_test_schema_name();
+
+    conn.execute_update(&format!("CREATE SCHEMA {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.batch_test (id INTEGER, name VARCHAR(100))",
+        schema_name
+    ))
+    .await
+    .expect("CREATE TABLE should succeed");
+
+    let prepared = conn
+        .prepare(&format!(
+            "INSERT INTO {}.batch_test VALUES (?, ?)",
+            schema_name
+        ))
+        .await
+        .expect("Failed to prepare INSERT");
+
+    assert_eq!(prepared.parameter_count(), 2);
+
+    let rows: Vec<Vec<Parameter>> = vec![
+        vec![
+            Parameter::Integer(1),
+            Parameter::String("Alice".to_string()),
+        ],
+        vec![Parameter::Integer(2), Parameter::String("Bob".to_string())],
+        vec![
+            Parameter::Integer(3),
+            Parameter::String("Charlie".to_string()),
+        ],
+    ];
+
+    let affected = conn
+        .execute_batch_update(&prepared, &rows)
+        .await
+        .expect("execute_batch_update should succeed");
+
+    assert_eq!(
+        affected, 3,
+        "Affected row count should equal the number of batch rows"
+    );
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+
+    // Verify all rows were inserted
+    let batches = conn
+        .query(&format!(
+            "SELECT id, name FROM {}.batch_test ORDER BY id",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "All 3 batch rows should be present");
+
+    let batch = &batches[0];
+    let name_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name column should be StringArray");
+
+    assert_eq!(name_col.value(0), "Alice");
+    assert_eq!(name_col.value(1), "Bob");
+    assert_eq!(name_col.value(2), "Charlie");
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.2 Batch SELECT: execute a prepared SELECT with a single-row parameter batch and
+/// verify the result set is returned correctly via `execute_batch`.
+///
+/// Note: exercises the `execute_batch` code path with a single-row batch; multi-row
+/// SELECT parameter semantics are out of scope for this test.
+#[tokio::test]
+async fn test_execute_batch_select_single_row() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let schema_name = generate_test_schema_name();
+
+    conn.execute_update(&format!("CREATE SCHEMA {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.batch_sel (id INTEGER, label VARCHAR(50))",
+        schema_name
+    ))
+    .await
+    .expect("CREATE TABLE should succeed");
+
+    conn.execute_update(&format!(
+        "INSERT INTO {}.batch_sel VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+        schema_name
+    ))
+    .await
+    .expect("INSERT should succeed");
+
+    // Prepare a SELECT with one parameter (filter by id)
+    let prepared = conn
+        .prepare(&format!(
+            "SELECT id, label FROM {}.batch_sel WHERE id = ?",
+            schema_name
+        ))
+        .await
+        .expect("Failed to prepare SELECT");
+
+    assert_eq!(prepared.parameter_count(), 1);
+
+    // Execute with a single-row parameter batch: fetch the row where id = 2
+    let rows: Vec<Vec<Parameter>> = vec![vec![Parameter::Integer(2)]];
+
+    let result_set = conn
+        .execute_batch(&prepared, &rows)
+        .await
+        .expect("execute_batch should succeed");
+
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("Failed to fetch result set");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "Should return 1 row for id = 2");
+
+    let label_col = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("label column should be StringArray");
+
+    assert_eq!(
+        label_col.value(0),
+        "two",
+        "Row with id=2 should have label 'two'"
+    );
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.3 Batch execution on a closed prepared statement must return `QueryError::StatementClosed`.
+#[tokio::test]
+async fn test_execute_batch_closed_statement() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let mut prepared = conn
+        .prepare("SELECT 1")
+        .await
+        .expect("Failed to prepare statement");
+
+    assert!(!prepared.is_closed());
+
+    // Mark the statement closed directly so we can still hold the binding and test both
+    // batch methods on the same closed statement.
+    prepared.mark_closed();
+
+    assert!(prepared.is_closed());
+
+    // Both batch methods must reject with StatementClosed
+    let rows: Vec<Vec<Parameter>> = vec![];
+
+    let update_err = conn
+        .execute_batch_update(&prepared, &rows)
+        .await
+        .expect_err("execute_batch_update on a closed statement must fail");
+
+    assert!(
+        matches!(update_err, QueryError::StatementClosed),
+        "Expected StatementClosed, got: {:?}",
+        update_err
+    );
+
+    let select_err = conn
+        .execute_batch(&prepared, &rows)
+        .await
+        .expect_err("execute_batch on a closed statement must fail");
+
+    assert!(
+        matches!(select_err, QueryError::StatementClosed),
+        "Expected StatementClosed, got: {:?}",
+        select_err
+    );
+
+    // Release the server-side handle since we bypassed close_prepared above.
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 11.4 `execute_batch_update` against a prepared SELECT (which returns a result set)
+/// must return `QueryError::UnexpectedResultSet`.
+#[tokio::test]
+async fn test_execute_batch_update_rejects_result_set() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    // Prepare a SELECT — it returns a result set, not an affected-row count
+    let prepared = conn
+        .prepare("SELECT 42 AS answer")
+        .await
+        .expect("Failed to prepare SELECT");
+
+    assert_eq!(prepared.parameter_count(), 0);
+
+    // Empty batch: no rows, no params — execute_batch_update must reject the result set response
+    let rows: Vec<Vec<Parameter>> = vec![];
+
+    let err = conn
+        .execute_batch_update(&prepared, &rows)
+        .await
+        .expect_err("execute_batch_update on a SELECT should fail with UnexpectedResultSet");
+
+    assert!(
+        matches!(err, QueryError::UnexpectedResultSet),
+        "Expected UnexpectedResultSet, got: {:?}",
+        err
+    );
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+
+    conn.close().await.expect("Failed to close connection");
 }

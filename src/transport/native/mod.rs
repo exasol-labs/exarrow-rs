@@ -399,16 +399,29 @@ impl NativeTcpTransport {
                 }
             }
 
-            // Write column data (column-major: for each column, for each row)
-            for (i, col_values) in cols.iter().enumerate() {
-                let (wire_type, _) = Self::infer_wire_type(handle, i, col_values);
-                let scale = if wire_type == T_DECIMAL {
-                    Self::decimal_metadata(handle, i).1
-                } else {
-                    0
-                };
-                for value in col_values {
-                    Self::write_param_value(&mut buf, wire_type, value, scale)?;
+            // Write parameter data in row-major order: col0_row0, col1_row0, col0_row1, ...
+            // Exasol's native prepared-statement protocol requires this interleaving.
+            // Column-major encoding causes the server to drop the connection for num_rows > 1;
+            // the two orderings coincide for num_rows = 1, which is why single-row execution
+            // was unaffected before this fix.
+            let wire_types_and_scales: Vec<(u32, i32)> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, col_values)| {
+                    let (wire_type, _) = Self::infer_wire_type(handle, i, col_values);
+                    let scale = if wire_type == T_DECIMAL {
+                        Self::decimal_metadata(handle, i).1
+                    } else {
+                        0
+                    };
+                    (wire_type, scale)
+                })
+                .collect();
+
+            for row_idx in 0..num_rows {
+                for (col_idx, col_values) in cols.iter().enumerate() {
+                    let (wire_type, scale) = wire_types_and_scales[col_idx];
+                    Self::write_param_value(&mut buf, wire_type, &col_values[row_idx], scale)?;
                 }
             }
         }
