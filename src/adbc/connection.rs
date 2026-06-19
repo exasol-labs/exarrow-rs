@@ -15,6 +15,7 @@ use crate::connection::session::{Session as SessionInfo, SessionConfig, SessionS
 use crate::error::{ConnectionError, ExasolError, QueryError};
 use crate::query::prepared::PreparedStatement;
 use crate::query::results::ResultSet;
+use crate::query::statement::Parameter;
 use crate::transport::protocol::{
     ConnectionParams as TransportConnectionParams, Credentials as TransportCredentials,
     QueryResult, TransportProtocol,
@@ -498,6 +499,116 @@ impl Connection {
             QueryResult::RowCount { count } => Ok(count),
             QueryResult::ResultSet { .. } => Err(QueryError::UnexpectedResultSet),
         }
+    }
+
+    /// Execute a prepared statement with multiple rows of parameters and return the number of
+    /// affected rows.
+    ///
+    /// Use this for batch INSERT, UPDATE, or DELETE statements.
+    ///
+    /// # Arguments
+    ///
+    /// * `stmt` - Prepared statement to execute
+    /// * `rows` - Slice of parameter rows; each row is a `Vec<Parameter>` in positional order
+    ///
+    /// # Returns
+    ///
+    /// The total number of rows affected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QueryError` if execution fails, if the statement is closed, or if Exasol
+    /// returns a result set instead of an affected-row count.
+    pub async fn execute_batch_update(
+        &mut self,
+        stmt: &PreparedStatement,
+        rows: &[Vec<Parameter>],
+    ) -> Result<i64, QueryError> {
+        if stmt.is_closed() {
+            return Err(QueryError::StatementClosed);
+        }
+
+        // Validate session state
+        self.session
+            .validate_ready()
+            .await
+            .map_err(|e| QueryError::InvalidState(e.to_string()))?;
+
+        // Update session state
+        self.session.set_state(SessionState::Executing).await;
+
+        // Convert batch parameters to column-major JSON format
+        let params_data = stmt.build_batch_parameters_data(rows)?;
+
+        let mut transport = self.transport.lock().await;
+        let result = transport
+            .execute_prepared_statement(stmt.handle_ref(), params_data)
+            .await
+            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+
+        drop(transport);
+
+        // Update session state back to ready/in_transaction
+        self.update_session_state_after_query().await;
+
+        match result {
+            QueryResult::RowCount { count } => Ok(count),
+            QueryResult::ResultSet { .. } => Err(QueryError::UnexpectedResultSet),
+        }
+    }
+
+    /// Execute a prepared statement with multiple rows of parameters and return a result set.
+    ///
+    /// Use this for batch SELECT statements or queries that return rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `stmt` - Prepared statement to execute
+    /// * `rows` - Slice of parameter rows; each row is a `Vec<Parameter>` in positional order
+    ///
+    /// # Returns
+    ///
+    /// A `ResultSet` containing the query results.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QueryError` if execution fails or if the statement is closed.
+    pub async fn execute_batch(
+        &mut self,
+        stmt: &PreparedStatement,
+        rows: &[Vec<Parameter>],
+    ) -> Result<ResultSet, QueryError> {
+        if stmt.is_closed() {
+            return Err(QueryError::StatementClosed);
+        }
+
+        // Validate session state
+        self.session
+            .validate_ready()
+            .await
+            .map_err(|e| QueryError::InvalidState(e.to_string()))?;
+
+        // Update session state
+        self.session.set_state(SessionState::Executing).await;
+
+        // Increment query counter
+        self.session.increment_query_count();
+
+        // Convert batch parameters to column-major JSON format
+        let params_data = stmt.build_batch_parameters_data(rows)?;
+
+        let mut transport = self.transport.lock().await;
+        let result = transport
+            .execute_prepared_statement(stmt.handle_ref(), params_data)
+            .await
+            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+
+        drop(transport);
+
+        // Update session state back to ready/in_transaction
+        self.update_session_state_after_query().await;
+
+        ResultSet::from_transport_result(result, Arc::clone(&self.transport))
     }
 
     /// Close a prepared statement and release server-side resources.

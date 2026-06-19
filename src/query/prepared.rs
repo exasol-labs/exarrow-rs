@@ -60,8 +60,11 @@ impl PreparedStatement {
         self.closed
     }
 
-    /// Mark the prepared statement as closed (called by Connection).
-    pub(crate) fn mark_closed(&mut self) {
+    /// Mark this statement closed so it cannot be reused.
+    ///
+    /// Call this after an external resource (e.g. a server-side handle) has already
+    /// been released, so the statement reflects the closed state without a network round-trip.
+    pub fn mark_closed(&mut self) {
         self.closed = true;
     }
 
@@ -98,6 +101,43 @@ impl PreparedStatement {
     /// Get bound parameters.
     pub fn parameters(&self) -> &[Option<Parameter>] {
         &self.parameters
+    }
+
+    /// Build batch parameters data in column-major format for multi-row execution.
+    ///
+    /// Accepts row-major input (`rows[r][c]`) and transposes it into the column-major
+    /// wire format (`columns[c][r]`) expected by the transport layer.
+    ///
+    /// Returns `Ok(None)` for an empty batch (mirrors the 0-parameter case).
+    /// Returns `Err(ParameterBindingError)` if any row's length differs from `parameter_count()`.
+    pub fn build_batch_parameters_data(
+        &self,
+        rows: &[Vec<Parameter>],
+    ) -> Result<Option<Vec<Vec<serde_json::Value>>>, QueryError> {
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let expected = self.parameter_count();
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != expected {
+                return Err(QueryError::ParameterBindingError {
+                    index: i,
+                    message: format!(
+                        "Row {} has {} parameters but statement expects {}",
+                        i,
+                        row.len(),
+                        expected
+                    ),
+                });
+            }
+        }
+
+        let columns: Vec<Vec<serde_json::Value>> = (0..expected)
+            .map(|c| rows.iter().map(|row| parameter_to_json(&row[c])).collect())
+            .collect();
+
+        Ok(Some(columns))
     }
 
     /// Build parameters data in column-major format for the protocol.
@@ -368,6 +408,102 @@ mod tests {
         assert_eq!(
             parameter_to_json(&Parameter::Binary(vec![0x00, 0xFF])),
             serde_json::json!("00ff")
+        );
+    }
+
+    #[test]
+    fn test_build_batch_params_empty() {
+        let handle = PreparedStatementHandle::new(1, 2, vec![], vec![]);
+        let stmt = PreparedStatement::new(handle);
+
+        let result = stmt.build_batch_parameters_data(&[]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_build_batch_params_arity_mismatch() {
+        let handle = PreparedStatementHandle::new(1, 2, vec![], vec![]);
+        let stmt = PreparedStatement::new(handle);
+
+        // Row 0 has 2 params (ok), row 1 has only 1 param (mismatch at index 1)
+        let rows = vec![
+            vec![Parameter::Integer(1), Parameter::Integer(2)],
+            vec![Parameter::Integer(3)],
+        ];
+        let result = stmt.build_batch_parameters_data(&rows);
+        assert!(matches!(
+            result.unwrap_err(),
+            QueryError::ParameterBindingError { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_build_batch_params_column_major() {
+        let handle = PreparedStatementHandle::new(1, 2, vec![], vec![]);
+        let stmt = PreparedStatement::new(handle);
+
+        let rows = vec![
+            vec![Parameter::Integer(10), Parameter::Integer(20)],
+            vec![Parameter::Integer(30), Parameter::Integer(40)],
+            vec![Parameter::Integer(50), Parameter::Integer(60)],
+        ];
+        let columns = stmt.build_batch_parameters_data(&rows).unwrap().unwrap();
+
+        // Column 0 should be [10, 30, 50], column 1 should be [20, 40, 60]
+        assert_eq!(columns.len(), 2);
+        assert_eq!(
+            columns[0],
+            vec![
+                serde_json::json!(10),
+                serde_json::json!(30),
+                serde_json::json!(50)
+            ]
+        );
+        assert_eq!(
+            columns[1],
+            vec![
+                serde_json::json!(20),
+                serde_json::json!(40),
+                serde_json::json!(60)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_batch_params_binary_hex() {
+        let handle = PreparedStatementHandle::new(1, 1, vec![], vec![]);
+        let stmt = PreparedStatement::new(handle);
+
+        let rows = vec![
+            vec![Parameter::Binary(vec![0xDE, 0xAD])],
+            vec![Parameter::Binary(vec![0xBE, 0xEF])],
+        ];
+        let columns = stmt.build_batch_parameters_data(&rows).unwrap().unwrap();
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(
+            columns[0],
+            vec![serde_json::json!("dead"), serde_json::json!("beef")]
+        );
+    }
+
+    #[test]
+    fn test_build_batch_params_mixed_types() {
+        let handle = PreparedStatementHandle::new(1, 2, vec![], vec![]);
+        let stmt = PreparedStatement::new(handle);
+
+        let rows = vec![
+            vec![Parameter::Integer(1), Parameter::Binary(vec![0xAB])],
+            vec![Parameter::Integer(2), Parameter::Binary(vec![0xCD])],
+        ];
+        let columns = stmt.build_batch_parameters_data(&rows).unwrap().unwrap();
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0], vec![serde_json::json!(1), serde_json::json!(2)]);
+        assert_eq!(
+            columns[1],
+            vec![serde_json::json!("ab"), serde_json::json!("cd")]
         );
     }
 }

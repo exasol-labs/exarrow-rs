@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.8
+
+- Feat: two new `Connection` methods for multi-row prepared-statement execution: `execute_batch_update` (executes a batch and returns the total affected row count) and `execute_batch` (executes a batch and returns a `ResultSet`). Both accept a slice of row parameter sets and handle column-major wire encoding internally.
+- Feat: `PreparedStatement::build_batch_parameters_data` — a builder that assembles row-major batch parameters (a slice of per-row `Vec<Parameter>`) into the column-major wire form required by the Exasol protocol.
+- No breaking changes; all additions are backward-compatible.
+
 ## 0.12.7
 
 - Fix: zero-row result sets now carry their column schema. `ResultSet::from_transport_result` previously produced an empty batch list for a result with no rows, so the schema (built from the result set's column metadata, which Exasol always returns) was lost. Consumers that read the schema from the first batch — notably the ADBC `RecordBatchReader` used by dbt Fusion for `SELECT ... WHERE FALSE LIMIT 0` schema probes — saw zero columns. An empty result set now yields a single zero-row batch carrying the schema. Affected dbt Fusion snapshots, contracts, unit tests, and `get_columns_in_query`.
