@@ -28,6 +28,20 @@ This example shows:
 - Result processing with Arrow RecordBatches
 - Proper connection cleanup
 
+### Prepared Statements
+
+The `prepared_statements.rs` example demonstrates parameterized prepared statements, including multi-row batch execution:
+
+```bash
+cargo run --example prepared_statements
+```
+
+This example shows:
+- Preparing a statement with `connection.prepare(...)`
+- Single-row execution with `bind` + `execute_prepared_update` / `execute_prepared`
+- Multi-row batch execution with `execute_batch_update` and `execute_batch`
+- Closing prepared statements with `close_prepared`
+
 ### Driver Manager Usage
 
 The `driver_manager_usage.rs` example demonstrates loading the driver dynamically via the ADBC driver manager, which is how external applications (Python, R, etc.) would use the driver:

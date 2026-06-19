@@ -71,7 +71,7 @@ See [**docs/**](docs/index.md) for comprehensive documentation:
 
 - [Setup & Connect](docs/setup-and-connect.md) - Docker setup, connection strings, parameters, TLS, and transport selection
 - [Queries](docs/queries.md) - Query execution and transactions
-- [Prepared Statements](docs/prepared-statements.md) - Parameter binding
+- [Prepared Statements](docs/prepared-statements.md) - Parameter binding and batch execution
 - [Import / Export](docs/import-export.md) - Bulk data transfer
   - [Parallel Import](docs/import-export.md#parallel-import)
   - [Schema Inference](docs/import-export.md#auto-table-creation)
