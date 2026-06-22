@@ -2153,6 +2153,15 @@ impl ConnectionBuilder {
         self
     }
 
+    /// Enable or disable server-certificate validation.
+    ///
+    /// Disable when connecting to an Exasol Docker container, which ships a
+    /// self-signed certificate that would otherwise fail validation.
+    pub fn validate_server_certificate(mut self, validate: bool) -> Self {
+        self.params_builder = self.params_builder.validate_server_certificate(validate);
+        self
+    }
+
     /// Build and connect.
     ///
     /// # Returns

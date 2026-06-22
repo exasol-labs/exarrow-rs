@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.0
+
+- Feat: `Connection::builder()` now exposes `.validate_server_certificate(bool)`, mirroring the connection-string `validateservercertificate` parameter. Previously the builder could only reach a self-signed Exasol (e.g. the Docker image) by disabling TLS entirely; it can now connect over TLS while accepting a self-signed certificate.
+- Refactor: removed ~1,180 lines of verified-dead and duplicated internal code from a whole-repo over-engineering audit. Includes dead native protocol constants and handshake helpers, an unused `AdbcErrorCode` enum, dead session/query helpers, and consolidation of the triplicated TLS certificate verifiers (into `transport::tls`) and the hand-rolled CSV parse/format/decompress paths.
+- Breaking: removed unused public API with no real consumers — `connection::session::SessionManager`, and the never-constructed `ExportError` variants `CsvParse`/`Arrow`/`Schema`/`Parquet` (plus the corresponding `From<parquet::errors::ParquetError>` impl). The documented public surface (`ArrowConverter`, `ResultSetIterator`, the `blocking_*` sync API, `ArrowToCsvWriter`, `CsvToArrowReader`) is unchanged.
+- Fix (tests): the test harness no longer mutates the shared process environment, so the integration suite is now order-independent regardless of thread count or execution order.
+
 ## 0.12.8
 
 - Feat: two new `Connection` methods for multi-row prepared-statement execution: `execute_batch_update` (executes a batch and returns the total affected row count) and `execute_batch` (executes a batch and returns a `ResultSet`). Both accept a slice of row parameter sets and handle column-major wire encoding internally.

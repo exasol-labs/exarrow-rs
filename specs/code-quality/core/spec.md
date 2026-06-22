@@ -36,6 +36,14 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 * *THEN* integration tests against Exasol database MUST pass
 * *AND* driver functionality SHALL remain intact
 
+### Scenario: Tests do not mutate shared process environment
+
+* *GIVEN* the test suite under `tests/`
+* *WHEN* any test exercises environment-derived configuration (e.g. the `EXASOL_HOST`/`EXASOL_PORT`/`EXASOL_USER`/`EXASOL_PASSWORD` connection parameters)
+* *THEN* it SHALL NOT call `std::env::set_var` or `std::env::remove_var`
+* *AND* logic that depends on those values SHALL be exercised through pure helpers that take the values as arguments (e.g. `common::connection_string`)
+* *AND* the integration suite MUST produce identical results regardless of test execution order or `--test-threads` count
+
 ### Scenario: Arrow and Parquet dependencies resolve to version 58 or above with no duplicate sub-crate versions
 
 * *GIVEN* the resolved dependency tree in `Cargo.lock`

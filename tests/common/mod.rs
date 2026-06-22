@@ -136,13 +136,14 @@ pub fn get_password() -> String {
 /// // Returns something like: "exasol://sys:exasol@localhost:8563?validate_certificate=false"
 /// ```
 pub fn get_test_connection_string() -> String {
-    format!(
-        "exasol://{}:{}@{}:{}?tls=true&validateservercertificate=0",
-        get_user(),
-        get_password(),
-        get_host(),
-        get_port()
-    )
+    connection_string(&get_user(), &get_password(), &get_host(), get_port())
+}
+
+/// Pure connection-string builder. Kept separate from the env-reading
+/// [`get_test_connection_string`] so it can be unit-tested with explicit
+/// arguments — tests must never mutate the shared process environment.
+pub fn connection_string(user: &str, password: &str, host: &str, port: u16) -> String {
+    format!("exasol://{user}:{password}@{host}:{port}?tls=true&validateservercertificate=0")
 }
 
 /// Build a connection string for a specific transport type.
@@ -358,40 +359,16 @@ mod tests {
         assert_eq!(DEFAULT_PASSWORD, "exasol");
     }
 
-    #[test]
-    fn test_get_host_default() {
-        // Clear env var if set
-        env::remove_var(ENV_EXASOL_HOST);
-        assert_eq!(get_host(), DEFAULT_HOST);
-    }
-
-    #[test]
-    fn test_get_port_default() {
-        env::remove_var(ENV_EXASOL_PORT);
-        assert_eq!(get_port(), DEFAULT_PORT);
-    }
-
-    #[test]
-    fn test_get_user_default() {
-        env::remove_var(ENV_EXASOL_USER);
-        assert_eq!(get_user(), DEFAULT_USER);
-    }
-
-    #[test]
-    fn test_get_password_default() {
-        env::remove_var(ENV_EXASOL_PASSWORD);
-        assert_eq!(get_password(), DEFAULT_PASSWORD);
-    }
+    // Note: the env-reading getters (get_host/get_port/get_user/get_password) are
+    // deliberately NOT unit-tested here. Doing so requires mutating the shared
+    // process environment (env::remove_var), which leaks into every other test in
+    // the binary and makes the integration suite order-dependent. The defaults are
+    // covered by `test_default_constants`; the DSN format is covered below via the
+    // pure `connection_string` builder.
 
     #[test]
     fn test_connection_string_format() {
-        // Clear all env vars to use defaults
-        env::remove_var(ENV_EXASOL_HOST);
-        env::remove_var(ENV_EXASOL_PORT);
-        env::remove_var(ENV_EXASOL_USER);
-        env::remove_var(ENV_EXASOL_PASSWORD);
-
-        let conn_str = get_test_connection_string();
+        let conn_str = connection_string("sys", "exasol", "localhost", 8563);
         assert_eq!(
             conn_str,
             "exasol://sys:exasol@localhost:8563?tls=true&validateservercertificate=0"
