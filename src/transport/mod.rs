@@ -45,6 +45,7 @@ pub mod messages;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod protocol;
+pub(crate) mod tls;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 

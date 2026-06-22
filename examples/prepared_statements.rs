@@ -31,7 +31,10 @@ async fn example_connection() -> Result<Connection, Box<dyn Error>> {
 /// Inserts one row with a single-row prepared statement, binding by index.
 async fn example_single_row(conn: &mut Connection) -> Result<i64, Box<dyn Error>> {
     let mut stmt = conn
-        .prepare(&format!("INSERT INTO {}.prep_example VALUES (?, ?)", SCHEMA))
+        .prepare(&format!(
+            "INSERT INTO {}.prep_example VALUES (?, ?)",
+            SCHEMA
+        ))
         .await?;
     stmt.bind(0, 1)?;
     stmt.bind(1, "Alice")?;
@@ -43,13 +46,19 @@ async fn example_single_row(conn: &mut Connection) -> Result<i64, Box<dyn Error>
 /// Inserts several rows in one batch call and returns the affected-row count.
 async fn example_batch_insert(conn: &mut Connection) -> Result<i64, Box<dyn Error>> {
     let prepared = conn
-        .prepare(&format!("INSERT INTO {}.prep_example VALUES (?, ?)", SCHEMA))
+        .prepare(&format!(
+            "INSERT INTO {}.prep_example VALUES (?, ?)",
+            SCHEMA
+        ))
         .await?;
 
     // Each inner Vec is one row's parameters, in positional order.
     let rows: Vec<Vec<Parameter>> = vec![
         vec![Parameter::Integer(2), Parameter::String("Bob".to_string())],
-        vec![Parameter::Integer(3), Parameter::String("Charlie".to_string())],
+        vec![
+            Parameter::Integer(3),
+            Parameter::String("Charlie".to_string()),
+        ],
     ];
 
     let affected = conn.execute_batch_update(&prepared, &rows).await?;

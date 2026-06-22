@@ -370,19 +370,6 @@ impl ImportQuery {
         self
     }
 
-    /// Get the configured file name with the appropriate extension.
-    ///
-    /// For `ImportFormat::Parquet`, the extension is always `.parquet` and
-    /// any configured compression suffix is bypassed. For `ImportFormat::Csv`,
-    /// the extension reflects the configured `Compression`.
-    fn get_file_name(&self) -> String {
-        let base_name = strip_known_extensions(&self.file_name);
-        match self.format {
-            ImportFormat::Parquet => format!("{}.parquet", base_name),
-            ImportFormat::Csv => format!("{}{}", base_name, self.compression.extension()),
-        }
-    }
-
     /// Build the complete IMPORT SQL statement.
     ///
     /// # Returns
@@ -479,7 +466,7 @@ impl ImportQuery {
 
             // FILE clause
             sql.push_str("\nFILE '");
-            sql.push_str(&self.get_file_name());
+            sql.push_str(&self.get_file_name_for(&self.file_name));
             sql.push('\'');
         }
 
@@ -534,9 +521,11 @@ impl ImportQuery {
         sql
     }
 
-    /// Get file name with the appropriate extension for multi-file entries.
+    /// Get a file name with the appropriate extension for the configured format.
     ///
-    /// Mirrors `get_file_name`'s format-aware extension policy.
+    /// For `ImportFormat::Parquet`, the extension is always `.parquet` and
+    /// any configured compression suffix is bypassed. For `ImportFormat::Csv`,
+    /// the extension reflects the configured `Compression`.
     fn get_file_name_for(&self, base_name: &str) -> String {
         let base = strip_known_extensions(base_name);
         match self.format {
