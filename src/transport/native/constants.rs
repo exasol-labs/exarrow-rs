@@ -1,9 +1,6 @@
 /// Magic value sent at the start of a login handshake.
 pub const LOGIN_MAGIC: u32 = 0x01121201;
 
-/// Magic value sent for proxy connections.
-pub const PROXY_MAGIC: u32 = 0x02212102;
-
 /// Maximum protocol version we support (matches Exasol 2025.1).
 pub const PROTOCOL_VERSION: u32 = 21;
 
@@ -25,20 +22,8 @@ pub const CMD_EXECUTE: u8 = 12;
 /// Close a result set handle.
 pub const CMD_CLOSE_RESULTSET: u8 = 13;
 
-/// Fetch rows from a result set.
-pub const CMD_FETCH: u8 = 14;
-
-/// Retrieve cluster host information.
-pub const CMD_GET_HOSTS: u8 = 16;
-
-/// Execute a batch of parameter sets.
-pub const CMD_EXECUTE_BATCH: u8 = 17;
-
 /// Close a prepared statement handle.
 pub const CMD_CLOSE_PREPARED: u8 = 18;
-
-/// Enter parallel execution mode.
-pub const CMD_ENTER_PARALLEL: u8 = 30;
 
 /// Disconnect from the server.
 pub const CMD_DISCONNECT: u8 = 32;
@@ -51,12 +36,6 @@ pub const CMD_SET_ATTRIBUTES: u8 = 35;
 
 /// Fetch rows (v2, with binary column data).
 pub const CMD_FETCH2: u8 = 36;
-
-/// Abort a running query.
-pub const CMD_ABORT_QUERY: u8 = 37;
-
-/// Continue after a "still executing" response.
-pub const CMD_CONTINUE: u8 = 38;
 
 /// Response: row count (DML result).
 pub const R_ROW_COUNT: i8 = 0;
@@ -88,9 +67,6 @@ pub const R_EMPTY: i8 = -2;
 /// Handle value indicating a small (inline) result set.
 pub const SMALL_RESULTSET: i32 = -3;
 
-/// Handle value indicating an invalid result set.
-pub const INVALID_RESULTSET: i32 = -4;
-
 /// Handle value used for parameter descriptions.
 pub const PARAMETER_DESCRIPTION: i32 = -5;
 
@@ -98,19 +74,12 @@ pub const ATTR_USERNAME: u16 = 1;
 pub const ATTR_CLIENTNAME: u16 = 2;
 pub const ATTR_CLIENTOS: u16 = 3;
 pub const ATTR_DRIVERNAME: u16 = 4;
-pub const ATTR_LANGUAGE: u16 = 5;
 pub const ATTR_SESSIONID: u16 = 6;
 pub const ATTR_AUTOCOMMIT: u16 = 7;
 pub const ATTR_CLIENTVERSION: u16 = 10;
-pub const ATTR_PASSWORD: u16 = 12;
 pub const ATTR_TRANSACTION_STATE: u16 = 17;
 pub const ATTR_PROTOCOL_VERSION: u16 = 19;
-pub const ATTR_DATETIME_FORMAT: u16 = 20;
-pub const ATTR_DATE_FORMAT: u16 = 21;
-pub const ATTR_CURRENT_SCHEMA: u16 = 22;
-pub const ATTR_NUMERIC_CHARACTERS: u16 = 23;
 pub const ATTR_DATA_MESSAGE_SIZE: u16 = 26;
-pub const ATTR_DATE_LANGUAGE: u16 = 31;
 pub const ATTR_PUBLIC_KEY: u16 = 32;
 pub const ATTR_RANDOM_PHRASE: u16 = 33;
 pub const ATTR_ENCODED_PASSWORD: u16 = 34;
@@ -123,13 +92,10 @@ pub const ATTR_CLIENT_SEND_KEY: u16 = 54;
 pub const ATTR_SNAPSHOT_TRANSACTIONS_ENABLED: u16 = 55;
 pub const ATTR_CLIENT_KEYS_LEN: u16 = 56;
 pub const ATTR_ENCRYPTION_REQUIRED: u16 = 57;
-pub const ATTR_DEFAULT_LIKE_ESCAPE_CHAR: u16 = 58;
-pub const ATTR_IDENTIFIER_QUOTE_STRING: u16 = 59;
 
 pub const ATTR_RELEASE_VERSION: u16 = 8;
 pub const ATTR_DATABASE_NAME: u16 = 37;
 pub const ATTR_PRODUCT_NAME: u16 = 38;
-pub const ATTR_CURRENT_CATALOG: u16 = 39;
 
 // Command-level pseudo-attribute IDs used by our attribute-based encoding
 // for SQL text, handles, and row counts in CMD_EXECUTE/CMD_FETCH messages.
@@ -140,12 +106,6 @@ pub const ATTR_SQL_TEXT: u16 = 200;
 pub const ATTR_RESULT_SET_HANDLE: u16 = 201;
 pub const ATTR_STATEMENT_HANDLE: u16 = 202;
 pub const ATTR_NUM_ROWS: u16 = 203;
-
-/// Wire type: byte (u8).
-pub const T_BYTE: u32 = 1;
-
-/// Wire type: short (i16).
-pub const T_SHORT: u32 = 2;
 
 /// Wire type: small integer (i32).
 pub const T_SMALLINT: u32 = 4;
@@ -201,12 +161,6 @@ pub const T_SMALLDECIMAL: u32 = 63;
 /// Wire type: big decimal.
 pub const T_BIGDECIMAL: u32 = 64;
 
-/// Column property flag: nullable.
-pub const COL_NULLABLE: u16 = 0x0001;
-
-/// Column property flag: varchar.
-pub const COL_VARCHAR: u16 = 0x0200;
-
 /// VCFlag: is varchar.
 pub const IS_VARCHAR: u8 = 0x80;
 
@@ -222,15 +176,6 @@ pub const MAX_DATA_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 /// ChaCha20 key length in bytes.
 pub const CHACHA20_KEY_LEN: usize = 32;
 
-/// Transaction state: normal (in transaction).
-pub const TRANSACTION_NORMAL: u32 = 0;
-
-/// Transaction state: committed.
-pub const TRANSACTION_COMMITTED: u32 = 1;
-
-/// Transaction state: rolled back.
-pub const TRANSACTION_ROLLED_BACK: u32 = 2;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,11 +183,6 @@ mod tests {
     #[test]
     fn login_magic_matches_protocol_spec() {
         assert_eq!(LOGIN_MAGIC, 0x01121201);
-    }
-
-    #[test]
-    fn proxy_magic_matches_protocol_spec() {
-        assert_eq!(PROXY_MAGIC, 0x02212102);
     }
 
     #[test]
@@ -276,7 +216,6 @@ mod tests {
     #[test]
     fn special_resultset_handles_are_negative() {
         assert_eq!(SMALL_RESULTSET, -3);
-        assert_eq!(INVALID_RESULTSET, -4);
         assert_eq!(PARAMETER_DESCRIPTION, -5);
     }
 }

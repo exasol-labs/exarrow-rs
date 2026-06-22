@@ -33,7 +33,7 @@ use arrow::array::builder::{
     TimestampMicrosecondBuilder,
 };
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -294,12 +294,17 @@ impl<R: AsyncBufRead + Unpin> CsvToArrowReader<R> {
                 continue;
             }
 
-            let fields = parse_csv_row(
+            let (fields, in_quotes) = crate::export::csv::parse_csv_row(
                 line,
                 self.column_separator,
                 self.column_delimiter,
-                self.current_row,
-            )?;
+            );
+            if in_quotes {
+                return Err(ExportError::CsvParseError {
+                    row: self.current_row,
+                    message: "Unclosed quote in CSV row".to_string(),
+                });
+            }
             rows.push(fields);
             self.current_row += 1;
         }
@@ -343,55 +348,6 @@ impl<R: AsyncBufRead + Unpin> CsvToArrowReader<R> {
         RecordBatch::try_new(Arc::clone(&self.schema), arrays)
             .map_err(|e| ExportError::ArrowError(e.to_string()))
     }
-}
-
-/// Parses a CSV row into fields, handling quoted values.
-fn parse_csv_row(
-    line: &str,
-    separator: char,
-    delimiter: char,
-    row: usize,
-) -> Result<Vec<String>, ExportError> {
-    let mut fields = Vec::new();
-    let mut current_field = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if in_quotes {
-            if c == delimiter {
-                // Check for escaped quote (double delimiter)
-                if chars.peek() == Some(&delimiter) {
-                    current_field.push(delimiter);
-                    chars.next();
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                current_field.push(c);
-            }
-        } else if c == delimiter {
-            in_quotes = true;
-        } else if c == separator {
-            fields.push(current_field);
-            current_field = String::new();
-        } else {
-            current_field.push(c);
-        }
-    }
-
-    // Don't forget the last field
-    fields.push(current_field);
-
-    // Validate that we're not still in quotes
-    if in_quotes {
-        return Err(ExportError::CsvParseError {
-            row,
-            message: "Unclosed quote in CSV row".to_string(),
-        });
-    }
-
-    Ok(fields)
 }
 
 /// Builds an Arrow array from string values.
@@ -690,80 +646,6 @@ pub fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, Export
     exasol_type_to_arrow_impl(exasol_type).map_err(ExportError::SchemaError)
 }
 
-/// Builds an Arrow schema from Exasol column metadata.
-pub fn build_schema_from_exasol_types(
-    columns: &[(String, ExasolType, bool)],
-) -> Result<Schema, ExportError> {
-    let fields: Result<Vec<Field>, ExportError> = columns
-        .iter()
-        .map(|(name, exasol_type, nullable)| {
-            let data_type = exasol_type_to_arrow(exasol_type)?;
-            Ok(Field::new(name, data_type, *nullable))
-        })
-        .collect();
-
-    Ok(Schema::new(fields?))
-}
-
-/// Writes Arrow RecordBatches to Arrow IPC format.
-///
-/// # Arguments
-///
-/// * `writer` - The async writer to write to
-/// * `schema` - The Arrow schema
-/// * `batches` - Iterator of RecordBatches to write
-///
-/// # Returns
-///
-/// The total number of rows written.
-pub async fn write_arrow_ipc<W, I>(
-    writer: &mut W,
-    schema: Arc<Schema>,
-    batches: I,
-) -> Result<u64, ExportError>
-where
-    W: AsyncWrite + Unpin + Send,
-    I: IntoIterator<Item = Result<RecordBatch, ExportError>>,
-{
-    use arrow::ipc::writer::StreamWriter;
-    use std::io::Cursor;
-
-    let mut total_rows = 0u64;
-
-    // We need to use synchronous Arrow IPC writer, then write to async
-    // First, collect all batches and write to a buffer
-    let mut buffer = Cursor::new(Vec::new());
-    {
-        let mut ipc_writer = StreamWriter::try_new(&mut buffer, &schema)
-            .map_err(|e| ExportError::ArrowError(e.to_string()))?;
-
-        for batch_result in batches {
-            let batch = batch_result?;
-            total_rows += batch.num_rows() as u64;
-            ipc_writer
-                .write(&batch)
-                .map_err(|e| ExportError::ArrowError(e.to_string()))?;
-        }
-
-        ipc_writer
-            .finish()
-            .map_err(|e| ExportError::ArrowError(e.to_string()))?;
-    }
-
-    // Write the buffer to the async writer
-    let data = buffer.into_inner();
-    writer
-        .write_all(&data)
-        .await
-        .map_err(|e| ExportError::IoError(e.to_string()))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| ExportError::IoError(e.to_string()))?;
-
-    Ok(total_rows)
-}
-
 /// Writes Arrow RecordBatches to Arrow IPC File format (with footer).
 ///
 /// # Arguments
@@ -974,6 +856,7 @@ pub async fn export_to_arrow_ipc<T: TransportProtocol + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::Field;
     use tokio::io::BufReader;
 
     // ==========================================================================
@@ -1027,53 +910,53 @@ mod tests {
     // Tests for CSV parsing
     // ==========================================================================
 
+    use crate::export::csv::parse_csv_row;
+
     #[test]
     fn test_parse_csv_row_simple() {
         let line = "1,hello,world";
-        let fields = parse_csv_row(line, ',', '"', 0).unwrap();
+        let (fields, in_quotes) = parse_csv_row(line, ',', '"');
+        assert!(!in_quotes);
         assert_eq!(fields, vec!["1", "hello", "world"]);
     }
 
     #[test]
     fn test_parse_csv_row_quoted() {
         let line = r#"1,"hello, world","test""#;
-        let fields = parse_csv_row(line, ',', '"', 0).unwrap();
+        let (fields, in_quotes) = parse_csv_row(line, ',', '"');
+        assert!(!in_quotes);
         assert_eq!(fields, vec!["1", "hello, world", "test"]);
     }
 
     #[test]
     fn test_parse_csv_row_escaped_quote() {
         let line = r#"1,"hello ""world""","test""#;
-        let fields = parse_csv_row(line, ',', '"', 0).unwrap();
+        let (fields, in_quotes) = parse_csv_row(line, ',', '"');
+        assert!(!in_quotes);
         assert_eq!(fields, vec!["1", r#"hello "world""#, "test"]);
     }
 
     #[test]
     fn test_parse_csv_row_empty_fields() {
         let line = "1,,3";
-        let fields = parse_csv_row(line, ',', '"', 0).unwrap();
+        let (fields, in_quotes) = parse_csv_row(line, ',', '"');
+        assert!(!in_quotes);
         assert_eq!(fields, vec!["1", "", "3"]);
     }
 
     #[test]
     fn test_parse_csv_row_custom_separator() {
         let line = "1;hello;world";
-        let fields = parse_csv_row(line, ';', '"', 0).unwrap();
+        let (fields, in_quotes) = parse_csv_row(line, ';', '"');
+        assert!(!in_quotes);
         assert_eq!(fields, vec!["1", "hello", "world"]);
     }
 
     #[test]
     fn test_parse_csv_row_unclosed_quote_error() {
         let line = r#"1,"hello"#;
-        let result = parse_csv_row(line, ',', '"', 0);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ExportError::CsvParseError { row, message } => {
-                assert_eq!(row, 0);
-                assert!(message.contains("Unclosed quote"));
-            }
-            _ => panic!("Expected CsvParseError"),
-        }
+        let (_, in_quotes) = parse_csv_row(line, ',', '"');
+        assert!(in_quotes, "unterminated quote should be reported");
     }
 
     // ==========================================================================
@@ -1311,28 +1194,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_schema_from_exasol_types() {
-        let columns = vec![
-            (
-                "id".to_string(),
-                ExasolType::Decimal {
-                    precision: 18,
-                    scale: 0,
-                },
-                false,
-            ),
-            ("name".to_string(), ExasolType::Varchar { size: 100 }, true),
-            ("active".to_string(), ExasolType::Boolean, true),
-        ];
-
-        let schema = build_schema_from_exasol_types(&columns).unwrap();
-        assert_eq!(schema.fields().len(), 3);
-        assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(schema.field(1).name(), "name");
-        assert_eq!(schema.field(2).name(), "active");
-    }
-
     // ==========================================================================
     // Tests for CsvToArrowReader
     // ==========================================================================
@@ -1419,35 +1280,6 @@ mod tests {
     // ==========================================================================
     // Tests for Arrow IPC writing
     // ==========================================================================
-
-    #[tokio::test]
-    async fn test_write_arrow_ipc() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])),
-                Arc::new(arrow::array::StringArray::from(vec![
-                    Some("a"),
-                    Some("b"),
-                    None,
-                ])),
-            ],
-        )
-        .unwrap();
-
-        let mut buffer = Vec::new();
-        let rows = write_arrow_ipc(&mut buffer, schema, vec![Ok(batch)])
-            .await
-            .unwrap();
-
-        assert_eq!(rows, 3);
-        assert!(!buffer.is_empty());
-    }
 
     #[tokio::test]
     async fn test_write_arrow_ipc_file() {
@@ -1574,113 +1406,6 @@ mod tests {
     fn test_exasol_type_to_arrow_hashtype() {
         let result = exasol_type_to_arrow(&ExasolType::Hashtype { byte_size: 32 }).unwrap();
         assert_eq!(result, DataType::Binary);
-    }
-
-    #[test]
-    fn test_build_schema_from_exasol_types_all_types() {
-        // Test comprehensive schema building with all supported Exasol types
-        let columns = vec![
-            ("bool_col".to_string(), ExasolType::Boolean, false),
-            ("char_col".to_string(), ExasolType::Char { size: 10 }, true),
-            (
-                "varchar_col".to_string(),
-                ExasolType::Varchar { size: 100 },
-                true,
-            ),
-            (
-                "decimal_col".to_string(),
-                ExasolType::Decimal {
-                    precision: 18,
-                    scale: 4,
-                },
-                true,
-            ),
-            ("double_col".to_string(), ExasolType::Double, true),
-            ("date_col".to_string(), ExasolType::Date, true),
-            (
-                "timestamp_col".to_string(),
-                ExasolType::Timestamp {
-                    with_local_time_zone: false,
-                },
-                true,
-            ),
-            (
-                "timestamp_tz_col".to_string(),
-                ExasolType::Timestamp {
-                    with_local_time_zone: true,
-                },
-                true,
-            ),
-            (
-                "interval_ym_col".to_string(),
-                ExasolType::IntervalYearToMonth,
-                true,
-            ),
-            (
-                "interval_ds_col".to_string(),
-                ExasolType::IntervalDayToSecond { precision: 3 },
-                true,
-            ),
-            (
-                "geometry_col".to_string(),
-                ExasolType::Geometry { srid: Some(4326) },
-                true,
-            ),
-            (
-                "hashtype_col".to_string(),
-                ExasolType::Hashtype { byte_size: 32 },
-                true,
-            ),
-        ];
-
-        let schema = build_schema_from_exasol_types(&columns).unwrap();
-
-        assert_eq!(schema.fields().len(), 12);
-
-        // Verify each field
-        assert_eq!(schema.field(0).name(), "bool_col");
-        assert_eq!(schema.field(0).data_type(), &DataType::Boolean);
-        assert!(!schema.field(0).is_nullable());
-
-        assert_eq!(schema.field(1).name(), "char_col");
-        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
-        assert!(schema.field(1).is_nullable());
-
-        assert_eq!(schema.field(2).name(), "varchar_col");
-        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
-
-        assert_eq!(schema.field(3).name(), "decimal_col");
-        assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(18, 4));
-
-        assert_eq!(schema.field(4).name(), "double_col");
-        assert_eq!(schema.field(4).data_type(), &DataType::Float64);
-
-        assert_eq!(schema.field(5).name(), "date_col");
-        assert_eq!(schema.field(5).data_type(), &DataType::Date32);
-
-        assert_eq!(schema.field(6).name(), "timestamp_col");
-        assert_eq!(
-            schema.field(6).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-
-        assert_eq!(schema.field(7).name(), "timestamp_tz_col");
-        assert_eq!(
-            schema.field(7).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        );
-
-        assert_eq!(schema.field(8).name(), "interval_ym_col");
-        assert_eq!(schema.field(8).data_type(), &DataType::Int64);
-
-        assert_eq!(schema.field(9).name(), "interval_ds_col");
-        assert_eq!(schema.field(9).data_type(), &DataType::Int64);
-
-        assert_eq!(schema.field(10).name(), "geometry_col");
-        assert_eq!(schema.field(10).data_type(), &DataType::Binary);
-
-        assert_eq!(schema.field(11).name(), "hashtype_col");
-        assert_eq!(schema.field(11).data_type(), &DataType::Binary);
     }
 
     // ==========================================================================

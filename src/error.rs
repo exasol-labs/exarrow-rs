@@ -2,7 +2,6 @@
 //!
 //! This module defines domain-specific error types organized by functional area.
 
-use std::fmt;
 use thiserror::Error;
 
 /// Top-level error type encompassing all possible errors.
@@ -181,77 +180,6 @@ pub enum TransportError {
     TlsError(String),
 }
 
-/// ADBC-compatible error codes.
-///
-/// These codes map to the ADBC specification for driver interoperability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdbcErrorCode {
-    /// Unknown error
-    Unknown = 0,
-    /// Connection error
-    Connection = 1,
-    /// Query error
-    Query = 2,
-    /// Invalid argument
-    InvalidArgument = 3,
-    /// Invalid state
-    InvalidState = 4,
-    /// Not implemented
-    NotImplemented = 5,
-    /// Timeout
-    Timeout = 6,
-}
-
-impl fmt::Display for AdbcErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AdbcErrorCode::Unknown => write!(f, "UNKNOWN"),
-            AdbcErrorCode::Connection => write!(f, "CONNECTION"),
-            AdbcErrorCode::Query => write!(f, "QUERY"),
-            AdbcErrorCode::InvalidArgument => write!(f, "INVALID_ARGUMENT"),
-            AdbcErrorCode::InvalidState => write!(f, "INVALID_STATE"),
-            AdbcErrorCode::NotImplemented => write!(f, "NOT_IMPLEMENTED"),
-            AdbcErrorCode::Timeout => write!(f, "TIMEOUT"),
-        }
-    }
-}
-
-impl ExasolError {
-    /// Map to ADBC error code.
-    pub fn to_adbc_code(&self) -> AdbcErrorCode {
-        match self {
-            ExasolError::Connection(e) => e.to_adbc_code(),
-            ExasolError::Query(e) => e.to_adbc_code(),
-            ExasolError::Conversion(_) => AdbcErrorCode::Query,
-            ExasolError::Transport(_) => AdbcErrorCode::Connection,
-        }
-    }
-}
-
-impl ConnectionError {
-    /// Map to ADBC error code.
-    pub fn to_adbc_code(&self) -> AdbcErrorCode {
-        match self {
-            ConnectionError::Timeout { .. } => AdbcErrorCode::Timeout,
-            ConnectionError::InvalidParameter { .. } => AdbcErrorCode::InvalidArgument,
-            _ => AdbcErrorCode::Connection,
-        }
-    }
-}
-
-impl QueryError {
-    /// Map to ADBC error code.
-    pub fn to_adbc_code(&self) -> AdbcErrorCode {
-        match self {
-            QueryError::Timeout { .. } => AdbcErrorCode::Timeout,
-            QueryError::InvalidState(_) => AdbcErrorCode::InvalidState,
-            QueryError::ParameterBindingError { .. } => AdbcErrorCode::InvalidArgument,
-            QueryError::StatementClosed => AdbcErrorCode::InvalidState,
-            _ => AdbcErrorCode::Query,
-        }
-    }
-}
-
 // Conversions from external error types
 impl From<arrow::error::ArrowError> for ConversionError {
     fn from(err: arrow::error::ArrowError) -> Self {
@@ -308,21 +236,6 @@ mod tests {
     }
 
     #[test]
-    fn test_adbc_error_code_mapping() {
-        let err = ExasolError::Connection(ConnectionError::Timeout { timeout_ms: 5000 });
-        assert_eq!(err.to_adbc_code(), AdbcErrorCode::Timeout);
-
-        let err = ExasolError::Query(QueryError::InvalidState("Bad state".to_string()));
-        assert_eq!(err.to_adbc_code(), AdbcErrorCode::InvalidState);
-    }
-
-    #[test]
-    fn test_error_code_display() {
-        assert_eq!(AdbcErrorCode::Connection.to_string(), "CONNECTION");
-        assert_eq!(AdbcErrorCode::Timeout.to_string(), "TIMEOUT");
-    }
-
-    #[test]
     fn test_transport_tls_error() {
         let err = TransportError::TlsError("Certificate validation failed".to_string());
         assert!(err.to_string().contains("TLS error"));
@@ -333,7 +246,6 @@ mod tests {
     fn test_statement_closed_error() {
         let err = QueryError::StatementClosed;
         assert!(err.to_string().contains("closed"));
-        assert_eq!(err.to_adbc_code(), AdbcErrorCode::InvalidState);
     }
 
     #[test]

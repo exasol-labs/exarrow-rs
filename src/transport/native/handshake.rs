@@ -54,30 +54,6 @@ pub fn build_login_packet(username: &str) -> Vec<u8> {
     buf
 }
 
-/// Parse the server's login response to extract session attributes.
-///
-/// The server sends: [total_size: u32 LE] followed by attribute data.
-/// Returns the parsed attributes containing public key, session info, etc.
-pub fn parse_login_response(data: &[u8]) -> Result<AttributeSet, TransportError> {
-    if data.len() < 4 {
-        return Err(TransportError::ProtocolError(
-            "Login response too short".into(),
-        ));
-    }
-    let total_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + total_size {
-        return Err(TransportError::ProtocolError(format!(
-            "Login response truncated: expected {} bytes, got {}",
-            4 + total_size,
-            data.len()
-        )));
-    }
-    let attr_data = &data[4..4 + total_size];
-    // Count attributes by scanning the data
-    let count = count_attributes(attr_data);
-    super::attributes::parse_attributes(attr_data, count)
-}
-
 /// Build the second-phase authentication message containing encrypted password and keys.
 ///
 /// Sends CMD_SET_ATTRIBUTES with the RSA-encrypted password and ChaCha20 keys.
@@ -349,83 +325,6 @@ fn exasol_encode_pwd(
     Ok(encrypted)
 }
 
-/// Count the number of attributes in a binary attribute buffer.
-///
-/// Scans forward through the buffer counting each attribute entry.
-fn count_attributes(data: &[u8]) -> u32 {
-    let mut count = 0u32;
-    let mut offset = 0;
-    while offset + 2 <= data.len() {
-        let id = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-        match attribute_wire_size(id) {
-            WireSize::Bool => {
-                if offset >= data.len() {
-                    break;
-                }
-                offset += 1;
-            }
-            WireSize::I32 => {
-                if offset + 4 > data.len() {
-                    break;
-                }
-                offset += 4;
-            }
-            WireSize::I64 => {
-                if offset + 8 > data.len() {
-                    break;
-                }
-                offset += 8;
-            }
-            WireSize::LengthPrefixed => {
-                if offset + 4 > data.len() {
-                    break;
-                }
-                let len = u32::from_le_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]) as usize;
-                offset += 4;
-                if offset + len > data.len() {
-                    break;
-                }
-                offset += len;
-            }
-        }
-        count += 1;
-    }
-    count
-}
-
-enum WireSize {
-    Bool,
-    I32,
-    I64,
-    LengthPrefixed,
-}
-
-fn attribute_wire_size(id: u16) -> WireSize {
-    match id {
-        ATTR_AUTOCOMMIT
-        | ATTR_TSUTC_ENABLED
-        | ATTR_ENCRYPTION_REQUIRED
-        | ATTR_SNAPSHOT_TRANSACTIONS_ENABLED
-        | ATTR_TRANSACTION_STATE => WireSize::Bool,
-        ATTR_PROTOCOL_VERSION
-        | ATTR_QUERY_TIMEOUT
-        | ATTR_QUERY_CACHE_ACCESS
-        | ATTR_CLIENT_KEYS_LEN => WireSize::I32,
-        ATTR_SESSIONID
-        | ATTR_DATA_MESSAGE_SIZE
-        | ATTR_RESULT_SET_HANDLE
-        | ATTR_STATEMENT_HANDLE
-        | ATTR_NUM_ROWS => WireSize::I64,
-        _ => WireSize::LengthPrefixed,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,20 +356,5 @@ mod tests {
         let msg_len = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]) as usize;
         // Total packet = 8 (magic + msg_len) + msg_len
         assert_eq!(packet.len(), 8 + msg_len);
-    }
-
-    #[test]
-    fn count_attributes_empty() {
-        assert_eq!(count_attributes(&[]), 0);
-    }
-
-    #[test]
-    fn count_attributes_roundtrip() {
-        let mut attrs = AttributeSet::new();
-        attrs.add(ATTR_USERNAME, AttributeValue::String("sys".into()));
-        attrs.add(ATTR_AUTOCOMMIT, AttributeValue::Bool(true));
-        attrs.add(ATTR_PROTOCOL_VERSION, AttributeValue::Int32(21));
-        let bytes = attrs.serialize();
-        assert_eq!(count_attributes(&bytes), 3);
     }
 }

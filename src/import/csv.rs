@@ -380,11 +380,7 @@ fn detect_compression(file_path: &Path, explicit_compression: Compression) -> Co
 ///
 /// `true` if the file appears to be compressed.
 fn is_compressed_file(file_path: &Path) -> bool {
-    let path_str = file_path.to_string_lossy().to_lowercase();
-    path_str.ends_with(".gz")
-        || path_str.ends_with(".gzip")
-        || path_str.ends_with(".bz2")
-        || path_str.ends_with(".bzip2")
+    detect_compression(file_path, Compression::None) != Compression::None
 }
 
 /// Import CSV data from a file path.

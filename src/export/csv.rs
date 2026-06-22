@@ -55,10 +55,6 @@ pub enum ExportError {
     #[error("CSV parsing error at row {row}: {message}")]
     CsvParseError { row: usize, message: String },
 
-    /// CSV parsing error (alternative for parquet module compatibility).
-    #[error("CSV parsing error at row {row}: {message}")]
-    CsvParse { row: usize, message: String },
-
     /// Decompression error.
     #[error("Decompression error: {0}")]
     DecompressionError(String),
@@ -74,24 +70,6 @@ pub enum ExportError {
     /// Export was cancelled.
     #[error("Export was cancelled")]
     Cancelled,
-
-    /// Arrow error.
-    #[error("Arrow error: {0}")]
-    Arrow(String),
-
-    /// Schema error.
-    #[error("Schema error: {0}")]
-    Schema(String),
-
-    /// Parquet error.
-    #[error("Parquet error: {0}")]
-    Parquet(String),
-}
-
-impl From<parquet::errors::ParquetError> for ExportError {
-    fn from(err: parquet::errors::ParquetError) -> Self {
-        ExportError::Parquet(err.to_string())
-    }
 }
 
 /// Options for CSV export configuration.
@@ -312,29 +290,7 @@ pub async fn export_to_stream<T: TransportProtocol + ?Sized, W: AsyncWrite + Unp
         }
 
         // Decompress if needed
-        let data = match compression {
-            Compression::Gzip => {
-                let decoder = GzDecoder::new(buffer.as_slice());
-                let mut decompressed = Vec::new();
-                std::io::Read::read_to_end(
-                    &mut std::io::BufReader::new(decoder),
-                    &mut decompressed,
-                )
-                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
-                decompressed
-            }
-            Compression::Bzip2 => {
-                let decoder = BzDecoder::new(buffer.as_slice());
-                let mut decompressed = Vec::new();
-                std::io::Read::read_to_end(
-                    &mut std::io::BufReader::new(decoder),
-                    &mut decompressed,
-                )
-                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
-                decompressed
-            }
-            Compression::None => buffer,
-        };
+        let data = decompress(buffer, compression)?;
 
         // Write to output and count rows
         writer.write_all(&data).await?;
@@ -390,29 +346,7 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
         }
 
         // Decompress if needed
-        let data = match compression {
-            Compression::Gzip => {
-                let decoder = GzDecoder::new(buffer.as_slice());
-                let mut decompressed = Vec::new();
-                std::io::Read::read_to_end(
-                    &mut std::io::BufReader::new(decoder),
-                    &mut decompressed,
-                )
-                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
-                decompressed
-            }
-            Compression::Bzip2 => {
-                let decoder = BzDecoder::new(buffer.as_slice());
-                let mut decompressed = Vec::new();
-                std::io::Read::read_to_end(
-                    &mut std::io::BufReader::new(decoder),
-                    &mut decompressed,
-                )
-                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
-                decompressed
-            }
-            Compression::None => buffer,
-        };
+        let data = decompress(buffer, compression)?;
 
         // Parse CSV data
         let csv_string = String::from_utf8(data).map_err(|e| ExportError::CsvParseError {
@@ -574,6 +508,29 @@ where
     result
 }
 
+/// Decompresses a buffer according to the configured compression.
+///
+/// Returns the buffer unchanged for `Compression::None`.
+fn decompress(buffer: Vec<u8>, compression: Compression) -> Result<Vec<u8>, ExportError> {
+    match compression {
+        Compression::Gzip => {
+            let decoder = GzDecoder::new(buffer.as_slice());
+            let mut decompressed = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(decoder), &mut decompressed)
+                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
+            Ok(decompressed)
+        }
+        Compression::Bzip2 => {
+            let decoder = BzDecoder::new(buffer.as_slice());
+            let mut decompressed = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(decoder), &mut decompressed)
+                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
+            Ok(decompressed)
+        }
+        Compression::None => Ok(buffer),
+    }
+}
+
 /// Parses CSV data into a vector of rows.
 fn parse_csv(
     data: &str,
@@ -652,6 +609,51 @@ fn parse_csv(
     }
 
     Ok(rows)
+}
+
+/// Parses a single CSV line into its fields, handling RFC-style quoting.
+///
+/// A field is opened/closed by `delimiter`; a doubled delimiter inside a quoted
+/// field is an escaped delimiter. `separator` splits fields when not inside
+/// quotes. This operates on a single already-split line and therefore does not
+/// handle newlines embedded in quoted fields (callers split on newlines first).
+///
+/// Returns the parsed fields together with a flag indicating whether the line
+/// ended while still inside a quoted field (unterminated quote). Callers decide
+/// whether an unterminated quote is an error.
+pub(crate) fn parse_csv_row(line: &str, separator: char, delimiter: char) -> (Vec<String>, bool) {
+    let mut fields = Vec::new();
+    let mut current_field = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == delimiter {
+                // Check for escaped quote (doubled delimiter)
+                if chars.peek() == Some(&delimiter) {
+                    current_field.push(delimiter);
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current_field.push(c);
+            }
+        } else if c == delimiter {
+            in_quotes = true;
+        } else if c == separator {
+            fields.push(current_field);
+            current_field = String::new();
+        } else {
+            current_field.push(c);
+        }
+    }
+
+    // Don't forget the last field
+    fields.push(current_field);
+
+    (fields, in_quotes)
 }
 
 #[cfg(test)]

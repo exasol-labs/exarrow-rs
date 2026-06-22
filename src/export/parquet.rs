@@ -25,11 +25,9 @@
 //! ).await?;
 //! ```
 
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, StringBuilder,
@@ -320,72 +318,6 @@ pub async fn export_to_parquet_stream<W: Write + Send>(
     Ok(total_rows)
 }
 
-/// Export data from Exasol to an async Parquet stream.
-///
-/// This function exports data from Exasol (table or query) to any writer implementing `AsyncWrite`.
-/// Useful for writing to async network streams, tokio files, or custom async destinations.
-///
-/// Since Parquet writers are synchronous, this function writes to an in-memory buffer first,
-/// then asynchronously writes the buffer to the output.
-///
-/// # Arguments
-///
-/// * `csv_data` - CSV data as bytes (simulating what would come from HTTP transport)
-/// * `schema` - Arrow schema for the data
-/// * `writer` - Any type implementing `AsyncWrite + Unpin`
-/// * `options` - Export options
-///
-/// # Returns
-///
-/// The number of rows exported.
-///
-/// # Errors
-///
-/// Returns `ParquetExportError` if:
-/// - CSV parsing fails
-/// - Arrow conversion fails
-/// - Parquet writing fails
-/// - Async IO fails
-pub async fn export_to_parquet_async_stream<W: AsyncWrite + Unpin + Send>(
-    csv_data: &[u8],
-    schema: Arc<Schema>,
-    writer: &mut W,
-    options: ParquetExportOptions,
-) -> Result<u64, ParquetExportError> {
-    // Parse CSV data into record batches
-    let batches = csv_to_record_batches(csv_data, &schema, &options)?;
-
-    // Calculate total rows
-    let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-
-    // Create writer properties with compression
-    let props = WriterProperties::builder()
-        .set_compression(options.compression.to_codec())
-        .set_encoding(Encoding::PLAIN)
-        .build();
-
-    // Write to in-memory buffer first (Parquet writer is synchronous)
-    let mut buffer = Cursor::new(Vec::new());
-    {
-        let mut parquet_writer = ArrowWriter::try_new(&mut buffer, schema.clone(), Some(props))?;
-
-        // Write all batches
-        for batch in batches {
-            parquet_writer.write(&batch)?;
-        }
-
-        // Close the writer to flush remaining data
-        parquet_writer.close()?;
-    }
-
-    // Asynchronously write the buffer to the output
-    let data = buffer.into_inner();
-    writer.write_all(&data).await?;
-    writer.flush().await?;
-
-    Ok(total_rows)
-}
-
 /// Convert CSV data to Arrow RecordBatches.
 ///
 /// # Arguments
@@ -476,34 +408,12 @@ fn parse_csv_line(
     row_idx: usize,
     expected_columns: usize,
 ) -> Result<Vec<Option<String>>, ParquetExportError> {
-    let mut values = Vec::with_capacity(expected_columns);
-    let mut current_value = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == options.column_delimiter {
-            if in_quotes {
-                // Check for escaped quote (doubled delimiter)
-                if chars.peek() == Some(&options.column_delimiter) {
-                    current_value.push(c);
-                    chars.next(); // Skip the second quote
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                in_quotes = true;
-            }
-        } else if c == options.column_separator && !in_quotes {
-            values.push(parse_csv_value(&current_value, options));
-            current_value.clear();
-        } else {
-            current_value.push(c);
-        }
-    }
-
-    // Push the last value
-    values.push(parse_csv_value(&current_value, options));
+    let (fields, _in_quotes) =
+        crate::export::csv::parse_csv_row(line, options.column_separator, options.column_delimiter);
+    let values: Vec<Option<String>> = fields
+        .iter()
+        .map(|field| parse_csv_value(field, options))
+        .collect();
 
     // Validate column count
     if values.len() != expected_columns {
@@ -1516,155 +1426,5 @@ mod tests {
         // Verify file content starts with PAR1
         let content = fs::read(&file_path).unwrap();
         assert_eq!(&content[0..4], b"PAR1");
-    }
-
-    // ==========================================================================
-    // Tests for AsyncWrite stream export
-    // ==========================================================================
-
-    #[tokio::test]
-    async fn test_export_to_parquet_async_stream_simple() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let options = ParquetExportOptions::default();
-        let csv_data = b"id,name\n1,Alice\n2,Bob\n3,Charlie";
-
-        let mut buffer = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut buffer);
-
-        // Use tokio's async write wrapper
-        let rows = export_to_parquet_async_stream(csv_data, schema, &mut cursor, options)
-            .await
-            .unwrap();
-
-        assert_eq!(rows, 3);
-        assert!(!buffer.is_empty());
-        // Verify it's a valid Parquet file (magic bytes: PAR1)
-        assert_eq!(&buffer[0..4], b"PAR1");
-    }
-
-    #[tokio::test]
-    async fn test_export_to_parquet_async_stream_with_compression() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
-
-        // Test with Gzip compression
-        let options = ParquetExportOptions {
-            compression: ParquetCompression::Gzip,
-            ..Default::default()
-        };
-        let csv_data = b"id\n1\n2\n3";
-
-        let mut buffer = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut buffer);
-
-        let rows = export_to_parquet_async_stream(csv_data, schema.clone(), &mut cursor, options)
-            .await
-            .unwrap();
-
-        assert_eq!(rows, 3);
-        assert!(!buffer.is_empty());
-        assert_eq!(&buffer[0..4], b"PAR1");
-    }
-
-    #[tokio::test]
-    async fn test_export_to_parquet_async_stream_schema_preservation() {
-        // Test that complex schema types are preserved through Parquet export
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("bool_col", DataType::Boolean, true),
-            Field::new("int_col", DataType::Int64, true),
-            Field::new("float_col", DataType::Float64, true),
-            Field::new("str_col", DataType::Utf8, true),
-            Field::new("decimal_col", DataType::Decimal128(18, 2), true),
-            Field::new("date_col", DataType::Date32, true),
-        ]));
-        let options = ParquetExportOptions::default();
-        let csv_data = b"bool_col,int_col,float_col,str_col,decimal_col,date_col\ntrue,42,3.14,hello,123.45,2024-01-15";
-
-        let mut buffer = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut buffer);
-
-        let rows = export_to_parquet_async_stream(csv_data, schema.clone(), &mut cursor, options)
-            .await
-            .unwrap();
-
-        assert_eq!(rows, 1);
-        assert!(!buffer.is_empty());
-
-        // Read the Parquet file back and verify schema
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        let bytes = bytes::Bytes::from(buffer);
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
-        let parquet_schema = builder.schema();
-
-        // Verify schema field names match
-        assert_eq!(parquet_schema.fields().len(), 6);
-        assert_eq!(parquet_schema.field(0).name(), "bool_col");
-        assert_eq!(parquet_schema.field(1).name(), "int_col");
-        assert_eq!(parquet_schema.field(2).name(), "float_col");
-        assert_eq!(parquet_schema.field(3).name(), "str_col");
-        assert_eq!(parquet_schema.field(4).name(), "decimal_col");
-        assert_eq!(parquet_schema.field(5).name(), "date_col");
-    }
-
-    #[tokio::test]
-    async fn test_export_to_parquet_roundtrip_data_integrity() {
-        // Test that data values are correctly preserved through Parquet export and read back
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("active", DataType::Boolean, true),
-        ]));
-        let options = ParquetExportOptions::default();
-        let csv_data = b"id,name,active\n1,Alice,true\n2,Bob,false\n3,,true";
-
-        let mut buffer = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut buffer);
-
-        let rows = export_to_parquet_async_stream(csv_data, schema, &mut cursor, options)
-            .await
-            .unwrap();
-
-        assert_eq!(rows, 3);
-
-        // Read the Parquet file back and verify data
-        use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-        let bytes = bytes::Bytes::from(buffer);
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
-        let mut reader = builder.build().unwrap();
-
-        let batch = reader.next().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 3);
-
-        // Verify column values
-        let id_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(id_col.value(0), 1);
-        assert_eq!(id_col.value(1), 2);
-        assert_eq!(id_col.value(2), 3);
-
-        let name_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(name_col.value(0), "Alice");
-        assert_eq!(name_col.value(1), "Bob");
-        assert!(name_col.is_null(2)); // Third row has NULL name
-
-        let active_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
-        assert!(active_col.value(0));
-        assert!(!active_col.value(1));
-        assert!(active_col.value(2));
     }
 }

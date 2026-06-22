@@ -52,23 +52,3 @@ pub use import::{
 pub use prepared::PreparedStatement;
 pub use results::{QueryMetadata, ResultSet, ResultSetIterator};
 pub use statement::{Parameter, Statement, StatementType};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_module_exports() {
-        // Verify that key types are exported and accessible
-        // This is a compile-time check more than a runtime check
-        let _: Option<StatementType> = None;
-        let _: Option<Parameter> = None;
-    }
-
-    #[test]
-    fn test_prepared_statement_export() {
-        // Verify that PreparedStatement is accessible
-        // This is a compile-time check
-        fn _takes_prepared_stmt(_stmt: PreparedStatement) {}
-    }
-}
