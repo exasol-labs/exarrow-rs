@@ -1073,7 +1073,7 @@ checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
 name = "exarrow-rs"
-version = "0.12.8"
+version = "0.13.0"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",

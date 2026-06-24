@@ -472,7 +472,7 @@ async fn test_connect_with_nonexistent_uri_schema_succeeds() {
         .username(&get_user())
         .password(&common::get_password())
         .schema(&schema_name)
-        .use_tls(false)
+        .validate_server_certificate(false)
         .connect()
         .await;
 
@@ -2256,12 +2256,14 @@ async fn test_uri_schema_is_opened_on_connect() {
     close_result.expect("close should succeed");
 }
 
-/// Connecting with a URI that names a schema which does NOT exist must
-/// surface the failure as `Err(...)`, not return a half-open `Connection`
-/// whose session state silently disagrees with the URI.
+/// Connecting with a URI that names a schema which does NOT exist must SUCCEED:
+/// per ADR-007 the implicit `OPEN SCHEMA` "schema ... not found" failure is
+/// swallowed and the session stays open with no active schema. This exercises
+/// the ADBC URI path (the one dbt uses); the builder path is covered by
+/// `test_connect_with_nonexistent_uri_schema_succeeds`.
 #[tokio::test]
 #[ignore]
-async fn test_uri_schema_activation_failure_returns_error() {
+async fn test_uri_schema_missing_is_best_effort_via_adbc() {
     skip_if_no_exasol!();
 
     let driver = exarrow_rs::adbc::Driver::new();
@@ -2278,18 +2280,23 @@ async fn test_uri_schema_activation_failure_returns_error() {
         .open(&conn_str)
         .expect("URI parse with schema should succeed");
 
-    let result = database.connect().await;
+    let conn = database.connect().await;
 
     assert!(
-        result.is_err(),
-        "connect() with non-existent URI schema must return Err, got Ok(...)"
+        conn.is_ok(),
+        "connect() with a non-existent URI schema must succeed (best-effort default, ADR-007), got: {:?}",
+        conn.err()
     );
-    let error_msg = result.unwrap_err().to_string().to_lowercase();
-    assert!(
-        error_msg.contains("schema") || error_msg.contains(&bogus_schema.to_lowercase()),
-        "error should reference the schema activation failure, got: {}",
-        error_msg
+    let conn = conn.unwrap();
+
+    // The missing schema was swallowed, so no schema is active.
+    assert_eq!(
+        conn.current_schema().await,
+        None,
+        "a swallowed missing URI schema must leave the session with no active schema"
     );
+
+    conn.close().await.expect("close should succeed");
 }
 
 // Section 10: Placeholder scanning and IN-clause integration tests
