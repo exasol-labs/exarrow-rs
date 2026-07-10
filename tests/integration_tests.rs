@@ -2257,7 +2257,7 @@ async fn test_uri_schema_is_opened_on_connect() {
 }
 
 /// Connecting with a URI that names a schema which does NOT exist must SUCCEED:
-/// per ADR-007 the implicit `OPEN SCHEMA` "schema ... not found" failure is
+/// per ADR-006 the implicit `OPEN SCHEMA` "schema ... not found" failure is
 /// swallowed and the session stays open with no active schema. This exercises
 /// the ADBC URI path (the one dbt uses); the builder path is covered by
 /// `test_connect_with_nonexistent_uri_schema_succeeds`.
@@ -2284,7 +2284,7 @@ async fn test_uri_schema_missing_is_best_effort_via_adbc() {
 
     assert!(
         conn.is_ok(),
-        "connect() with a non-existent URI schema must succeed (best-effort default, ADR-007), got: {:?}",
+        "connect() with a non-existent URI schema must succeed (best-effort default, ADR-006), got: {:?}",
         conn.err()
     );
     let conn = conn.unwrap();

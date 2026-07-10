@@ -3,8 +3,16 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "specs/**"
+      - "docs/**"
+      - "README.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "specs/**"
+      - "docs/**"
+      - "README.md"
   workflow_dispatch:
 
 env:
@@ -70,7 +78,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   licenses:
     name: License Check
