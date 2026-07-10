@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR: Fail-fast per-row arity check before any transport call in batch execution
+## ADR-005: Fail-fast per-row arity check before any transport call in batch execution
 
 **ID:** fail-fast-per-row-arity-check-in-batch-execution
 **Plan:** add-batch-prepared-execution

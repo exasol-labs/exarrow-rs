@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR: Zero-row result sets carry their column schema
+## ADR-004: Zero-row result sets carry their column schema
 
 **ID:** zero-row-result-sets-carry-column-schema
 **Plan:** fix-zero-row-result-schema

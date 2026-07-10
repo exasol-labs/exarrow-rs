@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR: In a library, "unused internally" is not "dead" — and tests must not mutate global env
+## ADR-007: In a library, "unused internally" is not "dead" — and tests must not mutate global env
 
 **ID:** unused-internally-is-not-dead-tests-must-not-mutate-env
 **Plan:** ponytail-audit-cleanup

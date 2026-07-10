@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR: Hand-rolled five-state lexer for SQL placeholder scanning
+## ADR-001: Hand-rolled five-state lexer for SQL placeholder scanning
 
 **ID:** hand-rolled-five-state-lexer-for-sql-placeholder-scanning
 **Plan:** fix-placeholder-scanning-and-in-clause-results

@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR: Suppress GHSA-2f9f-gq7v-9h6m (Apache Thrift) via documented deny.toml entry rather than patching
+## ADR-003: Suppress GHSA-2f9f-gq7v-9h6m (Apache Thrift) via documented deny.toml entry rather than patching
 
 **ID:** suppress-ghsa-2f9f-gq7v-9h6m-via-deny-toml
 **Plan:** add-security-advisory-policy
