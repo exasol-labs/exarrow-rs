@@ -113,7 +113,7 @@ Layered architecture following the ADBC Driver hierarchy: **Driver -> Database -
 ## Constraints
 
 - **Technical**: TLS enabled by default; production Exasol requires it. Credentials MUST NOT be logged or exposed.
-- **Code quality**: Zero `clippy` warnings across all targets/features and a documented, auditable `cargo-deny` advisory-suppression policy (with re-evaluation triggers) are enforced in CI before any change is considered complete.
+- **Code quality**: Zero `clippy` warnings across all targets/features and a documented, auditable `cargo-deny` advisory-suppression policy (with re-evaluation triggers) are enforced in CI before any code or build-impacting change is considered complete. Spec/doc-only changes (`specs/**`, `docs/**`, `README.md`) are exempt from this CI run per `paths-ignore`.
 - **Performance**: Arrow-native zero-copy where possible. Results streamed as RecordBatches to avoid memory bloat.
 - **Testing**: Integration tests require a running Exasol instance (Docker: `exasol/docker-db:latest` on port 8563, credentials `sys`/`exasol`).
 
