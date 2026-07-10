@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR: A URI-specified schema is a best-effort default, not a connect-time requirement
+## ADR-007: A URI-specified schema is a best-effort default, not a connect-time requirement
 
 **ID:** uri-specified-schema-is-best-effort-default
 **Plan:** change-uri-schema-best-effort
