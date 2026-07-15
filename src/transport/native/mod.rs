@@ -1224,11 +1224,14 @@ impl TransportProtocol for NativeTcpTransport {
             ));
         }
 
+        let timeout_secs_i32 = i32::try_from(timeout_secs).map_err(|_| {
+            TransportError::ProtocolError(format!(
+                "query_timeout of {timeout_secs}s exceeds the native protocol's i32 range"
+            ))
+        })?;
+
         let mut attrs = AttributeSet::new();
-        attrs.add(
-            ATTR_QUERY_TIMEOUT,
-            AttributeValue::Int32(timeout_secs as i32),
-        );
+        attrs.add(ATTR_QUERY_TIMEOUT, AttributeValue::Int32(timeout_secs_i32));
 
         let (header, payload) = self
             .send_and_receive(CMD_SET_ATTRIBUTES, &attrs, None)

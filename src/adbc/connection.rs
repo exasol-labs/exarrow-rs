@@ -66,10 +66,19 @@ fn secs_ceil(d: Duration) -> u64 {
 /// to [`QueryError::Timeout`], matched primarily on the SQL state code with the
 /// message text as a fallback; every other failure maps to
 /// [`QueryError::ExecutionFailed`].
+///
+/// `timeout_ms` is the effective timeout actually enforced by the server for
+/// this statement (`0` when none was configured). An `R0001` abort is only
+/// classified as [`QueryError::Timeout`] when a non-zero timeout was in
+/// effect — an ambient session-level `QUERY_TIMEOUT` firing on a statement the
+/// driver never limited surfaces as [`QueryError::ExecutionFailed`] instead,
+/// preserving the server's message rather than reporting a nonsensical
+/// "timeout after 0ms".
 fn map_execution_error(err: TransportError, timeout_ms: u64) -> QueryError {
     let message = err.to_string();
-    let is_query_timeout = message.contains("R0001")
-        || message.contains("Query terminated because timeout has been reached");
+    let is_query_timeout = timeout_ms > 0
+        && (message.contains("R0001")
+            || message.contains("Query terminated because timeout has been reached"));
     if is_query_timeout {
         QueryError::Timeout { timeout_ms }
     } else {
@@ -383,8 +392,11 @@ impl Connection {
             self.session.config_mut().query_timeout = stmt.timeout_ms().map(Duration::from_millis);
         }
 
-        let result =
-            exec_result.map_err(|e| map_execution_error(e, stmt.timeout_ms().unwrap_or(0)))?;
+        // Report the effective timeout actually enforced by the server
+        // (`target_secs`, in ms) rather than the raw sub-second request —
+        // e.g. a 1500ms request rounds up to a 2000ms server-side limit, and
+        // that's the value that fired.
+        let result = exec_result.map_err(|e| map_execution_error(e, target_secs * 1000))?;
 
         // Update session state back to ready/in_transaction
         self.update_session_state_after_query().await;
@@ -2356,6 +2368,22 @@ mod tests {
         );
         match map_execution_error(other, 5000) {
             QueryError::ExecutionFailed(msg) => assert!(msg.contains("42000")),
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_execution_error_with_zero_effective_timeout_is_not_classified_as_timeout() {
+        // An R0001 abort with no driver-configured timeout in effect (e.g. an
+        // ambient session-level QUERY_TIMEOUT the driver never set) must not
+        // be reported as `QueryError::Timeout { timeout_ms: 0 }` — that would
+        // read as "the client timed out immediately", which is false. The
+        // server's own message is preserved via ExecutionFailed instead.
+        let ambient = TransportError::ProtocolError(
+            "Query terminated because timeout has been reached. (SQL code: R0001)".to_string(),
+        );
+        match map_execution_error(ambient, 0) {
+            QueryError::ExecutionFailed(msg) => assert!(msg.contains("R0001")),
             other => panic!("expected ExecutionFailed, got {:?}", other),
         }
     }
