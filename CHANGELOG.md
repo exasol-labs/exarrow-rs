@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0
+
+- Breaking: `ConnectionParams::query_timeout` is now `Option<Duration>` (was `Duration`, silently defaulting to 300s). A configured timeout is no longer enforced by a client-side timer; instead it is forwarded to Exasol as the server-enforced `queryTimeout` session attribute, and the server aborts an over-running query and reports it through the normal response cycle. The default is now no timeout attribute set at all — the server's own `QUERY_TIMEOUT` governs — instead of a silent client-side 300s/120s timer. `Statement::timeout_ms()` similarly changes return type from `u64` to `Option<u64>`, with `None` as the new default (was `120_000`). The client-side `tokio::time::timeout` wrap around query execution has been removed entirely: a client-side give-up on a running query used to abandon the in-flight request and desync the connection's single owned transport; the server now enforces and reports timeouts instead.
+
 ## 0.13.0
 
 - Feat: `Connection::builder()` now exposes `.validate_server_certificate(bool)`, mirroring the connection-string `validateservercertificate` parameter. Previously the builder could only reach a self-signed Exasol (e.g. the Docker image) by disabling TLS entirely; it can now connect over TLS while accepting a self-signed certificate.

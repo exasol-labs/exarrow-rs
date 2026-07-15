@@ -824,6 +824,7 @@ mod tests {
             async fn close(&mut self) -> Result<(), crate::error::TransportError>;
             fn is_connected(&self) -> bool;
             async fn set_autocommit(&mut self, enabled: bool) -> Result<(), crate::error::TransportError>;
+            async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), crate::error::TransportError>;
         }
     }
 

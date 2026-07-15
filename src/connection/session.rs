@@ -31,8 +31,11 @@ pub struct SessionConfig {
     /// Default fetch size for queries
     pub default_fetch_size: usize,
 
-    /// Query timeout
-    pub query_timeout: Duration,
+    /// Query timeout currently applied to the session's `queryTimeout`
+    /// attribute. `None` means no attribute is set (server `QUERY_TIMEOUT`
+    /// governs). This is the reconcile baseline: `connect()` seeds it and
+    /// `execute_statement` reads and rewrites it after each reconcile.
+    pub query_timeout: Option<Duration>,
 }
 
 impl Default for SessionConfig {
@@ -44,7 +47,7 @@ impl Default for SessionConfig {
             max_retries: 3,
             auto_commit: true,
             default_fetch_size: 1000,
-            query_timeout: Duration::from_secs(300),
+            query_timeout: None,
         }
     }
 }
@@ -169,6 +172,14 @@ impl Session {
     /// Get session configuration.
     pub fn config(&self) -> &SessionConfig {
         &self.config
+    }
+
+    /// Get mutable access to the session configuration.
+    ///
+    /// Used by `execute_statement` to read and write back the applied
+    /// `query_timeout` baseline as part of the queryTimeout reconcile.
+    pub fn config_mut(&mut self) -> &mut SessionConfig {
+        &mut self.config
     }
 
     /// Get current session state.

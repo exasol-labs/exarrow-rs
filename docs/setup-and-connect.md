@@ -71,7 +71,7 @@ All parameters are set via URL query string (`?key=value&key2=value2`).
 | `validate_certificate` | `verify_certificate`, `validateservercertificate` | `true` | Validate the server's TLS certificate |
 | `certificate_fingerprint` | `certificatefingerprint` | — | Pin connection to a specific server certificate (SHA-256 hex of DER cert) |
 | `connection_timeout` | `timeout` | `30` | Connection timeout in seconds (max 300) |
-| `query_timeout` | — | `300` | Query timeout in seconds |
+| `query_timeout` | — | unset | Query timeout in seconds, forwarded to Exasol as the server-enforced `queryTimeout` session attribute (see [Session Attributes](#session-attributes)). When unset, no attribute is set and the server's own `QUERY_TIMEOUT` governs — the driver imposes no client-side timer. |
 | `idle_timeout` | — | `600` | Idle connection timeout in seconds |
 | `client_name` | — | `exarrow-rs` | Client application name sent to server |
 | `client_version` | — | crate version | Client version string sent to server |
@@ -119,7 +119,7 @@ Any unrecognized query parameter is forwarded as a session attribute to the Exas
 | `autocommit` | boolean | Auto-commit after each statement |
 | `currentSchema` | string | Current schema name |
 | `feedbackInterval` | number | Heartbeat interval during query execution (seconds) |
-| `queryTimeout` | number | Server-side query timeout (seconds) |
+| `queryTimeout` | number | Server-side query timeout (seconds). This is the same attribute the `query_timeout` connection parameter forwards — see [Parameters](#parameters); they are not independent knobs. |
 | `resultSetMaxRows` | number | Max result set rows (0 = unlimited) |
 | `snapshotTransactionsEnabled` | boolean | Enable snapshot transactions |
 | `timestampUtcEnabled` | boolean | Enable UTC timestamp conversion |

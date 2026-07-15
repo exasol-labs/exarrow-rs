@@ -279,6 +279,17 @@ pub trait TransportProtocol: Send + Sync {
     ///
     /// Returns `TransportError` if the operation fails.
     async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError>;
+
+    /// Set the query timeout on the server (seconds; `0` means unlimited).
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_secs` - The query timeout in whole seconds
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if the operation fails.
+    async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError>;
 }
 
 /// Result of a query execution.

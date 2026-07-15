@@ -789,6 +789,13 @@ impl SetAttributesRequest {
         attributes.insert("autocommit".to_string(), serde_json::Value::Bool(enabled));
         Self::new(attributes)
     }
+
+    /// Create a request to set the query-timeout attribute (seconds).
+    pub fn query_timeout(seconds: u64) -> Self {
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert("queryTimeout".to_string(), serde_json::Value::from(seconds));
+        Self::new(attributes)
+    }
 }
 
 /// Set attributes response.
@@ -1035,6 +1042,15 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
 
         assert!(json.contains("\"command\":\"disconnect\""));
+    }
+
+    #[test]
+    fn test_set_attributes_query_timeout_serialization() {
+        let request = SetAttributesRequest::query_timeout(30);
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert!(json.contains("\"command\":\"setAttributes\""));
+        assert!(json.contains("\"queryTimeout\":30"));
     }
 
     #[test]

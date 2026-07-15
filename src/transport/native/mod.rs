@@ -1216,6 +1216,29 @@ impl TransportProtocol for NativeTcpTransport {
         }
         Ok(())
     }
+
+    async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
+        if self.state != ConnectionState::Authenticated {
+            return Err(TransportError::ProtocolError(
+                "Must authenticate before setting attributes".to_string(),
+            ));
+        }
+
+        let mut attrs = AttributeSet::new();
+        attrs.add(
+            ATTR_QUERY_TIMEOUT,
+            AttributeValue::Int32(timeout_secs as i32),
+        );
+
+        let (header, payload) = self
+            .send_and_receive(CMD_SET_ATTRIBUTES, &attrs, None)
+            .await?;
+
+        if !payload.is_empty() {
+            let _ = Self::check_response(&header, &payload)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
