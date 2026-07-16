@@ -178,7 +178,7 @@ impl Session {
     ///
     /// Used by `execute_statement` to read and write back the applied
     /// `query_timeout` baseline as part of the queryTimeout reconcile.
-    pub fn config_mut(&mut self) -> &mut SessionConfig {
+    pub(crate) fn config_mut(&mut self) -> &mut SessionConfig {
         &mut self.config
     }
 

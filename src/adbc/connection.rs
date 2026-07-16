@@ -56,7 +56,12 @@ fn schema_open_error_is_missing_schema(err: &QueryError) -> bool {
 /// reserved exclusively for the no-timeout / reset path — a caller-requested
 /// near-zero-but-nonzero timeout must never collapse into that sentinel.
 fn secs_ceil(d: Duration) -> u64 {
-    d.as_millis().div_ceil(1000) as u64
+    let secs = d.as_secs();
+    if d.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
 }
 
 /// Map a transport-layer execution failure to a [`QueryError`].
@@ -319,7 +324,7 @@ impl Connection {
     pub fn create_statement(&self, sql: impl Into<String>) -> Statement {
         let mut stmt = Statement::new(sql);
         if let Some(d) = self.params.query_timeout {
-            stmt.set_timeout(d.as_millis() as u64);
+            stmt.set_timeout(d.as_millis().min(u64::MAX as u128) as u64);
         }
         stmt
     }
@@ -396,7 +401,8 @@ impl Connection {
         // (`target_secs`, in ms) rather than the raw sub-second request —
         // e.g. a 1500ms request rounds up to a 2000ms server-side limit, and
         // that's the value that fired.
-        let result = exec_result.map_err(|e| map_execution_error(e, target_secs * 1000))?;
+        let result =
+            exec_result.map_err(|e| map_execution_error(e, target_secs.saturating_mul(1000)))?;
 
         // Update session state back to ready/in_transaction
         self.update_session_state_after_query().await;
@@ -2321,6 +2327,7 @@ mod tests {
         assert_eq!(secs_ceil(Duration::from_millis(0)), 0);
         // Any positive sub-second timeout rounds UP to at least one second so
         // it never collapses into the unlimited sentinel.
+        assert_eq!(secs_ceil(Duration::from_nanos(1)), 1);
         assert_eq!(secs_ceil(Duration::from_millis(1)), 1);
         assert_eq!(secs_ceil(Duration::from_millis(999)), 1);
         assert_eq!(secs_ceil(Duration::from_millis(1000)), 1);
