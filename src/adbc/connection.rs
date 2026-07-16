@@ -12,7 +12,7 @@ use crate::adbc::Statement;
 use crate::connection::auth::AuthResponseData;
 use crate::connection::params::ConnectionParams;
 use crate::connection::session::{Session as SessionInfo, SessionConfig, SessionState};
-use crate::error::{ConnectionError, ExasolError, QueryError};
+use crate::error::{ConnectionError, ExasolError, QueryError, TransportError};
 use crate::query::prepared::PreparedStatement;
 use crate::query::results::ResultSet;
 use crate::query::statement::Parameter;
@@ -25,7 +25,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
 
 /// Session is a type alias for Connection.
 ///
@@ -48,6 +47,48 @@ pub type Session = Connection;
 /// found; all other errors return `false`.
 fn schema_open_error_is_missing_schema(err: &QueryError) -> bool {
     err.to_string().to_ascii_lowercase().contains("not found")
+}
+
+/// Round a duration up to whole seconds over its millisecond value.
+///
+/// Any positive sub-second duration maps to at least `1`; only a zero duration
+/// maps to `0`. Exasol treats `queryTimeout = 0` as "unlimited", so `0` is
+/// reserved exclusively for the no-timeout / reset path — a caller-requested
+/// near-zero-but-nonzero timeout must never collapse into that sentinel.
+fn secs_ceil(d: Duration) -> u64 {
+    let secs = d.as_secs();
+    if d.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
+}
+
+/// Map a transport-layer execution failure to a [`QueryError`].
+///
+/// A server-reported query-timeout abort carries Exasol SQL state `R0001`
+/// ("Query terminated because timeout has been reached."). Such a failure maps
+/// to [`QueryError::Timeout`], matched primarily on the SQL state code with the
+/// message text as a fallback; every other failure maps to
+/// [`QueryError::ExecutionFailed`].
+///
+/// `timeout_ms` is the effective timeout actually enforced by the server for
+/// this statement (`0` when none was configured). An `R0001` abort is only
+/// classified as [`QueryError::Timeout`] when a non-zero timeout was in
+/// effect — an ambient session-level `QUERY_TIMEOUT` firing on a statement the
+/// driver never limited surfaces as [`QueryError::ExecutionFailed`] instead,
+/// preserving the server's message rather than reporting a nonsensical
+/// "timeout after 0ms".
+fn map_execution_error(err: TransportError, timeout_ms: u64) -> QueryError {
+    let message = err.to_string();
+    let is_query_timeout = timeout_ms > 0
+        && (message.contains("R0001")
+            || message.contains("Query terminated because timeout has been reached"));
+    if is_query_timeout {
+        QueryError::Timeout { timeout_ms }
+    } else {
+        QueryError::ExecutionFailed(message)
+    }
 }
 
 fn blocking_runtime() -> &'static Runtime {
@@ -163,7 +204,22 @@ impl Connection {
             .await
             .map_err(|e| ConnectionError::AuthenticationFailed(e.to_string()))?;
 
-        // Create session config from connection params
+        // Forward a configured query timeout to the server so it enforces the
+        // limit itself. Absent configuration, no attribute is set and the
+        // server's own QUERY_TIMEOUT governs.
+        if let Some(d) = params.query_timeout {
+            transport
+                .set_query_timeout(secs_ceil(d))
+                .await
+                .map_err(|e| ConnectionError::ConnectionFailed {
+                    host: params.host.clone(),
+                    port: params.port,
+                    message: format!("failed to set query timeout: {}", e),
+                })?;
+        }
+
+        // Create session config from connection params. `query_timeout` seeds
+        // the applied-value baseline that `execute_statement` reconciles against.
         let session_config = SessionConfig {
             idle_timeout: params.idle_timeout,
             query_timeout: params.query_timeout,
@@ -267,7 +323,9 @@ impl Connection {
     ///
     pub fn create_statement(&self, sql: impl Into<String>) -> Statement {
         let mut stmt = Statement::new(sql);
-        stmt.set_timeout(self.params.query_timeout.as_millis() as u64);
+        if let Some(d) = self.params.query_timeout {
+            stmt.set_timeout(d.as_millis().min(u64::MAX as u128) as u64);
+        }
         stmt
     }
 
@@ -307,19 +365,44 @@ impl Connection {
         // Build final SQL with parameters
         let final_sql = stmt.build_sql()?;
 
-        // Execute with timeout
-        let timeout_duration = Duration::from_millis(stmt.timeout_ms());
-        let transport = Arc::clone(&self.transport);
+        // Reconcile the session `queryTimeout` in both directions before
+        // executing. `queryTimeout` is session-level, so a per-statement value
+        // (or its absence) is pushed to the server whenever it differs from the
+        // currently-applied value. A statement with no timeout resets the server
+        // to `0` (unlimited) so it never inherits a prior statement's limit.
+        let target_secs = match stmt.timeout_ms() {
+            Some(ms) => secs_ceil(Duration::from_millis(ms)),
+            None => 0,
+        };
+        let applied_secs = match self.session.config().query_timeout {
+            Some(d) => secs_ceil(d),
+            None => 0,
+        };
+        let needs_reconcile = target_secs != applied_secs;
 
-        let result = timeout(timeout_duration, async move {
-            let mut transport_guard = transport.lock().await;
-            transport_guard.execute_query(&final_sql).await
-        })
-        .await
-        .map_err(|_| QueryError::Timeout {
-            timeout_ms: stmt.timeout_ms(),
-        })?
-        .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+        let mut transport_guard = self.transport.lock().await;
+        if needs_reconcile {
+            transport_guard
+                .set_query_timeout(target_secs)
+                .await
+                .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+        }
+        let exec_result = transport_guard.execute_query(&final_sql).await;
+        drop(transport_guard);
+
+        // Record what was applied to the server so the next statement
+        // reconciles against the correct baseline. This runs even when the
+        // query itself aborts: the server's `queryTimeout` was still changed.
+        if needs_reconcile {
+            self.session.config_mut().query_timeout = stmt.timeout_ms().map(Duration::from_millis);
+        }
+
+        // Report the effective timeout actually enforced by the server
+        // (`target_secs`, in ms) rather than the raw sub-second request —
+        // e.g. a 1500ms request rounds up to a 2000ms server-side limit, and
+        // that's the value that fired.
+        let result =
+            exec_result.map_err(|e| map_execution_error(e, target_secs.saturating_mul(1000)))?;
 
         // Update session state back to ready/in_transaction
         self.update_session_state_after_query().await;
@@ -2236,6 +2319,80 @@ mod tests {
             !schema_open_error_is_missing_schema(&unrelated),
             "an unrelated error must NOT be classified as missing-schema (stays fatal)"
         );
+    }
+
+    #[test]
+    fn secs_ceil_reserves_zero_for_the_unlimited_reset_only() {
+        // Zero maps to zero: the "no timeout / reset to unlimited" sentinel.
+        assert_eq!(secs_ceil(Duration::from_millis(0)), 0);
+        // Any positive sub-second timeout rounds UP to at least one second so
+        // it never collapses into the unlimited sentinel.
+        assert_eq!(secs_ceil(Duration::from_nanos(1)), 1);
+        assert_eq!(secs_ceil(Duration::from_millis(1)), 1);
+        assert_eq!(secs_ceil(Duration::from_millis(999)), 1);
+        assert_eq!(secs_ceil(Duration::from_millis(1000)), 1);
+        // Whole-plus-a-remainder rounds up to the next whole second.
+        assert_eq!(secs_ceil(Duration::from_millis(1001)), 2);
+        assert_eq!(secs_ceil(Duration::from_millis(2500)), 3);
+        // Exact whole seconds are unchanged.
+        assert_eq!(secs_ceil(Duration::from_secs(60)), 60);
+    }
+
+    #[test]
+    fn map_execution_error_recognizes_server_query_timeout() {
+        // Primary signal: SQL state R0001 (WebSocket transport phrasing).
+        let ws = TransportError::ProtocolError(
+            "Query terminated because timeout has been reached. (SQL code: R0001)".to_string(),
+        );
+        assert!(matches!(
+            map_execution_error(ws, 5000),
+            QueryError::Timeout { timeout_ms: 5000 }
+        ));
+
+        // Primary signal survives the native transport phrasing ("SQL state").
+        let native = TransportError::ProtocolError(
+            "Query terminated because timeout has been reached. (SQL state: R0001)".to_string(),
+        );
+        assert!(matches!(
+            map_execution_error(native, 1000),
+            QueryError::Timeout { timeout_ms: 1000 }
+        ));
+
+        // Fallback signal: the message text alone, without the code.
+        let text_only = TransportError::ProtocolError(
+            "Query terminated because timeout has been reached.".to_string(),
+        );
+        assert!(matches!(
+            map_execution_error(text_only, 2000),
+            QueryError::Timeout { timeout_ms: 2000 }
+        ));
+    }
+
+    #[test]
+    fn map_execution_error_passes_through_other_failures() {
+        let other = TransportError::ProtocolError(
+            "syntax error, unexpected ')' (SQL code: 42000)".to_string(),
+        );
+        match map_execution_error(other, 5000) {
+            QueryError::ExecutionFailed(msg) => assert!(msg.contains("42000")),
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_execution_error_with_zero_effective_timeout_is_not_classified_as_timeout() {
+        // An R0001 abort with no driver-configured timeout in effect (e.g. an
+        // ambient session-level QUERY_TIMEOUT the driver never set) must not
+        // be reported as `QueryError::Timeout { timeout_ms: 0 }` — that would
+        // read as "the client timed out immediately", which is false. The
+        // server's own message is preserved via ExecutionFailed instead.
+        let ambient = TransportError::ProtocolError(
+            "Query terminated because timeout has been reached. (SQL code: R0001)".to_string(),
+        );
+        match map_execution_error(ambient, 0) {
+            QueryError::ExecutionFailed(msg) => assert!(msg.contains("R0001")),
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
     }
 }
 

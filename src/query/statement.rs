@@ -274,8 +274,9 @@ pub struct Statement {
     sql: String,
     /// Bound parameters (indexed by position)
     parameters: Vec<Option<Parameter>>,
-    /// Query timeout in milliseconds
-    timeout_ms: u64,
+    /// Query timeout in milliseconds. `None` means no per-statement timeout
+    /// is set; the connection's inherited/session timeout governs.
+    timeout_ms: Option<u64>,
     /// Statement type
     statement_type: StatementType,
 }
@@ -289,7 +290,7 @@ impl Statement {
         Self {
             sql,
             parameters: Vec::new(),
-            timeout_ms: 120_000, // 2 minutes default
+            timeout_ms: None,
             statement_type,
         }
     }
@@ -304,14 +305,14 @@ impl Statement {
         self.statement_type
     }
 
-    /// Get the timeout in milliseconds.
-    pub fn timeout_ms(&self) -> u64 {
+    /// Get the timeout in milliseconds, if one is set.
+    pub fn timeout_ms(&self) -> Option<u64> {
         self.timeout_ms
     }
 
     /// Set query timeout.
     pub fn set_timeout(&mut self, timeout_ms: u64) {
-        self.timeout_ms = timeout_ms;
+        self.timeout_ms = Some(timeout_ms);
     }
 
     /// Bind a parameter at the given index.
@@ -507,7 +508,7 @@ mod tests {
 
         assert_eq!(stmt.sql(), "SELECT * FROM users");
         assert_eq!(stmt.statement_type(), StatementType::Select);
-        assert_eq!(stmt.timeout_ms(), 120_000);
+        assert_eq!(stmt.timeout_ms(), None);
     }
 
     #[test]
@@ -538,7 +539,7 @@ mod tests {
     fn test_statement_set_timeout() {
         let mut stmt = Statement::new("SELECT * FROM users");
         stmt.set_timeout(30_000);
-        assert_eq!(stmt.timeout_ms(), 30_000);
+        assert_eq!(stmt.timeout_ms(), Some(30_000));
     }
 
     #[test]

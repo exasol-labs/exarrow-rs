@@ -811,6 +811,19 @@ impl TransportProtocol for WebSocketTransport {
         self.check_status(&response.status, &response.exception)?;
         Ok(())
     }
+
+    async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
+        if self.state != ConnectionState::Authenticated {
+            return Err(TransportError::ProtocolError(
+                "Must authenticate before setting attributes".to_string(),
+            ));
+        }
+
+        let request = SetAttributesRequest::query_timeout(timeout_secs);
+        let response: SetAttributesResponse = self.send_receive(&request).await?;
+        self.check_status(&response.status, &response.exception)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

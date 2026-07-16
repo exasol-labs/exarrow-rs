@@ -30,8 +30,9 @@ pub struct ConnectionParams {
     /// Connection timeout
     pub connection_timeout: Duration,
 
-    /// Query execution timeout
-    pub query_timeout: Duration,
+    /// Query execution timeout. `None` means no `queryTimeout` session
+    /// attribute is set and the server's own `QUERY_TIMEOUT` governs.
+    pub query_timeout: Option<Duration>,
 
     /// Idle connection timeout
     pub idle_timeout: Duration,
@@ -371,7 +372,7 @@ impl ConnectionBuilder {
 
         // Validate timeouts
         let connection_timeout = self.connection_timeout.unwrap_or(Duration::from_secs(30));
-        let query_timeout = self.query_timeout.unwrap_or(Duration::from_secs(300));
+        let query_timeout = self.query_timeout;
         let idle_timeout = self.idle_timeout.unwrap_or(Duration::from_secs(600));
 
         if connection_timeout.as_secs() > 300 {
@@ -633,7 +634,7 @@ mod tests {
         assert_eq!(params.password(), "secret");
         assert_eq!(params.schema, Some("MY_SCHEMA".to_string()));
         assert_eq!(params.connection_timeout, Duration::from_secs(20));
-        assert_eq!(params.query_timeout, Duration::from_secs(60));
+        assert_eq!(params.query_timeout, Some(Duration::from_secs(60)));
         assert!(params.use_tls);
         assert_eq!(params.client_name, "test-client");
         assert_eq!(params.attributes.get("custom"), Some(&"value".to_string()));
@@ -890,7 +891,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(params.connection_timeout, Duration::from_secs(30));
-        assert_eq!(params.query_timeout, Duration::from_secs(300));
+        assert_eq!(params.query_timeout, None);
         assert_eq!(params.idle_timeout, Duration::from_secs(600));
         assert!(params.use_tls);
         assert!(params.validate_server_certificate);
@@ -927,7 +928,7 @@ mod tests {
         let params =
             ConnectionParams::from_str("exasol://user@localhost?query_timeout=60").unwrap();
 
-        assert_eq!(params.query_timeout, Duration::from_secs(60));
+        assert_eq!(params.query_timeout, Some(Duration::from_secs(60)));
     }
 
     #[test]

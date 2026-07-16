@@ -67,10 +67,11 @@ Statements are pure data objects created via `Connection::create_statement()` an
 
 ### Scenario: Statement inherits connection query timeout
 
-* *GIVEN* a connection is configured with a `query_timeout`
+* *GIVEN* a connection carrying a query timeout setting, which is either an explicit timeout or no timeout
 * *WHEN* `create_statement()` is called on that connection
-* *THEN* the returned Statement SHALL use the connection's configured `query_timeout` as its execution timeout
-* *AND* the Statement SHALL NOT use a hardcoded timeout independent of the connection's configuration
+* *THEN* the returned Statement SHALL inherit that setting: the explicit timeout when the connection configures one, or no timeout when the connection configures none
+* *AND* the Statement SHALL NOT fall back to any hardcoded non-zero timeout independent of the connection's configuration
+* *AND* when the Statement carries an explicit timeout, `execute_statement()` SHALL forward that timeout to Exasol as the `queryTimeout` session attribute before executing, rather than enforce it with a client-side timer
 
 ### Scenario: Empty result schema surfaced via RecordBatchReader
 

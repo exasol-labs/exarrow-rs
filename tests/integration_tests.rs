@@ -2936,3 +2936,152 @@ async fn test_execute_batch_update_rejects_result_set() {
 
     conn.close().await.expect("Failed to close connection");
 }
+
+// Section: Query Timeout Tests (remove-query-timeout plan)
+//
+// `queryTimeout` is a server-enforced session attribute, not a client-side
+// timer. Absent configuration, no attribute is set and the server's own
+// `QUERY_TIMEOUT` governs; when configured, the server aborts the
+// over-running query and reports it through the normal response cycle, so
+// the connection is never desynced by an abandoned in-flight request.
+//
+// Exasol's own query result cache would otherwise make a second run of the
+// exact same cartesian-product query near-instant (verified manually: a cold
+// run of the 60k x 60k COUNT(*) below takes ~4s, a cached repeat ~0.1s), which
+// would silently defeat these tests' whole premise of a genuinely
+// multi-second, server-side-only query. Every test below disables it for its
+// own session first.
+
+/// Build a `COUNT(*)` over a cartesian-product `VALUES BETWEEN` join large
+/// enough to force a genuinely multi-second, server-side-only query — there
+/// is no client-side timer left to race against.
+fn long_running_count_query(side_rows: u32) -> String {
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM (VALUES BETWEEN 1 AND {n}) a CROSS JOIN (VALUES BETWEEN 1 AND {n}) b)",
+        n = side_rows
+    )
+}
+
+/// Disable Exasol's query result cache for the current session so a
+/// cartesian-product query genuinely recomputes every time it runs, instead
+/// of returning a cached result from a prior invocation with the same text.
+async fn disable_query_cache(conn: &mut Connection) {
+    conn.execute_update("ALTER SESSION SET QUERY_CACHE='OFF'")
+        .await
+        .expect("Failed to disable QUERY_CACHE for the test session");
+}
+
+/// With no `query_timeout` configured, a multi-second server-side query runs
+/// to completion. The client imposes no timer of its own; only the server's
+/// own `QUERY_TIMEOUT` (unset here) would apply.
+#[tokio::test]
+async fn test_no_query_timeout_by_default_allows_long_query() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    disable_query_cache(&mut conn).await;
+
+    let batches = conn
+        .query(long_running_count_query(60_000))
+        .await
+        .expect("Long-running query should complete — no client-side timeout is armed");
+
+    assert_eq!(batches.len(), 1, "Should return exactly one batch");
+    assert_eq!(batches[0].num_rows(), 1, "COUNT(*) should return one row");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// An explicit, short `query_timeout` is enforced by the server: the specific
+/// `QueryError::Timeout` variant surfaces (a generic `ExecutionFailed` would
+/// otherwise be indistinguishable from a true server-side abort now that the
+/// client-side timer is gone). Then, on the SAME `Connection`, a follow-up
+/// query must still succeed — proving the transport did not desync the way
+/// the old client-side timer wrap did when it dropped an in-flight future.
+#[tokio::test]
+async fn test_explicit_query_timeout_is_enforced() {
+    skip_if_no_exasol!();
+
+    let conn_str = format!("{}&query_timeout=2", get_test_connection_string());
+    let driver = exarrow_rs::adbc::Driver::new();
+    let database = driver.open(&conn_str).expect("open should succeed");
+    let mut conn = database
+        .connect()
+        .await
+        .expect("Connection with an explicit query_timeout should succeed");
+    disable_query_cache(&mut conn).await;
+
+    // Large enough to run far longer than the 2s server-side timeout if left
+    // unbounded — the server is expected to abort it, not let it complete.
+    let result = conn.query(long_running_count_query(100_000)).await;
+
+    match result {
+        Err(QueryError::Timeout { .. }) => {}
+        Err(other) => panic!(
+            "Expected the specific QueryError::Timeout variant from the server-enforced \
+             timeout, got a different error: {:?}",
+            other
+        ),
+        Ok(_) => panic!(
+            "Expected the long-running query to be aborted by the 2s server-side timeout, \
+             but it completed"
+        ),
+    }
+
+    // The whole point of server-side enforcement: the connection is not
+    // corrupted by the abort, so the same Connection keeps working.
+    let batches = conn.query("SELECT 1").await.expect(
+        "Follow-up query on the same Connection should succeed after a server-side timeout abort",
+    );
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// A `set_timeout` statement must not leak its server-side `queryTimeout`
+/// into a later default statement (`timeout_ms() == None`) on the same
+/// connection. The reconcile-and-write-back logic must reset the server's
+/// `queryTimeout` back to unlimited (`0`) once a statement asks for no limit
+/// — this proves the *default* statement executed *after* the short-timeout
+/// one still runs unbounded, not merely that the short-timeout statement
+/// works in isolation.
+#[tokio::test]
+async fn test_reconcile_clears_stale_timeout_for_default_statement() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    disable_query_cache(&mut conn).await;
+
+    // First statement: an explicit short timeout, pushed to the server session.
+    let mut short_stmt = conn.create_statement("SELECT 1");
+    short_stmt.set_timeout(2_000);
+    conn.execute_statement(&short_stmt)
+        .await
+        .expect("Trivial statement should complete well within its own 2s timeout");
+
+    // Second statement on the SAME connection: no set_timeout call, so it
+    // inherits None. If the server's queryTimeout were not reset back to
+    // unlimited, this multi-second query would inherit the stale 2s limit
+    // and be aborted.
+    let default_stmt = conn.create_statement(long_running_count_query(100_000));
+    assert_eq!(
+        default_stmt.timeout_ms(),
+        None,
+        "Default statement must not inherit a timeout — the connection itself has none configured"
+    );
+
+    let result_set = conn.execute_statement(&default_stmt).await.expect(
+        "Default statement must run unbounded — the prior statement's server-side timeout \
+         must have been reset, not inherited",
+    );
+
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("Failed to fetch results");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    conn.close().await.expect("Failed to close connection");
+}
