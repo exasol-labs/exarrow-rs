@@ -125,6 +125,53 @@ jobs:
       - name: Run unit tests with coverage
         run: cargo llvm-cov --lib --lcov --output-path lcov-unit.info
 
+      - name: Upload unit coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-unit
+          path: lcov-unit.info
+          if-no-files-found: error
+          retention-days: 1
+
+  sonar:
+    name: Sonar Analysis
+    needs: [unit-tests]
+    runs-on: ubuntu-latest
+    # Fork PRs don't get repo secrets, so SONAR_TOKEN would be empty and fail the scan.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Shallow clones disabled for a better relevancy of analysis
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Download unit coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: lcov-unit
+
+      - name: SonarQube Cloud scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
   integration-tests:
     name: Integration Tests
     needs: [lint, licenses, unit-tests]

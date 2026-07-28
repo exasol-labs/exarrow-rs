@@ -6,6 +6,7 @@
 [![Documentation](https://docs.rs/exarrow-rs/badge.svg)](https://docs.rs/exarrow-rs)
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/exasol-labs/exarrow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/exarrow-rs/actions/workflows/ci.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=exasol-labs_exarrow-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=exasol-labs_exarrow-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 ADBC-compatible driver for Exasol with Apache Arrow data format support.

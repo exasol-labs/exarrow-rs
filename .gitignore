@@ -14,6 +14,10 @@ tmp
 # Contains mutation testing data
 **/mutants.out*/
 
+# Coverage artifacts (cargo-llvm-cov)
+lcov-*.info
+*.profraw
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

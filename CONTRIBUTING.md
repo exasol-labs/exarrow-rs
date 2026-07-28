@@ -98,6 +98,7 @@ Driver manager tests (`tests/driver_manager_tests.rs`) load `target/release/libe
 - **GitHub Actions cache is immutable** — once a cache entry exists for a key based on `Cargo.lock`, it cannot be updated. The integration tests job explicitly rebuilds the release cdylib before driver manager tests to avoid stale artifacts.
 - **`cargo test` captures stdout/stderr by default.** When adding diagnostic traces for CI debugging, use `--nocapture`.
 - The integration tests job has a 30-minute timeout to prevent runaway hangs.
+- **SonarQube Cloud static analysis** runs via the `Sonar Analysis` job (config in `sonar-project.properties`), consuming the `unit-tests` job's lcov output for coverage. Its Quality Gate is intended to become a required, PR-blocking check (alongside Build/Lint/License Check/Unit Tests/Integration Tests) once rolled out. Integration-test coverage is deliberately not fed into Sonar — same FFI/`cargo-llvm-cov` atexit-hang reason as the driver manager tests above.
 
 ## Changelog
 
