@@ -137,6 +137,8 @@ jobs:
     name: Sonar Analysis
     needs: [unit-tests]
     runs-on: ubuntu-latest
+    # Fork PRs don't get repo secrets, so SONAR_TOKEN would be empty and fail the scan.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
     steps:
