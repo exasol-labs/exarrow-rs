@@ -2388,6 +2388,11 @@ impl adbc_core::Statement for FfiStatement {
 // The exported function will be named `AdbcDriverExasolInit`.
 adbc_ffi::export_driver!(AdbcDriverExasolInit, FfiDriver);
 
+/// Compatibility alias.
+///
+/// # Safety
+///
+/// `driver` must not be NULL. `error` may be NULL.
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ExarrowDriverInit(
@@ -2395,9 +2400,8 @@ pub unsafe extern "C" fn ExarrowDriverInit(
     driver: *mut std::os::raw::c_void,
     error: *mut adbc_ffi::FFI_AdbcError,
 ) -> adbc_core::error::AdbcStatusCode {
-    // Compatibility alias. AdbcDriverExasolInit is the "proper" name
-    // (note the lowercase) but initial versions exported ExarrowDriverInit
-    // instead.
+    // AdbcDriverExasolInit is the "proper" name (note the lowercase) but
+    // initial versions exported ExarrowDriverInit instead.
     AdbcDriverExasolInit(version, driver, error)
 }
 
