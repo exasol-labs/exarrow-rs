@@ -89,6 +89,13 @@ The system implements the ADBC (Arrow Database Connectivity) driver interface to
 * *AND* the driver SHALL extract the seconds fraction precision from the SECOND parameter
 * *AND* the driver SHALL NOT return an "Unknown Exasol type" error
 
+### Scenario: ADBC-compliant driver init symbol export
+
+* *GIVEN* an ADBC driver manager loads the driver's shared library
+* *WHEN* it resolves the library's init entrypoint
+* *THEN* the library SHALL export `AdbcDriverExasolInit` per the ADBC C API naming convention `AdbcDriver<Name>Init`
+* *AND* the library SHALL also export `ExarrowDriverInit` as a compatibility alias forwarding to `AdbcDriverExasolInit`
+
 ### Scenario: Boxed RecordBatchReader return type compliance
 
 * *GIVEN* the ADBC FFI driver is loaded by a driver manager
