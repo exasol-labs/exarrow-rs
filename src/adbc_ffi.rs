@@ -2400,8 +2400,8 @@ pub unsafe extern "C" fn ExarrowDriverInit(
     driver: *mut std::os::raw::c_void,
     error: *mut adbc_ffi::FFI_AdbcError,
 ) -> adbc_core::error::AdbcStatusCode {
-    // AdbcDriverExasolInit is the "proper" name (note the lowercase) but
-    // initial versions exported ExarrowDriverInit instead.
+    // `AdbcDriverExasolInit` matches the ADBC-recommended entrypoint naming convention.
+    // Initial versions exported `ExarrowDriverInit` instead.
     AdbcDriverExasolInit(version, driver, error)
 }
 
