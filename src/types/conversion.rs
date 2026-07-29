@@ -181,13 +181,19 @@ pub(crate) fn fractional_seconds_to_nanos(fraction: &str) -> i64 {
     fractional_seconds_to_units(fraction, NANOSECOND_DIGITS)
 }
 
+/// Parses the leading digits of `fraction` and scales the result to
+/// `unit_digits` places, without allocating: a shorter fraction is scaled up
+/// by the missing trailing zeros instead of being padded and re-parsed as a
+/// new string.
 fn fractional_seconds_to_units(fraction: &str, unit_digits: usize) -> i64 {
-    if fraction.len() <= unit_digits {
-        let padded = format!("{}{}", fraction, "0".repeat(unit_digits - fraction.len()));
-        padded.parse::<i64>().unwrap_or(0)
-    } else {
-        fraction[..unit_digits].parse::<i64>().unwrap_or(0)
+    if fraction.len() > unit_digits {
+        return fraction[..unit_digits].parse::<i64>().unwrap_or(0);
     }
+    let Ok(value) = fraction.parse::<i64>() else {
+        return 0;
+    };
+    let missing_digits = unit_digits - fraction.len();
+    value.saturating_mul(10i64.pow(missing_digits as u32))
 }
 
 /// Parses a decimal string to i128 with the given scale.

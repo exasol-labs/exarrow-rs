@@ -740,7 +740,7 @@ mod tests {
              FILE 'orders_export.csv.gz'\n\
              ENCODING = 'ISO-8859-1'\n\
              COLUMN SEPARATOR = '|'\n\
-             COLUMN DELIMITER = '''\n\
+             COLUMN DELIMITER = ''''\n\
              ROW SEPARATOR = 'CRLF'\n\
              NULL = '\\N'\n\
              WITH COLUMN NAMES\n\

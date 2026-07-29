@@ -158,8 +158,17 @@ mod tests {
     }
 
     /// Builds a `DigitallySignedStruct` from its TLS wire encoding, because its
-    /// constructor is crate-private in rustls: a `SignatureScheme` as a
-    /// big-endian `u16`, then the signature as a `u16`-length-prefixed payload.
+    /// constructor is crate-private in rustls and there is no public one: a
+    /// `SignatureScheme` as a big-endian `u16`, then the signature as a
+    /// `u16`-length-prefixed payload.
+    ///
+    /// `rustls::internal` is documented by rustls itself as "used in
+    /// integration tests... DOES NOT form part of the stable interface", so a
+    /// rustls upgrade (even a patch release) can break this function. If it
+    /// does, delete this function and the two `verify_tls1{2,3}_signature`
+    /// assertions in `assert_shared_verifier_members_are_permissive` below —
+    /// keep its `supported_verify_schemes` assertion, which needs no internal
+    /// API and does not depend on this helper.
     fn digitally_signed_struct() -> rustls::DigitallySignedStruct {
         const RSA_PKCS1_SHA256: [u8; 2] = [0x04, 0x01];
         let signature: &[u8] = b"not-a-real-signature";
