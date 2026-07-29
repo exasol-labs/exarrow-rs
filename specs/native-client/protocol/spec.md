@@ -94,3 +94,16 @@ The native TCP protocol connects to the same Exasol port (8563) as the WebSocket
 * *WHEN* setting session attributes (e.g., autocommit, current schema)
 * *THEN* the system SHALL send `CMD_SET_ATTRIBUTES` (35) with the attribute key-value pairs encoded in binary format
 * *AND* the system SHALL validate the server response
+
+### Scenario: Malformed handshake and attribute input is rejected without panicking
+
+* *GIVEN* the native protocol decodes server-supplied handshake bytes and binary attribute payloads
+* *WHEN* the server supplies an empty random phrase
+* *THEN* password encoding MUST return a `TransportError` that names the empty phrase
+* *AND* password encoding MUST NOT panic with a remainder-by-zero division
+* *WHEN* the server supplies a raw RSA public key shorter than 4 bytes or of odd length
+* *THEN* key parsing MUST return a `TransportError`
+* *WHEN* the server supplies a PKCS#1 DER key with a wrong tag, a truncated length field, or trailing bytes
+* *THEN* key parsing MUST return a `TransportError` that describes the defect
+* *WHEN* the server supplies an attribute payload truncated before its declared length
+* *THEN* attribute parsing MUST return a `TransportError` that names the required and the available byte counts
