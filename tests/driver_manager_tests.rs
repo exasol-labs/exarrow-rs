@@ -110,6 +110,195 @@ macro_rules! skip_if_no_library {
     };
 }
 
+// Test fixtures
+
+/// Run a statement for its side effect only, failing the test if it does not
+/// succeed.
+fn execute_ddl<C: AdbcConnection>(conn: &mut C, sql: String) {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(&sql)
+        .unwrap_or_else(|e| panic!("Failed to set query {:?}: {:?}", sql, e));
+    stmt.execute_update()
+        .unwrap_or_else(|e| panic!("Failed to execute {:?}: {:?}", sql, e));
+}
+
+/// Create a schema holding one `TEST_TABLE (ID INT, NAME VARCHAR(100))`.
+fn create_schema_with_test_table<C: AdbcConnection>(conn: &mut C, schema_name: &str) {
+    execute_ddl(conn, format!("CREATE SCHEMA {}", schema_name));
+    execute_ddl(
+        conn,
+        format!(
+            "CREATE TABLE {}.TEST_TABLE (ID INT, NAME VARCHAR(100))",
+            schema_name
+        ),
+    );
+}
+
+/// Drop a test schema.
+///
+/// Failure is deliberately ignored so a cleanup problem never masks the
+/// assertion failure that actually matters.
+fn drop_test_schema<C: AdbcConnection>(conn: &mut C, schema_name: &str) {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
+        .unwrap();
+    let _ = stmt.execute_update();
+}
+
+// Column readers
+
+/// Read a whole-number column as `i64`, whichever numeric Arrow type Exasol
+/// chose to report it as.
+fn integers_in(column: &dyn Array) -> Vec<i64> {
+    if let Some(values) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal128Array>()
+    {
+        return (0..values.len()).map(|i| values.value(i) as i64).collect();
+    }
+    if let Some(values) = column.as_any().downcast_ref::<Int32Array>() {
+        return (0..values.len()).map(|i| values.value(i) as i64).collect();
+    }
+    if let Some(values) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
+        return (0..values.len()).map(|i| values.value(i)).collect();
+    }
+    Vec::new()
+}
+
+/// Read the non-null values of a text column, or nothing when it is not text.
+fn strings_in(column: &dyn Array) -> Vec<String> {
+    let Some(values) = column.as_any().downcast_ref::<StringArray>() else {
+        return Vec::new();
+    };
+    (0..values.len())
+        .filter(|i| !values.is_null(*i))
+        .map(|i| values.value(i).to_string())
+        .collect()
+}
+
+// GetObjects result navigation
+//
+// The GetObjects result is a single catalog row wrapping a list of schemas, each
+// wrapping a list of tables, each wrapping a list of columns. These helpers
+// flatten one level each, so a test states what it expects to find rather than
+// restating the walk.
+
+fn as_structs(array: &dyn Array, what: &str) -> StructArray {
+    array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap_or_else(|| panic!("{} should be a StructArray", what))
+        .clone()
+}
+
+fn list_field_of(entries: &StructArray, name: &str) -> ListArray {
+    entries
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("struct should have {}", name))
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap_or_else(|| panic!("{} should be a ListArray", name))
+        .clone()
+}
+
+fn text_field_of(entries: &StructArray, name: &str) -> Vec<String> {
+    let values = entries
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("struct should have {}", name));
+    strings_in(values.as_ref())
+}
+
+/// The `catalog_db_schemas` list of one `GetObjects` batch.
+fn schemas_list_of(batch: &RecordBatch) -> ListArray {
+    batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("catalog_db_schemas should be ListArray")
+        .clone()
+}
+
+/// Every schema entry group across every row and batch of a `GetObjects` result,
+/// skipping rows whose schema list is null.
+fn schema_entries<R: RecordBatchReader>(reader: R) -> Vec<StructArray> {
+    let mut entries = Vec::new();
+    for batch_result in reader {
+        let batch: RecordBatch = batch_result.expect("Failed to read batch");
+        let schemas = schemas_list_of(&batch);
+        for row in 0..batch.num_rows() {
+            if !schemas.is_null(row) {
+                entries.push(as_structs(schemas.value(row).as_ref(), "schema entries"));
+            }
+        }
+    }
+    entries
+}
+
+/// The `db_schema_name` of every schema entry.
+fn schema_names_of(entries: &[StructArray]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|group| text_field_of(group, "db_schema_name"))
+        .collect()
+}
+
+/// Whether every schema entry leaves its nested table list null, which is what
+/// schema depth must report.
+fn every_table_list_is_null(entries: &[StructArray]) -> bool {
+    entries.iter().all(|group| {
+        let tables = list_field_of(group, "db_schema_tables");
+        (0..group.len()).all(|row| tables.is_null(row))
+    })
+}
+
+/// Every table entry group nested under `entries`.
+fn table_entries_of(entries: &[StructArray]) -> Vec<StructArray> {
+    let mut tables = Vec::new();
+    for group in entries {
+        let list = list_field_of(group, "db_schema_tables");
+        for row in 0..group.len() {
+            if !list.is_null(row) {
+                tables.push(as_structs(list.value(row).as_ref(), "table entries"));
+            }
+        }
+    }
+    tables
+}
+
+/// The `(table_name, table_type)` of every table entry.
+fn tables_of(entries: &[StructArray]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .flat_map(|group| {
+            let names = text_field_of(group, "table_name");
+            let types = text_field_of(group, "table_type");
+            names.into_iter().zip(types)
+        })
+        .collect()
+}
+
+/// Every column entry group nested under the given table entries.
+fn column_entries_of(tables: &[StructArray]) -> Vec<StructArray> {
+    let mut columns = Vec::new();
+    for group in tables {
+        let list = list_field_of(group, "table_columns");
+        for row in 0..group.len() {
+            if !list.is_null(row) {
+                columns.push(as_structs(list.value(row).as_ref(), "column entries"));
+            }
+        }
+    }
+    columns
+}
+
+/// The `column_name` of every column entry.
+fn column_names_of(entries: &[StructArray]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|group| text_field_of(group, "column_name"))
+        .collect()
+}
+
 // Section 10.2 & 10.3: Driver Loading Tests
 
 /// Test that the driver can be loaded via the driver manager.
@@ -1621,511 +1810,233 @@ macro_rules! setup_driver_manager_conn {
     };
 }
 
-/// Combined test for get_objects at all depth levels via driver manager.
-///
-/// Creates a dedicated test schema with a table so that the test does not
-/// depend on system schemas (which may not appear in EXA_ALL_SCHEMAS on a
-/// fresh CI container).
+// GetObjects Tests
+//
+// Each test creates its own schema holding one table, so it does not depend on
+// system schemas (which may not appear in EXA_ALL_SCHEMAS on a fresh CI
+// container) and does not collide with the other tests running alongside it.
+
+/// At catalog depth the result is the single `EXA` catalog with its schema list
+/// left null, so a consumer can tell "not requested" from "none exist".
 #[test]
-fn test_driver_manager_get_objects() {
+fn test_get_objects_at_catalog_depth_reports_only_the_exa_catalog() {
     skip_if_no_library!();
     skip_if_no_exasol!();
 
     setup_driver_manager_conn!(_driver, _db, conn);
 
-    let schema_name = generate_unique_test_name("TEST_GET_OBJECTS");
-
-    // Create test schema and table
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
-            .unwrap();
-        stmt.execute_update().unwrap();
-    }
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!(
-            "CREATE TABLE {}.TEST_TABLE (ID INT, NAME VARCHAR(100))",
-            schema_name
-        ))
-        .unwrap();
-        stmt.execute_update().unwrap();
-    }
-
-    // --- Test Catalogs depth ---
-    {
-        let mut reader = conn
-            .get_objects(ObjectDepth::Catalogs, None, None, None, None, None)
-            .expect("get_objects(Catalogs) should succeed");
-
-        let mut total_rows = 0;
-        let mut catalog_names = Vec::new();
-        let mut schemas_all_null = true;
-
-        for batch_result in reader.by_ref() {
-            let batch: RecordBatch = batch_result.expect("Failed to read batch");
-            total_rows += batch.num_rows();
-
-            let catalog_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("catalog_name should be StringArray");
-
-            for i in 0..catalog_col.len() {
-                if !catalog_col.is_null(i) {
-                    catalog_names.push(catalog_col.value(i).to_string());
-                }
-            }
-
-            let schemas_col = batch.column(1);
-            for i in 0..batch.num_rows() {
-                if !schemas_col.is_null(i) {
-                    schemas_all_null = false;
-                }
-            }
-        }
-
-        assert_eq!(total_rows, 1, "Should return exactly 1 catalog row");
-        assert_eq!(catalog_names, vec!["EXA"], "Catalog name should be 'EXA'");
-        assert!(
-            schemas_all_null,
-            "catalog_db_schemas should be null at Catalogs depth"
-        );
-    }
-
-    // --- Test Schemas depth ---
-    {
-        let mut reader = conn
-            .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
-            .expect("get_objects(Schemas) should succeed");
-
-        let mut found_catalog = false;
-        let mut schema_names = Vec::new();
-
-        for batch_result in reader.by_ref() {
-            let batch: RecordBatch = batch_result.expect("Failed to read batch");
-
-            let catalog_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("catalog_name should be StringArray");
-
-            let schemas_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("catalog_db_schemas should be ListArray");
-
-            for i in 0..batch.num_rows() {
-                if !catalog_col.is_null(i) && catalog_col.value(i) == "EXA" {
-                    found_catalog = true;
-
-                    let schema_list = schemas_col.value(i);
-                    let schema_structs = schema_list
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .expect("Schema list values should be StructArray");
-
-                    let name_col = schema_structs
-                        .column_by_name("db_schema_name")
-                        .expect("Schema struct should have db_schema_name")
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("db_schema_name should be StringArray");
-
-                    for j in 0..schema_structs.len() {
-                        if !name_col.is_null(j) {
-                            schema_names.push(name_col.value(j).to_string());
-                        }
-
-                        if let Some(tables_col) = schema_structs.column_by_name("db_schema_tables")
-                        {
-                            assert!(
-                                tables_col.is_null(j),
-                                "db_schema_tables should be null at Schemas depth"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        assert!(found_catalog, "Should find catalog 'EXA'");
-        assert!(
-            !schema_names.is_empty(),
-            "Should return at least one schema"
-        );
-        assert!(
-            schema_names.contains(&schema_name),
-            "Should contain test schema '{}', got: {:?}",
-            schema_name,
-            schema_names
-        );
-    }
-
-    // --- Test Tables depth ---
-    {
-        let mut reader = conn
-            .get_objects(
-                ObjectDepth::Tables,
-                None,
-                Some(schema_name.as_str()),
-                None,
-                None,
-                None,
-            )
-            .expect("get_objects(Tables) should succeed");
-
-        let mut table_names = Vec::new();
-        let mut table_types = Vec::new();
-
-        for batch_result in reader.by_ref() {
-            let batch: RecordBatch = batch_result.expect("Failed to read batch");
-
-            let schemas_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("catalog_db_schemas should be ListArray");
-
-            for i in 0..batch.num_rows() {
-                if schemas_col.is_null(i) {
-                    continue;
-                }
-
-                let schema_list = schemas_col.value(i);
-                let schema_structs = schema_list
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("Schema list values should be StructArray");
-
-                let tables_list_col = schema_structs
-                    .column_by_name("db_schema_tables")
-                    .expect("Schema struct should have db_schema_tables");
-
-                let tables_list = tables_list_col
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .expect("db_schema_tables should be ListArray");
-
-                for j in 0..schema_structs.len() {
-                    if tables_list.is_null(j) {
-                        continue;
-                    }
-
-                    let table_array = tables_list.value(j);
-                    let table_structs = table_array
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .expect("Table list values should be StructArray");
-
-                    let name_col = table_structs
-                        .column_by_name("table_name")
-                        .expect("Table struct should have table_name")
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("table_name should be StringArray");
-
-                    let type_col = table_structs
-                        .column_by_name("table_type")
-                        .expect("Table struct should have table_type")
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("table_type should be StringArray");
-
-                    for k in 0..table_structs.len() {
-                        if !name_col.is_null(k) {
-                            table_names.push(name_col.value(k).to_string());
-                        }
-                        if !type_col.is_null(k) {
-                            let tt = type_col.value(k).to_string();
-                            if !table_types.contains(&tt) {
-                                table_types.push(tt);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        assert!(
-            table_names.contains(&"TEST_TABLE".to_string()),
-            "Should find TEST_TABLE, got: {:?}",
-            table_names
-        );
-        assert!(
-            table_types.contains(&"TABLE".to_string()),
-            "Should have TABLE type, got: {:?}",
-            table_types
-        );
-    }
-
-    // --- Test All depth ---
-    {
-        let mut reader = conn
-            .get_objects(
-                ObjectDepth::All,
-                None,
-                Some(schema_name.as_str()),
-                None,
-                None,
-                None,
-            )
-            .expect("get_objects(All) should succeed");
-
-        let mut found_columns = false;
-        let mut column_names = Vec::new();
-
-        for batch_result in reader.by_ref() {
-            let batch: RecordBatch = batch_result.expect("Failed to read batch");
-
-            let schemas_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("catalog_db_schemas should be ListArray");
-
-            for i in 0..batch.num_rows() {
-                if schemas_col.is_null(i) {
-                    continue;
-                }
-
-                let schema_list = schemas_col.value(i);
-                let schema_structs = schema_list
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("Schema list values should be StructArray");
-
-                let tables_list_col = schema_structs
-                    .column_by_name("db_schema_tables")
-                    .expect("Schema struct should have db_schema_tables");
-
-                let tables_list = tables_list_col
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .expect("db_schema_tables should be ListArray");
-
-                for j in 0..schema_structs.len() {
-                    if tables_list.is_null(j) {
-                        continue;
-                    }
-
-                    let table_array = tables_list.value(j);
-                    let table_structs = table_array
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .expect("Table list values should be StructArray");
-
-                    let columns_list_col = table_structs
-                        .column_by_name("table_columns")
-                        .expect("Table struct should have table_columns");
-
-                    let columns_list = columns_list_col
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .expect("table_columns should be ListArray");
-
-                    for k in 0..table_structs.len() {
-                        if columns_list.is_null(k) {
-                            continue;
-                        }
-
-                        let col_array = columns_list.value(k);
-                        let col_structs = col_array
-                            .as_any()
-                            .downcast_ref::<StructArray>()
-                            .expect("Column list values should be StructArray");
-
-                        if col_structs.len() > 0 {
-                            found_columns = true;
-
-                            let col_name = col_structs
-                                .column_by_name("column_name")
-                                .expect("Column struct should have column_name")
-                                .as_any()
-                                .downcast_ref::<StringArray>()
-                                .expect("column_name should be StringArray");
-
-                            for idx in 0..col_name.len() {
-                                if !col_name.is_null(idx) {
-                                    column_names.push(col_name.value(idx).to_string());
-                                }
-                            }
-
-                            let ordinal = col_structs
-                                .column_by_name("ordinal_position")
-                                .expect("Column struct should have ordinal_position");
-                            assert!(!ordinal.is_empty(), "ordinal_position should not be empty");
-                        }
-                    }
-                }
-            }
-        }
-
-        assert!(
-            found_columns,
-            "Should find columns at All depth for test schema"
-        );
-        assert!(
-            column_names.contains(&"ID".to_string()),
-            "Should find column ID, got: {:?}",
-            column_names
-        );
-        assert!(
-            column_names.contains(&"NAME".to_string()),
-            "Should find column NAME, got: {:?}",
-            column_names
-        );
-    }
-
-    // --- Test schema filter ---
-    {
-        let mut reader = conn
-            .get_objects(
-                ObjectDepth::Schemas,
-                None,
-                Some(schema_name.as_str()),
-                None,
-                None,
-                None,
-            )
-            .expect("get_objects with schema filter should succeed");
-
-        let mut schema_names = Vec::new();
-
-        for batch_result in reader.by_ref() {
-            let batch: RecordBatch = batch_result.expect("Failed to read batch");
-
-            let schemas_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("catalog_db_schemas should be ListArray");
-
-            for i in 0..batch.num_rows() {
-                if schemas_col.is_null(i) {
-                    continue;
-                }
-
-                let schema_list = schemas_col.value(i);
-                let schema_structs = schema_list
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("Schema list values should be StructArray");
-
-                let name_col = schema_structs
-                    .column_by_name("db_schema_name")
-                    .expect("Schema struct should have db_schema_name")
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("db_schema_name should be StringArray");
-
-                for j in 0..schema_structs.len() {
-                    if !name_col.is_null(j) {
-                        schema_names.push(name_col.value(j).to_string());
-                    }
-                }
-            }
-        }
-
-        assert!(
-            !schema_names.is_empty(),
-            "Should return at least one schema matching filter"
-        );
-
-        for name in &schema_names {
-            assert_eq!(
-                name, &schema_name,
-                "All returned schemas should match the filter '{}', got: {}",
-                schema_name, name
-            );
-        }
-    }
-
-    // --- Test table_type filter (VIEW only) ---
-    {
-        let mut reader = conn
-            .get_objects(
-                ObjectDepth::Tables,
-                None,
-                Some(schema_name.as_str()),
-                None,
-                Some(vec!["VIEW"]),
-                None,
-            )
-            .expect("get_objects with table_type filter should succeed");
-
-        for batch_result in reader.by_ref() {
-            let batch: RecordBatch = batch_result.expect("Failed to read batch");
-
-            let schemas_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .expect("catalog_db_schemas should be ListArray");
-
-            for i in 0..batch.num_rows() {
-                if schemas_col.is_null(i) {
-                    continue;
-                }
-
-                let schema_list = schemas_col.value(i);
-                let schema_structs = schema_list
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .expect("Schema list values should be StructArray");
-
-                let tables_list_col = schema_structs
-                    .column_by_name("db_schema_tables")
-                    .expect("Schema struct should have db_schema_tables");
-
-                let tables_list = tables_list_col
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .expect("db_schema_tables should be ListArray");
-
-                for j in 0..schema_structs.len() {
-                    if tables_list.is_null(j) {
-                        continue;
-                    }
-
-                    let table_array = tables_list.value(j);
-                    let table_structs = table_array
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .expect("Table list values should be StructArray");
-
-                    let type_col = table_structs
-                        .column_by_name("table_type")
-                        .expect("Table struct should have table_type")
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("table_type should be StringArray");
-
-                    for k in 0..table_structs.len() {
-                        if !type_col.is_null(k) {
-                            let tt = type_col.value(k).to_string();
-                            assert_eq!(
-                                tt, "VIEW",
-                                "All returned tables should be VIEW when filtered, got: {}",
-                                tt
-                            );
-                        }
-                    }
-                }
+    let reader = conn
+        .get_objects(ObjectDepth::Catalogs, None, None, None, None, None)
+        .expect("get_objects(Catalogs) should succeed");
+
+    let mut total_rows = 0;
+    let mut catalog_names = Vec::new();
+    let mut schemas_all_null = true;
+
+    for batch_result in reader {
+        let batch: RecordBatch = batch_result.expect("Failed to read batch");
+        total_rows += batch.num_rows();
+        catalog_names.extend(strings_in(batch.column(0).as_ref()));
+
+        let schemas = batch.column(1);
+        for row in 0..batch.num_rows() {
+            if !schemas.is_null(row) {
+                schemas_all_null = false;
             }
         }
     }
 
-    // Cleanup: drop test schema
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
-            .unwrap();
-        let _ = stmt.execute_update();
+    assert_eq!(total_rows, 1, "Should return exactly 1 catalog row");
+    assert_eq!(catalog_names, vec!["EXA"], "Catalog name should be 'EXA'");
+    assert!(
+        schemas_all_null,
+        "catalog_db_schemas should be null at Catalogs depth"
+    );
+}
+
+/// At schema depth every schema is listed but each one's table list stays null.
+#[test]
+fn test_get_objects_at_schema_depth_lists_schemas_without_tables() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_GET_OBJ_SCHEMAS");
+    create_schema_with_test_table(&mut conn, &schema_name);
+
+    let reader = conn
+        .get_objects(ObjectDepth::Schemas, None, None, None, None, None)
+        .expect("get_objects(Schemas) should succeed");
+    let entries = schema_entries(reader);
+    let names = schema_names_of(&entries);
+
+    assert!(
+        !entries.is_empty(),
+        "Should find catalog 'EXA' with schemas"
+    );
+    assert!(
+        names.contains(&schema_name),
+        "Should contain test schema '{}', got: {:?}",
+        schema_name,
+        names
+    );
+    assert!(
+        every_table_list_is_null(&entries),
+        "db_schema_tables should be null at Schemas depth"
+    );
+
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// At table depth the schema's tables are listed with their object type.
+#[test]
+fn test_get_objects_at_table_depth_lists_the_tables_of_the_schema() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_GET_OBJ_TABLES");
+    create_schema_with_test_table(&mut conn, &schema_name);
+
+    let reader = conn
+        .get_objects(
+            ObjectDepth::Tables,
+            None,
+            Some(schema_name.as_str()),
+            None,
+            None,
+            None,
+        )
+        .expect("get_objects(Tables) should succeed");
+    let tables = tables_of(&table_entries_of(&schema_entries(reader)));
+
+    assert!(
+        tables.contains(&("TEST_TABLE".to_string(), "TABLE".to_string())),
+        "Should find TEST_TABLE as a TABLE, got: {:?}",
+        tables
+    );
+
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// At full depth every column of every table is listed, with its ordinal.
+#[test]
+fn test_get_objects_at_full_depth_lists_the_columns_of_the_table() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_GET_OBJ_ALL");
+    create_schema_with_test_table(&mut conn, &schema_name);
+
+    let reader = conn
+        .get_objects(
+            ObjectDepth::All,
+            None,
+            Some(schema_name.as_str()),
+            None,
+            None,
+            None,
+        )
+        .expect("get_objects(All) should succeed");
+    let column_entries = column_entries_of(&table_entries_of(&schema_entries(reader)));
+
+    assert!(
+        !column_entries.is_empty(),
+        "Should find columns at All depth for test schema"
+    );
+
+    let names = column_names_of(&column_entries);
+    assert!(
+        names.contains(&"ID".to_string()),
+        "Should find column ID, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"NAME".to_string()),
+        "Should find column NAME, got: {:?}",
+        names
+    );
+
+    for group in &column_entries {
+        let ordinals = group
+            .column_by_name("ordinal_position")
+            .expect("Column struct should have ordinal_position");
+        assert!(!ordinals.is_empty(), "ordinal_position should not be empty");
     }
+
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// A schema filter narrows the result to exactly the named schema.
+#[test]
+fn test_get_objects_honors_the_schema_filter() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_GET_OBJ_FILTER");
+    create_schema_with_test_table(&mut conn, &schema_name);
+
+    let reader = conn
+        .get_objects(
+            ObjectDepth::Schemas,
+            None,
+            Some(schema_name.as_str()),
+            None,
+            None,
+            None,
+        )
+        .expect("get_objects with schema filter should succeed");
+    let names = schema_names_of(&schema_entries(reader));
+
+    assert!(
+        !names.is_empty(),
+        "Should return at least one schema matching filter"
+    );
+    for name in &names {
+        assert_eq!(
+            name, &schema_name,
+            "All returned schemas should match the filter '{}', got: {}",
+            schema_name, name
+        );
+    }
+
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// A `table_type` filter excludes objects of every other type. The test schema
+/// holds only a table, so filtering for views must return no table at all.
+#[test]
+fn test_get_objects_honors_the_table_type_filter() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_GET_OBJ_TYPE");
+    create_schema_with_test_table(&mut conn, &schema_name);
+
+    let reader = conn
+        .get_objects(
+            ObjectDepth::Tables,
+            None,
+            Some(schema_name.as_str()),
+            None,
+            Some(vec!["VIEW"]),
+            None,
+        )
+        .expect("get_objects with table_type filter should succeed");
+    let tables = tables_of(&table_entries_of(&schema_entries(reader)));
+
+    for (name, table_type) in &tables {
+        assert_eq!(
+            table_type, "VIEW",
+            "All returned tables should be VIEW when filtered, got {} for {}",
+            table_type, name
+        );
+    }
+
+    drop_test_schema(&mut conn, &schema_name);
 }
 
 #[test]
@@ -2402,24 +2313,16 @@ fn test_bind_execute_update() {
 
     let schema_name = generate_unique_test_name("TEST_BIND_EXEC_UPD");
 
-    // Create schema and table
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!("CREATE SCHEMA {}", schema_name))
-            .unwrap();
-        stmt.execute_update().unwrap();
-    }
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!(
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {}", schema_name));
+    execute_ddl(
+        &mut conn,
+        format!(
             "CREATE TABLE {}.BIND_TABLE (id INTEGER, name VARCHAR(100))",
             schema_name
-        ))
-        .unwrap();
-        stmt.execute_update().unwrap();
-    }
+        ),
+    );
 
-    // Prepare INSERT, bind a RecordBatch, and execute_update
+    // Prepare INSERT, bind a three-row RecordBatch, and execute_update.
     {
         let mut stmt = conn.new_statement().expect("Failed to create statement");
         stmt.set_sql_query(format!(
@@ -2428,20 +2331,8 @@ fn test_bind_execute_update() {
         ))
         .unwrap();
         stmt.prepare().unwrap();
+        stmt.bind(bind_table_batch()).unwrap();
 
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("name", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![10, 20, 30])),
-                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
-            ],
-        )
-        .unwrap();
-
-        stmt.bind(batch).unwrap();
         let result = stmt.execute_update();
         assert!(
             result.is_ok(),
@@ -2450,66 +2341,49 @@ fn test_bind_execute_update() {
         );
     }
 
-    // Verify inserted rows
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!(
-            "SELECT id, name FROM {}.BIND_TABLE ORDER BY id",
-            schema_name
-        ))
-        .unwrap();
-        let mut reader = stmt.execute().unwrap();
+    let (ids, names) = read_bind_table(&mut conn, &schema_name);
+    assert_eq!(ids, vec![10, 20, 30], "IDs should match inserted values");
+    assert_eq!(
+        names,
+        vec!["alpha", "beta", "gamma"],
+        "Names should match inserted values"
+    );
 
-        let mut all_ids = Vec::new();
-        let mut all_names = Vec::new();
-        for batch_result in reader.by_ref() {
-            let batch = batch_result.expect("Failed to read batch");
-            let id_col = batch.column(0);
-            let name_col = batch.column(1);
+    drop_test_schema(&mut conn, &schema_name);
+}
 
-            if let Some(arr) = id_col
-                .as_any()
-                .downcast_ref::<arrow::array::Decimal128Array>()
-            {
-                for i in 0..arr.len() {
-                    all_ids.push(arr.value(i) as i64);
-                }
-            } else if let Some(arr) = id_col.as_any().downcast_ref::<Int32Array>() {
-                for i in 0..arr.len() {
-                    all_ids.push(arr.value(i) as i64);
-                }
-            } else if let Some(arr) = id_col.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                for i in 0..arr.len() {
-                    all_ids.push(arr.value(i));
-                }
-            }
+/// The three rows bound as parameters by the bind/execute tests.
+fn bind_table_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap()
+}
 
-            if let Some(arr) = name_col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    all_names.push(arr.value(i).to_string());
-                }
-            }
-        }
+/// Read `BIND_TABLE` back as its ids and names, ordered by id.
+fn read_bind_table<C: AdbcConnection>(conn: &mut C, schema_name: &str) -> (Vec<i64>, Vec<String>) {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!(
+        "SELECT id, name FROM {}.BIND_TABLE ORDER BY id",
+        schema_name
+    ))
+    .unwrap();
 
-        assert_eq!(
-            all_ids,
-            vec![10, 20, 30],
-            "IDs should match inserted values"
-        );
-        assert_eq!(
-            all_names,
-            vec!["alpha", "beta", "gamma"],
-            "Names should match inserted values"
-        );
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    for batch_result in stmt.execute().unwrap() {
+        let batch = batch_result.expect("Failed to read batch");
+        ids.extend(integers_in(batch.column(0).as_ref()));
+        names.extend(strings_in(batch.column(1).as_ref()));
     }
-
-    // Cleanup
-    {
-        let mut stmt = conn.new_statement().expect("Failed to create statement");
-        stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
-            .unwrap();
-        let _ = stmt.execute_update();
-    }
+    (ids, names)
 }
 
 #[test]

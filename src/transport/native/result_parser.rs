@@ -1,6 +1,24 @@
+use std::sync::Arc;
+
+use arrow::array::{
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder,
+    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+
 use crate::error::TransportError;
 
-use super::constants::*;
+use super::constants::{
+    IS_VARCHAR, PARAMETER_DESCRIPTION, R_COLUMN_COUNT, R_EMPTY, R_EXCEPTION, R_HANDLE, R_MORE_ROWS,
+    R_RESULT_SET, R_ROW_COUNT, R_STILL_EXECUTING, R_WARNING, T_BIGDECIMAL, T_BINARY, T_BOOLEAN,
+    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTEGER, T_INTERVAL_DAY,
+    T_INTERVAL_YEAR, T_REAL, T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ,
+    T_TIMESTAMP_UTC,
+};
+
+/// One decoded column: the Arrow field describing it and the array holding its values.
+type BuiltColumn = (Field, ArrayRef);
 
 /// Parsed column metadata from a native protocol result set.
 #[derive(Debug, Clone)]
@@ -520,18 +538,12 @@ fn build_batch_from_wire(
     offset: &mut usize,
     column_metas: &[NativeColumnMeta],
     num_rows: usize,
-) -> Result<arrow::record_batch::RecordBatch, TransportError> {
-    use std::sync::Arc;
-
-    use arrow::array::ArrayRef;
-    use arrow::datatypes::Schema;
-
+) -> Result<RecordBatch, TransportError> {
     if column_metas.is_empty() {
-        let schema = Arc::new(Schema::empty());
-        return arrow::record_batch::RecordBatch::try_new_with_options(
-            schema,
+        return RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
             vec![],
-            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(num_rows)),
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
         )
         .map_err(|e| {
             TransportError::ProtocolError(format!("Failed to create empty RecordBatch: {}", e))
@@ -547,8 +559,7 @@ fn build_batch_from_wire(
         arrays.push(array);
     }
 
-    let schema = Arc::new(Schema::new(fields));
-    arrow::record_batch::RecordBatch::try_new(schema, arrays)
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|e| TransportError::ProtocolError(format!("Failed to create RecordBatch: {}", e)))
 }
 
@@ -564,207 +575,317 @@ fn decimal_precision_scale(meta: &NativeColumnMeta, default_precision: i32) -> (
 }
 
 /// Parse one column worth of wire bytes directly into an Arrow array.
+///
+/// Types with no binary wire representation of their own — CHAR, GEOMETRY, HASHTYPE,
+/// both INTERVAL kinds, and any type id this driver does not recognise — decode as
+/// length-prefixed UTF-8 strings.
 fn fill_column_builder(
     data: &[u8],
     offset: &mut usize,
     meta: &NativeColumnMeta,
     num_rows: usize,
-) -> Result<
-    (
-        arrow::datatypes::Field,
-        std::sync::Arc<dyn arrow::array::Array>,
-    ),
-    TransportError,
-> {
-    use std::sync::Arc;
-
-    use arrow::array::{
-        BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder,
-        Int32Builder, Int64Builder, TimestampMicrosecondBuilder,
-    };
-    use arrow::datatypes::{DataType as ArrowDataType, Field, TimeUnit};
-
+) -> Result<BuiltColumn, TransportError> {
     match meta.type_id {
-        T_DOUBLE => {
-            let mut b = Float64Builder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_f64(data, offset)?);
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Float64, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_REAL => {
-            let mut b = Float64Builder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_f32(data, offset)? as f64);
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Float64, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_INTEGER => {
-            let mut b = Int64Builder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_i64(data, offset)?);
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Int64, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_SMALLINT => {
-            let mut b = Int32Builder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_i32(data, offset)?);
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Int32, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_BOOLEAN => {
-            let mut b = BooleanBuilder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_u8(data, offset)? != 0);
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Boolean, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_BINARY => {
-            let mut b = BinaryBuilder::with_capacity(num_rows, num_rows * 16);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    let len = read_i32(data, offset)? as usize;
-                    if *offset + len > data.len() {
-                        return Err(TransportError::ProtocolError(
-                            "Binary data truncated".into(),
-                        ));
-                    }
-                    b.append_value(&data[*offset..*offset + len]);
-                    *offset += len;
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Binary, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_SMALLDECIMAL => {
-            let (precision, scale) = decimal_precision_scale(meta, 9);
-            let dt = ArrowDataType::Decimal128(precision, scale);
-            let mut b = Decimal128Builder::with_capacity(num_rows).with_data_type(dt.clone());
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_i32(data, offset)? as i128);
-                }
-            }
-            let field = Field::new(&meta.name, dt, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_DECIMAL => {
-            let (precision, scale) = decimal_precision_scale(meta, 18);
-            let dt = ArrowDataType::Decimal128(precision, scale);
-            let mut b = Decimal128Builder::with_capacity(num_rows).with_data_type(dt.clone());
-            let use_i32 = meta.precision.unwrap_or(18) <= 9;
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else if use_i32 {
-                    b.append_value(read_i32(data, offset)? as i128);
-                } else {
-                    b.append_value(read_i64(data, offset)? as i128);
-                }
-            }
-            let field = Field::new(&meta.name, dt, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_BIGDECIMAL => {
-            let (precision, scale) = decimal_precision_scale(meta, 36);
-            let dt = ArrowDataType::Decimal128(precision, scale);
-            let mut b = Decimal128Builder::with_capacity(num_rows).with_data_type(dt.clone());
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    b.append_value(read_i128(data, offset)?);
-                }
-            }
-            let field = Field::new(&meta.name, dt, true);
-            Ok((field, Arc::new(b.finish())))
-        }
-        T_DATE => {
-            let mut b = Date32Builder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    let packed = read_i32(data, offset)?;
-                    let year = packed >> 16;
-                    let month = ((packed >> 8) & 0xFF) as u32;
-                    let day = (packed & 0xFF) as u32;
-                    b.append_value(crate::types::conversion::ymd_to_days(year, month, day));
-                }
-            }
-            let field = Field::new(&meta.name, ArrowDataType::Date32, true);
-            Ok((field, Arc::new(b.finish())))
-        }
+        T_DOUBLE => fill_double_column(data, offset, &meta.name, num_rows),
+        T_REAL => fill_real_column(data, offset, &meta.name, num_rows),
+        T_INTEGER => fill_integer_column(data, offset, &meta.name, num_rows),
+        T_SMALLINT => fill_smallint_column(data, offset, &meta.name, num_rows),
+        T_BOOLEAN => fill_boolean_column(data, offset, &meta.name, num_rows),
+        T_BINARY => fill_binary_column(data, offset, &meta.name, num_rows),
+        T_SMALLDECIMAL => fill_smalldecimal_column(data, offset, meta, num_rows),
+        T_DECIMAL => fill_decimal_column(data, offset, meta, num_rows),
+        T_BIGDECIMAL => fill_bigdecimal_column(data, offset, meta, num_rows),
+        T_DATE => fill_date_column(data, offset, &meta.name, num_rows),
         T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC => {
-            let mut b = TimestampMicrosecondBuilder::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                if read_u8(data, offset)? == 0 {
-                    b.append_null();
-                } else {
-                    let year = read_i16(data, offset)? as i32;
-                    let month = read_u8(data, offset)? as u32;
-                    let day = read_u8(data, offset)? as u32;
-                    let hour = read_u8(data, offset)? as u64;
-                    let minute = read_u8(data, offset)? as u64;
-                    let second = read_u8(data, offset)? as u64;
-                    let nanos = read_i32(data, offset)?;
-                    b.append_value(crate::types::conversion::ymd_hms_nanos_to_micros(
-                        year, month, day, hour, minute, second, nanos,
-                    ));
-                }
-            }
-            let finished = b.finish();
-            let (data_type, array): (ArrowDataType, std::sync::Arc<dyn arrow::array::Array>) =
-                if meta.type_id == T_TIMESTAMP_UTC {
-                    let with_tz = finished.with_timezone("UTC");
-                    (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                        Arc::new(with_tz),
-                    )
-                } else {
-                    (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                        Arc::new(finished),
-                    )
-                };
-            let field = Field::new(&meta.name, data_type, true);
-            Ok((field, array))
-        }
-        T_CHAR | T_GEOMETRY | T_HASHTYPE | T_INTERVAL_YEAR | T_INTERVAL_DAY => {
-            fill_string_builder(data, offset, &meta.name, num_rows)
+            fill_timestamp_column(data, offset, meta, num_rows)
         }
         _ => fill_string_builder(data, offset, &meta.name, num_rows),
     }
+}
+
+fn fill_double_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = Float64Builder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_f64(data, offset)?);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Float64, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_real_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = Float64Builder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_f32(data, offset)? as f64);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Float64, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_integer_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = Int64Builder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_i64(data, offset)?);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Int64, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_smallint_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = Int32Builder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_i32(data, offset)?);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Int32, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_boolean_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = BooleanBuilder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_u8(data, offset)? != 0);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Boolean, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_binary_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = BinaryBuilder::with_capacity(num_rows, num_rows * 16);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_length_prefixed(data, offset, "Binary data truncated")?);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Binary, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_smalldecimal_column(
+    data: &[u8],
+    offset: &mut usize,
+    meta: &NativeColumnMeta,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let data_type = decimal_data_type(meta, 9);
+    let mut builder = Decimal128Builder::with_capacity(num_rows).with_data_type(data_type.clone());
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_i32(data, offset)? as i128);
+        }
+    }
+    Ok((
+        Field::new(&meta.name, data_type, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_decimal_column(
+    data: &[u8],
+    offset: &mut usize,
+    meta: &NativeColumnMeta,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let data_type = decimal_data_type(meta, 18);
+    let mut builder = Decimal128Builder::with_capacity(num_rows).with_data_type(data_type.clone());
+    let use_i32 = meta.precision.unwrap_or(18) <= 9;
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else if use_i32 {
+            builder.append_value(read_i32(data, offset)? as i128);
+        } else {
+            builder.append_value(read_i64(data, offset)? as i128);
+        }
+    }
+    Ok((
+        Field::new(&meta.name, data_type, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_bigdecimal_column(
+    data: &[u8],
+    offset: &mut usize,
+    meta: &NativeColumnMeta,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let data_type = decimal_data_type(meta, 36);
+    let mut builder = Decimal128Builder::with_capacity(num_rows).with_data_type(data_type.clone());
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_i128(data, offset)?);
+        }
+    }
+    Ok((
+        Field::new(&meta.name, data_type, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn decimal_data_type(meta: &NativeColumnMeta, default_precision: i32) -> ArrowDataType {
+    let (precision, scale) = decimal_precision_scale(meta, default_precision);
+    ArrowDataType::Decimal128(precision, scale)
+}
+
+fn fill_date_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = Date32Builder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_packed_date_days(data, offset)?);
+        }
+    }
+    Ok((
+        Field::new(name, ArrowDataType::Date32, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_timestamp_column(
+    data: &[u8],
+    offset: &mut usize,
+    meta: &NativeColumnMeta,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = TimestampMicrosecondBuilder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            builder.append_value(read_timestamp_micros(data, offset)?);
+        }
+    }
+
+    let finished = builder.finish();
+    if meta.type_id == T_TIMESTAMP_UTC {
+        return Ok((
+            Field::new(
+                &meta.name,
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Arc::new(finished.with_timezone("UTC")),
+        ));
+    }
+    Ok((
+        Field::new(
+            &meta.name,
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Arc::new(finished),
+    ))
+}
+
+/// Decode the packed `[year:16][month:8][day:8]` DATE value into Arrow Date32 days.
+fn read_packed_date_days(data: &[u8], offset: &mut usize) -> Result<i32, TransportError> {
+    let packed = read_i32(data, offset)?;
+    let year = packed >> 16;
+    let month = ((packed >> 8) & 0xFF) as u32;
+    let day = (packed & 0xFF) as u32;
+    Ok(crate::types::conversion::ymd_to_days(year, month, day))
+}
+
+fn read_timestamp_micros(data: &[u8], offset: &mut usize) -> Result<i64, TransportError> {
+    let year = read_i16(data, offset)? as i32;
+    let month = read_u8(data, offset)? as u32;
+    let day = read_u8(data, offset)? as u32;
+    let hour = read_u8(data, offset)? as u64;
+    let minute = read_u8(data, offset)? as u64;
+    let second = read_u8(data, offset)? as u64;
+    let nanos = read_i32(data, offset)?;
+    Ok(crate::types::conversion::ymd_hms_nanos_to_micros(
+        year, month, day, hour, minute, second, nanos,
+    ))
+}
+
+/// Read a length-prefixed value, reporting `truncated_message` when the declared
+/// length runs past the end of the buffer.
+fn read_length_prefixed<'a>(
+    data: &'a [u8],
+    offset: &mut usize,
+    truncated_message: &str,
+) -> Result<&'a [u8], TransportError> {
+    let len = read_i32(data, offset)? as usize;
+    if *offset + len > data.len() {
+        return Err(TransportError::ProtocolError(truncated_message.to_owned()));
+    }
+    let value = &data[*offset..*offset + len];
+    *offset += len;
+    Ok(value)
 }
 
 /// Specialised length-prefixed string path that appends directly to a
@@ -774,38 +895,23 @@ fn fill_string_builder(
     offset: &mut usize,
     name: &str,
     num_rows: usize,
-) -> Result<
-    (
-        arrow::datatypes::Field,
-        std::sync::Arc<dyn arrow::array::Array>,
-    ),
-    TransportError,
-> {
-    use std::sync::Arc;
-
-    use arrow::array::StringBuilder;
-    use arrow::datatypes::{DataType as ArrowDataType, Field};
-
-    let mut b = StringBuilder::with_capacity(num_rows, num_rows * 16);
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
     for _ in 0..num_rows {
         if read_u8(data, offset)? == 0 {
-            b.append_null();
+            builder.append_null();
         } else {
-            let len = read_i32(data, offset)? as usize;
-            if *offset + len > data.len() {
-                return Err(TransportError::ProtocolError(
-                    "String data truncated".into(),
-                ));
-            }
-            let s = std::str::from_utf8(&data[*offset..*offset + len]).map_err(|e| {
+            let bytes = read_length_prefixed(data, offset, "String data truncated")?;
+            let text = std::str::from_utf8(bytes).map_err(|e| {
                 TransportError::ProtocolError(format!("Invalid UTF-8 in string: {}", e))
             })?;
-            b.append_value(s);
-            *offset += len;
+            builder.append_value(text);
         }
     }
-    let field = Field::new(name, ArrowDataType::Utf8, true);
-    Ok((field, Arc::new(b.finish())))
+    Ok((
+        Field::new(name, ArrowDataType::Utf8, true),
+        Arc::new(builder.finish()),
+    ))
 }
 
 pub fn parse_fetch_to_record_batch(
@@ -938,6 +1044,7 @@ fn read_i128(data: &[u8], offset: &mut usize) -> Result<i128, TransportError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::{IS_UTF8, SMALL_RESULTSET};
     use super::*;
 
     #[test]
@@ -1050,20 +1157,70 @@ mod tests {
     /// Helper: build a minimal result set payload (after the result-type byte).
     /// Contains only column metadata (0 rows) so no column data section.
     fn build_result_set_header(columns: &[(&str, u32, Vec<u8>)]) -> Vec<u8> {
+        build_result_set_header_with_handle(SMALL_RESULTSET, columns)
+    }
+
+    fn build_result_set_header_with_handle(
+        handle: i32,
+        columns: &[(&str, u32, Vec<u8>)],
+    ) -> Vec<u8> {
         let mut data = Vec::new();
-        // handle
-        data.extend_from_slice(&(-3i32).to_le_bytes()); // SMALL_RESULTSET
-                                                        // num_columns
+        data.extend_from_slice(&handle.to_le_bytes());
         data.extend_from_slice(&(columns.len() as i32).to_le_bytes());
         // total_rows
         data.extend_from_slice(&0i64.to_le_bytes());
         // rows_received
         data.extend_from_slice(&0i64.to_le_bytes());
-        // column metadata
         for (name, type_id, extra) in columns {
             write_col_meta(&mut data, name, *type_id, extra);
         }
         data
+    }
+
+    fn exception_part(message: &str, sql_state: &str) -> Vec<u8> {
+        let mut data = vec![R_EXCEPTION as u8];
+        data.extend_from_slice(&(message.len() as i32).to_le_bytes());
+        data.extend_from_slice(message.as_bytes());
+        data.extend_from_slice(sql_state.as_bytes());
+        data
+    }
+
+    fn handle_part(statement_handle: i32, sub_results: &[Vec<u8>]) -> Vec<u8> {
+        let mut data = vec![R_HANDLE as u8];
+        data.extend_from_slice(&statement_handle.to_le_bytes());
+        for sub in sub_results {
+            data.extend_from_slice(sub);
+        }
+        data
+    }
+
+    fn more_rows_part(payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![R_MORE_ROWS as u8];
+        data.extend_from_slice(payload);
+        data
+    }
+
+    /// Metadata bytes a CHAR column carries: vcFlag(1) + maxLen(4) + octetLen(4).
+    fn varchar_meta_bytes(max_len: i32) -> Vec<u8> {
+        let mut extra = vec![IS_VARCHAR | IS_UTF8];
+        extra.extend_from_slice(&max_len.to_le_bytes());
+        extra.extend_from_slice(&(max_len * 4).to_le_bytes());
+        extra
+    }
+
+    fn protocol_message(error: TransportError) -> String {
+        match error {
+            TransportError::ProtocolError(msg) => msg,
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    fn parse_error(data: &[u8]) -> String {
+        protocol_message(parse_response(data).unwrap_err())
+    }
+
+    fn legacy_error(data: &[u8]) -> String {
+        protocol_message(parse_legacy_response(data).unwrap_err())
     }
 
     #[test]
@@ -1651,6 +1808,116 @@ mod tests {
     }
 
     #[test]
+    fn single_pass_real_column_widens_f32_to_f64() {
+        use arrow::array::{Array, Float64Array};
+        use arrow::datatypes::DataType;
+
+        let columns = vec![meta("r", T_REAL, None, None)];
+        let mut data = Vec::new();
+        data.push(1u8);
+        data.extend_from_slice(&1.5f32.to_le_bytes());
+        data.push(0u8);
+
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Float64);
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 1.5);
+        assert!(arr.is_null(1));
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn single_pass_smallint_column_decodes_to_int32() {
+        use arrow::array::{Array, Int32Array};
+        use arrow::datatypes::DataType;
+
+        let columns = vec![meta("si", T_SMALLINT, None, None)];
+        let mut data = Vec::new();
+        data.push(1u8);
+        data.extend_from_slice(&(-7i32).to_le_bytes());
+        data.push(0u8);
+
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), -7);
+        assert!(arr.is_null(1));
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn single_pass_timestamp_with_local_time_zone_has_no_arrow_timezone() {
+        use arrow::datatypes::{DataType, TimeUnit};
+
+        let columns = vec![meta("ts", T_TIMESTAMP_LOCAL_TZ, None, None)];
+        let mut data = Vec::new();
+        data.push(1u8);
+        data.extend_from_slice(&1970i16.to_le_bytes());
+        data.push(1u8);
+        data.push(1u8);
+        data.push(0u8);
+        data.push(0u8);
+        data.push(0u8);
+        data.extend_from_slice(&0i32.to_le_bytes());
+
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn single_pass_string_like_types_all_decode_as_utf8() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::DataType;
+
+        const UNKNOWN_TYPE_ID: u32 = 9_999;
+        let string_like = [
+            T_CHAR,
+            T_GEOMETRY,
+            T_HASHTYPE,
+            T_INTERVAL_YEAR,
+            T_INTERVAL_DAY,
+            UNKNOWN_TYPE_ID,
+        ];
+
+        for type_id in string_like {
+            let columns = vec![meta("s", type_id, None, None)];
+            let mut data = Vec::new();
+            data.push(1u8);
+            data.extend_from_slice(&2i32.to_le_bytes());
+            data.extend_from_slice(b"ok");
+
+            let mut offset = 0;
+            let batch = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap();
+            assert_eq!(
+                batch.schema().field(0).data_type(),
+                &DataType::Utf8,
+                "type_id {type_id}"
+            );
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(arr.value(0), "ok", "type_id {type_id}");
+            assert_eq!(offset, data.len(), "type_id {type_id}");
+        }
+    }
+
+    #[test]
     fn single_pass_bigdecimal_preserves_i128() {
         use arrow::array::Decimal128Array;
         use arrow::datatypes::DataType;
@@ -1675,5 +1942,716 @@ mod tests {
             .unwrap();
         assert_eq!(arr.value(0), big);
         assert_eq!(offset, data.len());
+    }
+
+    // --- Legacy (un-counted) framing ---
+
+    #[test]
+    fn legacy_result_set_carries_its_column_metadata() {
+        let data = result_set_part(build_result_set_header(&[("ID", T_INTEGER, Vec::new())]));
+
+        let resp = parse_legacy_response(&data).unwrap();
+
+        assert!(resp.warnings.is_empty());
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                handle, columns, ..
+            } => {
+                assert_eq!(handle, SMALL_RESULTSET);
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "ID");
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_handle_without_sub_result_reports_no_columns() {
+        let resp = parse_legacy_response(&handle_part(77, &[])).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                handle,
+                columns,
+                batch,
+                total_rows,
+                rows_received,
+            } => {
+                assert_eq!(handle, 77);
+                assert!(columns.is_empty());
+                assert!(batch.is_none());
+                assert_eq!(total_rows, 0);
+                assert_eq!(rows_received, 0);
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_row_count_returns_the_affected_row_count() {
+        let resp = parse_legacy_response(&row_count_part(9)).unwrap();
+        assert!(matches!(resp.terminal, NativeResponse::RowCount(9)));
+    }
+
+    #[test]
+    fn legacy_exception_returns_message_and_sql_state() {
+        let resp = parse_legacy_response(&exception_part("boom", "42000")).unwrap();
+
+        match resp.terminal {
+            NativeResponse::Exception { message, sql_state } => {
+                assert_eq!(message, "boom");
+                assert_eq!(sql_state, "42000");
+            }
+            other => panic!("Expected Exception, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_warning_is_collected_and_leaves_an_empty_terminal() {
+        let resp = parse_legacy_response(&warning_part("careful", "01000")).unwrap();
+
+        assert_eq!(
+            resp.warnings,
+            vec![NativeWarning {
+                message: "careful".to_owned(),
+                sql_state: "01000".to_owned(),
+            }]
+        );
+        assert!(matches!(resp.terminal, NativeResponse::Empty));
+    }
+
+    #[test]
+    fn legacy_column_count_is_consumed_and_yields_an_empty_terminal() {
+        let resp = parse_legacy_response(&column_count_part(4)).unwrap();
+
+        assert!(resp.warnings.is_empty());
+        assert!(matches!(resp.terminal, NativeResponse::Empty));
+    }
+
+    #[test]
+    fn legacy_empty_response_yields_an_empty_terminal() {
+        let resp = parse_legacy_response(&empty_part()).unwrap();
+        assert!(matches!(resp.terminal, NativeResponse::Empty));
+    }
+
+    #[test]
+    fn legacy_still_executing_without_status_message_is_accepted() {
+        let resp = parse_legacy_response(&[R_STILL_EXECUTING as u8]).unwrap();
+        assert!(matches!(resp.terminal, NativeResponse::StillExecuting));
+    }
+
+    #[test]
+    fn legacy_still_executing_consumes_its_status_message() {
+        let mut data = vec![R_STILL_EXECUTING as u8];
+        data.extend_from_slice(&7i32.to_le_bytes());
+        data.extend_from_slice(b"running");
+
+        let resp = parse_legacy_response(&data).unwrap();
+        assert!(matches!(resp.terminal, NativeResponse::StillExecuting));
+    }
+
+    #[test]
+    fn legacy_still_executing_with_a_short_status_message_is_rejected() {
+        let mut data = vec![R_STILL_EXECUTING as u8];
+        data.extend_from_slice(&10i32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+
+        assert_eq!(
+            legacy_error(&data),
+            "StillExecuting status message truncated"
+        );
+    }
+
+    #[test]
+    fn legacy_more_rows_takes_the_rest_of_the_buffer() {
+        let resp = parse_legacy_response(&more_rows_part(&[0xAA, 0xBB, 0xCC])).unwrap();
+
+        match resp.terminal {
+            NativeResponse::MoreRows(payload) => assert_eq!(payload, vec![0xAA, 0xBB, 0xCC]),
+            other => panic!("Expected MoreRows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_response_type_is_rejected() {
+        assert_eq!(legacy_error(&[0x7F]), "Unknown response type: 127");
+    }
+
+    #[test]
+    fn legacy_response_with_unconsumed_bytes_is_rejected() {
+        let mut data = empty_part();
+        data.push(0xAA);
+
+        assert!(
+            legacy_error(&data).starts_with("Trailing bytes after legacy response:"),
+            "unexpected message"
+        );
+    }
+
+    // --- Handle-only responses and their sub-results ---
+
+    #[test]
+    fn handle_sub_result_with_small_resultset_handle_describes_result_columns() {
+        let sub = result_set_part(build_result_set_header_with_handle(
+            SMALL_RESULTSET,
+            &[("C1", T_INTEGER, Vec::new())],
+        ));
+
+        let resp = parse_legacy_response(&handle_part(5, &[sub])).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                handle,
+                columns,
+                total_rows,
+                ..
+            } => {
+                assert_eq!(handle, 5);
+                assert_eq!(total_rows, SMALL_RESULTSET as i64);
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "C1");
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_sub_result_with_parameter_description_handle_describes_parameters() {
+        let sub = result_set_part(build_result_set_header_with_handle(
+            PARAMETER_DESCRIPTION,
+            &[("P1", T_CHAR, varchar_meta_bytes(100))],
+        ));
+
+        let resp = parse_legacy_response(&handle_part(5, &[sub])).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                total_rows,
+                columns,
+                ..
+            } => {
+                assert_eq!(total_rows, PARAMETER_DESCRIPTION as i64);
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "P1");
+                assert!(columns[0].is_varchar);
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_with_both_sub_results_prefers_the_parameter_description() {
+        let result_columns = result_set_part(build_result_set_header_with_handle(
+            SMALL_RESULTSET,
+            &[("C1", T_INTEGER, Vec::new())],
+        ));
+        let parameters = result_set_part(build_result_set_header_with_handle(
+            PARAMETER_DESCRIPTION,
+            &[("P1", T_INTEGER, Vec::new())],
+        ));
+
+        let resp = parse_legacy_response(&handle_part(5, &[result_columns, parameters])).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                total_rows,
+                columns,
+                ..
+            } => {
+                assert_eq!(total_rows, PARAMETER_DESCRIPTION as i64);
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].name, "P1");
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_sub_result_that_is_not_a_result_set_leaves_no_columns() {
+        let resp = parse_legacy_response(&handle_part(5, &[empty_part()])).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                columns,
+                total_rows,
+                ..
+            } => {
+                assert!(columns.is_empty());
+                assert_eq!(total_rows, 0);
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    // --- Counted envelope framing ---
+
+    #[test]
+    fn more_rows_as_the_final_envelope_part_is_accepted() {
+        let data = envelope(&[column_count_part(2), more_rows_part(&[1, 2, 3])]);
+
+        let resp = parse_response(&data).unwrap();
+
+        match resp.terminal {
+            NativeResponse::MoreRows(payload) => assert_eq!(payload, vec![1, 2, 3]),
+            other => panic!("Expected MoreRows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn more_rows_before_the_final_envelope_part_is_rejected() {
+        let data = envelope(&[more_rows_part(&[1, 2, 3]), empty_part()]);
+
+        assert_eq!(
+            parse_error(&data),
+            "MoreRows must be the final native response part"
+        );
+    }
+
+    #[test]
+    fn two_terminal_results_in_one_envelope_are_rejected() {
+        let data = envelope(&[row_count_part(1), row_count_part(2)]);
+
+        assert_eq!(
+            parse_error(&data),
+            "Multiple terminal results in native response envelope"
+        );
+    }
+
+    #[test]
+    fn unknown_response_type_inside_an_envelope_names_its_offset() {
+        let data = envelope(&[column_count_part(1), vec![0x7F]]);
+
+        let msg = parse_error(&data);
+        assert!(
+            msg.starts_with("Unknown response type: 127 at offset 9"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn envelope_with_an_exception_part_returns_the_exception() {
+        let data = envelope(&[
+            warning_part("careful", "01000"),
+            exception_part("bad", "42000"),
+        ]);
+
+        let resp = parse_response(&data).unwrap();
+
+        assert_eq!(resp.warnings.len(), 1);
+        match resp.terminal {
+            NativeResponse::Exception { message, sql_state } => {
+                assert_eq!(message, "bad");
+                assert_eq!(sql_state, "42000");
+            }
+            other => panic!("Expected Exception, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn envelope_with_a_handle_part_returns_the_statement_handle() {
+        let data = envelope(&[handle_part(31, &[])]);
+
+        let resp = parse_response(&data).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet { handle, .. } => assert_eq!(handle, 31),
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    // --- Falling back from the counted envelope to legacy framing ---
+
+    /// A payload under five bytes cannot hold a result count, so it is read as legacy.
+    #[test]
+    fn payload_too_short_for_a_result_count_falls_back_to_legacy() {
+        let resp = parse_response(&[R_STILL_EXECUTING as u8]).unwrap();
+        assert!(matches!(resp.terminal, NativeResponse::StillExecuting));
+    }
+
+    /// A legacy row count whose first four bytes read as an out-of-range result
+    /// count (10752) is not mistaken for a counted envelope.
+    #[test]
+    fn out_of_range_result_count_falls_back_to_legacy() {
+        let data = row_count_part(42);
+        assert_eq!(
+            i32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            10_752
+        );
+
+        let resp = parse_response(&data).unwrap();
+        assert!(matches!(resp.terminal, NativeResponse::RowCount(42)));
+    }
+
+    /// A legacy result set whose fifth byte is not a known part type is not
+    /// mistaken for a counted envelope holding one part.
+    #[test]
+    fn unknown_first_part_type_falls_back_to_legacy() {
+        let handle = i32::from_le_bytes([0x00, 0x00, 0x00, 0x63]);
+        let data = result_set_part(build_result_set_header_with_handle(handle, &[]));
+        assert_eq!(i32::from_le_bytes([data[0], data[1], data[2], data[3]]), 1);
+        assert!(!is_known_response_type(data[4] as i8));
+
+        let resp = parse_response(&data).unwrap();
+
+        match resp.terminal {
+            NativeResponse::ResultSet {
+                handle: parsed,
+                batch,
+                ..
+            } => {
+                assert_eq!(parsed, handle);
+                assert!(batch.is_none());
+            }
+            other => panic!("Expected ResultSet, got {other:?}"),
+        }
+    }
+
+    /// A counted parse that leaves bytes unconsumed is discarded, and the same
+    /// payload is re-read as a legacy MoreRows response.
+    #[test]
+    fn counted_envelope_leaving_trailing_bytes_falls_back_to_legacy() {
+        let mut data = 6i32.to_le_bytes().to_vec();
+        for _ in 0..6 {
+            data.extend_from_slice(&column_count_part(0));
+        }
+        data.push(0xAA);
+
+        let resp = parse_response(&data).unwrap();
+
+        match resp.terminal {
+            NativeResponse::MoreRows(payload) => assert_eq!(payload, data[1..].to_vec()),
+            other => panic!("Expected MoreRows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_response_types_are_exactly_the_nine_protocol_parts() {
+        for result_type in [
+            R_ROW_COUNT,
+            R_RESULT_SET,
+            R_HANDLE,
+            R_COLUMN_COUNT,
+            R_WARNING,
+            R_STILL_EXECUTING,
+            R_MORE_ROWS,
+            R_EXCEPTION,
+            R_EMPTY,
+        ] {
+            assert!(
+                is_known_response_type(result_type),
+                "{result_type} should be known"
+            );
+        }
+        for result_type in [7i8, 99, -3, -128] {
+            assert!(
+                !is_known_response_type(result_type),
+                "{result_type} should be unknown"
+            );
+        }
+    }
+
+    // --- Message parts ---
+
+    #[test]
+    fn message_part_shorter_than_its_length_prefix_is_rejected() {
+        let mut data = vec![R_EXCEPTION as u8];
+        data.extend_from_slice(&10i32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+
+        assert_eq!(legacy_error(&data), "Exception message truncated");
+    }
+
+    #[test]
+    fn non_utf8_message_part_is_rejected() {
+        let mut data = vec![R_EXCEPTION as u8];
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]);
+        data.extend_from_slice(b"42000");
+
+        assert!(
+            legacy_error(&data).starts_with("Invalid exception UTF-8: "),
+            "unexpected message"
+        );
+    }
+
+    #[test]
+    fn message_part_without_room_for_a_sql_state_uses_the_unknown_state() {
+        let mut data = 2i32.to_le_bytes().to_vec();
+        data.extend_from_slice(b"ab");
+        data.extend_from_slice(b"123");
+
+        let mut offset = 0;
+        let warning = parse_message_part(&data, &mut offset).unwrap();
+
+        assert_eq!(warning.message, "ab");
+        assert_eq!(warning.sql_state, "?????");
+        assert_eq!(offset, 6);
+    }
+
+    #[test]
+    fn message_part_with_a_non_utf8_sql_state_uses_the_unknown_state() {
+        let mut data = 2i32.to_le_bytes().to_vec();
+        data.extend_from_slice(b"ab");
+        data.extend_from_slice(&[0xFFu8; 5]);
+
+        let mut offset = 0;
+        let warning = parse_message_part(&data, &mut offset).unwrap();
+
+        assert_eq!(warning.sql_state, "?????");
+        assert_eq!(offset, data.len());
+    }
+
+    // --- Column metadata errors ---
+
+    #[test]
+    fn column_name_longer_than_the_buffer_is_rejected() {
+        let mut data = SMALL_RESULTSET.to_le_bytes().to_vec();
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&50i32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+
+        assert_eq!(
+            protocol_message(parse_result_set(&data).unwrap_err()),
+            "Column name truncated"
+        );
+    }
+
+    #[test]
+    fn non_utf8_column_name_is_rejected() {
+        let mut data = SMALL_RESULTSET.to_le_bytes().to_vec();
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]);
+        data.extend_from_slice(&T_INTEGER.to_le_bytes());
+
+        assert!(
+            protocol_message(parse_result_set(&data).unwrap_err())
+                .starts_with("Invalid column name UTF-8: "),
+            "unexpected message"
+        );
+    }
+
+    #[test]
+    fn string_like_column_metadata_without_its_varchar_flag_is_rejected() {
+        for (type_id, expected) in [
+            (T_CHAR, "CHAR metadata truncated"),
+            (T_GEOMETRY, "CHAR metadata truncated"),
+            (T_HASHTYPE, "CHAR metadata truncated"),
+            (T_INTERVAL_YEAR, "INTERVAL metadata truncated"),
+            (T_INTERVAL_DAY, "INTERVAL metadata truncated"),
+        ] {
+            let data = build_result_set_header(&[("C", type_id, Vec::new())]);
+
+            assert_eq!(
+                protocol_message(parse_result_set(&data).unwrap_err()),
+                expected,
+                "type_id {type_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_rows_received_in_a_result_set_is_rejected() {
+        let mut data = SMALL_RESULTSET.to_le_bytes().to_vec();
+        data.extend_from_slice(&0i32.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&(-1i64).to_le_bytes());
+
+        assert_eq!(
+            protocol_message(parse_result_set(&data).unwrap_err()),
+            "Invalid row count from server: -1"
+        );
+    }
+
+    #[test]
+    fn negative_rows_received_in_a_fetch_is_rejected() {
+        let data = (-5i64).to_le_bytes();
+
+        assert_eq!(
+            protocol_message(parse_fetch_to_record_batch(&data, &[]).unwrap_err()),
+            "Invalid row count from server: -5"
+        );
+    }
+
+    #[test]
+    fn batch_without_columns_still_reports_its_row_count() {
+        let data = Vec::new();
+        let mut offset = 0;
+
+        let batch = build_batch_from_wire(&data, &mut offset, &[], 3).unwrap();
+
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(offset, 0);
+    }
+
+    // --- Truncated column values ---
+
+    #[test]
+    fn truncated_column_values_name_the_missing_primitive() {
+        let cases: Vec<(u32, Vec<u8>, &str)> = vec![
+            (T_INTEGER, vec![], "Data truncated (u8)"),
+            (T_BOOLEAN, vec![1u8], "Data truncated (u8)"),
+            (T_DOUBLE, vec![1u8, 0, 0], "Data truncated (f64)"),
+            (T_REAL, vec![1u8, 0], "Data truncated (f32)"),
+            (T_INTEGER, vec![1u8, 0, 0, 0], "Data truncated (i64)"),
+            (T_SMALLINT, vec![1u8, 0], "Data truncated (i32)"),
+            (T_DATE, vec![1u8, 0], "Data truncated (i32)"),
+            (T_BIGDECIMAL, vec![1u8, 0, 0], "Data truncated (i128)"),
+            (T_TIMESTAMP, vec![1u8, 0], "Data truncated (i16)"),
+        ];
+
+        for (type_id, data, expected) in cases {
+            let columns = vec![meta("c", type_id, None, None)];
+            let mut offset = 0;
+
+            let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+            assert_eq!(protocol_message(err), expected, "type_id {type_id}");
+        }
+    }
+
+    #[test]
+    fn string_value_longer_than_the_buffer_is_rejected() {
+        let columns = vec![meta("s", T_CHAR, None, None)];
+        let mut data = vec![1u8];
+        data.extend_from_slice(&10i32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+
+        let mut offset = 0;
+        let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        assert_eq!(protocol_message(err), "String data truncated");
+    }
+
+    #[test]
+    fn non_utf8_string_value_is_rejected() {
+        let columns = vec![meta("s", T_CHAR, None, None)];
+        let mut data = vec![1u8];
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]);
+
+        let mut offset = 0;
+        let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        assert!(
+            protocol_message(err).starts_with("Invalid UTF-8 in string: "),
+            "unexpected message"
+        );
+    }
+
+    #[test]
+    fn binary_value_longer_than_the_buffer_is_rejected() {
+        let columns = vec![meta("b", T_BINARY, None, None)];
+        let mut data = vec![1u8];
+        data.extend_from_slice(&10i32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+
+        let mut offset = 0;
+        let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        assert_eq!(protocol_message(err), "Binary data truncated");
+    }
+
+    #[test]
+    fn decimal_columns_accept_nulls_on_both_wire_widths() {
+        use arrow::array::{Array, Decimal128Array};
+
+        for (precision, value_bytes) in [
+            (9, 1_234i32.to_le_bytes().to_vec()),
+            (18, 1_234i64.to_le_bytes().to_vec()),
+        ] {
+            let columns = vec![meta("d", T_DECIMAL, Some(precision), Some(0))];
+            let mut data = vec![1u8];
+            data.extend_from_slice(&value_bytes);
+            data.push(0u8);
+
+            let mut offset = 0;
+            let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
+
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap();
+            assert_eq!(arr.value(0), 1_234i128, "precision {precision}");
+            assert!(arr.is_null(1), "precision {precision}");
+            assert_eq!(offset, data.len(), "precision {precision}");
+        }
+    }
+
+    #[test]
+    fn bigdecimal_column_accepts_nulls() {
+        use arrow::array::{Array, Decimal128Array};
+
+        let columns = vec![meta("bd", T_BIGDECIMAL, Some(36), Some(0))];
+        let mut data = vec![1u8];
+        data.extend_from_slice(&7i128.to_le_bytes());
+        data.push(0u8);
+
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
+
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 7i128);
+        assert!(arr.is_null(1));
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn result_set_with_unconsumed_bytes_is_rejected() {
+        let mut data = build_result_set_header(&[]);
+        data.push(0xAA);
+
+        assert!(
+            protocol_message(parse_result_set(&data).unwrap_err())
+                .starts_with("Trailing bytes after result-set response:"),
+            "unexpected message"
+        );
+    }
+
+    #[test]
+    fn result_set_promising_rows_it_does_not_carry_is_rejected() {
+        let mut data = SMALL_RESULTSET.to_le_bytes().to_vec();
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&2i64.to_le_bytes());
+        data.extend_from_slice(&2i64.to_le_bytes());
+        write_col_meta(&mut data, "I", T_INTEGER, &[]);
+
+        assert_eq!(
+            protocol_message(parse_result_set(&data).unwrap_err()),
+            "Data truncated (u8)"
+        );
+    }
+
+    // --- Decimal precision and scale clamping ---
+
+    #[test]
+    fn decimal_precision_and_scale_are_clamped_to_the_arrow_range() {
+        let cases = [
+            (None, None, 18, (18u8, 0i8)),
+            (Some(100), Some(2), 18, (38, 2)),
+            (Some(0), Some(2), 18, (1, 2)),
+            (Some(10), Some(1_000), 18, (10, 127)),
+            (Some(10), Some(-1_000), 18, (10, -128)),
+        ];
+
+        for (precision, scale, default_precision, expected) in cases {
+            let column = meta("d", T_DECIMAL, precision, scale);
+
+            assert_eq!(
+                decimal_precision_scale(&column, default_precision),
+                expected,
+                "precision {precision:?}, scale {scale:?}"
+            );
+        }
     }
 }

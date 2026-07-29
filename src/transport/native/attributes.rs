@@ -1,5 +1,13 @@
 use crate::error::TransportError;
 
+use super::constants::{
+    ATTR_AUTOCOMMIT, ATTR_CLIENT_KEYS_LEN, ATTR_CLIENT_RECEIVE_KEY, ATTR_CLIENT_SEND_KEY,
+    ATTR_DATA_MESSAGE_SIZE, ATTR_ENCODED_PASSWORD, ATTR_ENCRYPTION_REQUIRED, ATTR_NUM_ROWS,
+    ATTR_PROTOCOL_VERSION, ATTR_PUBLIC_KEY, ATTR_QUERY_CACHE_ACCESS, ATTR_QUERY_TIMEOUT,
+    ATTR_RANDOM_PHRASE, ATTR_RESULT_SET_HANDLE, ATTR_SESSIONID, ATTR_SNAPSHOT_TRANSACTIONS_ENABLED,
+    ATTR_STATEMENT_HANDLE, ATTR_TRANSACTION_STATE, ATTR_TSUTC_ENABLED,
+};
+
 /// A single attribute value in the native binary protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValue {
@@ -74,99 +82,124 @@ pub fn parse_attributes(data: &[u8], count: u32) -> Result<AttributeSet, Transpo
     let mut offset = 0;
 
     for _ in 0..count {
-        if offset + 2 > data.len() {
-            return Err(TransportError::ProtocolError(
-                "attribute data truncated: missing attr_id".into(),
-            ));
-        }
-        let id = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
-
-        let value = match attribute_type(id) {
-            AttrType::Str | AttrType::Bin => {
-                if offset + 4 > data.len() {
-                    return Err(TransportError::ProtocolError(
-                        "attribute data truncated: missing length".into(),
-                    ));
-                }
-                let len = u32::from_le_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]) as usize;
-                offset += 4;
-                if offset + len > data.len() {
-                    return Err(TransportError::ProtocolError(format!(
-                        "attribute data truncated: need {} bytes, have {}",
-                        len,
-                        data.len() - offset
-                    )));
-                }
-                let bytes = &data[offset..offset + len];
-                offset += len;
-                if attribute_type(id) == AttrType::Bin {
-                    AttributeValue::Binary(bytes.to_vec())
-                } else {
-                    let s = std::str::from_utf8(bytes).map_err(|e| {
-                        TransportError::ProtocolError(format!(
-                            "invalid UTF-8 in attribute {id}: {e}"
-                        ))
-                    })?;
-                    AttributeValue::String(s.to_owned())
-                }
-            }
-            AttrType::I32 => {
-                if offset + 4 > data.len() {
-                    return Err(TransportError::ProtocolError(
-                        "attribute data truncated: missing i32".into(),
-                    ));
-                }
-                let v = i32::from_le_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]);
-                offset += 4;
-                AttributeValue::Int32(v)
-            }
-            AttrType::I64 => {
-                if offset + 8 > data.len() {
-                    return Err(TransportError::ProtocolError(
-                        "attribute data truncated: missing i64".into(),
-                    ));
-                }
-                let v = i64::from_le_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                    data[offset + 4],
-                    data[offset + 5],
-                    data[offset + 6],
-                    data[offset + 7],
-                ]);
-                offset += 8;
-                AttributeValue::Int64(v)
-            }
-            AttrType::Bool => {
-                if offset >= data.len() {
-                    return Err(TransportError::ProtocolError(
-                        "attribute data truncated: missing bool".into(),
-                    ));
-                }
-                let v = data[offset] != 0;
-                offset += 1;
-                AttributeValue::Bool(v)
-            }
-        };
+        let id = read_attribute_id(data, &mut offset)?;
+        let value = read_attribute_value(data, &mut offset, id)?;
         set.add(id, value);
     }
     Ok(set)
 }
 
 // --- private helpers ---
+
+fn read_attribute_id(data: &[u8], offset: &mut usize) -> Result<u16, TransportError> {
+    if *offset + 2 > data.len() {
+        return Err(TransportError::ProtocolError(
+            "attribute data truncated: missing attr_id".into(),
+        ));
+    }
+    let id = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
+    *offset += 2;
+    Ok(id)
+}
+
+fn read_attribute_value(
+    data: &[u8],
+    offset: &mut usize,
+    id: u16,
+) -> Result<AttributeValue, TransportError> {
+    match attribute_type(id) {
+        AttrType::Str => read_string(data, offset, id),
+        AttrType::Bin => Ok(AttributeValue::Binary(
+            read_length_prefixed(data, offset)?.to_vec(),
+        )),
+        AttrType::I32 => read_int32(data, offset),
+        AttrType::I64 => read_int64(data, offset),
+        AttrType::Bool => read_bool(data, offset),
+    }
+}
+
+fn read_length_prefixed<'a>(
+    data: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], TransportError> {
+    if *offset + 4 > data.len() {
+        return Err(TransportError::ProtocolError(
+            "attribute data truncated: missing length".into(),
+        ));
+    }
+    let len = u32::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+    ]) as usize;
+    *offset += 4;
+    if *offset + len > data.len() {
+        return Err(TransportError::ProtocolError(format!(
+            "attribute data truncated: need {} bytes, have {}",
+            len,
+            data.len() - *offset
+        )));
+    }
+    let bytes = &data[*offset..*offset + len];
+    *offset += len;
+    Ok(bytes)
+}
+
+fn read_string(data: &[u8], offset: &mut usize, id: u16) -> Result<AttributeValue, TransportError> {
+    let bytes = read_length_prefixed(data, offset)?;
+    let s = std::str::from_utf8(bytes).map_err(|e| {
+        TransportError::ProtocolError(format!("invalid UTF-8 in attribute {id}: {e}"))
+    })?;
+    Ok(AttributeValue::String(s.to_owned()))
+}
+
+fn read_int32(data: &[u8], offset: &mut usize) -> Result<AttributeValue, TransportError> {
+    if *offset + 4 > data.len() {
+        return Err(TransportError::ProtocolError(
+            "attribute data truncated: missing i32".into(),
+        ));
+    }
+    let v = i32::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(AttributeValue::Int32(v))
+}
+
+fn read_int64(data: &[u8], offset: &mut usize) -> Result<AttributeValue, TransportError> {
+    if *offset + 8 > data.len() {
+        return Err(TransportError::ProtocolError(
+            "attribute data truncated: missing i64".into(),
+        ));
+    }
+    let v = i64::from_le_bytes([
+        data[*offset],
+        data[*offset + 1],
+        data[*offset + 2],
+        data[*offset + 3],
+        data[*offset + 4],
+        data[*offset + 5],
+        data[*offset + 6],
+        data[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(AttributeValue::Int64(v))
+}
+
+fn read_bool(data: &[u8], offset: &mut usize) -> Result<AttributeValue, TransportError> {
+    if *offset >= data.len() {
+        return Err(TransportError::ProtocolError(
+            "attribute data truncated: missing bool".into(),
+        ));
+    }
+    let v = data[*offset] != 0;
+    *offset += 1;
+    Ok(AttributeValue::Bool(v))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttrType {
@@ -189,7 +222,6 @@ enum AttrType {
 ///                    CLIENT_RECEIVE_KEY(53), CLIENT_SEND_KEY(54).
 /// Everything else is a string.
 fn attribute_type(id: u16) -> AttrType {
-    use super::constants::*;
     match id {
         // T_boolean attributes (1 byte)
         ATTR_AUTOCOMMIT              // 7
@@ -287,6 +319,7 @@ fn serialize_attribute(attr: &Attribute, buf: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::ATTR_USERNAME;
     use super::*;
 
     #[test]
@@ -349,6 +382,137 @@ mod tests {
 
         let parsed = parse_attributes(&bytes, 0).unwrap();
         assert_eq!(parsed.num_attributes(), 0);
+    }
+
+    /// Parse and unwrap the protocol-error message, failing the test on success.
+    fn parse_error(data: &[u8], count: u32) -> String {
+        match parse_attributes(data, count) {
+            Err(TransportError::ProtocolError(msg)) => msg,
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_attribute_set_is_empty() {
+        let set = AttributeSet::default();
+        assert_eq!(set.num_attributes(), 0);
+        assert_eq!(set.data_len(), 0);
+        assert!(set.serialize().is_empty());
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_attribute() {
+        let mut set = AttributeSet::new();
+        set.add(ATTR_AUTOCOMMIT, AttributeValue::Bool(false));
+        assert_eq!(set.get(ATTR_PROTOCOL_VERSION), None);
+        assert_eq!(set.get(ATTR_AUTOCOMMIT), Some(&AttributeValue::Bool(false)));
+    }
+
+    #[test]
+    fn single_byte_buffer_is_too_short_for_an_attribute_id() {
+        assert_eq!(
+            parse_error(&[0x01], 1),
+            "attribute data truncated: missing attr_id"
+        );
+    }
+
+    #[test]
+    fn string_attribute_without_full_length_prefix_is_truncated() {
+        let mut data = ATTR_USERNAME.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(
+            parse_error(&data, 1),
+            "attribute data truncated: missing length"
+        );
+    }
+
+    #[test]
+    fn string_attribute_shorter_than_its_length_prefix_reports_both_sizes() {
+        let mut data = ATTR_USERNAME.to_le_bytes().to_vec();
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+        assert_eq!(
+            parse_error(&data, 1),
+            "attribute data truncated: need 5 bytes, have 2"
+        );
+    }
+
+    #[test]
+    fn binary_attribute_shorter_than_its_length_prefix_reports_both_sizes() {
+        let mut data = ATTR_PUBLIC_KEY.to_le_bytes().to_vec();
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.push(0xAB);
+        assert_eq!(
+            parse_error(&data, 1),
+            "attribute data truncated: need 4 bytes, have 1"
+        );
+    }
+
+    #[test]
+    fn int32_attribute_with_two_payload_bytes_is_truncated() {
+        let mut data = ATTR_PROTOCOL_VERSION.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(
+            parse_error(&data, 1),
+            "attribute data truncated: missing i32"
+        );
+    }
+
+    #[test]
+    fn int64_attribute_with_four_payload_bytes_is_truncated() {
+        let mut data = ATTR_SESSIONID.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            parse_error(&data, 1),
+            "attribute data truncated: missing i64"
+        );
+    }
+
+    #[test]
+    fn bool_attribute_without_payload_byte_is_truncated() {
+        let data = ATTR_AUTOCOMMIT.to_le_bytes().to_vec();
+        assert_eq!(
+            parse_error(&data, 1),
+            "attribute data truncated: missing bool"
+        );
+    }
+
+    #[test]
+    fn non_utf8_string_attribute_names_the_offending_attribute_id() {
+        let mut data = ATTR_USERNAME.to_le_bytes().to_vec();
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]);
+
+        let msg = parse_error(&data, 1);
+        assert!(
+            msg.starts_with(&format!("invalid UTF-8 in attribute {ATTR_USERNAME}: ")),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn bool_attribute_round_trips_false() {
+        let mut set = AttributeSet::new();
+        set.add(ATTR_AUTOCOMMIT, AttributeValue::Bool(false));
+
+        let parsed = parse_attributes(&set.serialize(), 1).unwrap();
+        assert_eq!(
+            parsed.get(ATTR_AUTOCOMMIT),
+            Some(&AttributeValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn unknown_attribute_id_is_parsed_as_a_string() {
+        const UNKNOWN_ATTR_ID: u16 = 4_242;
+        let mut set = AttributeSet::new();
+        set.add(UNKNOWN_ATTR_ID, AttributeValue::String("free text".into()));
+
+        let parsed = parse_attributes(&set.serialize(), 1).unwrap();
+        assert_eq!(
+            parsed.get(UNKNOWN_ATTR_ID),
+            Some(&AttributeValue::String("free text".into()))
+        );
     }
 
     #[test]

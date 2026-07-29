@@ -634,7 +634,331 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE my_schema.my_table"));
     }
 
-    // Note: Integration tests for infer_schema_from_parquet would require
-    // creating actual Parquet files, which is better suited for the
-    // integration test suite.
+    #[test]
+    fn test_quote_identifier_escapes_embedded_quotes() {
+        assert_eq!(quote_identifier("my_table"), "\"my_table\"");
+        assert_eq!(quote_identifier("tab\"le"), "\"tab\"\"le\"");
+    }
+
+    #[test]
+    fn test_widen_type_char_keeps_the_larger_size() {
+        let widened = widen_type(
+            &ExasolType::Char { size: 10 },
+            &ExasolType::Char { size: 40 },
+        );
+
+        assert_eq!(widened, ExasolType::Char { size: 40 });
+    }
+
+    #[test]
+    fn test_widen_type_char_caps_at_exasol_char_limit() {
+        let widened = widen_type(
+            &ExasolType::Char { size: 1_000 },
+            &ExasolType::Char { size: 5_000 },
+        );
+
+        assert_eq!(widened, ExasolType::Char { size: 2_000 });
+    }
+
+    #[test]
+    fn test_widen_type_varchar_before_char_still_yields_varchar() {
+        let widened = widen_type(
+            &ExasolType::Varchar { size: 100 },
+            &ExasolType::Char { size: 250 },
+        );
+
+        assert_eq!(widened, ExasolType::Varchar { size: 250 });
+    }
+
+    #[test]
+    fn test_widen_type_varchar_char_caps_at_exasol_varchar_limit() {
+        let widened = widen_type(
+            &ExasolType::Varchar { size: 3_000_000 },
+            &ExasolType::Char { size: 10 },
+        );
+
+        assert_eq!(widened, ExasolType::Varchar { size: 2_000_000 });
+    }
+
+    #[test]
+    fn test_widen_type_interval_day_to_second_keeps_the_larger_precision() {
+        let widened = widen_type(
+            &ExasolType::IntervalDayToSecond { precision: 3 },
+            &ExasolType::IntervalDayToSecond { precision: 6 },
+        );
+
+        assert_eq!(widened, ExasolType::IntervalDayToSecond { precision: 6 });
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_rejects_empty_slice() {
+        let err = infer_schema_from_parquet_files(&[], ColumnNameMode::Quoted).unwrap_err();
+
+        assert!(
+            matches!(err, ImportError::SchemaInferenceError(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("No files provided for schema inference"),
+            "got: {err}"
+        );
+    }
+
+    fn write_parquet(path: &Path, fields: Vec<arrow::datatypes::Field>) {
+        use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(fields));
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|field| match field.data_type() {
+                DataType::Int32 => Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                DataType::Int64 => Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                _ => Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+            })
+            .collect();
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+        let file = std::fs::File::create(path).expect("create file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_maps_columns_and_nullability() {
+        use arrow::datatypes::{DataType, Field};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("data.parquet");
+        write_parquet(
+            &path,
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("my name", DataType::Utf8, true),
+            ],
+        );
+
+        let inferred =
+            infer_schema_from_parquet(&path, ColumnNameMode::Sanitize).expect("inference");
+
+        assert_eq!(inferred.source_files, vec![path.clone()]);
+        assert_eq!(inferred.columns.len(), 2);
+        assert_eq!(inferred.columns[0].original_name, "id");
+        assert_eq!(inferred.columns[0].ddl_name, "ID");
+        assert_eq!(
+            inferred.columns[0].exasol_type,
+            ExasolType::Decimal {
+                precision: 36,
+                scale: 0
+            }
+        );
+        assert!(!inferred.columns[0].nullable);
+        assert_eq!(inferred.columns[1].ddl_name, "MY_NAME");
+        assert!(inferred.columns[1].nullable);
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_reports_missing_file() {
+        let err = infer_schema_from_parquet(
+            Path::new("/nonexistent/dir/missing.parquet"),
+            ColumnNameMode::Quoted,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to open file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_reports_unreadable_metadata() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("broken.parquet");
+        std::fs::write(&path, b"not parquet at all").expect("write file");
+
+        let err = infer_schema_from_parquet(&path, ColumnNameMode::Quoted).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to read Parquet metadata"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_delegates_for_a_single_file() {
+        use arrow::datatypes::{DataType, Field};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("one.parquet");
+        write_parquet(&path, vec![Field::new("id", DataType::Int32, false)]);
+
+        let inferred =
+            infer_schema_from_parquet_files(std::slice::from_ref(&path), ColumnNameMode::Quoted)
+                .expect("inference");
+
+        assert_eq!(inferred.source_files, vec![path]);
+        assert_eq!(inferred.columns[0].ddl_name, "\"id\"");
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_widens_types_and_nullability() {
+        use arrow::datatypes::{DataType, Field};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let first = dir.path().join("first.parquet");
+        let second = dir.path().join("second.parquet");
+        write_parquet(&first, vec![Field::new("id", DataType::Int32, false)]);
+        write_parquet(&second, vec![Field::new("id", DataType::Int64, true)]);
+
+        let inferred = infer_schema_from_parquet_files(
+            &[first.clone(), second.clone()],
+            ColumnNameMode::Quoted,
+        )
+        .expect("inference");
+
+        assert_eq!(inferred.source_files, vec![first, second]);
+        assert_eq!(
+            inferred.columns[0].exasol_type,
+            ExasolType::Decimal {
+                precision: 36,
+                scale: 0
+            }
+        );
+        assert!(inferred.columns[0].nullable);
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_rejects_differing_column_counts() {
+        use arrow::datatypes::{DataType, Field};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let first = dir.path().join("first.parquet");
+        let second = dir.path().join("second.parquet");
+        write_parquet(&first, vec![Field::new("id", DataType::Int32, false)]);
+        write_parquet(
+            &second,
+            vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("extra", DataType::Utf8, true),
+            ],
+        );
+
+        let err =
+            infer_schema_from_parquet_files(&[first, second], ColumnNameMode::Quoted).unwrap_err();
+
+        assert!(
+            matches!(err, ImportError::SchemaMismatchError(_)),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("has 1 columns"), "got: {err}");
+        assert!(err.to_string().contains("has 2 columns"), "got: {err}");
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_reports_missing_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let existing = dir.path().join("one.parquet");
+        write_parquet(
+            &existing,
+            vec![arrow::datatypes::Field::new(
+                "id",
+                arrow::datatypes::DataType::Int32,
+                false,
+            )],
+        );
+
+        let err = infer_schema_from_parquet_files(
+            &[existing, PathBuf::from("/nonexistent/dir/missing.parquet")],
+            ColumnNameMode::Quoted,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to open file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_reports_unreadable_metadata() {
+        use arrow::datatypes::{DataType, Field};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let first = dir.path().join("first.parquet");
+        let broken = dir.path().join("broken.parquet");
+        write_parquet(&first, vec![Field::new("id", DataType::Int32, false)]);
+        std::fs::write(&broken, b"not parquet at all").expect("write file");
+
+        let err =
+            infer_schema_from_parquet_files(&[first, broken], ColumnNameMode::Quoted).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to read Parquet metadata"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_from_parquet_files_reports_unmappable_type_in_a_later_file() {
+        use arrow::array::{ArrayRef, Time32SecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let first = dir.path().join("first.parquet");
+        write_parquet(&first, vec![Field::new("t", DataType::Int32, false)]);
+
+        let second = dir.path().join("second.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Time32(TimeUnit::Second),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Time32SecondArray::from(vec![1])) as ArrayRef],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(&second).expect("create file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let err =
+            infer_schema_from_parquet_files(&[first, second], ColumnNameMode::Quoted).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Failed to map type for column 't'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_infer_schema_rejects_unmappable_arrow_type() {
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        let schema = Schema::new(vec![Field::new(
+            "t",
+            DataType::Time32(TimeUnit::Second),
+            false,
+        )]);
+
+        let err = arrow_schema_to_columns(&schema, ColumnNameMode::Quoted).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Failed to map type for column 't'"),
+            "got: {err}"
+        );
+    }
 }

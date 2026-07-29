@@ -212,54 +212,104 @@ fn scan_placeholders(sql: &str) -> Vec<usize> {
     let mut iter = sql.char_indices();
 
     while let Some((i, c)) = iter.next() {
-        match state {
-            ScanState::Normal => match c {
-                '?' => positions.push(i),
-                '\'' => state = ScanState::SingleQuoted,
-                '"' => state = ScanState::DoubleQuoted,
-                '-' if bytes.get(i + 1) == Some(&b'-') => {
-                    iter.next();
-                    state = ScanState::LineComment;
-                }
-                '/' if bytes.get(i + 1) == Some(&b'*') => {
-                    iter.next();
-                    state = ScanState::BlockComment;
-                }
-                _ => {}
-            },
-            ScanState::SingleQuoted => {
-                if c == '\'' {
-                    if bytes.get(i + 1) == Some(&b'\'') {
-                        iter.next();
-                    } else {
-                        state = ScanState::Normal;
-                    }
-                }
-            }
-            ScanState::DoubleQuoted => {
-                if c == '"' {
-                    if bytes.get(i + 1) == Some(&b'"') {
-                        iter.next();
-                    } else {
-                        state = ScanState::Normal;
-                    }
-                }
-            }
-            ScanState::LineComment => {
-                if c == '\n' {
-                    state = ScanState::Normal;
-                }
-            }
-            ScanState::BlockComment => {
-                if c == '*' && bytes.get(i + 1) == Some(&b'/') {
-                    iter.next();
-                    state = ScanState::Normal;
-                }
-            }
+        let step = scan_step(state, c, bytes.get(i + 1).copied());
+        if step.is_placeholder {
+            positions.push(i);
         }
+        if step.consumed_pair {
+            iter.next();
+        }
+        state = step.state;
     }
 
     positions
+}
+
+/// What one scanned character means for the placeholder scanner.
+///
+/// `consumed_pair` marks the two-character tokens (`--`, `/*`, `*/`, `''`,
+/// `""`): the scanner must skip their second character so it is not
+/// re-interpreted on its own.
+struct ScanStep {
+    state: ScanState,
+    is_placeholder: bool,
+    consumed_pair: bool,
+}
+
+impl ScanStep {
+    fn go(state: ScanState) -> Self {
+        Self {
+            state,
+            is_placeholder: false,
+            consumed_pair: false,
+        }
+    }
+
+    fn go_past_pair(state: ScanState) -> Self {
+        Self {
+            state,
+            is_placeholder: false,
+            consumed_pair: true,
+        }
+    }
+
+    fn placeholder() -> Self {
+        Self {
+            state: ScanState::Normal,
+            is_placeholder: true,
+            consumed_pair: false,
+        }
+    }
+}
+
+/// Feed one character (plus the raw byte that follows it) to the scanner.
+fn scan_step(state: ScanState, c: char, next: Option<u8>) -> ScanStep {
+    match state {
+        ScanState::Normal => step_outside_literal(c, next),
+        ScanState::SingleQuoted => step_inside_quotes(state, '\'', c, next),
+        ScanState::DoubleQuoted => step_inside_quotes(state, '"', c, next),
+        ScanState::LineComment => step_inside_line_comment(c),
+        ScanState::BlockComment => step_inside_block_comment(c, next),
+    }
+}
+
+fn step_outside_literal(c: char, next: Option<u8>) -> ScanStep {
+    match c {
+        '?' => ScanStep::placeholder(),
+        '\'' => ScanStep::go(ScanState::SingleQuoted),
+        '"' => ScanStep::go(ScanState::DoubleQuoted),
+        '-' if next == Some(b'-') => ScanStep::go_past_pair(ScanState::LineComment),
+        '/' if next == Some(b'*') => ScanStep::go_past_pair(ScanState::BlockComment),
+        _ => ScanStep::go(ScanState::Normal),
+    }
+}
+
+/// A doubled quote is an escape and keeps the scanner inside the literal;
+/// a single one closes it.
+fn step_inside_quotes(state: ScanState, quote: char, c: char, next: Option<u8>) -> ScanStep {
+    if c != quote {
+        return ScanStep::go(state);
+    }
+    if next == Some(quote as u8) {
+        return ScanStep::go_past_pair(state);
+    }
+    ScanStep::go(ScanState::Normal)
+}
+
+fn step_inside_line_comment(c: char) -> ScanStep {
+    if c == '\n' {
+        ScanStep::go(ScanState::Normal)
+    } else {
+        ScanStep::go(ScanState::LineComment)
+    }
+}
+
+fn step_inside_block_comment(c: char, next: Option<u8>) -> ScanStep {
+    if c == '*' && next == Some(b'/') {
+        ScanStep::go_past_pair(ScanState::Normal)
+    } else {
+        ScanStep::go(ScanState::BlockComment)
+    }
 }
 
 /// SQL statement as a pure data container.
@@ -759,5 +809,102 @@ mod tests {
         let sql = "SELECT '-- still in string ?', ?";
         let positions = scan_placeholders(sql);
         assert_eq!(positions, vec![sql.len() - 1]);
+    }
+
+    // --- StatementType predicates ---
+
+    #[test]
+    fn test_returns_row_count_only_for_dml_that_reports_affected_rows() {
+        assert!(StatementType::Insert.returns_row_count());
+        assert!(StatementType::Update.returns_row_count());
+        assert!(StatementType::Delete.returns_row_count());
+
+        assert!(!StatementType::Select.returns_row_count());
+        assert!(!StatementType::Ddl.returns_row_count());
+        assert!(!StatementType::Transaction.returns_row_count());
+        assert!(!StatementType::Other.returns_row_count());
+    }
+
+    // --- Parameter::to_sql_literal edge cases ---
+
+    #[test]
+    fn test_float_parameter_rejects_nan_and_infinity() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = Parameter::Float(value).to_sql_literal().unwrap_err();
+
+            assert!(matches!(err, QueryError::ParameterBindingError { .. }));
+            assert_eq!(
+                err.to_string(),
+                "Parameter binding error for parameter 0: NaN and Infinity are not supported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_parameter_renders_as_a_quoted_hex_string() {
+        let literal = Parameter::Binary(vec![0x00, 0x0f, 0xff])
+            .to_sql_literal()
+            .unwrap();
+
+        assert_eq!(literal, "'000fff'");
+    }
+
+    #[test]
+    fn test_empty_binary_parameter_renders_as_an_empty_quoted_string() {
+        assert_eq!(
+            Parameter::Binary(Vec::new()).to_sql_literal().unwrap(),
+            "''"
+        );
+    }
+
+    // --- Statement::bind_all ---
+
+    #[test]
+    fn test_bind_all_binds_every_parameter_by_position() {
+        let mut statement = Statement::new("SELECT * FROM t WHERE a = ? AND b = ? AND c = ?");
+        statement.bind_all(&[10i64, 20, 30]).unwrap();
+
+        assert_eq!(
+            statement.build_sql().unwrap(),
+            "SELECT * FROM t WHERE a = 10 AND b = 20 AND c = 30"
+        );
+    }
+
+    #[test]
+    fn test_bind_all_with_no_parameters_leaves_the_statement_unbound() {
+        let mut statement = Statement::new("SELECT 1");
+        statement.bind_all::<i64>(&[]).unwrap();
+
+        assert!(statement.parameters().is_empty());
+    }
+
+    #[test]
+    fn test_bind_all_propagates_a_binding_failure() {
+        let mut statement = Statement::new("SELECT ?");
+        statement.bind_all(&["' OR 1=1"]).unwrap();
+
+        let err = statement.build_sql().unwrap_err();
+
+        assert!(matches!(err, QueryError::SqlInjectionDetected));
+    }
+
+    // --- Debug for Statement ---
+
+    #[test]
+    fn test_statement_debug_shows_sql_type_and_timeout_but_no_parameters() {
+        let mut statement = Statement::new("SELECT ?");
+        statement.set_timeout(1234);
+        statement.bind(0, "secret").unwrap();
+
+        let rendered = format!("{:?}", statement);
+
+        assert!(rendered.starts_with("Statement {"), "got: {}", rendered);
+        assert!(rendered.contains("sql: \"SELECT ?\""));
+        assert!(rendered.contains("statement_type: Select"));
+        assert!(rendered.contains("timeout_ms: Some(1234)"));
+        assert!(
+            !rendered.contains("secret"),
+            "bound parameter values must not leak into Debug output"
+        );
     }
 }

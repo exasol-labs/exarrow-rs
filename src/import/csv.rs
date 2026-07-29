@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::query::import::{Compression, ImportFileEntry, ImportQuery, RowSeparator, TrimMode};
 use crate::transport::HttpTransportClient;
 
-use super::parallel::{stream_files_parallel, ParallelTransportPool};
+use super::parallel::{resolve_stream_task, stream_files_parallel, ParallelTransportPool};
 use super::source::IntoFileSources;
 use super::ImportError;
 
@@ -549,13 +549,7 @@ where
             .await?;
 
     // Build multi-file IMPORT SQL
-    let entries: Vec<ImportFileEntry> = pool
-        .file_entries()
-        .iter()
-        .map(|e| ImportFileEntry::new(e.address.clone(), e.file_name.clone(), e.public_key.clone()))
-        .collect();
-
-    let query = build_multi_file_query(table, &options, entries);
+    let query = build_multi_file_query(table, &options, pool.query_file_entries());
     let sql = query.build();
 
     // Get connections for streaming
@@ -569,19 +563,8 @@ where
     // Execute the IMPORT SQL in parallel
     let sql_result = execute_sql(sql).await;
 
-    // Wait for streaming to complete
-    let stream_result = stream_handle.await;
-
-    // Handle results - check stream task first
-    match stream_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(e) => {
-            return Err(ImportError::StreamError(format!(
-                "Stream task panicked: {e}"
-            )))
-        }
-    }
+    // Wait for streaming to complete; check it first as it holds protocol errors
+    resolve_stream_task(stream_handle.await)?;
 
     // Return the row count from SQL execution
     sql_result.map_err(ImportError::SqlError)
@@ -1502,5 +1485,101 @@ mod tests {
         assert!(sql.contains("IMPORT INTO test_schema.data (id, name)"));
         assert!(sql.contains("SKIP = 1"));
         assert!(sql.contains("FILE '001.csv.gz'"));
+    }
+
+    #[test]
+    fn test_build_multi_file_query_emits_null_value_and_reject_limit() {
+        use crate::query::import::ImportFileEntry;
+
+        let options = CsvImportOptions::default()
+            .null_value("\\N")
+            .reject_limit(5)
+            .trim_mode(TrimMode::Trim);
+
+        let entries = vec![ImportFileEntry::new(
+            "10.0.0.5:8563".to_string(),
+            "001.csv".to_string(),
+            None,
+        )];
+
+        let sql = build_multi_file_query("data", &options, entries).build();
+
+        assert!(sql.contains("NULL = '\\N'"), "got: {sql}");
+        assert!(sql.contains("REJECT LIMIT 5"), "got: {sql}");
+        assert!(sql.contains("TRIM = 'TRIM'"), "got: {sql}");
+    }
+
+    #[tokio::test]
+    async fn test_import_from_files_rejects_an_empty_file_list() {
+        let execute_sql = |_sql: String| async { Ok::<u64, String>(1) };
+
+        let err = import_from_files(
+            execute_sql,
+            "t",
+            Vec::<std::path::PathBuf>::new(),
+            CsvImportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::InvalidConfig(_)), "got: {err}");
+        assert!(
+            err.to_string().contains("No files provided for import"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_from_file_reports_an_unreadable_file() {
+        let execute_sql = |_sql: String| async { Ok::<u64, String>(1) };
+
+        let err = import_from_file(
+            execute_sql,
+            "t",
+            Path::new("/nonexistent/dir/missing.csv"),
+            CsvImportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_import_from_files_delegates_a_single_path_to_the_single_file_import() {
+        let execute_sql = |_sql: String| async { Ok::<u64, String>(1) };
+
+        let err = import_from_files(
+            execute_sql,
+            "t",
+            vec![std::path::PathBuf::from("/nonexistent/dir/missing.csv")],
+            CsvImportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_import_from_files_reports_an_unreadable_file_among_many() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let existing = dir.path().join("first.csv");
+        std::fs::write(&existing, b"1,a\n").expect("write file");
+        let execute_sql = |_sql: String| async { Ok::<u64, String>(1) };
+
+        let err = import_from_files(
+            execute_sql,
+            "t",
+            vec![
+                existing,
+                std::path::PathBuf::from("/nonexistent/second.csv"),
+            ],
+            CsvImportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
     }
 }

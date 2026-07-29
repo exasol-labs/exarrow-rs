@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+mod clauses;
 pub mod export;
 pub mod import;
 pub mod prepared;

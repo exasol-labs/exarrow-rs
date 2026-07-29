@@ -14,7 +14,23 @@ use crate::transport::HttpTransportClient;
 use super::ImportError;
 
 /// Default chunk size for HTTP chunked transfer encoding (64KB).
-const CHUNK_SIZE: usize = 64 * 1024;
+pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
+
+/// Resolve a spawned streaming task's outcome into a single error type.
+///
+/// A panicked task and a failed stream are indistinguishable to callers, so
+/// both collapse into `ImportError` here rather than at every call site.
+pub(crate) fn resolve_stream_task(
+    joined: Result<Result<(), ImportError>, tokio::task::JoinError>,
+) -> Result<(), ImportError> {
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(ImportError::StreamError(format!(
+            "Stream task panicked: {e}"
+        ))),
+    }
+}
 
 /// Entry describing a file for parallel import.
 ///
@@ -154,6 +170,24 @@ impl ParallelTransportPool {
         &self.entries
     }
 
+    /// Returns the pool's file entries in the form the IMPORT query builder consumes.
+    ///
+    /// The pool owns the mapping from established connections to SQL file
+    /// clauses so callers never restate it.
+    #[must_use]
+    pub fn query_file_entries(&self) -> Vec<crate::query::import::ImportFileEntry> {
+        self.entries
+            .iter()
+            .map(|e| {
+                crate::query::import::ImportFileEntry::new(
+                    e.address.clone(),
+                    e.file_name.clone(),
+                    e.public_key.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Returns the number of connections in the pool.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -242,8 +276,17 @@ pub async fn stream_files_parallel(
         stream_handles.push(handle);
     }
 
-    // Wait for all streams to complete with fail-fast
-    for (idx, handle) in stream_handles.into_iter().enumerate() {
+    join_stream_handles(stream_handles).await
+}
+
+/// Await every streaming task with fail-fast semantics.
+///
+/// Reports the index of the failing task so a multi-file import points at the
+/// file that broke.
+async fn join_stream_handles(
+    handles: Vec<JoinHandle<Result<(), ImportError>>>,
+) -> Result<(), ImportError> {
+    for (idx, handle) in handles.into_iter().enumerate() {
         handle
             .await
             .map_err(|e| {
@@ -317,16 +360,7 @@ pub async fn stream_parquet_files_parallel(
         stream_handles.push(handle);
     }
 
-    for (idx, handle) in stream_handles.into_iter().enumerate() {
-        handle
-            .await
-            .map_err(|e| {
-                ImportError::ParallelImportError(format!("Stream task {} panicked: {e}", idx))
-            })?
-            .map_err(|e| ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx)))?;
-    }
-
-    Ok(())
+    join_stream_handles(stream_handles).await
 }
 
 /// Converts multiple Parquet files to CSV format in parallel.
@@ -522,5 +556,219 @@ mod tests {
 
         let result = stream_parquet_files_parallel(connections, file_paths).await;
         assert!(result.is_ok());
+    }
+
+    fn pool_with_entries(entries: Vec<ImportFileEntry>) -> ParallelTransportPool {
+        ParallelTransportPool {
+            connections: Vec::new(),
+            entries,
+        }
+    }
+
+    #[test]
+    fn test_query_file_entries_mirrors_pool_entries() {
+        let pool = pool_with_entries(vec![
+            ImportFileEntry::new("10.0.0.1:8000".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new(
+                "10.0.0.2:8000".to_string(),
+                "002.csv".to_string(),
+                Some("ab:cd".to_string()),
+            ),
+        ]);
+
+        let query_entries = pool.query_file_entries();
+
+        assert_eq!(query_entries.len(), 2);
+        assert_eq!(query_entries[0].address, "10.0.0.1:8000");
+        assert_eq!(query_entries[0].file_name, "001.csv");
+        assert_eq!(query_entries[0].public_key, None);
+        assert_eq!(query_entries[1].address, "10.0.0.2:8000");
+        assert_eq!(query_entries[1].file_name, "002.csv");
+        assert_eq!(query_entries[1].public_key, Some("ab:cd".to_string()));
+    }
+
+    #[test]
+    fn test_pool_reports_file_entries_and_emptiness() {
+        let empty = pool_with_entries(Vec::new());
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.file_entries().is_empty());
+        assert!(empty.query_file_entries().is_empty());
+
+        let pool = pool_with_entries(vec![ImportFileEntry::new(
+            "10.0.0.1:8000".to_string(),
+            "001.csv".to_string(),
+            None,
+        )]);
+        assert_eq!(pool.file_entries().len(), 1);
+        assert!(format!("{pool:?}").contains("connection_count"));
+    }
+
+    #[test]
+    fn test_into_connections_yields_the_pool_connections() {
+        let pool = pool_with_entries(vec![ImportFileEntry::new(
+            "10.0.0.1:8000".to_string(),
+            "001.csv".to_string(),
+            None,
+        )]);
+
+        assert!(pool.into_connections().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parallel_transport_pool_reports_the_failing_connection_index() {
+        // Port 1 is never served by Exasol, so the handshake fails immediately.
+        let err = ParallelTransportPool::connect("127.0.0.1", 1, false, 2)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ImportError::ParallelImportError(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Connection 0 failed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_stream_task_passes_through_success_and_stream_error() {
+        assert!(resolve_stream_task(Ok(Ok(()))).is_ok());
+
+        let err = resolve_stream_task(Ok(Err(ImportError::InvalidConfig("boom".to_string()))))
+            .unwrap_err();
+
+        assert!(matches!(err, ImportError::InvalidConfig(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stream_task_maps_panic_to_stream_error() {
+        let handle = tokio::spawn(async { panic!("task exploded") });
+        let joined = handle.await;
+
+        let err = resolve_stream_task(joined.map(|_: ()| Ok(()))).unwrap_err();
+
+        assert!(matches!(err, ImportError::StreamError(_)), "got: {err}");
+        assert!(
+            err.to_string().contains("Stream task panicked"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_join_stream_handles_reports_failing_stream_index() {
+        let handles = vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Err(ImportError::InvalidConfig("bad file".to_string())) }),
+        ];
+
+        let err = join_stream_handles(handles).await.unwrap_err();
+
+        assert!(err.to_string().contains("Stream 1 failed"), "got: {err}");
+        assert!(err.to_string().contains("bad file"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_join_stream_handles_reports_panicking_task_index() {
+        let handles = vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { panic!("stream exploded") }),
+        ];
+
+        let err = join_stream_handles(handles).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("Stream task 1 panicked"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_join_stream_handles_accepts_all_successful_tasks() {
+        let handles = vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Ok(()) }),
+        ];
+
+        assert!(join_stream_handles(handles).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_convert_parquet_files_to_csv_reports_unreadable_file() {
+        let result = convert_parquet_files_to_csv(
+            vec![PathBuf::from("/nonexistent/dir/missing.parquet")],
+            1024,
+            String::new(),
+            ',',
+            '"',
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ImportError::ParallelImportError(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Failed to open Parquet file"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_convert_parquet_files_to_csv_rejects_non_parquet_content() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("not-parquet.parquet");
+        std::fs::write(&path, b"this is not a parquet file").expect("write file");
+
+        let err = convert_parquet_files_to_csv(vec![path], 1024, String::new(), ',', '"')
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Failed to read Parquet file"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_convert_parquet_files_to_csv_renders_every_file_as_csv_rows() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut paths = Vec::new();
+        for (idx, name) in ["a", "b"].iter().enumerate() {
+            let path = dir.path().join(format!("{name}.parquet"));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("label", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![idx as i32])),
+                    Arc::new(StringArray::from(vec![Some(*name)])),
+                ],
+            )
+            .expect("batch");
+            let file = std::fs::File::create(&path).expect("create file");
+            let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+            paths.push(path);
+        }
+
+        let csv_data = convert_parquet_files_to_csv(paths, 1024, String::new(), ',', '"')
+            .await
+            .expect("conversion");
+
+        assert_eq!(csv_data.len(), 2);
+        assert_eq!(String::from_utf8(csv_data[0].clone()).unwrap(), "0,a\n");
+        assert_eq!(String::from_utf8(csv_data[1].clone()).unwrap(), "1,b\n");
     }
 }
