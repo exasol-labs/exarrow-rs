@@ -360,6 +360,68 @@ mod tests {
     }
 
     #[test]
+    fn later_column_longer_than_first_pads_missing_leading_values_with_null() {
+        // Column-major: [[1], [2, 3]] — the second column has one extra value.
+        let json = json!({ "data": [[1], [2, 3]] });
+        let result: TestData = serde_json::from_value(json).unwrap();
+
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0], vec![json!(1), json!(2)]);
+        assert_eq!(result.data[1], vec![Value::Null, json!(3)]);
+    }
+
+    #[test]
+    fn later_column_shorter_than_first_pads_trailing_rows_with_null() {
+        // Column-major: [[1, 2], [3]] — the second column is one value short.
+        let json = json!({ "data": [[1, 2], [3]] });
+        let result: TestData = serde_json::from_value(json).unwrap();
+
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0], vec![json!(1), json!(3)]);
+        assert_eq!(result.data[1], vec![json!(2), Value::Null]);
+    }
+
+    #[test]
+    fn non_array_data_reports_column_major_array_expectation() {
+        let json = json!({ "data": 5 });
+        let err = serde_json::from_value::<TestData>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("column-major data array"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn non_array_column_reports_column_values_expectation() {
+        let json = json!({ "data": [5] });
+        let err = serde_json::from_value::<TestData>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("array of column values"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn option_visitor_expects_null_or_column_major_array() {
+        struct Expectation;
+
+        impl fmt::Display for Expectation {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                <OptionDataVisitor as Visitor<'_>>::expecting(&OptionDataVisitor, f)
+            }
+        }
+
+        assert_eq!(Expectation.to_string(), "null or column-major data array");
+    }
+
+    #[test]
+    fn option_visitor_maps_unit_to_absent_data() {
+        let visited: Result<Option<Vec<Vec<Value>>>, serde_json::Error> =
+            OptionDataVisitor.visit_unit();
+        assert_eq!(visited.unwrap(), None);
+    }
+
+    #[test]
     fn test_realistic_exasol_response() {
         // Simulate a realistic Exasol response with different data types
         let json = json!({

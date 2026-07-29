@@ -122,14 +122,41 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the coverage tooling
+        run: python3 -m unittest discover --start-directory scripts --pattern 'test_*.py'
+
       - name: Run unit tests with coverage
         run: cargo llvm-cov --lib --lcov --output-path lcov-unit.info
 
+      # cargo llvm-cov instruments #[cfg(test)] modules too, so the raw report
+      # counts the unit tests in their own denominator. Everything downstream
+      # (the floor below, the Sonar Quality Gate) reads the stripped report.
+      - name: Reduce coverage to production code
+        run: |
+          python3 scripts/strip_test_coverage.py strip \
+            --input lcov-unit.info \
+            --output lcov-unit-production.info \
+            --summary coverage-summary.json
+
+      - name: Enforce production coverage floors
+        run: python3 scripts/strip_test_coverage.py check --summary coverage-summary.json
+
+      # always(): a run that trips the floor is exactly the run whose report
+      # someone needs to read, and the sonar job needs the artifact regardless.
       - name: Upload unit coverage
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lcov-unit
-          path: lcov-unit.info
+          path: |
+            lcov-unit-production.info
+            coverage-summary.json
+            lcov-unit.info
           if-no-files-found: error
           retention-days: 1
 

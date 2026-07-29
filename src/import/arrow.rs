@@ -197,11 +197,10 @@ impl<W: AsyncWrite + Unpin> ArrowToCsvWriter<W> {
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<usize, ImportError> {
         let mut bytes_written = 0;
         let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
 
         // Write header if requested and this is the first batch
         if self.options.write_header && self.rows_written == 0 {
-            let header = self.format_header(batch)?;
+            let header = format_header(&self.options, batch);
             self.writer
                 .write_all(header.as_bytes())
                 .await
@@ -209,21 +208,8 @@ impl<W: AsyncWrite + Unpin> ArrowToCsvWriter<W> {
             bytes_written += header.len();
         }
 
-        // Write each row
         for row_idx in 0..num_rows {
-            let mut row_str = String::with_capacity(256);
-
-            for col_idx in 0..num_cols {
-                if col_idx > 0 {
-                    row_str.push(self.options.column_separator);
-                }
-
-                let column = batch.column(col_idx);
-                let value = self.format_value(column, row_idx)?;
-                row_str.push_str(&value);
-            }
-
-            row_str.push_str(self.options.row_separator);
+            let row_str = format_row(&self.options, batch, row_idx)?;
 
             self.writer
                 .write_all(row_str.as_bytes())
@@ -250,170 +236,6 @@ impl<W: AsyncWrite + Unpin> ArrowToCsvWriter<W> {
     pub fn rows_written(&self) -> usize {
         self.rows_written
     }
-
-    /// Format header row from schema.
-    fn format_header(&self, batch: &RecordBatch) -> Result<String, ImportError> {
-        let schema = batch.schema();
-        let mut header = String::new();
-
-        for (idx, field) in schema.fields().iter().enumerate() {
-            if idx > 0 {
-                header.push(self.options.column_separator);
-            }
-            header.push_str(&self.escape_string(field.name()));
-        }
-        header.push_str(self.options.row_separator);
-
-        Ok(header)
-    }
-
-    /// Format a value from an Arrow array at the given row index.
-    fn format_value(&self, array: &dyn Array, row_idx: usize) -> Result<String, ImportError> {
-        if array.is_null(row_idx) {
-            return Ok(self.options.null_value.clone());
-        }
-
-        let data_type = array.data_type();
-        match data_type {
-            DataType::Boolean => {
-                let arr = array.as_boolean();
-                Ok(if arr.value(row_idx) { "true" } else { "false" }.to_string())
-            }
-            DataType::Int8 => Ok(array.as_primitive::<Int8Type>().value(row_idx).to_string()),
-            DataType::Int16 => Ok(array.as_primitive::<Int16Type>().value(row_idx).to_string()),
-            DataType::Int32 => Ok(array.as_primitive::<Int32Type>().value(row_idx).to_string()),
-            DataType::Int64 => Ok(array.as_primitive::<Int64Type>().value(row_idx).to_string()),
-            DataType::UInt8 => Ok(array.as_primitive::<UInt8Type>().value(row_idx).to_string()),
-            DataType::UInt16 => Ok(array
-                .as_primitive::<UInt16Type>()
-                .value(row_idx)
-                .to_string()),
-            DataType::UInt32 => Ok(array
-                .as_primitive::<UInt32Type>()
-                .value(row_idx)
-                .to_string()),
-            DataType::UInt64 => Ok(array
-                .as_primitive::<UInt64Type>()
-                .value(row_idx)
-                .to_string()),
-            DataType::Float32 => {
-                let val = array.as_primitive::<Float32Type>().value(row_idx);
-                Ok(format_float(val as f64))
-            }
-            DataType::Float64 => {
-                let val = array.as_primitive::<Float64Type>().value(row_idx);
-                Ok(format_float(val))
-            }
-            DataType::Utf8 => {
-                let arr = array.as_string::<i32>();
-                Ok(self.escape_string(arr.value(row_idx)))
-            }
-            DataType::LargeUtf8 => {
-                let arr = array.as_string::<i64>();
-                Ok(self.escape_string(arr.value(row_idx)))
-            }
-            DataType::Date32 => {
-                let val = array.as_primitive::<Date32Type>().value(row_idx);
-                Ok(format_date32(val))
-            }
-            DataType::Timestamp(unit, _tz) => self.format_timestamp(array, row_idx, unit),
-            DataType::Decimal128(precision, scale) => {
-                self.format_decimal128(array, row_idx, *precision, *scale)
-            }
-            DataType::Binary => {
-                let arr = array.as_binary::<i32>();
-                Ok(hex::encode(arr.value(row_idx)))
-            }
-            DataType::LargeBinary => {
-                let arr = array.as_binary::<i64>();
-                Ok(hex::encode(arr.value(row_idx)))
-            }
-            other => Err(ImportError::ConversionError(format!(
-                "Unsupported Arrow type for CSV conversion: {:?}",
-                other
-            ))),
-        }
-    }
-
-    /// Format a timestamp value.
-    fn format_timestamp(
-        &self,
-        array: &dyn Array,
-        row_idx: usize,
-        unit: &arrow::datatypes::TimeUnit,
-    ) -> Result<String, ImportError> {
-        use arrow::datatypes::TimeUnit;
-
-        let micros = match unit {
-            TimeUnit::Second => {
-                let val = array.as_primitive::<TimestampSecondType>().value(row_idx);
-                val * 1_000_000
-            }
-            TimeUnit::Millisecond => {
-                let val = array
-                    .as_primitive::<TimestampMillisecondType>()
-                    .value(row_idx);
-                val * 1_000
-            }
-            TimeUnit::Microsecond => array
-                .as_primitive::<TimestampMicrosecondType>()
-                .value(row_idx),
-            TimeUnit::Nanosecond => {
-                let val = array
-                    .as_primitive::<TimestampNanosecondType>()
-                    .value(row_idx);
-                val / 1_000
-            }
-        };
-
-        Ok(format_timestamp_micros(micros))
-    }
-
-    /// Format a Decimal128 value.
-    fn format_decimal128(
-        &self,
-        array: &dyn Array,
-        row_idx: usize,
-        _precision: u8,
-        scale: i8,
-    ) -> Result<String, ImportError> {
-        let arr = array
-            .as_any()
-            .downcast_ref::<arrow::array::Decimal128Array>()
-            .ok_or_else(|| ImportError::ConversionError("Expected Decimal128Array".to_string()))?;
-
-        let value = arr.value(row_idx);
-        Ok(format_decimal128(value, scale))
-    }
-
-    /// Escape a string value for CSV.
-    ///
-    /// Quotes the string if it contains the separator, delimiter, or newlines.
-    /// Doubles any delimiter characters inside the string.
-    fn escape_string(&self, s: &str) -> String {
-        let sep = self.options.column_separator;
-        let delim = self.options.column_delimiter;
-
-        // Check if quoting is needed
-        let needs_quoting =
-            s.contains(sep) || s.contains(delim) || s.contains('\n') || s.contains('\r');
-
-        if needs_quoting {
-            // Quote the string and double any delimiter characters
-            let mut result = String::with_capacity(s.len() + 4);
-            result.push(delim);
-            for c in s.chars() {
-                if c == delim {
-                    result.push(delim);
-                }
-                result.push(c);
-            }
-            result.push(delim);
-            result
-        } else {
-            s.to_string()
-        }
-    }
 }
 
 /// Synchronous Arrow to CSV converter for testing and simple use cases.
@@ -437,32 +259,18 @@ impl<W: Write> SyncArrowToCsvWriter<W> {
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<usize, ImportError> {
         let mut bytes_written = 0;
         let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
 
         // Write header if requested and this is the first batch
         if self.options.write_header && self.rows_written == 0 {
-            let header = self.format_header(batch)?;
+            let header = format_header(&self.options, batch);
             self.writer
                 .write_all(header.as_bytes())
                 .map_err(|e| ImportError::CsvWriteError(e.to_string()))?;
             bytes_written += header.len();
         }
 
-        // Write each row
         for row_idx in 0..num_rows {
-            let mut row_str = String::with_capacity(256);
-
-            for col_idx in 0..num_cols {
-                if col_idx > 0 {
-                    row_str.push(self.options.column_separator);
-                }
-
-                let column = batch.column(col_idx);
-                let value = self.format_value(column, row_idx)?;
-                row_str.push_str(&value);
-            }
-
-            row_str.push_str(self.options.row_separator);
+            let row_str = format_row(&self.options, batch, row_idx)?;
 
             self.writer
                 .write_all(row_str.as_bytes())
@@ -481,165 +289,186 @@ impl<W: Write> SyncArrowToCsvWriter<W> {
             .map_err(|e| ImportError::CsvWriteError(e.to_string()))?;
         Ok(self.rows_written)
     }
+}
 
-    /// Format header row from schema.
-    fn format_header(&self, batch: &RecordBatch) -> Result<String, ImportError> {
-        let schema = batch.schema();
-        let mut header = String::new();
+/// Format the header row from a batch schema, terminated by the row separator.
+fn format_header(options: &CsvWriterOptions, batch: &RecordBatch) -> String {
+    let schema = batch.schema();
+    let mut header = String::new();
 
-        for (idx, field) in schema.fields().iter().enumerate() {
-            if idx > 0 {
-                header.push(self.options.column_separator);
-            }
-            header.push_str(&self.escape_string(field.name()));
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if idx > 0 {
+            header.push(options.column_separator);
         }
-        header.push_str(self.options.row_separator);
-
-        Ok(header)
+        header.push_str(&escape_string(options, field.name()));
     }
+    header.push_str(options.row_separator);
 
-    /// Format a value from an Arrow array at the given row index.
-    fn format_value(&self, array: &dyn Array, row_idx: usize) -> Result<String, ImportError> {
-        if array.is_null(row_idx) {
-            return Ok(self.options.null_value.clone());
+    header
+}
+
+/// Format one batch row as a separator-joined CSV line, terminated by the row separator.
+fn format_row(
+    options: &CsvWriterOptions,
+    batch: &RecordBatch,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let mut row_str = String::with_capacity(256);
+
+    for col_idx in 0..batch.num_columns() {
+        if col_idx > 0 {
+            row_str.push(options.column_separator);
         }
+        row_str.push_str(&format_value(options, batch.column(col_idx), row_idx)?);
+    }
 
-        let data_type = array.data_type();
-        match data_type {
-            DataType::Boolean => {
-                let arr = array.as_boolean();
-                Ok(if arr.value(row_idx) { "true" } else { "false" }.to_string())
-            }
-            DataType::Int8 => Ok(array.as_primitive::<Int8Type>().value(row_idx).to_string()),
-            DataType::Int16 => Ok(array.as_primitive::<Int16Type>().value(row_idx).to_string()),
-            DataType::Int32 => Ok(array.as_primitive::<Int32Type>().value(row_idx).to_string()),
-            DataType::Int64 => Ok(array.as_primitive::<Int64Type>().value(row_idx).to_string()),
-            DataType::UInt8 => Ok(array.as_primitive::<UInt8Type>().value(row_idx).to_string()),
-            DataType::UInt16 => Ok(array
-                .as_primitive::<UInt16Type>()
-                .value(row_idx)
-                .to_string()),
-            DataType::UInt32 => Ok(array
-                .as_primitive::<UInt32Type>()
-                .value(row_idx)
-                .to_string()),
-            DataType::UInt64 => Ok(array
-                .as_primitive::<UInt64Type>()
-                .value(row_idx)
-                .to_string()),
-            DataType::Float32 => {
-                let val = array.as_primitive::<Float32Type>().value(row_idx);
-                Ok(format_float(val as f64))
-            }
-            DataType::Float64 => {
-                let val = array.as_primitive::<Float64Type>().value(row_idx);
-                Ok(format_float(val))
-            }
-            DataType::Utf8 => {
-                let arr = array.as_string::<i32>();
-                Ok(self.escape_string(arr.value(row_idx)))
-            }
-            DataType::LargeUtf8 => {
-                let arr = array.as_string::<i64>();
-                Ok(self.escape_string(arr.value(row_idx)))
-            }
-            DataType::Date32 => {
-                let val = array.as_primitive::<Date32Type>().value(row_idx);
-                Ok(format_date32(val))
-            }
-            DataType::Timestamp(unit, _tz) => self.format_timestamp(array, row_idx, unit),
-            DataType::Decimal128(precision, scale) => {
-                self.format_decimal128(array, row_idx, *precision, *scale)
-            }
-            DataType::Binary => {
-                let arr = array.as_binary::<i32>();
-                Ok(hex::encode(arr.value(row_idx)))
-            }
-            DataType::LargeBinary => {
-                let arr = array.as_binary::<i64>();
-                Ok(hex::encode(arr.value(row_idx)))
-            }
-            other => Err(ImportError::ConversionError(format!(
-                "Unsupported Arrow type for CSV conversion: {:?}",
-                other
-            ))),
+    row_str.push_str(options.row_separator);
+
+    Ok(row_str)
+}
+
+/// Format a value from an Arrow array at the given row index.
+fn format_value(
+    options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    if array.is_null(row_idx) {
+        return Ok(options.null_value.clone());
+    }
+
+    let data_type = array.data_type();
+    match data_type {
+        DataType::Boolean => {
+            let arr = array.as_boolean();
+            Ok(if arr.value(row_idx) { "true" } else { "false" }.to_string())
         }
+        DataType::Int8 => Ok(array.as_primitive::<Int8Type>().value(row_idx).to_string()),
+        DataType::Int16 => Ok(array.as_primitive::<Int16Type>().value(row_idx).to_string()),
+        DataType::Int32 => Ok(array.as_primitive::<Int32Type>().value(row_idx).to_string()),
+        DataType::Int64 => Ok(array.as_primitive::<Int64Type>().value(row_idx).to_string()),
+        DataType::UInt8 => Ok(array.as_primitive::<UInt8Type>().value(row_idx).to_string()),
+        DataType::UInt16 => Ok(array
+            .as_primitive::<UInt16Type>()
+            .value(row_idx)
+            .to_string()),
+        DataType::UInt32 => Ok(array
+            .as_primitive::<UInt32Type>()
+            .value(row_idx)
+            .to_string()),
+        DataType::UInt64 => Ok(array
+            .as_primitive::<UInt64Type>()
+            .value(row_idx)
+            .to_string()),
+        DataType::Float32 => {
+            let val = array.as_primitive::<Float32Type>().value(row_idx);
+            Ok(format_float(val as f64))
+        }
+        DataType::Float64 => {
+            let val = array.as_primitive::<Float64Type>().value(row_idx);
+            Ok(format_float(val))
+        }
+        DataType::Utf8 => {
+            let arr = array.as_string::<i32>();
+            Ok(escape_string(options, arr.value(row_idx)))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_string::<i64>();
+            Ok(escape_string(options, arr.value(row_idx)))
+        }
+        DataType::Date32 => {
+            let val = array.as_primitive::<Date32Type>().value(row_idx);
+            Ok(format_date32(val))
+        }
+        DataType::Timestamp(unit, _tz) => Ok(format_timestamp(array, row_idx, unit)),
+        DataType::Decimal128(_precision, scale) => format_decimal_value(array, row_idx, *scale),
+        DataType::Binary => {
+            let arr = array.as_binary::<i32>();
+            Ok(hex::encode(arr.value(row_idx)))
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_binary::<i64>();
+            Ok(hex::encode(arr.value(row_idx)))
+        }
+        other => Err(ImportError::ConversionError(format!(
+            "Unsupported Arrow type for CSV conversion: {:?}",
+            other
+        ))),
+    }
+}
+
+/// Format a timestamp value, normalizing every Arrow time unit to microseconds.
+fn format_timestamp(
+    array: &dyn Array,
+    row_idx: usize,
+    unit: &arrow::datatypes::TimeUnit,
+) -> String {
+    use arrow::datatypes::TimeUnit;
+
+    let micros = match unit {
+        TimeUnit::Second => {
+            let val = array.as_primitive::<TimestampSecondType>().value(row_idx);
+            val * 1_000_000
+        }
+        TimeUnit::Millisecond => {
+            let val = array
+                .as_primitive::<TimestampMillisecondType>()
+                .value(row_idx);
+            val * 1_000
+        }
+        TimeUnit::Microsecond => array
+            .as_primitive::<TimestampMicrosecondType>()
+            .value(row_idx),
+        TimeUnit::Nanosecond => {
+            let val = array
+                .as_primitive::<TimestampNanosecondType>()
+                .value(row_idx);
+            val / 1_000
+        }
+    };
+
+    format_timestamp_micros(micros)
+}
+
+/// Format a Decimal128 array element using the column's declared scale.
+fn format_decimal_value(
+    array: &dyn Array,
+    row_idx: usize,
+    scale: i8,
+) -> Result<String, ImportError> {
+    let arr = array
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal128Array>()
+        .ok_or_else(|| ImportError::ConversionError("Expected Decimal128Array".to_string()))?;
+
+    Ok(format_decimal128(arr.value(row_idx), scale))
+}
+
+/// Escape a string value for CSV.
+///
+/// Quotes the string if it contains the separator, delimiter, or newlines.
+/// Doubles any delimiter characters inside the string.
+fn escape_string(options: &CsvWriterOptions, s: &str) -> String {
+    let sep = options.column_separator;
+    let delim = options.column_delimiter;
+
+    let needs_quoting =
+        s.contains(sep) || s.contains(delim) || s.contains('\n') || s.contains('\r');
+
+    if !needs_quoting {
+        return s.to_string();
     }
 
-    /// Format a timestamp value.
-    fn format_timestamp(
-        &self,
-        array: &dyn Array,
-        row_idx: usize,
-        unit: &arrow::datatypes::TimeUnit,
-    ) -> Result<String, ImportError> {
-        use arrow::datatypes::TimeUnit;
-
-        let micros = match unit {
-            TimeUnit::Second => {
-                let val = array.as_primitive::<TimestampSecondType>().value(row_idx);
-                val * 1_000_000
-            }
-            TimeUnit::Millisecond => {
-                let val = array
-                    .as_primitive::<TimestampMillisecondType>()
-                    .value(row_idx);
-                val * 1_000
-            }
-            TimeUnit::Microsecond => array
-                .as_primitive::<TimestampMicrosecondType>()
-                .value(row_idx),
-            TimeUnit::Nanosecond => {
-                let val = array
-                    .as_primitive::<TimestampNanosecondType>()
-                    .value(row_idx);
-                val / 1_000
-            }
-        };
-
-        Ok(format_timestamp_micros(micros))
-    }
-
-    /// Format a Decimal128 value.
-    fn format_decimal128(
-        &self,
-        array: &dyn Array,
-        row_idx: usize,
-        _precision: u8,
-        scale: i8,
-    ) -> Result<String, ImportError> {
-        let arr = array
-            .as_any()
-            .downcast_ref::<arrow::array::Decimal128Array>()
-            .ok_or_else(|| ImportError::ConversionError("Expected Decimal128Array".to_string()))?;
-
-        let value = arr.value(row_idx);
-        Ok(format_decimal128(value, scale))
-    }
-
-    /// Escape a string value for CSV.
-    fn escape_string(&self, s: &str) -> String {
-        let sep = self.options.column_separator;
-        let delim = self.options.column_delimiter;
-
-        let needs_quoting =
-            s.contains(sep) || s.contains(delim) || s.contains('\n') || s.contains('\r');
-
-        if needs_quoting {
-            let mut result = String::with_capacity(s.len() + 4);
+    let mut result = String::with_capacity(s.len() + 4);
+    result.push(delim);
+    for c in s.chars() {
+        if c == delim {
             result.push(delim);
-            for c in s.chars() {
-                if c == delim {
-                    result.push(delim);
-                }
-                result.push(c);
-            }
-            result.push(delim);
-            result
-        } else {
-            s.to_string()
         }
+        result.push(c);
     }
+    result.push(delim);
+    result
 }
 
 /// Format a floating-point value for CSV.
@@ -787,8 +616,22 @@ where
     // Convert RecordBatch to CSV bytes
     let csv_bytes = record_batch_to_csv(batch, options.csv_options.clone())?;
 
-    // Create CSV import options from Arrow options
-    let csv_options = super::csv::CsvImportOptions {
+    // Use the CSV import stream function to send the data
+    super::csv::import_from_stream(
+        execute_sql,
+        table,
+        std::io::Cursor::new(csv_bytes),
+        csv_import_options(&options),
+    )
+    .await
+}
+
+/// Translate Arrow import options into the CSV import options of the transport path.
+///
+/// Arrow data is always converted to UTF-8 CSV with LF rows and no compression,
+/// so only the caller-visible options carry over.
+fn csv_import_options(options: &ArrowImportOptions) -> super::csv::CsvImportOptions {
+    super::csv::CsvImportOptions {
         encoding: "UTF-8".to_string(),
         column_separator: options.csv_options.column_separator,
         column_delimiter: options.csv_options.column_delimiter,
@@ -807,16 +650,7 @@ where
         columns: options.columns.clone(),
         host: options.host.clone(),
         port: options.port,
-    };
-
-    // Use the CSV import stream function to send the data
-    super::csv::import_from_stream(
-        execute_sql,
-        table,
-        std::io::Cursor::new(csv_bytes),
-        csv_options,
-    )
-    .await
+    }
 }
 
 /// Import multiple RecordBatches from an iterator into an Exasol table.
@@ -858,34 +692,12 @@ where
     }
     writer.finish()?;
 
-    // Create CSV import options from Arrow options
-    let csv_options = super::csv::CsvImportOptions {
-        encoding: "UTF-8".to_string(),
-        column_separator: options.csv_options.column_separator,
-        column_delimiter: options.csv_options.column_delimiter,
-        row_separator: crate::query::import::RowSeparator::LF,
-        skip_rows: 0,
-        null_value: if options.csv_options.null_value.is_empty() {
-            None
-        } else {
-            Some(options.csv_options.null_value.clone())
-        },
-        trim_mode: crate::query::import::TrimMode::None,
-        compression: crate::query::import::Compression::None,
-        reject_limit: None,
-        use_tls: options.use_tls,
-        schema: options.schema.clone(),
-        columns: options.columns.clone(),
-        host: options.host.clone(),
-        port: options.port,
-    };
-
     // Use the CSV import stream function to send the data
     super::csv::import_from_stream(
         execute_sql,
         table,
         std::io::Cursor::new(all_csv_bytes),
-        csv_options,
+        csv_import_options(&options),
     )
     .await
 }
@@ -943,34 +755,12 @@ where
     }
     writer.finish()?;
 
-    // Create CSV import options from Arrow options
-    let csv_options = super::csv::CsvImportOptions {
-        encoding: "UTF-8".to_string(),
-        column_separator: options.csv_options.column_separator,
-        column_delimiter: options.csv_options.column_delimiter,
-        row_separator: crate::query::import::RowSeparator::LF,
-        skip_rows: 0,
-        null_value: if options.csv_options.null_value.is_empty() {
-            None
-        } else {
-            Some(options.csv_options.null_value.clone())
-        },
-        trim_mode: crate::query::import::TrimMode::None,
-        compression: crate::query::import::Compression::None,
-        reject_limit: None,
-        use_tls: options.use_tls,
-        schema: options.schema.clone(),
-        columns: options.columns.clone(),
-        host: options.host.clone(),
-        port: options.port,
-    };
-
     // Use the CSV import stream function to send the data
     super::csv::import_from_stream(
         execute_sql,
         table,
         std::io::Cursor::new(all_csv_bytes),
-        csv_options,
+        csv_import_options(&options),
     )
     .await
 }
@@ -1111,29 +901,25 @@ mod tests {
 
     #[test]
     fn test_escape_string_no_special_chars() {
-        let writer = SyncArrowToCsvWriter::new(Vec::new(), CsvWriterOptions::default());
-        let escaped = writer.escape_string("hello");
+        let escaped = escape_string(&CsvWriterOptions::default(), "hello");
         assert_eq!(escaped, "hello");
     }
 
     #[test]
     fn test_escape_string_with_separator() {
-        let writer = SyncArrowToCsvWriter::new(Vec::new(), CsvWriterOptions::default());
-        let escaped = writer.escape_string("hello,world");
+        let escaped = escape_string(&CsvWriterOptions::default(), "hello,world");
         assert_eq!(escaped, "\"hello,world\"");
     }
 
     #[test]
     fn test_escape_string_with_delimiter() {
-        let writer = SyncArrowToCsvWriter::new(Vec::new(), CsvWriterOptions::default());
-        let escaped = writer.escape_string("say \"hello\"");
+        let escaped = escape_string(&CsvWriterOptions::default(), "say \"hello\"");
         assert_eq!(escaped, "\"say \"\"hello\"\"\"");
     }
 
     #[test]
     fn test_escape_string_with_newline() {
-        let writer = SyncArrowToCsvWriter::new(Vec::new(), CsvWriterOptions::default());
-        let escaped = writer.escape_string("line1\nline2");
+        let escaped = escape_string(&CsvWriterOptions::default(), "line1\nline2");
         assert_eq!(escaped, "\"line1\nline2\"");
     }
 
@@ -1858,5 +1644,284 @@ mod tests {
         // End of 1999 - December 31, 1999 is day 10956 from epoch
         let (y, m, d) = days_to_ymd(10956);
         assert_eq!((y, m, d), (1999, 12, 31));
+    }
+
+    #[test]
+    fn test_days_to_ymd_before_epoch() {
+        assert_eq!(days_to_ymd(-1), (1969, 12, 31));
+        assert_eq!(days_to_ymd(-365), (1969, 1, 1));
+        // 1900-01-01 is 25567 days before the epoch; 1900 is not a leap year.
+        assert_eq!(days_to_ymd(-25567), (1900, 1, 1));
+        // Crosses the negative-era branch of the Hinnant algorithm.
+        assert_eq!(days_to_ymd(-719_468), (0, 3, 1));
+        assert_eq!(days_to_ymd(-719_469), (0, 2, 29));
+        // Before the year-zero era boundary, where the era divisor turns negative.
+        assert_eq!(days_to_ymd(-800_000), (-221, 9, 4));
+    }
+
+    #[test]
+    fn test_format_date32_before_epoch() {
+        assert_eq!(format_date32(-1), "1969-12-31");
+        assert_eq!(format_date32(-25567), "1900-01-01");
+    }
+
+    #[test]
+    fn test_format_timestamp_micros_truncates_negative_day_offset() {
+        // Characterization: integer division truncates toward zero, so a
+        // pre-epoch timestamp keeps the epoch date and an absolute time of day.
+        // The parquet import path (chrono-based) renders these differently.
+        assert_eq!(
+            format_timestamp_micros(-1_000_000),
+            "1970-01-01 00:00:01.000000"
+        );
+        assert_eq!(
+            format_timestamp_micros(-86_400_000_000),
+            "1969-12-31 00:00:00.000000"
+        );
+    }
+
+    #[test]
+    fn test_format_value_rejects_unsupported_type() {
+        let array = arrow::array::Time32SecondArray::from(vec![1]);
+        let options = CsvWriterOptions::default();
+
+        let err = format_value(&options, &array, 0).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Unsupported Arrow type for CSV conversion"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_format_value_null_uses_configured_null_marker() {
+        let array = arrow::array::StringArray::from(vec![None::<&str>]);
+        let options = CsvWriterOptions {
+            null_value: "\\N".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(format_value(&options, &array, 0).unwrap(), "\\N");
+    }
+
+    #[test]
+    fn test_format_header_escapes_names_containing_the_separator() {
+        let schema = Schema::new(vec![
+            Field::new("a,b", DataType::Int32, false),
+            Field::new("plain", DataType::Int32, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+
+        let header = format_header(&CsvWriterOptions::default(), &batch);
+
+        assert_eq!(header, "\"a,b\",plain\n");
+    }
+
+    #[test]
+    fn test_format_row_joins_columns_and_terminates_with_row_separator() {
+        let batch = create_test_batch();
+
+        let row = format_row(&CsvWriterOptions::default(), &batch, 0).unwrap();
+
+        assert_eq!(row, "1,Alice,1.5\n");
+    }
+
+    #[test]
+    fn test_csv_import_options_maps_empty_null_value_to_none() {
+        let options = ArrowImportOptions::new()
+            .exasol_host("db.example.com")
+            .exasol_port(8563)
+            .use_tls(true)
+            .column_separator(';')
+            .column_delimiter('\'');
+
+        let csv_options = csv_import_options(&options);
+
+        assert_eq!(csv_options.encoding, "UTF-8");
+        assert_eq!(csv_options.column_separator, ';');
+        assert_eq!(csv_options.column_delimiter, '\'');
+        assert_eq!(csv_options.null_value, None);
+        assert_eq!(csv_options.skip_rows, 0);
+        assert!(csv_options.use_tls);
+        assert_eq!(csv_options.host, "db.example.com");
+        assert_eq!(csv_options.port, 8563);
+        assert_eq!(csv_options.schema, None);
+        assert_eq!(csv_options.columns, None);
+    }
+
+    #[test]
+    fn test_csv_import_options_carries_null_value_schema_and_columns() {
+        let options = ArrowImportOptions::new()
+            .null_value("NULL")
+            .schema("staging")
+            .columns(vec!["a".to_string(), "b".to_string()]);
+
+        let csv_options = csv_import_options(&options);
+
+        assert_eq!(csv_options.null_value, Some("NULL".to_string()));
+        assert_eq!(csv_options.schema, Some("staging".to_string()));
+        assert_eq!(
+            csv_options.columns,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_writer_writes_rows_and_reports_byte_count() {
+        let mut buffer = Vec::new();
+        let mut writer = ArrowToCsvWriter::new(&mut buffer, CsvWriterOptions::default());
+
+        let bytes = writer.write_batch(&create_test_batch()).await.unwrap();
+
+        assert_eq!(writer.rows_written(), 3);
+        assert_eq!(bytes, buffer.len());
+        assert_eq!(
+            String::from_utf8(buffer).unwrap(),
+            "1,Alice,1.5\n2,Bob,2.5\n3,,3.5\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_writer_writes_header_only_before_the_first_batch() {
+        let options = CsvWriterOptions {
+            write_header: true,
+            ..Default::default()
+        };
+        let mut buffer = Vec::new();
+        let mut writer = ArrowToCsvWriter::new(&mut buffer, options);
+
+        writer.write_batch(&create_test_batch()).await.unwrap();
+        writer.write_batch(&create_test_batch()).await.unwrap();
+        let rows = writer.finish().await.unwrap();
+
+        let csv = String::from_utf8(buffer).unwrap();
+        assert_eq!(rows, 6);
+        assert_eq!(csv.matches("id,name,value\n").count(), 1);
+        assert!(csv.starts_with("id,name,value\n1,Alice,1.5\n"));
+    }
+
+    #[tokio::test]
+    async fn test_async_writer_formats_every_supported_arrow_type() {
+        use arrow::array::{
+            BinaryArray, Decimal128Array, LargeBinaryArray, LargeStringArray,
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+            UInt32Array, UInt64Array, UInt8Array,
+        };
+        use arrow::datatypes::TimeUnit;
+
+        let schema = Schema::new(vec![
+            Field::new("b", DataType::Boolean, false),
+            Field::new("i8", DataType::Int8, false),
+            Field::new("i16", DataType::Int16, false),
+            Field::new("i64", DataType::Int64, false),
+            Field::new("u8", DataType::UInt8, false),
+            Field::new("u16", DataType::UInt16, false),
+            Field::new("u32", DataType::UInt32, false),
+            Field::new("u64", DataType::UInt64, false),
+            Field::new("f32", DataType::Float32, false),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("ls", DataType::LargeUtf8, false),
+            Field::new("d", DataType::Date32, false),
+            Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("dec", DataType::Decimal128(10, 2), false),
+            Field::new("bin", DataType::Binary, false),
+            Field::new("lbin", DataType::LargeBinary, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(arrow::array::BooleanArray::from(vec![false])),
+                Arc::new(arrow::array::Int8Array::from(vec![-8])),
+                Arc::new(arrow::array::Int16Array::from(vec![-16])),
+                Arc::new(arrow::array::Int64Array::from(vec![-64])),
+                Arc::new(UInt8Array::from(vec![8u8])),
+                Arc::new(UInt16Array::from(vec![16u16])),
+                Arc::new(UInt32Array::from(vec![32u32])),
+                Arc::new(UInt64Array::from(vec![64u64])),
+                Arc::new(arrow::array::Float32Array::from(vec![1.5f32])),
+                Arc::new(arrow::array::Float64Array::from(vec![f64::NAN])),
+                Arc::new(arrow::array::StringArray::from(vec!["a,b"])),
+                Arc::new(LargeStringArray::from(vec!["large"])),
+                Arc::new(arrow::array::Date32Array::from(vec![-1])),
+                Arc::new(TimestampSecondArray::from(vec![1])),
+                Arc::new(TimestampMillisecondArray::from(vec![1_500])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_123,
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_000_123_999])),
+                Arc::new(
+                    Decimal128Array::from(vec![-12345i128])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+                Arc::new(BinaryArray::from(vec![&[0xDEu8, 0xADu8][..]])),
+                Arc::new(LargeBinaryArray::from(vec![&[0xBEu8, 0xEFu8][..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        let mut writer = ArrowToCsvWriter::new(&mut buffer, CsvWriterOptions::default());
+        writer.write_batch(&batch).await.unwrap();
+
+        assert_eq!(
+            String::from_utf8(buffer).unwrap(),
+            concat!(
+                "false,-8,-16,-64,8,16,32,64,1.5,NaN,\"a,b\",large,1969-12-31,",
+                "1970-01-01 00:00:01.000000,1970-01-01 00:00:01.500000,",
+                "1970-01-01 00:00:01.000123,1970-01-01 00:00:01.000123,",
+                "-123.45,dead,beef\n"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_writer_propagates_unsupported_type_error() {
+        let schema = Schema::new(vec![Field::new(
+            "t",
+            DataType::Time32(arrow::datatypes::TimeUnit::Second),
+            false,
+        )]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(arrow::array::Time32SecondArray::from(vec![1]))],
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        let mut writer = ArrowToCsvWriter::new(&mut buffer, CsvWriterOptions::default());
+
+        let err = writer.write_batch(&batch).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("Unsupported Arrow type"),
+            "got: {err}"
+        );
+        assert_eq!(writer.rows_written(), 0);
     }
 }

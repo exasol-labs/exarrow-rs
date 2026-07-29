@@ -8,6 +8,9 @@ use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::types::ExasolType;
 
+const MICROSECOND_DIGITS: usize = 6;
+const NANOSECOND_DIGITS: usize = 9;
+
 /// Parses a date string (YYYY-MM-DD) to days since Unix epoch (1970-01-01).
 ///
 /// # Arguments
@@ -43,31 +46,7 @@ pub fn parse_date_to_days(date_str: &str) -> Result<i32, String> {
         return Err(format!("Day out of range: {}", day));
     }
 
-    // Calculate days since Unix epoch (1970-01-01)
-    let days_from_year =
-        (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-
-    let days_from_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => unreachable!(),
-    };
-
-    // Add leap day if after February and leap year
-    let is_leap_year = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_adjustment = if month > 2 && is_leap_year { 1 } else { 0 };
-
-    Ok(days_from_year + days_from_month + day as i32 - 1 + leap_adjustment)
+    Ok(ymd_to_days(year, month, day))
 }
 
 /// Converts a year/month/day triple directly to days since Unix epoch (1970-01-01).
@@ -135,56 +114,80 @@ pub fn ymd_hms_nanos_to_micros(
 /// * `Ok(i64)` - Microseconds since Unix epoch
 /// * `Err(String)` - Description of the parsing error
 pub fn parse_timestamp_to_micros(timestamp_str: &str) -> Result<i64, String> {
-    // Split date and time
-    let parts: Vec<&str> = timestamp_str.split(' ').collect();
-    if parts.is_empty() {
-        return Err(format!("Invalid timestamp format: {}", timestamp_str));
+    let segments: Vec<&str> = timestamp_str.split(' ').collect();
+
+    let days = parse_date_to_days(segments[0])?;
+    let date_micros = days as i64 * 86400 * 1_000_000;
+
+    match segments.get(1) {
+        Some(time_str) => Ok(date_micros + parse_time_of_day_to_micros(time_str)?),
+        None => Ok(date_micros),
+    }
+}
+
+/// Converts a "HH:MM[:SS[.ffffff]]" time-of-day field to microseconds.
+///
+/// A field with fewer than two colon-separated components carries no
+/// recognizable time and contributes zero, matching Exasol's tolerance for
+/// date-only timestamp literals.
+fn parse_time_of_day_to_micros(time_str: &str) -> Result<i64, String> {
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() < 2 {
+        return Ok(0);
     }
 
-    // Parse date part
-    let days = parse_date_to_days(parts[0])?;
-    let mut micros = days as i64 * 86400 * 1_000_000;
+    let hours: i64 = time_parts[0]
+        .parse()
+        .map_err(|_| format!("Invalid hour: {}", time_parts[0]))?;
+    let minutes: i64 = time_parts[1]
+        .parse()
+        .map_err(|_| format!("Invalid minute: {}", time_parts[1]))?;
 
-    // Parse time part if present
-    if parts.len() > 1 {
-        let time_parts: Vec<&str> = parts[1].split(':').collect();
-        if time_parts.len() >= 2 {
-            let hours: i64 = time_parts[0]
-                .parse()
-                .map_err(|_| format!("Invalid hour: {}", time_parts[0]))?;
-            let minutes: i64 = time_parts[1]
-                .parse()
-                .map_err(|_| format!("Invalid minute: {}", time_parts[1]))?;
-
-            micros += hours * 3600 * 1_000_000;
-            micros += minutes * 60 * 1_000_000;
-
-            if time_parts.len() >= 3 {
-                // Parse seconds and microseconds
-                let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
-                let seconds: i64 = sec_parts[0]
-                    .parse()
-                    .map_err(|_| format!("Invalid second: {}", sec_parts[0]))?;
-
-                micros += seconds * 1_000_000;
-
-                if sec_parts.len() > 1 {
-                    // Parse fractional seconds (microseconds)
-                    let frac = sec_parts[1];
-                    let frac_micros = if frac.len() <= 6 {
-                        let padding = 6 - frac.len();
-                        let padded = format!("{}{}", frac, "0".repeat(padding));
-                        padded.parse::<i64>().unwrap_or(0)
-                    } else {
-                        frac[..6].parse::<i64>().unwrap_or(0)
-                    };
-                    micros += frac_micros;
-                }
-            }
-        }
+    let mut micros = hours * 3600 * 1_000_000 + minutes * 60 * 1_000_000;
+    if let Some(seconds_field) = time_parts.get(2) {
+        micros += parse_seconds_field_to_micros(seconds_field)?;
     }
-
     Ok(micros)
+}
+
+/// Converts a "SS[.ffffff]" seconds field to microseconds.
+fn parse_seconds_field_to_micros(seconds_field: &str) -> Result<i64, String> {
+    let sec_parts: Vec<&str> = seconds_field.split('.').collect();
+    let seconds: i64 = sec_parts[0]
+        .parse()
+        .map_err(|_| format!("Invalid second: {}", sec_parts[0]))?;
+
+    let mut micros = seconds * 1_000_000;
+    if let Some(fraction) = sec_parts.get(1) {
+        micros += fractional_seconds_to_micros(fraction);
+    }
+    Ok(micros)
+}
+
+/// Converts the digits following a seconds field's decimal point to whole
+/// microseconds, right-padding shorter fractions and truncating longer ones.
+///
+/// Exasol emits fractional seconds with a precision that varies by column, so
+/// every caller has to normalize to a fixed width; this keeps that rule in one
+/// place. Digits that do not parse count as zero rather than failing, because a
+/// malformed fraction never invalidates the whole-second part of a value.
+pub(crate) fn fractional_seconds_to_micros(fraction: &str) -> i64 {
+    fractional_seconds_to_units(fraction, MICROSECOND_DIGITS)
+}
+
+/// Nanosecond-precision counterpart of `fractional_seconds_to_micros`, used for
+/// Exasol INTERVAL DAY TO SECOND values.
+pub(crate) fn fractional_seconds_to_nanos(fraction: &str) -> i64 {
+    fractional_seconds_to_units(fraction, NANOSECOND_DIGITS)
+}
+
+fn fractional_seconds_to_units(fraction: &str, unit_digits: usize) -> i64 {
+    if fraction.len() <= unit_digits {
+        let padded = format!("{}{}", fraction, "0".repeat(unit_digits - fraction.len()));
+        padded.parse::<i64>().unwrap_or(0)
+    } else {
+        fraction[..unit_digits].parse::<i64>().unwrap_or(0)
+    }
 }
 
 /// Parses a decimal string to i128 with the given scale.
@@ -359,6 +362,117 @@ mod tests {
         assert_eq!(micros, 123000);
     }
 
+    #[test]
+    fn test_parse_timestamp_to_micros_empty_string_reports_date_format() {
+        let error = parse_timestamp_to_micros("").unwrap_err();
+        assert_eq!(error, "Invalid date format:  (expected YYYY-MM-DD)");
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_time_without_colon_is_ignored() {
+        // A time segment with fewer than two colon-separated fields contributes nothing
+        let micros = parse_timestamp_to_micros("1970-01-01 12").unwrap();
+        assert_eq!(micros, 0);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_ignores_segments_after_the_time() {
+        // Only the first two space-separated segments are interpreted
+        let micros = parse_timestamp_to_micros("1970-01-01 01:00:00 CET").unwrap();
+        assert_eq!(micros, 3600 * 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_ignores_fields_after_the_seconds() {
+        let micros = parse_timestamp_to_micros("1970-01-01 00:00:01:99").unwrap();
+        assert_eq!(micros, 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_before_unix_epoch() {
+        let micros = parse_timestamp_to_micros("1969-12-31 23:00:00").unwrap();
+        assert_eq!(micros, -86_400 * 1_000_000 + 23 * 3_600 * 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_invalid_hour() {
+        let error = parse_timestamp_to_micros("1970-01-01 XX:00:00").unwrap_err();
+        assert_eq!(error, "Invalid hour: XX");
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_invalid_minute() {
+        let error = parse_timestamp_to_micros("1970-01-01 00:XX:00").unwrap_err();
+        assert_eq!(error, "Invalid minute: XX");
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_invalid_second() {
+        let error = parse_timestamp_to_micros("1970-01-01 00:00:XX").unwrap_err();
+        assert_eq!(error, "Invalid second: XX");
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_non_numeric_fraction_counts_as_zero() {
+        let micros = parse_timestamp_to_micros("1970-01-01 00:00:01.abc").unwrap();
+        assert_eq!(micros, 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_date_to_days_each_month_of_a_non_leap_year() {
+        let cumulative_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        for (index, expected) in cumulative_days.iter().enumerate() {
+            let month = index + 1;
+            let date = format!("1970-{:02}-01", month);
+            assert_eq!(
+                parse_date_to_days(&date).unwrap(),
+                *expected,
+                "mismatch for {}",
+                date
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_date_to_days_reports_invalid_year() {
+        assert_eq!(
+            parse_date_to_days("XXXX-01-01").unwrap_err(),
+            "Invalid year: XXXX"
+        );
+    }
+
+    #[test]
+    fn test_parse_date_to_days_reports_unparsable_month() {
+        assert_eq!(
+            parse_date_to_days("2024-XX-01").unwrap_err(),
+            "Invalid month: XX"
+        );
+    }
+
+    #[test]
+    fn test_parse_date_to_days_reports_unparsable_day() {
+        assert_eq!(
+            parse_date_to_days("2024-01-XX").unwrap_err(),
+            "Invalid day: XX"
+        );
+    }
+
+    #[test]
+    fn test_parse_date_to_days_reports_month_out_of_range() {
+        assert_eq!(
+            parse_date_to_days("2024-13-01").unwrap_err(),
+            "Month out of range: 13"
+        );
+    }
+
+    #[test]
+    fn test_parse_date_to_days_reports_day_out_of_range() {
+        assert_eq!(
+            parse_date_to_days("2024-01-32").unwrap_err(),
+            "Day out of range: 32"
+        );
+    }
+
     // Tests for ymd_to_days
 
     #[test]
@@ -390,6 +504,13 @@ mod tests {
                 date
             );
         }
+    }
+
+    #[test]
+    fn test_ymd_to_days_month_out_of_range_contributes_no_month_offset() {
+        // ymd_to_days does no validation: an out-of-range month adds zero days
+        assert_eq!(ymd_to_days(1970, 13, 1), 0);
+        assert_eq!(ymd_to_days(1970, 0, 1), 0);
     }
 
     #[test]
@@ -431,6 +552,53 @@ mod tests {
             + 5 * 1_000_000
             + 678_000;
         assert_eq!(micros, expected);
+    }
+
+    // Tests for fractional_seconds_to_micros / fractional_seconds_to_nanos
+
+    #[test]
+    fn test_fractional_seconds_to_micros_pads_short_fractions() {
+        assert_eq!(fractional_seconds_to_micros("1"), 100_000);
+        assert_eq!(fractional_seconds_to_micros("12"), 120_000);
+        assert_eq!(fractional_seconds_to_micros("123456"), 123_456);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_micros_truncates_long_fractions() {
+        assert_eq!(fractional_seconds_to_micros("123456789"), 123_456);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_micros_empty_is_zero() {
+        assert_eq!(fractional_seconds_to_micros(""), 0);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_micros_unparsable_is_zero() {
+        assert_eq!(fractional_seconds_to_micros("abc"), 0);
+        assert_eq!(fractional_seconds_to_micros("abcdefghi"), 0);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_nanos_pads_short_fractions() {
+        assert_eq!(fractional_seconds_to_nanos("1"), 100_000_000);
+        assert_eq!(fractional_seconds_to_nanos("123456"), 123_456_000);
+        assert_eq!(fractional_seconds_to_nanos("123456789"), 123_456_789);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_nanos_truncates_long_fractions() {
+        assert_eq!(fractional_seconds_to_nanos("123456789012"), 123_456_789);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_nanos_empty_is_zero() {
+        assert_eq!(fractional_seconds_to_nanos(""), 0);
+    }
+
+    #[test]
+    fn test_fractional_seconds_to_nanos_unparsable_is_zero() {
+        assert_eq!(fractional_seconds_to_nanos("abc"), 0);
     }
 
     // Tests for parse_decimal_to_i128

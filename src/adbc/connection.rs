@@ -2270,28 +2270,6 @@ impl Default for ConnectionBuilder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_connection_builder() {
-        let _builder = ConnectionBuilder::new()
-            .host("localhost")
-            .port(8563)
-            .username("test")
-            .password("secret")
-            .schema("MY_SCHEMA")
-            .use_tls(false);
-
-        // Builder should compile and be valid
-        // Actual connection requires a running Exasol instance
-    }
-
-    #[test]
-    fn test_create_statement_is_sync() {
-        // This test verifies that create_statement is synchronous
-        // by calling it without await
-        // Note: We can't actually create a Connection without a database,
-        // but we can verify the API compiles correctly
-    }
-
     /// Regression test for the best-effort URI-schema fix.
     ///
     /// A schema named in the connection URI that does not yet exist must NOT
@@ -2391,6 +2369,2147 @@ mod tests {
         );
         match map_execution_error(ambient, 0) {
             QueryError::ExecutionFailed(msg) => assert!(msg.contains("R0001")),
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Mock-transport harness
+    //
+    // Every test below drives a real `Connection` over the shared
+    // `TransportProtocol` mock, so the connection's own logic — parameter
+    // mapping, generated SQL, timeout reconciliation, transaction bookkeeping —
+    // is asserted without a live Exasol or any network I/O.
+    // ========================================================================
+
+    use crate::transport::messages::SessionInfo as TransportSessionInfo;
+    use crate::transport::test_support::MockTransport;
+    use std::sync::Mutex as SyncMutex;
+
+    /// Every SQL string the mocked transport was asked to execute, in order.
+    type SqlLog = Arc<SyncMutex<Vec<String>>>;
+
+    fn new_sql_log() -> SqlLog {
+        Arc::new(SyncMutex::new(Vec::new()))
+    }
+
+    fn recorded(log: &SqlLog) -> Vec<String> {
+        log.lock().expect("SQL log poisoned").clone()
+    }
+
+    /// The single SQL statement the connection issued.
+    ///
+    /// Panics when the count is not exactly one, so a test that means to assert
+    /// on "the" statement can never silently assert on the first of several.
+    fn only_sql(log: &SqlLog) -> String {
+        let statements = recorded(log);
+        assert_eq!(
+            statements.len(),
+            1,
+            "expected exactly one statement, got {:?}",
+            statements
+        );
+        statements.into_iter().next().unwrap()
+    }
+
+    fn transport_session_info() -> TransportSessionInfo {
+        TransportSessionInfo {
+            session_id: "1739284756".to_string(),
+            protocol_version: 3,
+            release_version: "8.32.0".to_string(),
+            database_name: "exadb".to_string(),
+            product_name: "EXASolution".to_string(),
+            max_data_message_size: 64 * 1024,
+            time_zone: Some("Europe/Berlin".to_string()),
+        }
+    }
+
+    fn test_params() -> ConnectionParams {
+        ConnectionParams::builder()
+            .host("db.example.invalid")
+            .port(8563)
+            .username("tester")
+            .password("s3cr3t-pw")
+            .build()
+            .expect("test connection params must be valid")
+    }
+
+    /// A transport that connects and authenticates cleanly and records the SQL
+    /// it is handed, answering every statement with a zero-row row count.
+    fn recording_transport(log: &SqlLog) -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        let log = Arc::clone(log);
+        transport.expect_execute_query().returning(move |sql| {
+            log.lock().expect("SQL log poisoned").push(sql.to_string());
+            Ok(QueryResult::row_count(0))
+        });
+        transport
+    }
+
+    /// A connected `Connection` over `recording_transport`, with no default
+    /// schema so the only recorded SQL is what the test itself triggers.
+    async fn connected(log: &SqlLog) -> Connection {
+        Connection::connect_with_transport(test_params(), recording_transport(log))
+            .await
+            .expect("mock transport must connect")
+    }
+
+    // ------------------------------------------------------------------------
+    // Metadata SQL builders
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_catalogs_selects_distinct_schema_names_as_catalogs() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_catalogs()
+            .await
+            .expect("get_catalogs must succeed");
+
+        assert_eq!(
+            only_sql(&log),
+            "SELECT DISTINCT SCHEMA_NAME AS CATALOG_NAME FROM SYS.EXA_ALL_SCHEMAS ORDER BY CATALOG_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schemas_without_filter_omits_the_where_clause() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_schemas(None).await.expect("get_schemas");
+
+        assert_eq!(
+            only_sql(&log),
+            "SELECT SCHEMA_NAME FROM SYS.EXA_ALL_SCHEMAS ORDER BY SCHEMA_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schemas_with_catalog_filters_on_schema_name() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_schemas(Some("SALES")).await.expect("get_schemas");
+
+        assert_eq!(
+            only_sql(&log),
+            "SELECT SCHEMA_NAME FROM SYS.EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = 'SALES' ORDER BY SCHEMA_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schemas_doubles_single_quotes_in_the_filter() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_schemas(Some("O'BRIEN"))
+            .await
+            .expect("get_schemas");
+
+        assert_eq!(
+            only_sql(&log),
+            "SELECT SCHEMA_NAME FROM SYS.EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = 'O''BRIEN' ORDER BY SCHEMA_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tables_without_filters_restricts_to_tables_and_views_only() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_tables(None, None, None).await.expect("get_tables");
+
+        assert_eq!(
+            only_sql(&log),
+            "SELECT ROOT_NAME AS TABLE_SCHEMA, OBJECT_NAME AS TABLE_NAME, OBJECT_TYPE AS TABLE_TYPE \
+             FROM SYS.EXA_ALL_OBJECTS WHERE OBJECT_TYPE IN ('TABLE', 'VIEW') ORDER BY ROOT_NAME, OBJECT_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tables_ignores_the_catalog_argument_because_exasol_has_no_catalogs() {
+        let with_catalog = new_sql_log();
+        let mut conn = connected(&with_catalog).await;
+        conn.get_tables(Some("ANY_CATALOG"), None, None)
+            .await
+            .expect("get_tables");
+
+        let without_catalog = new_sql_log();
+        let mut conn = connected(&without_catalog).await;
+        conn.get_tables(None, None, None).await.expect("get_tables");
+
+        assert_eq!(only_sql(&with_catalog), only_sql(&without_catalog));
+    }
+
+    #[tokio::test]
+    async fn get_tables_filters_on_schema_and_table_when_both_are_given() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_tables(None, Some("SALES"), Some("ORDERS"))
+            .await
+            .expect("get_tables");
+
+        assert_eq!(
+            only_sql(&log),
+            "SELECT ROOT_NAME AS TABLE_SCHEMA, OBJECT_NAME AS TABLE_NAME, OBJECT_TYPE AS TABLE_TYPE \
+             FROM SYS.EXA_ALL_OBJECTS WHERE OBJECT_TYPE IN ('TABLE', 'VIEW') AND ROOT_NAME = 'SALES' \
+             AND OBJECT_NAME = 'ORDERS' ORDER BY ROOT_NAME, OBJECT_NAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tables_doubles_single_quotes_in_schema_and_table_filters() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_tables(None, Some("IT'S"), Some("O'HARA"))
+            .await
+            .expect("get_tables");
+
+        let sql = only_sql(&log);
+        assert!(
+            sql.contains("ROOT_NAME = 'IT''S'"),
+            "schema filter must be escaped, got: {}",
+            sql
+        );
+        assert!(
+            sql.contains("OBJECT_NAME = 'O''HARA'"),
+            "table filter must be escaped, got: {}",
+            sql
+        );
+    }
+
+    #[tokio::test]
+    async fn get_columns_without_filters_omits_the_where_clause() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_columns(None, None, None, None)
+            .await
+            .expect("get_columns");
+
+        let sql = only_sql(&log);
+        assert!(
+            !sql.contains("WHERE"),
+            "unfiltered get_columns must not emit a WHERE clause, got: {}",
+            sql
+        );
+        assert!(sql.contains("FROM SYS.EXA_ALL_COLUMNS"), "got: {}", sql);
+        assert!(
+            sql.contains("ORDER BY COLUMN_SCHEMA, COLUMN_TABLE, ORDINAL_POSITION"),
+            "got: {}",
+            sql
+        );
+    }
+
+    #[tokio::test]
+    async fn get_columns_filters_on_schema_table_and_column() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_columns(None, Some("SALES"), Some("ORDERS"), Some("ID"))
+            .await
+            .expect("get_columns");
+
+        let sql = only_sql(&log);
+        assert!(
+            sql.contains(
+                "WHERE COLUMN_SCHEMA = 'SALES' AND COLUMN_TABLE = 'ORDERS' AND COLUMN_NAME = 'ID'"
+            ),
+            "got: {}",
+            sql
+        );
+    }
+
+    /// Exasol has no catalog level, so `get_columns` treats a catalog argument
+    /// as a second schema predicate rather than ignoring it. Passing both a
+    /// catalog and a differing schema therefore yields two conflicting
+    /// `COLUMN_SCHEMA` predicates and matches nothing — recorded here as the
+    /// current contract so a future change to it is a deliberate one.
+    #[tokio::test]
+    async fn get_columns_maps_the_catalog_argument_onto_column_schema() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_columns(Some("CAT"), Some("SALES"), None, None)
+            .await
+            .expect("get_columns");
+
+        let sql = only_sql(&log);
+        assert!(
+            sql.contains("WHERE COLUMN_SCHEMA = 'CAT' AND COLUMN_SCHEMA = 'SALES'"),
+            "got: {}",
+            sql
+        );
+    }
+
+    #[tokio::test]
+    async fn get_columns_doubles_single_quotes_in_every_filter() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.get_columns(Some("C'AT"), Some("S'CH"), Some("T'BL"), Some("C'OL"))
+            .await
+            .expect("get_columns");
+
+        let sql = only_sql(&log);
+        for expected in [
+            "COLUMN_SCHEMA = 'C''AT'",
+            "COLUMN_SCHEMA = 'S''CH'",
+            "COLUMN_TABLE = 'T''BL'",
+            "COLUMN_NAME = 'C''OL'",
+        ] {
+            assert!(
+                sql.contains(expected),
+                "expected escaped predicate {} in: {}",
+                expected,
+                sql
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Connection setup: connect_with_transport
+    // ------------------------------------------------------------------------
+
+    /// A slot a mock expectation writes its observed argument into.
+    type Captured<T> = Arc<SyncMutex<Option<T>>>;
+
+    fn new_capture<T>() -> Captured<T> {
+        Arc::new(SyncMutex::new(None))
+    }
+
+    fn captured<T: Clone>(slot: &Captured<T>) -> T {
+        slot.lock()
+            .expect("capture poisoned")
+            .clone()
+            .expect("expectation was never called")
+    }
+
+    #[tokio::test]
+    async fn connect_maps_every_connection_parameter_onto_the_transport() {
+        let observed: Captured<TransportConnectionParams> = new_capture();
+        let mut transport = MockTransport::new();
+        let sink = Arc::clone(&observed);
+        transport.expect_connect().returning(move |params| {
+            *sink.lock().expect("capture poisoned") = Some(params.clone());
+            Ok(())
+        });
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+
+        let params = ConnectionParams::builder()
+            .host("db.example.invalid")
+            .port(9999)
+            .username("tester")
+            .password("s3cr3t-pw")
+            .use_tls(false)
+            .validate_server_certificate(false)
+            .connection_timeout(Duration::from_millis(4_500))
+            .certificate_fingerprint("ab12cd34")
+            .build()
+            .expect("params");
+
+        Connection::connect_with_transport(params, transport)
+            .await
+            .expect("connect");
+
+        let mapped = captured(&observed);
+        assert_eq!(mapped.host, "db.example.invalid");
+        assert_eq!(mapped.port, 9999);
+        assert!(!mapped.use_tls);
+        assert!(!mapped.validate_server_certificate);
+        assert_eq!(mapped.timeout_ms, 4_500);
+        assert_eq!(
+            mapped.certificate_fingerprint.as_deref(),
+            Some("ab12cd34"),
+            "a configured fingerprint must be pinned on the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_leaves_the_fingerprint_unset_when_none_is_configured() {
+        let observed: Captured<TransportConnectionParams> = new_capture();
+        let mut transport = MockTransport::new();
+        let sink = Arc::clone(&observed);
+        transport.expect_connect().returning(move |params| {
+            *sink.lock().expect("capture poisoned") = Some(params.clone());
+            Ok(())
+        });
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+
+        Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert!(captured(&observed).certificate_fingerprint.is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_forwards_the_configured_username_and_password() {
+        let observed: Captured<(String, String)> = new_capture();
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        let sink = Arc::clone(&observed);
+        transport
+            .expect_authenticate()
+            .returning(move |credentials| {
+                *sink.lock().expect("capture poisoned") =
+                    Some((credentials.username.clone(), credentials.password.clone()));
+                Ok(transport_session_info())
+            });
+
+        Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(
+            captured(&observed),
+            ("tester".to_string(), "s3cr3t-pw".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_pushes_a_configured_query_timeout_rounded_up_to_whole_seconds() {
+        let observed: Captured<u64> = new_capture();
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        let sink = Arc::clone(&observed);
+        transport
+            .expect_set_query_timeout()
+            .times(1)
+            .returning(move |secs| {
+                *sink.lock().expect("capture poisoned") = Some(secs);
+                Ok(())
+            });
+
+        let params = ConnectionParams::builder()
+            .host("db.example.invalid")
+            .username("tester")
+            .password("s3cr3t-pw")
+            .query_timeout(Duration::from_millis(1_500))
+            .build()
+            .expect("params");
+
+        let conn = Connection::connect_with_transport(params, transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(captured(&observed), 2, "1500ms must round up to 2s");
+        assert_eq!(
+            conn.session.config().query_timeout,
+            Some(Duration::from_millis(1_500)),
+            "the session baseline must record the configured value verbatim"
+        );
+    }
+
+    /// Absent configuration, no `queryTimeout` attribute is set at all so the
+    /// server's own `QUERY_TIMEOUT` governs. `MockTransport` has no
+    /// `set_query_timeout` expectation here, so any call would panic.
+    #[tokio::test]
+    async fn connect_sets_no_query_timeout_when_none_is_configured() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(conn.session.config().query_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn connect_seeds_the_session_from_the_authentication_response() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+
+        let params = ConnectionParams::builder()
+            .host("db.example.invalid")
+            .username("tester")
+            .password("s3cr3t-pw")
+            .idle_timeout(Duration::from_secs(120))
+            .build()
+            .expect("params");
+
+        let conn = Connection::connect_with_transport(params, transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(conn.session_id(), "1739284756");
+        assert_eq!(conn.session.config().idle_timeout, Duration::from_secs(120));
+        let server = conn.session.server_info();
+        assert_eq!(server.release_version, "8.32.0");
+        assert_eq!(server.database_name, "exadb");
+        assert_eq!(server.product_name, "EXASolution");
+        assert_eq!(server.max_data_message_size, 64 * 1024);
+        assert_eq!(server.time_zone, "Europe/Berlin");
+        assert_eq!(server.max_identifier_length, 128);
+        assert_eq!(server.max_varchar_length, 2_000_000);
+        assert_eq!(server.identifier_quote_string, "\"");
+    }
+
+    #[tokio::test]
+    async fn connect_defaults_the_session_time_zone_to_utc_when_the_server_reports_none() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport.expect_authenticate().returning(|_| {
+            Ok(TransportSessionInfo {
+                time_zone: None,
+                ..transport_session_info()
+            })
+        });
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(conn.session.server_info().time_zone, "UTC");
+    }
+
+    #[tokio::test]
+    async fn connect_reports_a_transport_connect_failure_with_host_and_port() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_connect()
+            .returning(|_| Err(TransportError::IoError("refused".to_string())));
+
+        let error = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect_err("a failing transport must fail the connection");
+
+        match error {
+            ConnectionError::ConnectionFailed {
+                host,
+                port,
+                message,
+            } => {
+                assert_eq!(host, "db.example.invalid");
+                assert_eq!(port, 8563);
+                assert!(message.contains("refused"), "got: {}", message);
+            }
+            other => panic!("expected ConnectionFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_reports_an_authentication_failure_as_authentication_failed() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Err(TransportError::ProtocolError("bad credentials".to_string())));
+
+        let error = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect_err("failed authentication must fail the connection");
+
+        match error {
+            ConnectionError::AuthenticationFailed(message) => {
+                assert!(message.contains("bad credentials"), "got: {}", message);
+            }
+            other => panic!("expected AuthenticationFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_fails_when_the_server_rejects_the_configured_query_timeout() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_set_query_timeout()
+            .returning(|_| Err(TransportError::ProtocolError("not permitted".to_string())));
+
+        let params = ConnectionParams::builder()
+            .host("db.example.invalid")
+            .username("tester")
+            .password("s3cr3t-pw")
+            .query_timeout(Duration::from_secs(30))
+            .build()
+            .expect("params");
+
+        let error = Connection::connect_with_transport(params, transport)
+            .await
+            .expect_err("a rejected query timeout must fail the connection");
+
+        match error {
+            ConnectionError::ConnectionFailed { message, .. } => {
+                assert!(
+                    message.contains("failed to set query timeout"),
+                    "got: {}",
+                    message
+                );
+                assert!(message.contains("not permitted"), "got: {}", message);
+            }
+            other => panic!("expected ConnectionFailed, got {:?}", other),
+        }
+    }
+
+    // --- the two schema-open branches ---
+
+    fn params_with_schema(schema: &str) -> ConnectionParams {
+        ConnectionParams::builder()
+            .host("db.example.invalid")
+            .port(8563)
+            .username("tester")
+            .password("s3cr3t-pw")
+            .schema(schema)
+            .build()
+            .expect("params")
+    }
+
+    #[tokio::test]
+    async fn connect_opens_the_schema_named_in_the_connection_uri() {
+        let log = new_sql_log();
+        let conn = Connection::connect_with_transport(
+            params_with_schema("SALES"),
+            recording_transport(&log),
+        )
+        .await
+        .expect("connect");
+
+        assert_eq!(only_sql(&log), "OPEN SCHEMA SALES");
+        assert_eq!(conn.current_schema().await, Some("SALES".to_string()));
+    }
+
+    /// A schema named in the URI is a best-effort default: one that does not
+    /// exist yet must leave the connection open with no active schema.
+    #[tokio::test]
+    async fn connect_survives_a_schema_from_the_uri_that_does_not_exist_yet() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_execute_query().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "schema FOO not found [line 1, column 13] (SQL state: 42000)".to_string(),
+            ))
+        });
+
+        let conn = Connection::connect_with_transport(params_with_schema("FOO"), transport)
+            .await
+            .expect("a not-yet-existing URI schema must not fail the connection");
+
+        assert_eq!(
+            conn.current_schema().await,
+            None,
+            "the session must be left with no active schema"
+        );
+        assert!(!conn.is_closed().await, "the connection must stay open");
+    }
+
+    /// Any schema-open failure other than "not found" means a genuinely broken
+    /// connection: it must close the transport rather than hand back a
+    /// half-open `Connection`.
+    #[tokio::test]
+    async fn connect_closes_the_transport_when_opening_the_uri_schema_fails_fatally() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_execute_query().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "insufficient privileges for schema SALES".to_string(),
+            ))
+        });
+        transport.expect_close().times(1).returning(|| Ok(()));
+
+        let error = Connection::connect_with_transport(params_with_schema("SALES"), transport)
+            .await
+            .expect_err("a fatal schema-open failure must fail the connection");
+
+        match error {
+            ConnectionError::ConnectionFailed {
+                host,
+                port,
+                message,
+            } => {
+                assert_eq!(host, "db.example.invalid");
+                assert_eq!(port, 8563);
+                assert!(
+                    message.contains("failed to activate schema 'SALES' from connection URI"),
+                    "got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("insufficient privileges"),
+                    "got: {}",
+                    message
+                );
+            }
+            other => panic!("expected ConnectionFailed, got {:?}", other),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // execute_statement: queryTimeout reconciliation
+    // ------------------------------------------------------------------------
+
+    /// Every `timeout_secs` the connection pushed to the server, in order.
+    type TimeoutLog = Arc<SyncMutex<Vec<u64>>>;
+
+    fn new_timeout_log() -> TimeoutLog {
+        Arc::new(SyncMutex::new(Vec::new()))
+    }
+
+    fn recorded_timeouts(log: &TimeoutLog) -> Vec<u64> {
+        log.lock().expect("timeout log poisoned").clone()
+    }
+
+    /// A transport that records both the SQL and every pushed `queryTimeout`,
+    /// answering each statement with `answer`.
+    fn transport_recording_timeouts(
+        sql_log: &SqlLog,
+        timeout_log: &TimeoutLog,
+        answer: fn() -> Result<QueryResult, TransportError>,
+    ) -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        let timeouts = Arc::clone(timeout_log);
+        transport.expect_set_query_timeout().returning(move |secs| {
+            timeouts.lock().expect("timeout log poisoned").push(secs);
+            Ok(())
+        });
+        let statements = Arc::clone(sql_log);
+        transport.expect_execute_query().returning(move |sql| {
+            statements
+                .lock()
+                .expect("SQL log poisoned")
+                .push(sql.to_string());
+            answer()
+        });
+        transport
+    }
+
+    fn ok_row_count() -> Result<QueryResult, TransportError> {
+        Ok(QueryResult::row_count(1))
+    }
+
+    fn params_with_query_timeout(timeout: Duration) -> ConnectionParams {
+        ConnectionParams::builder()
+            .host("db.example.invalid")
+            .port(8563)
+            .username("tester")
+            .password("s3cr3t-pw")
+            .query_timeout(timeout)
+            .build()
+            .expect("params")
+    }
+
+    #[tokio::test]
+    async fn execute_statement_pushes_a_statement_timeout_the_session_has_not_applied() {
+        let sql_log = new_sql_log();
+        let timeouts = new_timeout_log();
+        let mut conn = Connection::connect_with_transport(
+            test_params(),
+            transport_recording_timeouts(&sql_log, &timeouts, ok_row_count),
+        )
+        .await
+        .expect("connect");
+
+        let mut stmt = Statement::new("SELECT 1");
+        stmt.set_timeout(2_500);
+        conn.execute_statement(&stmt).await.expect("execute");
+
+        assert_eq!(
+            recorded_timeouts(&timeouts),
+            vec![3],
+            "2500ms must be pushed as a 3s server-side limit"
+        );
+        assert_eq!(
+            conn.session.config().query_timeout,
+            Some(Duration::from_millis(2_500)),
+            "the applied baseline must record the statement's request"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_statement_skips_the_push_when_the_timeout_already_matches() {
+        let sql_log = new_sql_log();
+        let timeouts = new_timeout_log();
+        let mut conn = Connection::connect_with_transport(
+            params_with_query_timeout(Duration::from_secs(30)),
+            transport_recording_timeouts(&sql_log, &timeouts, ok_row_count),
+        )
+        .await
+        .expect("connect");
+
+        let stmt = conn.create_statement("SELECT 1");
+        conn.execute_statement(&stmt).await.expect("execute");
+
+        assert_eq!(
+            recorded_timeouts(&timeouts),
+            vec![30],
+            "only connect may push; the statement matches the applied value"
+        );
+    }
+
+    /// A statement carrying no timeout must reset the session-level
+    /// `queryTimeout` to `0` (unlimited) so it never inherits a prior
+    /// statement's limit.
+    #[tokio::test]
+    async fn execute_statement_resets_the_server_to_unlimited_for_an_untimed_statement() {
+        let sql_log = new_sql_log();
+        let timeouts = new_timeout_log();
+        let mut conn = Connection::connect_with_transport(
+            params_with_query_timeout(Duration::from_secs(10)),
+            transport_recording_timeouts(&sql_log, &timeouts, ok_row_count),
+        )
+        .await
+        .expect("connect");
+
+        conn.execute_statement(&Statement::new("SELECT 1"))
+            .await
+            .expect("execute");
+
+        assert_eq!(recorded_timeouts(&timeouts), vec![10, 0]);
+        assert_eq!(conn.session.config().query_timeout, None);
+    }
+
+    /// The server's `queryTimeout` was changed before the statement ran, so the
+    /// recorded baseline must reflect that even when the statement then aborts —
+    /// otherwise the next statement reconciles against a stale value and skips
+    /// a push it actually needs.
+    #[tokio::test]
+    async fn execute_statement_records_the_applied_timeout_even_when_the_query_fails() {
+        let sql_log = new_sql_log();
+        let timeouts = new_timeout_log();
+        let mut conn = Connection::connect_with_transport(
+            test_params(),
+            transport_recording_timeouts(&sql_log, &timeouts, || {
+                Err(TransportError::ProtocolError("boom".to_string()))
+            }),
+        )
+        .await
+        .expect("connect");
+
+        let mut stmt = Statement::new("SELECT 1");
+        stmt.set_timeout(5_000);
+        conn.execute_statement(&stmt)
+            .await
+            .expect_err("the query must fail");
+
+        assert_eq!(recorded_timeouts(&timeouts), vec![5]);
+        assert_eq!(
+            conn.session.config().query_timeout,
+            Some(Duration::from_millis(5_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_statement_fails_when_the_server_rejects_the_timeout_push() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_set_query_timeout()
+            .returning(|_| Err(TransportError::ProtocolError("rejected".to_string())));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let mut stmt = Statement::new("SELECT 1");
+        stmt.set_timeout(1_000);
+        match conn.execute_statement(&stmt).await {
+            Err(QueryError::ExecutionFailed(message)) => {
+                assert!(message.contains("rejected"), "got: {}", message)
+            }
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    /// The reported `timeout_ms` is the limit the server actually enforced —
+    /// the request rounded up to whole seconds — not the raw sub-second request.
+    #[tokio::test]
+    async fn execute_statement_reports_a_server_timeout_abort_with_the_effective_limit() {
+        let sql_log = new_sql_log();
+        let timeouts = new_timeout_log();
+        let mut conn = Connection::connect_with_transport(
+            test_params(),
+            transport_recording_timeouts(&sql_log, &timeouts, || {
+                Err(TransportError::ProtocolError(
+                    "Query terminated because timeout has been reached. (SQL code: R0001)"
+                        .to_string(),
+                ))
+            }),
+        )
+        .await
+        .expect("connect");
+
+        let mut stmt = Statement::new("SELECT 1");
+        stmt.set_timeout(1_500);
+        match conn.execute_statement(&stmt).await {
+            Err(QueryError::Timeout { timeout_ms }) => assert_eq!(
+                timeout_ms, 2_000,
+                "a 1500ms request is enforced as a 2000ms server-side limit"
+            ),
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_statement_rejects_a_closed_session_as_an_invalid_state() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn.execute_statement(&Statement::new("SELECT 1")).await {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+        assert!(
+            recorded(&log).is_empty(),
+            "no SQL may reach the server from a closed session"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_statement_propagates_an_unbound_parameter_before_reaching_the_server() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        match conn.execute_statement(&Statement::new("SELECT ?")).await {
+            Err(QueryError::ParameterBindingError { index, .. }) => assert_eq!(index, 0),
+            other => panic!("expected ParameterBindingError, got {:?}", other),
+        }
+        assert!(
+            recorded(&log).is_empty(),
+            "an unbuildable statement must never reach the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_statement_returns_the_session_to_ready_and_counts_the_query() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.execute_statement(&Statement::new("SELECT 1"))
+            .await
+            .expect("execute");
+
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+        assert_eq!(conn.session.query_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_statement_returns_the_session_to_in_transaction_inside_a_transaction() {
+        let sql_log = new_sql_log();
+        let mut transport = recording_transport(&sql_log);
+        transport.expect_set_autocommit().returning(|_| Ok(()));
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+        conn.begin_transaction().await.expect("begin");
+
+        conn.execute_statement(&Statement::new("SELECT 1"))
+            .await
+            .expect("execute");
+
+        assert_eq!(conn.session.state().await, SessionState::InTransaction);
+    }
+
+    #[tokio::test]
+    async fn create_statement_inherits_the_connections_configured_query_timeout() {
+        let sql_log = new_sql_log();
+        let timeouts = new_timeout_log();
+        let conn = Connection::connect_with_transport(
+            params_with_query_timeout(Duration::from_millis(7_200)),
+            transport_recording_timeouts(&sql_log, &timeouts, ok_row_count),
+        )
+        .await
+        .expect("connect");
+
+        assert_eq!(
+            conn.create_statement("SELECT 1").timeout_ms(),
+            Some(7_200),
+            "the raw configured value is carried onto the statement verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_statement_leaves_the_timeout_unset_when_none_is_configured() {
+        let log = new_sql_log();
+        let conn = connected(&log).await;
+
+        assert_eq!(conn.create_statement("SELECT 1").timeout_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn query_fetches_every_batch_of_a_complete_result_set() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(single_decimal_result_set()));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let batches = conn.query("SELECT 1").await.expect("query");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_rejects_a_statement_that_returns_only_a_row_count() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        match conn.query("DELETE FROM T").await {
+            Err(QueryError::NoResultSet(_)) => {}
+            other => panic!("expected NoResultSet, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_update_returns_the_affected_row_count() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(QueryResult::row_count(5)));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(
+            conn.execute_update("DELETE FROM T").await.expect("update"),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_statement_update_returns_the_affected_row_count() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(QueryResult::row_count(42)));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(
+            conn.execute_statement_update(&Statement::new("DELETE FROM T"))
+                .await
+                .expect("update"),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_statement_update_rejects_a_statement_that_returns_a_result_set() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(single_decimal_result_set()));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        match conn
+            .execute_statement_update(&Statement::new("SELECT 1"))
+            .await
+        {
+            Err(QueryError::NoResultSet(_)) => {}
+            other => panic!("expected NoResultSet, got {:?}", other),
+        }
+    }
+
+    /// A one-row, one-column DECIMAL result set — the smallest well-formed
+    /// `ResultSet` answer a mocked transport can give.
+    fn single_decimal_result_set() -> QueryResult {
+        use crate::transport::messages::{ColumnInfo, DataType, ResultData, ResultPayload};
+        QueryResult::result_set(
+            None,
+            ResultData {
+                columns: vec![ColumnInfo {
+                    name: "N".to_string(),
+                    data_type: DataType::decimal(18, 0),
+                }],
+                data: ResultPayload::Json(vec![vec![serde_json::json!(1)]]),
+                total_rows: 1,
+            },
+        )
+    }
+
+    // ------------------------------------------------------------------------
+    // Transactions
+    // ------------------------------------------------------------------------
+
+    /// A connected connection whose transport also accepts autocommit changes.
+    async fn connected_for_transactions(log: &SqlLog) -> Connection {
+        let mut transport = recording_transport(log);
+        transport.expect_set_autocommit().returning(|_| Ok(()));
+        Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect")
+    }
+
+    #[tokio::test]
+    async fn begin_transaction_disables_autocommit_on_the_server() {
+        let observed: Captured<bool> = new_capture();
+        let sql_log = new_sql_log();
+        let mut transport = recording_transport(&sql_log);
+        let sink = Arc::clone(&observed);
+        transport
+            .expect_set_autocommit()
+            .times(1)
+            .returning(move |enabled| {
+                *sink.lock().expect("capture poisoned") = Some(enabled);
+                Ok(())
+            });
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        conn.begin_transaction().await.expect("begin");
+
+        assert!(
+            !captured(&observed),
+            "beginning a transaction must disable autocommit"
+        );
+        assert!(conn.in_transaction());
+        assert!(
+            recorded(&sql_log).is_empty(),
+            "autocommit is an attribute, not a statement"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_transaction_fails_when_the_server_rejects_disabling_autocommit() {
+        let sql_log = new_sql_log();
+        let mut transport = recording_transport(&sql_log);
+        transport
+            .expect_set_autocommit()
+            .returning(|_| Err(TransportError::ProtocolError("no autocommit".to_string())));
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        match conn.begin_transaction().await {
+            Err(QueryError::TransactionError(message)) => {
+                assert!(message.contains("no autocommit"), "got: {}", message)
+            }
+            other => panic!("expected TransactionError, got {:?}", other),
+        }
+        assert!(
+            !conn.in_transaction(),
+            "a rejected autocommit change must not mark a transaction active"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_transaction_rejects_a_second_overlapping_transaction() {
+        let log = new_sql_log();
+        let mut conn = connected_for_transactions(&log).await;
+        conn.begin_transaction().await.expect("first begin");
+
+        match conn.begin_transaction().await {
+            Err(QueryError::TransactionError(message)) => {
+                assert!(
+                    message.contains("Transaction already active"),
+                    "got: {}",
+                    message
+                )
+            }
+            other => panic!("expected TransactionError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_issues_a_commit_statement_and_ends_the_transaction() {
+        let log = new_sql_log();
+        let mut conn = connected_for_transactions(&log).await;
+        conn.begin_transaction().await.expect("begin");
+
+        conn.commit().await.expect("commit");
+
+        assert_eq!(recorded(&log), vec!["COMMIT".to_string()]);
+        assert!(!conn.in_transaction());
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn commit_outside_a_transaction_is_a_no_op() {
+        let log = new_sql_log();
+        let mut conn = connected_for_transactions(&log).await;
+
+        conn.commit().await.expect("commit");
+
+        assert!(
+            recorded(&log).is_empty(),
+            "committing without a transaction must issue no SQL"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_issues_a_rollback_statement_and_ends_the_transaction() {
+        let log = new_sql_log();
+        let mut conn = connected_for_transactions(&log).await;
+        conn.begin_transaction().await.expect("begin");
+
+        conn.rollback().await.expect("rollback");
+
+        assert_eq!(recorded(&log), vec!["ROLLBACK".to_string()]);
+        assert!(!conn.in_transaction());
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn rollback_outside_a_transaction_is_a_no_op() {
+        let log = new_sql_log();
+        let mut conn = connected_for_transactions(&log).await;
+
+        conn.rollback().await.expect("rollback");
+
+        assert!(
+            recorded(&log).is_empty(),
+            "rolling back without a transaction must issue no SQL"
+        );
+    }
+
+    /// A failed `COMMIT` must leave the transaction active rather than silently
+    /// clearing it — the work is still uncommitted on the server.
+    #[tokio::test]
+    async fn commit_keeps_the_transaction_active_when_the_statement_fails() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_set_autocommit().returning(|_| Ok(()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Err(TransportError::ProtocolError("commit failed".to_string())));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+        conn.begin_transaction().await.expect("begin");
+
+        conn.commit().await.expect_err("commit must fail");
+
+        assert!(conn.in_transaction());
+    }
+
+    #[tokio::test]
+    async fn in_transaction_is_false_on_a_freshly_connected_connection() {
+        let log = new_sql_log();
+        let conn = connected(&log).await;
+
+        assert!(!conn.in_transaction());
+    }
+
+    #[tokio::test]
+    async fn set_schema_opens_the_schema_and_records_it_on_the_session() {
+        let log = new_sql_log();
+        let mut conn = connected(&log).await;
+
+        conn.set_schema("SALES").await.expect("set_schema");
+
+        assert_eq!(only_sql(&log), "OPEN SCHEMA SALES");
+        assert_eq!(conn.current_schema().await, Some("SALES".to_string()));
+    }
+
+    // ------------------------------------------------------------------------
+    // make_sql_executor
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sql_executor_returns_the_row_count_for_a_row_count_result() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(QueryResult::row_count(7)));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let execute = conn.make_sql_executor();
+        assert_eq!(execute("IMPORT INTO T ...".to_string()).await, Ok(7));
+    }
+
+    /// The executor exists for import/export statements, which report a row
+    /// count. A statement that unexpectedly answers with a result set reports
+    /// zero rows rather than failing the import.
+    #[tokio::test]
+    async fn sql_executor_reports_zero_rows_for_a_result_set_result() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(single_decimal_result_set()));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let execute = conn.make_sql_executor();
+        assert_eq!(execute("SELECT 1".to_string()).await, Ok(0));
+    }
+
+    #[tokio::test]
+    async fn sql_executor_surfaces_a_transport_failure_as_its_message() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_execute_query()
+            .returning(|_| Err(TransportError::IoError("socket closed".to_string())));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let execute = conn.make_sql_executor();
+        let error = execute("IMPORT INTO T ...".to_string())
+            .await
+            .expect_err("a transport failure must surface");
+        assert!(error.contains("socket closed"), "got: {}", error);
+    }
+
+    /// Parallel file imports call the executor repeatedly, so it must survive
+    /// more than one invocation.
+    #[tokio::test]
+    async fn sql_executor_is_reusable_across_several_statements() {
+        let log = new_sql_log();
+        let conn = connected(&log).await;
+
+        let execute = conn.make_sql_executor();
+        execute("IMPORT INTO T FROM 'part-0'".to_string())
+            .await
+            .expect("first");
+        execute("IMPORT INTO T FROM 'part-1'".to_string())
+            .await
+            .expect("second");
+
+        assert_eq!(
+            recorded(&log),
+            vec![
+                "IMPORT INTO T FROM 'part-0'".to_string(),
+                "IMPORT INTO T FROM 'part-1'".to_string()
+            ]
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Debug rendering and the connection builder
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn debug_output_identifies_the_connection_without_leaking_the_password() {
+        let log = new_sql_log();
+        let conn = connected(&log).await;
+
+        let rendered = format!("{:?}", conn);
+
+        assert!(
+            !rendered.contains("s3cr3t-pw"),
+            "the password must never appear in debug output, got: {}",
+            rendered
+        );
+        assert!(!rendered.contains("password"), "got: {}", rendered);
+        assert!(rendered.contains("1739284756"), "got: {}", rendered);
+        assert!(rendered.contains("db.example.invalid"), "got: {}", rendered);
+        assert!(rendered.contains("8563"), "got: {}", rendered);
+        assert!(rendered.contains("tester"), "got: {}", rendered);
+        assert!(
+            rendered.contains("in_transaction: false"),
+            "got: {}",
+            rendered
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_output_reports_an_active_transaction() {
+        let log = new_sql_log();
+        let mut conn = connected_for_transactions(&log).await;
+        conn.begin_transaction().await.expect("begin");
+
+        assert!(
+            format!("{:?}", conn).contains("in_transaction: true"),
+            "an active transaction must be visible in debug output"
+        );
+    }
+
+    #[test]
+    fn connection_builder_carries_every_setting_into_the_built_parameters() {
+        let builder = ConnectionBuilder::default()
+            .host("db.example.invalid")
+            .port(9999)
+            .username("tester")
+            .password("s3cr3t-pw")
+            .schema("SALES")
+            .use_tls(false)
+            .validate_server_certificate(false);
+
+        let params = builder
+            .params_builder
+            .build()
+            .expect("a fully specified builder must produce valid parameters");
+
+        assert_eq!(params.host, "db.example.invalid");
+        assert_eq!(params.port, 9999);
+        assert_eq!(params.username, "tester");
+        assert_eq!(params.password(), "s3cr3t-pw");
+        assert_eq!(params.schema.as_deref(), Some("SALES"));
+        assert!(!params.use_tls);
+        assert!(!params.validate_server_certificate);
+    }
+
+    #[test]
+    fn connection_builder_validates_the_server_certificate_by_default() {
+        let params = ConnectionBuilder::new()
+            .host("db.example.invalid")
+            .username("tester")
+            .password("s3cr3t-pw")
+            .params_builder
+            .build()
+            .expect("params");
+
+        assert!(
+            params.validate_server_certificate,
+            "certificate validation must stay on unless explicitly disabled"
+        );
+        assert!(
+            params.use_tls,
+            "TLS must stay on unless explicitly disabled"
+        );
+    }
+
+    /// Parameter validation happens before any dialling, so an incomplete
+    /// builder fails locally rather than on the network.
+    #[tokio::test]
+    async fn connection_builder_connect_rejects_a_missing_host_before_dialling() {
+        let error = ConnectionBuilder::new()
+            .username("tester")
+            .password("s3cr3t-pw")
+            .connect()
+            .await
+            .expect_err("a builder without a host must not connect");
+
+        match error {
+            ExasolError::Connection(ConnectionError::InvalidParameter { parameter, .. }) => {
+                assert_eq!(parameter, "host")
+            }
+            other => panic!("expected a missing-host InvalidParameter, got {:?}", other),
+        }
+    }
+
+    /// The connection-string parser already rejects an unknown `transport`, so
+    /// this arm is a defence-in-depth guard reachable only by setting the
+    /// public field directly. It must still name the transport it refused.
+    #[tokio::test]
+    async fn from_params_rejects_a_transport_the_build_does_not_provide() {
+        let mut params = test_params();
+        params.transport = Some("telepathy".to_string());
+
+        let error = Connection::from_params(params)
+            .await
+            .expect_err("an unavailable transport must not connect");
+
+        match error {
+            ConnectionError::InvalidParameter { parameter, message } => {
+                assert_eq!(parameter, "transport");
+                assert!(
+                    message.contains("Transport 'telepathy' is not available"),
+                    "got: {}",
+                    message
+                );
+            }
+            other => panic!("expected InvalidParameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn connection_builder_entry_point_produces_a_usable_builder() {
+        let params = Connection::builder()
+            .host("db.example.invalid")
+            .username("tester")
+            .password("s3cr3t-pw")
+            .params_builder
+            .build()
+            .expect("params");
+
+        assert_eq!(params.host, "db.example.invalid");
+    }
+
+    // ------------------------------------------------------------------------
+    // Connection lifecycle and accessors
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn params_exposes_the_parameters_the_connection_was_built_from() {
+        let log = new_sql_log();
+        let conn = connected(&log).await;
+
+        assert_eq!(conn.params().host, "db.example.invalid");
+        assert_eq!(conn.params().port, 8563);
+        assert_eq!(conn.params().username, "tester");
+    }
+
+    #[tokio::test]
+    async fn close_closes_the_session_and_the_transport() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_close().times(1).returning(|| Ok(()));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        conn.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn close_reports_a_failing_transport_with_host_and_port() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_close()
+            .returning(|| Err(TransportError::IoError("already gone".to_string())));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        match conn.close().await {
+            Err(ConnectionError::ConnectionFailed {
+                host,
+                port,
+                message,
+            }) => {
+                assert_eq!(host, "db.example.invalid");
+                assert_eq!(port, 8563);
+                assert!(message.contains("already gone"), "got: {}", message);
+            }
+            other => panic!("expected ConnectionFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn is_closed_reflects_the_session_state() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_close().returning(|| Ok(()));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert!(!conn.is_closed().await);
+        conn.shutdown().await.expect("shutdown");
+        assert!(conn.is_closed().await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_failing_transport_with_host_and_port() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_close()
+            .returning(|| Err(TransportError::IoError("already gone".to_string())));
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        match conn.shutdown().await {
+            Err(ConnectionError::ConnectionFailed { message, .. }) => {
+                assert!(message.contains("already gone"), "got: {}", message)
+            }
+            other => panic!("expected ConnectionFailed, got {:?}", other),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Prepared statements
+    // ------------------------------------------------------------------------
+
+    use crate::transport::protocol::PreparedStatementHandle;
+
+    fn handle_with(num_params: i32) -> PreparedStatementHandle {
+        PreparedStatementHandle::new(17, num_params, Vec::new(), Vec::new())
+    }
+
+    /// The parameter rows the mocked transport was handed for execution.
+    type ParameterLog = Arc<SyncMutex<Vec<Option<Vec<Vec<serde_json::Value>>>>>>;
+
+    /// A connected connection whose transport prepares a `num_params`-parameter
+    /// statement, answers every execution with `answer`, and records the
+    /// parameters it was given.
+    async fn connected_for_prepared(
+        num_params: i32,
+        answer: fn() -> Result<QueryResult, TransportError>,
+        parameters: &ParameterLog,
+    ) -> Connection {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_create_prepared_statement()
+            .returning(move |_| Ok(handle_with(num_params)));
+        let sink = Arc::clone(parameters);
+        transport
+            .expect_execute_prepared_statement()
+            .returning(move |_, params| {
+                sink.lock().expect("parameter log poisoned").push(params);
+                answer()
+            });
+        transport
+            .expect_close_prepared_statement()
+            .returning(|_| Ok(()));
+        Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect")
+    }
+
+    fn new_parameter_log() -> ParameterLog {
+        Arc::new(SyncMutex::new(Vec::new()))
+    }
+
+    fn recorded_parameters(log: &ParameterLog) -> Vec<Option<Vec<Vec<serde_json::Value>>>> {
+        log.lock().expect("parameter log poisoned").clone()
+    }
+
+    fn closed_prepared_statement() -> PreparedStatement {
+        let mut stmt = PreparedStatement::new(handle_with(0));
+        stmt.mark_closed();
+        stmt
+    }
+
+    #[tokio::test]
+    async fn prepare_returns_a_statement_sized_by_the_servers_parameter_count() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(2, ok_row_count, &parameters).await;
+
+        let stmt = conn
+            .prepare("INSERT INTO T VALUES (?, ?)")
+            .await
+            .expect("prepare");
+
+        assert_eq!(stmt.parameter_count(), 2);
+        assert_eq!(stmt.handle(), 17);
+        assert!(!stmt.is_closed());
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_a_closed_session() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn.prepare("SELECT 1").await {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_surfaces_a_transport_failure() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_create_prepared_statement()
+            .returning(|_| Err(TransportError::ProtocolError("syntax error".to_string())));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        match conn.prepare("SELCT 1").await {
+            Err(QueryError::ExecutionFailed(message)) => {
+                assert!(message.contains("syntax error"), "got: {}", message)
+            }
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_forwards_bound_parameters_in_column_major_order() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(2, ok_row_count, &parameters).await;
+        let mut stmt = conn
+            .prepare("INSERT INTO T VALUES (?, ?)")
+            .await
+            .expect("prepare");
+        stmt.bind(0, Parameter::Integer(7)).expect("bind 0");
+        stmt.bind(1, Parameter::String("seven".to_string()))
+            .expect("bind 1");
+
+        conn.execute_prepared(&stmt).await.expect("execute");
+
+        assert_eq!(
+            recorded_parameters(&parameters),
+            vec![Some(vec![
+                vec![serde_json::json!(7)],
+                vec![serde_json::json!("seven")]
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_sends_no_parameters_for_a_parameterless_statement() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+        let stmt = conn.prepare("DELETE FROM T").await.expect("prepare");
+
+        conn.execute_prepared(&stmt).await.expect("execute");
+
+        assert_eq!(recorded_parameters(&parameters), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_rejects_a_closed_statement() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+
+        match conn.execute_prepared(&closed_prepared_statement()).await {
+            Err(QueryError::StatementClosed) => {}
+            other => panic!("expected StatementClosed, got {:?}", other),
+        }
+        assert!(
+            recorded_parameters(&parameters).is_empty(),
+            "a closed statement must never reach the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_rejects_a_closed_session() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn.execute_prepared(&stmt).await {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_propagates_an_unbound_parameter() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(1, ok_row_count, &parameters).await;
+        let stmt = conn.prepare("SELECT ?").await.expect("prepare");
+
+        match conn.execute_prepared(&stmt).await {
+            Err(QueryError::ParameterBindingError { index, .. }) => assert_eq!(index, 0),
+            other => panic!("expected ParameterBindingError, got {:?}", other),
+        }
+        assert!(recorded_parameters(&parameters).is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_surfaces_a_transport_failure() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(
+            0,
+            || Err(TransportError::ProtocolError("table missing".to_string())),
+            &parameters,
+        )
+        .await;
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+
+        match conn.execute_prepared(&stmt).await {
+            Err(QueryError::ExecutionFailed(message)) => {
+                assert!(message.contains("table missing"), "got: {}", message)
+            }
+            other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_counts_the_query_and_returns_the_session_to_ready() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+
+        conn.execute_prepared(&stmt).await.expect("execute");
+
+        assert_eq!(conn.session.query_count(), 1);
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_update_returns_the_affected_row_count() {
+        let parameters = new_parameter_log();
+        let mut conn =
+            connected_for_prepared(0, || Ok(QueryResult::row_count(13)), &parameters).await;
+        let stmt = conn.prepare("DELETE FROM T").await.expect("prepare");
+
+        assert_eq!(
+            conn.execute_prepared_update(&stmt).await.expect("update"),
+            13
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_update_rejects_a_statement_that_returns_a_result_set() {
+        let parameters = new_parameter_log();
+        let mut conn =
+            connected_for_prepared(0, || Ok(single_decimal_result_set()), &parameters).await;
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+
+        match conn.execute_prepared_update(&stmt).await {
+            Err(QueryError::UnexpectedResultSet) => {}
+            other => panic!("expected UnexpectedResultSet, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_update_rejects_a_closed_statement() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+
+        match conn
+            .execute_prepared_update(&closed_prepared_statement())
+            .await
+        {
+            Err(QueryError::StatementClosed) => {}
+            other => panic!("expected StatementClosed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_update_rejects_a_closed_session() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+        let stmt = conn.prepare("DELETE FROM T").await.expect("prepare");
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn.execute_prepared_update(&stmt).await {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_batch_update_transposes_parameter_rows_into_columns() {
+        let parameters = new_parameter_log();
+        let mut conn =
+            connected_for_prepared(2, || Ok(QueryResult::row_count(3)), &parameters).await;
+        let stmt = conn
+            .prepare("INSERT INTO T VALUES (?, ?)")
+            .await
+            .expect("prepare");
+
+        let affected = conn
+            .execute_batch_update(
+                &stmt,
+                &[
+                    vec![Parameter::Integer(1), Parameter::String("a".to_string())],
+                    vec![Parameter::Integer(2), Parameter::String("b".to_string())],
+                    vec![Parameter::Integer(3), Parameter::String("c".to_string())],
+                ],
+            )
+            .await
+            .expect("batch update");
+
+        assert_eq!(affected, 3);
+        assert_eq!(
+            recorded_parameters(&parameters),
+            vec![Some(vec![
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!(2),
+                    serde_json::json!(3)
+                ],
+                vec![
+                    serde_json::json!("a"),
+                    serde_json::json!("b"),
+                    serde_json::json!("c")
+                ]
+            ])],
+            "row-major input must reach the wire column-major"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_batch_update_rejects_a_row_whose_length_differs_from_the_statement() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(2, ok_row_count, &parameters).await;
+        let stmt = conn
+            .prepare("INSERT INTO T VALUES (?, ?)")
+            .await
+            .expect("prepare");
+
+        match conn
+            .execute_batch_update(
+                &stmt,
+                &[
+                    vec![Parameter::Integer(1), Parameter::Integer(2)],
+                    vec![Parameter::Integer(3)],
+                ],
+            )
+            .await
+        {
+            Err(QueryError::ParameterBindingError { index, .. }) => assert_eq!(index, 1),
+            other => panic!("expected ParameterBindingError, got {:?}", other),
+        }
+        assert!(recorded_parameters(&parameters).is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_batch_update_rejects_a_statement_that_returns_a_result_set() {
+        let parameters = new_parameter_log();
+        let mut conn =
+            connected_for_prepared(1, || Ok(single_decimal_result_set()), &parameters).await;
+        let stmt = conn.prepare("SELECT ?").await.expect("prepare");
+
+        match conn
+            .execute_batch_update(&stmt, &[vec![Parameter::Integer(1)]])
+            .await
+        {
+            Err(QueryError::UnexpectedResultSet) => {}
+            other => panic!("expected UnexpectedResultSet, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_batch_update_rejects_a_closed_statement() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+
+        match conn
+            .execute_batch_update(&closed_prepared_statement(), &[])
+            .await
+        {
+            Err(QueryError::StatementClosed) => {}
+            other => panic!("expected StatementClosed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_batch_update_rejects_a_closed_session() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(1, ok_row_count, &parameters).await;
+        let stmt = conn
+            .prepare("DELETE FROM T WHERE ID = ?")
+            .await
+            .expect("prepare");
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn
+            .execute_batch_update(&stmt, &[vec![Parameter::Integer(1)]])
+            .await
+        {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_batch_returns_a_result_set_and_counts_the_query() {
+        let parameters = new_parameter_log();
+        let mut conn =
+            connected_for_prepared(1, || Ok(single_decimal_result_set()), &parameters).await;
+        let stmt = conn.prepare("SELECT ?").await.expect("prepare");
+
+        let result = conn
+            .execute_batch(&stmt, &[vec![Parameter::Integer(1)]])
+            .await
+            .expect("batch");
+
+        assert!(
+            result.row_count().is_none(),
+            "a result set has no row count"
+        );
+        assert_eq!(conn.session.query_count(), 1);
+    }
+
+    /// An empty batch mirrors the zero-parameter case: no parameters are sent.
+    #[tokio::test]
+    async fn execute_batch_with_no_rows_sends_no_parameters() {
+        let parameters = new_parameter_log();
+        let mut conn =
+            connected_for_prepared(1, || Ok(single_decimal_result_set()), &parameters).await;
+        let stmt = conn.prepare("SELECT ?").await.expect("prepare");
+
+        conn.execute_batch(&stmt, &[]).await.expect("batch");
+
+        assert_eq!(recorded_parameters(&parameters), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn execute_batch_rejects_a_closed_statement() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(0, ok_row_count, &parameters).await;
+
+        match conn.execute_batch(&closed_prepared_statement(), &[]).await {
+            Err(QueryError::StatementClosed) => {}
+            other => panic!("expected StatementClosed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_batch_rejects_a_closed_session() {
+        let parameters = new_parameter_log();
+        let mut conn = connected_for_prepared(1, ok_row_count, &parameters).await;
+        let stmt = conn.prepare("SELECT ?").await.expect("prepare");
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn
+            .execute_batch(&stmt, &[vec![Parameter::Integer(1)]])
+            .await
+        {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_prepared_releases_the_server_handle_and_marks_the_statement_closed() {
+        let closed: Captured<i32> = new_capture();
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_create_prepared_statement()
+            .returning(|_| Ok(handle_with(0)));
+        let sink = Arc::clone(&closed);
+        transport
+            .expect_close_prepared_statement()
+            .times(1)
+            .returning(move |handle| {
+                *sink.lock().expect("capture poisoned") = Some(handle.handle);
+                Ok(())
+            });
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+
+        conn.close_prepared(stmt).await.expect("close_prepared");
+
+        assert_eq!(captured(&closed), 17);
+    }
+
+    /// Closing an already-closed statement must not send a second release for a
+    /// handle the server has already freed.
+    #[tokio::test]
+    async fn close_prepared_on_an_already_closed_statement_sends_nothing() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_close_prepared_statement()
+            .times(0)
+            .returning(|_| Ok(()));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        conn.close_prepared(closed_prepared_statement())
+            .await
+            .expect("closing a closed statement must succeed");
+    }
+
+    #[tokio::test]
+    async fn close_prepared_surfaces_a_transport_failure() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_create_prepared_statement()
+            .returning(|_| Ok(handle_with(0)));
+        transport
+            .expect_close_prepared_statement()
+            .returning(|_| Err(TransportError::IoError("socket closed".to_string())));
+
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+
+        match conn.close_prepared(stmt).await {
+            Err(QueryError::ExecutionFailed(message)) => {
+                assert!(message.contains("socket closed"), "got: {}", message)
+            }
             other => panic!("expected ExecutionFailed, got {:?}", other),
         }
     }

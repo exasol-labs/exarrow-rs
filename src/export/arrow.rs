@@ -1562,4 +1562,282 @@ mod tests {
 
         assert_eq!(all_values, vec![1, 2, 3, 4, 5]);
     }
+
+    #[test]
+    fn test_from_io_error_wraps_message() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no access");
+
+        let err: ExportError = io_err.into();
+
+        assert!(matches!(err, ExportError::IoError(_)), "got: {err}");
+        assert!(err.to_string().contains("no access"), "got: {err}");
+    }
+
+    #[test]
+    fn test_from_arrow_error_wraps_message() {
+        let arrow_err = arrow::error::ArrowError::SchemaError("mismatched".to_string());
+
+        let err: ExportError = arrow_err.into();
+
+        assert!(matches!(err, ExportError::ArrowError(_)), "got: {err}");
+        assert!(err.to_string().contains("mismatched"), "got: {err}");
+    }
+
+    fn int64_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    #[tokio::test]
+    async fn test_csv_to_arrow_reader_new_wraps_an_unbuffered_reader() {
+        let options = ArrowExportOptions::default();
+        let mut reader = CsvToArrowReader::new(&b"7\n8\n"[..], int64_schema(), &options);
+
+        assert_eq!(reader.schema().fields().len(), 1);
+        let batch = reader.next_batch().await.unwrap().expect("a batch");
+
+        assert_eq!(batch.num_rows(), 2);
+        assert!(reader.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_csv_to_arrow_reader_skips_blank_lines() {
+        let options = ArrowExportOptions::default();
+        let mut reader = CsvToArrowReader::new(&b"1\n\n2\n"[..], int64_schema(), &options);
+
+        let batch = reader.next_batch().await.unwrap().expect("a batch");
+
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_csv_to_arrow_reader_rejects_unclosed_quote() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let options = ArrowExportOptions::default();
+        let mut reader = CsvToArrowReader::new(&b"\"unterminated\n"[..], schema, &options);
+
+        let err = reader.next_batch().await.unwrap_err();
+
+        assert!(
+            matches!(err, ExportError::CsvParseError { row: 0, .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("Unclosed quote"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_array_from_strings_dispatches_float64() {
+        use arrow::array::Array;
+
+        let array =
+            build_array_from_strings(&["1.5", ""], &DataType::Float64, true, &None, 0, 0).unwrap();
+
+        let floats = array
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(floats.value(0), 1.5);
+        assert!(floats.is_null(1));
+    }
+
+    #[test]
+    fn test_build_float64_array_accepts_special_values() {
+        let array = build_float64_array(
+            &["Infinity", "inf", "-Infinity", "-inf", "NaN", "nan"],
+            false,
+            &None,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let floats = array
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!(floats.value(0).is_infinite() && floats.value(0).is_sign_positive());
+        assert!(floats.value(1).is_infinite() && floats.value(1).is_sign_positive());
+        assert!(floats.value(2).is_infinite() && floats.value(2).is_sign_negative());
+        assert!(floats.value(3).is_infinite() && floats.value(3).is_sign_negative());
+        assert!(floats.value(4).is_nan());
+        assert!(floats.value(5).is_nan());
+    }
+
+    #[test]
+    fn test_build_array_from_strings_dispatches_date32() {
+        let array =
+            build_array_from_strings(&["1970-01-02"], &DataType::Date32, false, &None, 0, 0)
+                .unwrap();
+
+        let days = array
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+        assert_eq!(days.value(0), 1);
+    }
+
+    #[test]
+    fn test_build_array_from_strings_dispatches_timestamp() {
+        let array = build_array_from_strings(
+            &["1970-01-01 00:00:01"],
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+            &None,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let micros = array
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(micros.value(0), 1_000_000);
+    }
+
+    #[test]
+    fn test_build_array_from_strings_dispatches_decimal128() {
+        let array = build_array_from_strings(
+            &["123.45"],
+            &DataType::Decimal128(10, 2),
+            false,
+            &None,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let decimals = array
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>()
+            .unwrap();
+        assert_eq!(decimals.value(0), 12345);
+    }
+
+    #[test]
+    fn test_build_array_from_strings_rejects_unsupported_type() {
+        let err =
+            build_array_from_strings(&["x"], &DataType::Binary, true, &None, 0, 0).unwrap_err();
+
+        assert!(matches!(err, ExportError::SchemaError(_)), "got: {err}");
+        assert!(
+            err.to_string().contains("Unsupported data type"),
+            "got: {err}"
+        );
+    }
+
+    fn assert_non_nullable_null_error(result: Result<ArrayRef, ExportError>, expected_row: usize) {
+        match result.expect_err("expected a NULL rejection") {
+            ExportError::TypeConversionError {
+                row,
+                column,
+                message,
+            } => {
+                assert_eq!(row, expected_row);
+                assert_eq!(column, 4);
+                assert_eq!(message, "NULL value in non-nullable column");
+            }
+            other => panic!("Expected TypeConversionError, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_every_builder_rejects_null_in_a_non_nullable_column() {
+        let values = ["ok", ""];
+        let null_value = None;
+
+        assert_non_nullable_null_error(
+            build_boolean_array(&["true", ""], false, &null_value, 10, 4),
+            11,
+        );
+        assert_non_nullable_null_error(
+            build_int64_array(&["1", ""], false, &null_value, 10, 4),
+            11,
+        );
+        assert_non_nullable_null_error(
+            build_float64_array(&["1.0", ""], false, &null_value, 10, 4),
+            11,
+        );
+        assert_non_nullable_null_error(
+            build_date32_array(&["1970-01-01", ""], false, &null_value, 10, 4),
+            11,
+        );
+        assert_non_nullable_null_error(
+            build_timestamp_array(&["1970-01-01 00:00:00", ""], false, &null_value, 10, 4),
+            11,
+        );
+        assert_non_nullable_null_error(
+            build_decimal128_array(&["1.00", ""], 10, 2, false, &null_value, 10, 4),
+            11,
+        );
+        // The string builder substitutes an empty value instead of failing.
+        let strings = build_string_array(&values, false, &null_value).unwrap();
+        assert_eq!(strings.null_count(), 0);
+    }
+
+    fn assert_parse_error_at(result: Result<ArrayRef, ExportError>, needle: &str) {
+        match result.expect_err("expected a parse failure") {
+            ExportError::TypeConversionError {
+                row,
+                column,
+                message,
+            } => {
+                assert_eq!(row, 6);
+                assert_eq!(column, 2);
+                assert!(message.contains(needle), "got: {message}");
+            }
+            other => panic!("Expected TypeConversionError, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_every_builder_reports_the_failing_row_and_column() {
+        let null_value = None;
+
+        assert_parse_error_at(
+            build_boolean_array(&["maybe"], true, &null_value, 6, 2),
+            "Invalid boolean value: maybe",
+        );
+        assert_parse_error_at(
+            build_int64_array(&["twelve"], true, &null_value, 6, 2),
+            "Invalid integer value 'twelve'",
+        );
+        assert_parse_error_at(
+            build_float64_array(&["one point five"], true, &null_value, 6, 2),
+            "Invalid float value 'one point five'",
+        );
+        assert_parse_error_at(
+            build_date32_array(&["1970/01/01"], true, &null_value, 6, 2),
+            "1970/01/01",
+        );
+        assert_parse_error_at(
+            build_timestamp_array(&["yesterday"], true, &null_value, 6, 2),
+            "yesterday",
+        );
+        assert_parse_error_at(
+            build_decimal128_array(&["abc"], 10, 2, true, &null_value, 6, 2),
+            "abc",
+        );
+    }
+
+    #[test]
+    fn test_build_decimal128_array_rejects_invalid_precision_and_scale() {
+        let err = build_decimal128_array(&["1.0"], 100, 2, true, &None, 0, 0).unwrap_err();
+
+        assert!(matches!(err, ExportError::ArrowError(_)), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_string_array_appends_null_for_nullable_columns() {
+        use arrow::array::Array;
+
+        let array = build_string_array(&["a", "", "c"], true, &None).unwrap();
+
+        let strings = array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(strings.null_count(), 1);
+        assert_eq!(strings.value(0), "a");
+        assert_eq!(strings.value(2), "c");
+    }
 }

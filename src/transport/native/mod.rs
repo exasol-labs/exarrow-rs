@@ -23,7 +23,16 @@ use super::protocol::{
 use super::tls::{FingerprintVerifier, NoVerifier};
 
 use self::attributes::{AttributeSet, AttributeValue};
-use self::constants::*;
+use self::constants::{
+    ATTR_AUTOCOMMIT, ATTR_DATABASE_NAME, ATTR_DATA_MESSAGE_SIZE, ATTR_PRODUCT_NAME,
+    ATTR_PROTOCOL_VERSION, ATTR_PUBLIC_KEY, ATTR_QUERY_TIMEOUT, ATTR_RANDOM_PHRASE,
+    ATTR_RELEASE_VERSION, ATTR_SESSIONID, ATTR_TIMEZONE, CMD_CLOSE_PREPARED, CMD_CLOSE_RESULTSET,
+    CMD_CREATE_PREPARED, CMD_DISCONNECT, CMD_EXECUTE, CMD_EXECUTE_PREPARED, CMD_FETCH2,
+    CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
+    MAX_DATA_MESSAGE_SIZE, PARAMETER_DESCRIPTION, PROTOCOL_VERSION, SMALL_RESULTSET, T_BOOLEAN,
+    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR,
+    T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
+};
 use self::encryption::ChaCha20Encryptor;
 use self::framing::{MessageHeader, SerialCounter};
 use self::result_parser::{NativeColumnMeta, NativeResponse, NativeResponseEnvelope};
@@ -373,60 +382,87 @@ impl NativeTcpTransport {
         buf.extend_from_slice(&(num_rows as i64).to_le_bytes()); // total_rows
         buf.extend_from_slice(&(num_rows as i64).to_le_bytes()); // rows_in_msg
 
-        if let Some(cols) = parameters {
-            // Write column headers
-            for (i, col_values) in cols.iter().enumerate() {
-                let (wire_type, col_name) = Self::infer_wire_type(handle, i, col_values);
-                let name_bytes = col_name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as i32).to_le_bytes());
-                buf.extend_from_slice(name_bytes);
-                buf.extend_from_slice(&(wire_type as i32).to_le_bytes());
+        let Some(cols) = parameters else {
+            return Ok(buf);
+        };
 
-                // Type-specific metadata
-                match wire_type {
-                    T_CHAR => {
-                        buf.push(IS_VARCHAR | IS_UTF8); // vc_flag: is_varchar + utf8
-                        buf.extend_from_slice(&2_000_000i32.to_le_bytes()); // max_len
-                        buf.extend_from_slice(&(2_000_000i32 * 4).to_le_bytes());
-                        // octet_len
-                    }
-                    T_DECIMAL => {
-                        let (prec, scale) = Self::decimal_metadata(handle, i);
-                        buf.extend_from_slice(&prec.to_le_bytes());
-                        buf.extend_from_slice(&scale.to_le_bytes());
-                    }
-                    _ => {} // BOOLEAN, DOUBLE, etc. have no extra metadata
-                }
-            }
-
-            // Write parameter data in row-major order: col0_row0, col1_row0, col0_row1, ...
-            // Exasol's native prepared-statement protocol requires this interleaving.
-            // Column-major encoding causes the server to drop the connection for num_rows > 1;
-            // the two orderings coincide for num_rows = 1, which is why single-row execution
-            // was unaffected before this fix.
-            let wire_types_and_scales: Vec<(u32, i32)> = cols
-                .iter()
-                .enumerate()
-                .map(|(i, col_values)| {
-                    let (wire_type, _) = Self::infer_wire_type(handle, i, col_values);
-                    let scale = if wire_type == T_DECIMAL {
-                        Self::decimal_metadata(handle, i).1
-                    } else {
-                        0
-                    };
-                    (wire_type, scale)
-                })
-                .collect();
-
-            for row_idx in 0..num_rows {
-                for (col_idx, col_values) in cols.iter().enumerate() {
-                    let (wire_type, scale) = wire_types_and_scales[col_idx];
-                    Self::write_param_value(&mut buf, wire_type, &col_values[row_idx], scale)?;
-                }
-            }
-        }
+        Self::write_column_headers(&mut buf, handle, cols);
+        Self::write_parameter_rows(&mut buf, handle, cols, num_rows)?;
 
         Ok(buf)
+    }
+
+    fn write_column_headers(
+        buf: &mut Vec<u8>,
+        handle: &PreparedStatementHandle,
+        cols: &[Vec<serde_json::Value>],
+    ) {
+        for (i, col_values) in cols.iter().enumerate() {
+            let (wire_type, col_name) = Self::infer_wire_type(handle, i, col_values);
+            let name_bytes = col_name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as i32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(wire_type as i32).to_le_bytes());
+            Self::write_column_metadata(buf, handle, i, wire_type);
+        }
+    }
+
+    /// Append the type-specific metadata a column header carries.
+    /// BOOLEAN, DOUBLE and the other fixed-width types have none.
+    fn write_column_metadata(
+        buf: &mut Vec<u8>,
+        handle: &PreparedStatementHandle,
+        col_idx: usize,
+        wire_type: u32,
+    ) {
+        match wire_type {
+            T_CHAR => {
+                buf.push(IS_VARCHAR | IS_UTF8); // vc_flag: is_varchar + utf8
+                buf.extend_from_slice(&2_000_000i32.to_le_bytes()); // max_len
+                buf.extend_from_slice(&(2_000_000i32 * 4).to_le_bytes()); // octet_len
+            }
+            T_DECIMAL => {
+                let (prec, scale) = Self::decimal_metadata(handle, col_idx);
+                buf.extend_from_slice(&prec.to_le_bytes());
+                buf.extend_from_slice(&scale.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+
+    /// Append parameter data in row-major order: col0_row0, col1_row0, col0_row1, ...
+    ///
+    /// Exasol's native prepared-statement protocol requires this interleaving.
+    /// Column-major encoding causes the server to drop the connection for num_rows > 1;
+    /// the two orderings coincide for num_rows = 1, which is why single-row execution
+    /// was unaffected before this fix.
+    fn write_parameter_rows(
+        buf: &mut Vec<u8>,
+        handle: &PreparedStatementHandle,
+        cols: &[Vec<serde_json::Value>],
+        num_rows: usize,
+    ) -> Result<(), TransportError> {
+        let wire_types_and_scales: Vec<(u32, i32)> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, col_values)| {
+                let (wire_type, _) = Self::infer_wire_type(handle, i, col_values);
+                let scale = if wire_type == T_DECIMAL {
+                    Self::decimal_metadata(handle, i).1
+                } else {
+                    0
+                };
+                (wire_type, scale)
+            })
+            .collect();
+
+        for row_idx in 0..num_rows {
+            for (col_idx, col_values) in cols.iter().enumerate() {
+                let (wire_type, scale) = wire_types_and_scales[col_idx];
+                Self::write_param_value(buf, wire_type, &col_values[row_idx], scale)?;
+            }
+        }
+        Ok(())
     }
 
     /// Determine wire type and column name from handle metadata or by inference.
@@ -675,6 +711,51 @@ impl Default for NativeTcpTransport {
     }
 }
 
+/// Read an attribute the server may encode either as raw bytes or as text.
+///
+/// The handshake attributes that carry key material (public key, random phrase)
+/// arrive as `T_binary` from current servers but as `T_char` from older ones,
+/// so both encodings resolve to the same byte string here.
+fn attribute_bytes(attrs: &AttributeSet, id: u16) -> Option<Vec<u8>> {
+    match attrs.get(id)? {
+        AttributeValue::Binary(bytes) => Some(bytes.clone()),
+        AttributeValue::String(text) => Some(text.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// Read a text attribute, ignoring any other encoding.
+fn attribute_text(attrs: &AttributeSet, id: u16) -> Option<String> {
+    match attrs.get(id)? {
+        AttributeValue::String(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// Read an integer attribute, widening the 32-bit encoding to 64 bits.
+fn attribute_integer(attrs: &AttributeSet, id: u16) -> Option<i64> {
+    match attrs.get(id)? {
+        AttributeValue::Int64(value) => Some(*value),
+        AttributeValue::Int32(value) => Some(*value as i64),
+        _ => None,
+    }
+}
+
+/// Fail when a response payload carries a server exception, describing it with `context`.
+fn reject_exception(context: &str, result_data: &[u8]) -> Result<(), TransportError> {
+    if result_data.is_empty() {
+        return Ok(());
+    }
+    let response = result_parser::parse_response(result_data)?;
+    if let NativeResponse::Exception { message, sql_state } = response.terminal {
+        return Err(TransportError::ProtocolError(format!(
+            "{}: {} (SQL state: {})",
+            context, message, sql_state
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TransportProtocol for NativeTcpTransport {
     async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
@@ -767,63 +848,36 @@ impl TransportProtocol for NativeTcpTransport {
         )?;
 
         // Extract public key (binary: [exponent:128 BE][modulus:128 BE])
-        let public_key = match server_attrs.get(ATTR_PUBLIC_KEY) {
-            Some(AttributeValue::String(s)) => s.as_bytes().to_vec(),
-            Some(AttributeValue::Binary(b)) => b.clone(),
-            _ => {
-                return Err(TransportError::ProtocolError(
-                    "Server did not send public key".into(),
-                ))
-            }
-        };
+        let public_key = attribute_bytes(&server_attrs, ATTR_PUBLIC_KEY).ok_or_else(|| {
+            TransportError::ProtocolError("Server did not send public key".into())
+        })?;
 
         // Extract random phrase for RSA interleaving
-        let random_phrase = match server_attrs.get(ATTR_RANDOM_PHRASE) {
-            Some(AttributeValue::Binary(b)) => b.clone(),
-            Some(AttributeValue::String(s)) => s.as_bytes().to_vec(),
-            _ => {
-                return Err(TransportError::ProtocolError(
-                    "Server did not send random phrase".into(),
-                ))
-            }
-        };
+        let random_phrase =
+            attribute_bytes(&server_attrs, ATTR_RANDOM_PHRASE).ok_or_else(|| {
+                TransportError::ProtocolError("Server did not send random phrase".into())
+            })?;
 
         // Extract session info from server attributes
-        let session_id = match server_attrs.get(ATTR_SESSIONID) {
-            Some(AttributeValue::Int64(id)) => id.to_string(),
-            Some(AttributeValue::Int32(id)) => id.to_string(),
-            _ => "0".to_string(),
-        };
+        let session_id = attribute_integer(&server_attrs, ATTR_SESSIONID)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "0".to_string());
 
-        let protocol_version = match server_attrs.get(ATTR_PROTOCOL_VERSION) {
-            Some(AttributeValue::Int32(v)) => *v,
-            _ => PROTOCOL_VERSION as i32,
-        };
+        let protocol_version = attribute_integer(&server_attrs, ATTR_PROTOCOL_VERSION)
+            .map(|version| version as i32)
+            .unwrap_or(PROTOCOL_VERSION as i32);
 
-        let release_version = match server_attrs.get(ATTR_RELEASE_VERSION) {
-            Some(AttributeValue::String(s)) => s.clone(),
-            _ => String::new(),
-        };
+        let release_version =
+            attribute_text(&server_attrs, ATTR_RELEASE_VERSION).unwrap_or_default();
 
-        let database_name = match server_attrs.get(ATTR_DATABASE_NAME) {
-            Some(AttributeValue::String(s)) => s.clone(),
-            _ => String::new(),
-        };
+        let database_name = attribute_text(&server_attrs, ATTR_DATABASE_NAME).unwrap_or_default();
 
-        let product_name = match server_attrs.get(ATTR_PRODUCT_NAME) {
-            Some(AttributeValue::String(s)) => s.clone(),
-            _ => String::new(),
-        };
+        let product_name = attribute_text(&server_attrs, ATTR_PRODUCT_NAME).unwrap_or_default();
 
-        let max_data_msg_size = match server_attrs.get(ATTR_DATA_MESSAGE_SIZE) {
-            Some(AttributeValue::Int64(v)) => *v,
-            _ => MAX_DATA_MESSAGE_SIZE as i64,
-        };
+        let max_data_msg_size = attribute_integer(&server_attrs, ATTR_DATA_MESSAGE_SIZE)
+            .unwrap_or(MAX_DATA_MESSAGE_SIZE as i64);
 
-        let time_zone = match server_attrs.get(ATTR_TIMEZONE) {
-            Some(AttributeValue::String(s)) => Some(s.clone()),
-            _ => None,
-        };
+        let time_zone = attribute_text(&server_attrs, ATTR_TIMEZONE);
 
         // Phase 2: Send password + ChaCha20 keys
         let use_chacha20 = !self.tls_active;
@@ -841,15 +895,7 @@ impl TransportProtocol for NativeTcpTransport {
 
         // Check for exception in the result part (skip attribute data)
         let result_data = Self::extract_result_data(&header, &payload);
-        if !result_data.is_empty() {
-            let response = result_parser::parse_response(&result_data)?;
-            if let NativeResponse::Exception { message, sql_state } = response.terminal {
-                return Err(TransportError::ProtocolError(format!(
-                    "Authentication failed: {} (SQL state: {})",
-                    message, sql_state
-                )));
-            }
-        }
+        reject_exception("Authentication failed", &result_data)?;
 
         // Activate ChaCha20 encryption for all subsequent messages (skip over TLS)
         if use_chacha20 && !auth.send_key.is_empty() {
@@ -864,15 +910,7 @@ impl TransportProtocol for NativeTcpTransport {
 
         // Parse session attributes from the response
         let ga_result_data = Self::extract_result_data(&ga_header, &ga_payload);
-        if !ga_result_data.is_empty() {
-            let response = result_parser::parse_response(&ga_result_data)?;
-            if let NativeResponse::Exception { message, sql_state } = response.terminal {
-                return Err(TransportError::ProtocolError(format!(
-                    "GET_ATTRIBUTES failed: {} (SQL state: {})",
-                    message, sql_state
-                )));
-            }
-        }
+        reject_exception("GET_ATTRIBUTES failed", &ga_result_data)?;
 
         // The GET_ATTRIBUTES response header has attributes
         let ga_attrs = if ga_header.num_attributes > 0 && ga_header.attribute_data_len > 0 {
@@ -883,31 +921,18 @@ impl TransportProtocol for NativeTcpTransport {
             AttributeSet::new()
         };
 
-        let session_id = match ga_attrs.get(ATTR_SESSIONID) {
-            Some(AttributeValue::Int64(id)) => id.to_string(),
-            Some(AttributeValue::Int32(id)) => id.to_string(),
-            _ => session_id,
-        };
+        let session_id = attribute_integer(&ga_attrs, ATTR_SESSIONID)
+            .map(|id| id.to_string())
+            .unwrap_or(session_id);
 
-        let release_version = match ga_attrs.get(ATTR_RELEASE_VERSION) {
-            Some(AttributeValue::String(s)) => s.clone(),
-            _ => release_version,
-        };
+        let release_version =
+            attribute_text(&ga_attrs, ATTR_RELEASE_VERSION).unwrap_or(release_version);
 
-        let database_name = match ga_attrs.get(ATTR_DATABASE_NAME) {
-            Some(AttributeValue::String(s)) => s.clone(),
-            _ => database_name,
-        };
+        let database_name = attribute_text(&ga_attrs, ATTR_DATABASE_NAME).unwrap_or(database_name);
 
-        let product_name = match ga_attrs.get(ATTR_PRODUCT_NAME) {
-            Some(AttributeValue::String(s)) => s.clone(),
-            _ => product_name,
-        };
+        let product_name = attribute_text(&ga_attrs, ATTR_PRODUCT_NAME).unwrap_or(product_name);
 
-        let time_zone = match ga_attrs.get(ATTR_TIMEZONE) {
-            Some(AttributeValue::String(s)) => Some(s.clone()),
-            _ => time_zone,
-        };
+        let time_zone = attribute_text(&ga_attrs, ATTR_TIMEZONE).or(time_zone);
 
         let session_info = SessionInfo {
             session_id,
@@ -1346,5 +1371,612 @@ mod tests {
     fn scale_decimal_value_round_trips_negative_float() {
         let v = serde_json::json!(-1.23);
         assert_eq!(NativeTcpTransport::scale_decimal_value(&v, 2), -123);
+    }
+
+    // --- Reading server handshake attributes ---
+
+    fn attribute_set(values: &[(u16, AttributeValue)]) -> AttributeSet {
+        let mut attrs = AttributeSet::new();
+        for (id, value) in values {
+            attrs.add(*id, value.clone());
+        }
+        attrs
+    }
+
+    #[test]
+    fn attribute_bytes_accepts_both_binary_and_text_encodings() {
+        let attrs = attribute_set(&[
+            (ATTR_PUBLIC_KEY, AttributeValue::Binary(vec![1, 2, 3])),
+            (
+                ATTR_RANDOM_PHRASE,
+                AttributeValue::String("phrase".to_owned()),
+            ),
+        ]);
+
+        assert_eq!(
+            attribute_bytes(&attrs, ATTR_PUBLIC_KEY),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            attribute_bytes(&attrs, ATTR_RANDOM_PHRASE),
+            Some(b"phrase".to_vec())
+        );
+    }
+
+    #[test]
+    fn attribute_bytes_rejects_numeric_and_absent_attributes() {
+        let attrs = attribute_set(&[(ATTR_PUBLIC_KEY, AttributeValue::Int32(7))]);
+
+        assert_eq!(attribute_bytes(&attrs, ATTR_PUBLIC_KEY), None);
+        assert_eq!(attribute_bytes(&attrs, ATTR_RANDOM_PHRASE), None);
+    }
+
+    #[test]
+    fn attribute_text_reads_only_text_attributes() {
+        let attrs = attribute_set(&[
+            (
+                ATTR_RELEASE_VERSION,
+                AttributeValue::String("8.34.0".to_owned()),
+            ),
+            (ATTR_DATABASE_NAME, AttributeValue::Int64(4)),
+        ]);
+
+        assert_eq!(
+            attribute_text(&attrs, ATTR_RELEASE_VERSION),
+            Some("8.34.0".to_owned())
+        );
+        assert_eq!(attribute_text(&attrs, ATTR_DATABASE_NAME), None);
+        assert_eq!(attribute_text(&attrs, ATTR_PRODUCT_NAME), None);
+    }
+
+    #[test]
+    fn attribute_integer_widens_int32_and_reads_int64() {
+        let attrs = attribute_set(&[
+            (ATTR_PROTOCOL_VERSION, AttributeValue::Int32(21)),
+            (ATTR_SESSIONID, AttributeValue::Int64(1_700_000_000_000)),
+            (ATTR_TIMEZONE, AttributeValue::String("UTC".to_owned())),
+        ]);
+
+        assert_eq!(attribute_integer(&attrs, ATTR_PROTOCOL_VERSION), Some(21));
+        assert_eq!(
+            attribute_integer(&attrs, ATTR_SESSIONID),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(attribute_integer(&attrs, ATTR_TIMEZONE), None);
+        assert_eq!(attribute_integer(&attrs, ATTR_DATA_MESSAGE_SIZE), None);
+    }
+
+    // --- Rejecting server exceptions ---
+
+    #[test]
+    fn reject_exception_accepts_an_empty_payload() {
+        assert!(reject_exception("Authentication failed", &[]).is_ok());
+    }
+
+    #[test]
+    fn reject_exception_accepts_a_payload_without_an_exception() {
+        let payload = 0i32.to_le_bytes();
+        assert!(reject_exception("Authentication failed", &payload).is_ok());
+    }
+
+    // --- Splitting attribute data from result data ---
+
+    fn header_with_attribute_len(attribute_data_len: u32) -> MessageHeader {
+        MessageHeader::new(CMD_EXECUTE, 1, 0, attribute_data_len, 1)
+    }
+
+    #[test]
+    fn result_data_starts_after_the_attribute_block() {
+        let header = header_with_attribute_len(2);
+        let payload = [0xAA, 0xBB, 0x01, 0x02];
+
+        assert_eq!(
+            NativeTcpTransport::extract_result_data(&header, &payload),
+            vec![0x01, 0x02]
+        );
+        assert_eq!(
+            NativeTcpTransport::result_data_slice(&header, &payload),
+            &[0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn result_data_is_empty_when_attributes_fill_the_payload() {
+        let header = header_with_attribute_len(4);
+        let payload = [0xAA, 0xBB, 0xCC, 0xDD];
+
+        assert!(NativeTcpTransport::extract_result_data(&header, &payload).is_empty());
+        assert!(NativeTcpTransport::result_data_slice(&header, &payload).is_empty());
+    }
+
+    #[test]
+    fn result_data_is_empty_when_the_attribute_length_overruns_the_payload() {
+        let header = header_with_attribute_len(99);
+        let payload = [0xAA];
+
+        assert!(NativeTcpTransport::extract_result_data(&header, &payload).is_empty());
+        assert!(NativeTcpTransport::result_data_slice(&header, &payload).is_empty());
+    }
+
+    #[test]
+    fn check_response_returns_the_envelope_for_a_row_count() {
+        let mut payload = vec![0xAA];
+        payload.extend_from_slice(&1i32.to_le_bytes());
+        payload.push(constants::R_ROW_COUNT as u8);
+        payload.extend_from_slice(&12i64.to_le_bytes());
+
+        let envelope =
+            NativeTcpTransport::check_response(&header_with_attribute_len(1), &payload).unwrap();
+
+        assert!(matches!(envelope.terminal, NativeResponse::RowCount(12)));
+    }
+
+    #[test]
+    fn check_response_turns_a_server_exception_into_an_error() {
+        let message = "syntax error";
+        let mut payload = 1i32.to_le_bytes().to_vec();
+        payload.push(constants::R_EXCEPTION as u8);
+        payload.extend_from_slice(&(message.len() as i32).to_le_bytes());
+        payload.extend_from_slice(message.as_bytes());
+        payload.extend_from_slice(b"42000");
+
+        let err = NativeTcpTransport::check_response(&header_with_attribute_len(0), &payload)
+            .unwrap_err();
+
+        match err {
+            TransportError::ProtocolError(msg) => {
+                assert_eq!(msg, "syntax error (SQL state: 42000)")
+            }
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    // --- Converting native responses to query results ---
+
+    fn column_meta(name: &str, type_id: u32) -> NativeColumnMeta {
+        NativeColumnMeta {
+            name: name.to_string(),
+            type_id,
+            precision: None,
+            scale: None,
+            is_varchar: false,
+            max_len: None,
+        }
+    }
+
+    #[test]
+    fn column_info_carries_the_mapped_data_type() {
+        let columns = vec![column_meta("ID", T_DECIMAL), column_meta("FLAG", T_BOOLEAN)];
+
+        let infos = NativeTcpTransport::to_column_info(&columns);
+
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "ID");
+        assert_eq!(infos[0].data_type.type_name, "DECIMAL");
+        assert_eq!(infos[1].name, "FLAG");
+        assert_eq!(infos[1].data_type.type_name, "BOOLEAN");
+    }
+
+    #[test]
+    fn small_result_set_needs_no_fetch_handle() {
+        let response = NativeResponse::ResultSet {
+            handle: SMALL_RESULTSET,
+            columns: vec![column_meta("ID", T_DECIMAL)],
+            batch: None,
+            total_rows: 3,
+            rows_received: 3,
+        };
+
+        match NativeTcpTransport::native_result_to_query_result(response).unwrap() {
+            QueryResult::ResultSet { handle, data } => {
+                assert!(handle.is_none());
+                assert_eq!(data.total_rows, 3);
+                assert_eq!(data.columns.len(), 1);
+            }
+            other => panic!("expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn large_result_set_keeps_its_fetch_handle() {
+        let response = NativeResponse::ResultSet {
+            handle: 42,
+            columns: Vec::new(),
+            batch: None,
+            total_rows: 1_000,
+            rows_received: 100,
+        };
+
+        match NativeTcpTransport::native_result_to_query_result(response).unwrap() {
+            QueryResult::ResultSet { handle, .. } => {
+                assert_eq!(handle.map(|h| h.as_i32()), Some(42))
+            }
+            other => panic!("expected ResultSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_count_and_empty_responses_become_row_counts() {
+        assert!(matches!(
+            NativeTcpTransport::native_result_to_query_result(NativeResponse::RowCount(7)).unwrap(),
+            QueryResult::RowCount { count: 7 }
+        ));
+        assert!(matches!(
+            NativeTcpTransport::native_result_to_query_result(NativeResponse::Empty).unwrap(),
+            QueryResult::RowCount { count: 0 }
+        ));
+    }
+
+    #[test]
+    fn a_still_executing_response_is_not_a_query_result() {
+        let err = NativeTcpTransport::native_result_to_query_result(NativeResponse::StillExecuting)
+            .unwrap_err();
+
+        match err {
+            TransportError::ProtocolError(msg) => assert_eq!(msg, "Unexpected response type"),
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    // --- Mapping declared and inferred parameter types ---
+
+    fn data_type(type_name: &str) -> super::super::messages::DataType {
+        super::super::messages::DataType {
+            type_name: type_name.to_string(),
+            precision: None,
+            scale: None,
+            size: None,
+            character_set: None,
+            with_local_time_zone: None,
+            fraction: None,
+        }
+    }
+
+    #[test]
+    fn declared_parameter_types_map_to_their_wire_types() {
+        let cases = [
+            ("DECIMAL", T_DECIMAL),
+            ("DOUBLE", T_DOUBLE),
+            ("BOOLEAN", T_BOOLEAN),
+            ("VARCHAR", T_CHAR),
+            ("CHAR", T_CHAR),
+            ("DATE", T_DATE),
+            ("TIMESTAMP", T_TIMESTAMP),
+            ("TIMESTAMP WITH LOCAL TIME ZONE", T_TIMESTAMP_UTC),
+            ("GEOMETRY", T_GEOMETRY),
+            ("HASHTYPE", T_HASHTYPE),
+            ("INTERVAL YEAR TO MONTH", T_INTERVAL_YEAR),
+            ("INTERVAL DAY TO SECOND", T_INTERVAL_DAY),
+            ("SOMETHING ELSE", T_CHAR),
+        ];
+
+        for (type_name, expected) in cases {
+            assert_eq!(
+                NativeTcpTransport::data_type_to_wire_type(&data_type(type_name)),
+                expected,
+                "{type_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_values_infer_their_wire_types() {
+        let cases = [
+            (serde_json::Value::Null, T_CHAR),
+            (serde_json::json!(true), T_BOOLEAN),
+            (serde_json::json!(7), T_DECIMAL),
+            (serde_json::json!(1.5), T_DOUBLE),
+            (serde_json::json!("text"), T_CHAR),
+            (serde_json::json!([1, 2]), T_CHAR),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(
+                NativeTcpTransport::json_value_to_wire_type(&value),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_parameter_metadata_supplies_the_wire_type_and_name() {
+        let handle = PreparedStatementHandle::new(
+            1,
+            2,
+            vec![data_type("BOOLEAN"), data_type("DOUBLE")],
+            vec![Some("FLAG".to_string()), None],
+        );
+
+        assert_eq!(
+            NativeTcpTransport::infer_wire_type(&handle, 0, &[]),
+            (T_BOOLEAN, "FLAG".to_string())
+        );
+        assert_eq!(
+            NativeTcpTransport::infer_wire_type(&handle, 1, &[]),
+            (T_DOUBLE, "param1".to_string())
+        );
+    }
+
+    #[test]
+    fn parameters_beyond_the_declared_metadata_are_inferred_from_their_values() {
+        let handle = PreparedStatementHandle::new(1, 0, Vec::new(), Vec::new());
+
+        assert_eq!(
+            NativeTcpTransport::infer_wire_type(&handle, 0, &[serde_json::json!(true)]),
+            (T_BOOLEAN, "param0".to_string())
+        );
+        assert_eq!(
+            NativeTcpTransport::infer_wire_type(&handle, 1, &[]),
+            (T_CHAR, "param1".to_string())
+        );
+    }
+
+    #[test]
+    fn decimal_metadata_falls_back_to_eighteen_zero() {
+        let declared = super::super::messages::DataType::decimal(12, 3);
+        let handle = PreparedStatementHandle::new(1, 1, vec![declared], vec![None]);
+
+        assert_eq!(NativeTcpTransport::decimal_metadata(&handle, 0), (12, 3));
+        assert_eq!(NativeTcpTransport::decimal_metadata(&handle, 1), (18, 0));
+    }
+
+    // --- Encoding parameter values ---
+
+    fn encoded_param(wire_type: u32, value: serde_json::Value, scale: i32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        NativeTcpTransport::write_param_value(&mut buf, wire_type, &value, scale).unwrap();
+        buf
+    }
+
+    #[test]
+    fn a_null_parameter_is_a_lone_null_marker() {
+        assert_eq!(
+            encoded_param(T_DECIMAL, serde_json::Value::Null, 0),
+            vec![0u8]
+        );
+    }
+
+    #[test]
+    fn boolean_parameters_are_encoded_as_one_byte() {
+        assert_eq!(
+            encoded_param(T_BOOLEAN, serde_json::json!(true), 0),
+            vec![1u8, 1u8]
+        );
+        assert_eq!(
+            encoded_param(T_BOOLEAN, serde_json::json!(false), 0),
+            vec![1u8, 0u8]
+        );
+        assert_eq!(
+            encoded_param(T_BOOLEAN, serde_json::json!("not a bool"), 0),
+            vec![1u8, 0u8]
+        );
+    }
+
+    #[test]
+    fn double_parameters_are_encoded_as_little_endian_f64() {
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&1.5f64.to_le_bytes());
+        assert_eq!(encoded_param(T_DOUBLE, serde_json::json!(1.5), 0), expected);
+
+        let mut zero = vec![1u8];
+        zero.extend_from_slice(&0.0f64.to_le_bytes());
+        assert_eq!(encoded_param(T_DOUBLE, serde_json::json!("nope"), 0), zero);
+    }
+
+    #[test]
+    fn decimal_parameters_are_encoded_as_a_scaled_i64() {
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&123i64.to_le_bytes());
+        assert_eq!(
+            encoded_param(T_DECIMAL, serde_json::json!(1.23), 2),
+            expected
+        );
+    }
+
+    #[test]
+    fn date_parameters_are_encoded_as_a_packed_i32() {
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&((2024 << 16) + (3 << 8) + 9i32).to_le_bytes());
+        assert_eq!(
+            encoded_param(T_DATE, serde_json::json!("2024-03-09"), 0),
+            expected
+        );
+    }
+
+    #[test]
+    fn string_parameters_are_length_prefixed() {
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&5i32.to_le_bytes());
+        expected.extend_from_slice(b"hello");
+        assert_eq!(
+            encoded_param(T_CHAR, serde_json::json!("hello"), 0),
+            expected
+        );
+    }
+
+    #[test]
+    fn non_string_values_on_a_string_column_are_encoded_as_their_json_text() {
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        expected.extend_from_slice(b"42");
+        assert_eq!(encoded_param(T_CHAR, serde_json::json!(42), 0), expected);
+    }
+
+    #[test]
+    fn packed_dates_fall_back_field_by_field() {
+        let default = (2000 << 16) + (1 << 8) + 1;
+
+        // Wrong number of dash-separated fields.
+        assert_eq!(NativeTcpTransport::parse_date_to_packed("2024-01"), default);
+        // Three fields, none of them numeric.
+        assert_eq!(
+            NativeTcpTransport::parse_date_to_packed("not-a-date"),
+            default
+        );
+        // Only the unparsable field falls back.
+        assert_eq!(
+            NativeTcpTransport::parse_date_to_packed("2024-xx-05"),
+            (2024 << 16) + (1 << 8) + 5
+        );
+    }
+
+    #[test]
+    fn timestamps_encode_their_fractional_seconds_as_nanoseconds() {
+        let mut buf = Vec::new();
+        NativeTcpTransport::write_timestamp_bytes(&mut buf, "2024-03-09 14:25:36.123456");
+
+        let mut expected = 2024i16.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[3, 9, 14, 25, 36]);
+        expected.extend_from_slice(&123_456_000i32.to_le_bytes());
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn timestamps_without_a_time_part_default_to_midnight() {
+        let mut buf = Vec::new();
+        NativeTcpTransport::write_timestamp_bytes(&mut buf, "2024-03-09");
+
+        let mut expected = 2024i16.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[3, 9, 0, 0, 0]);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn unparsable_timestamp_fields_fall_back_to_their_defaults() {
+        let mut buf = Vec::new();
+        NativeTcpTransport::write_timestamp_bytes(&mut buf, "bad-value! xx:yy:zz");
+
+        let mut expected = 2000i16.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[1, 1, 0, 0, 0]);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        assert_eq!(buf, expected);
+    }
+
+    // --- CMD_EXECUTE_PREPARED payload ---
+
+    #[test]
+    fn prepared_payload_without_parameters_declares_no_columns() {
+        let handle = PreparedStatementHandle::new(5, 0, Vec::new(), Vec::new());
+
+        let payload = NativeTcpTransport::build_execute_prepared_payload(&handle, None).unwrap();
+
+        let mut expected = 5i32.to_le_bytes().to_vec();
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.push(1u8);
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        expected.extend_from_slice(&0i64.to_le_bytes());
+        expected.extend_from_slice(&0i64.to_le_bytes());
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn prepared_payload_with_an_empty_parameter_list_declares_no_columns() {
+        let handle = PreparedStatementHandle::new(5, 0, Vec::new(), Vec::new());
+
+        let payload =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&[])).unwrap();
+
+        assert_eq!(
+            payload,
+            NativeTcpTransport::build_execute_prepared_payload(&handle, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_payload_interleaves_parameter_values_row_by_row() {
+        let handle = PreparedStatementHandle::new(
+            9,
+            2,
+            vec![data_type("BOOLEAN"), data_type("VARCHAR")],
+            vec![Some("FLAG".to_string()), Some("NAME".to_string())],
+        );
+        let parameters = vec![
+            vec![serde_json::json!(true), serde_json::json!(false)],
+            vec![serde_json::json!("a"), serde_json::json!("b")],
+        ];
+
+        let payload =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)).unwrap();
+
+        let mut expected = 9i32.to_le_bytes().to_vec();
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.push(1u8);
+        expected.extend_from_slice(&2i32.to_le_bytes()); // num_columns
+        expected.extend_from_slice(&2i64.to_le_bytes()); // total_rows
+        expected.extend_from_slice(&2i64.to_le_bytes()); // rows_in_msg
+                                                         // BOOLEAN column header, no type metadata
+        expected.extend_from_slice(&4i32.to_le_bytes());
+        expected.extend_from_slice(b"FLAG");
+        expected.extend_from_slice(&(T_BOOLEAN as i32).to_le_bytes());
+        // VARCHAR column header carries vc_flag, max_len and octet_len
+        expected.extend_from_slice(&4i32.to_le_bytes());
+        expected.extend_from_slice(b"NAME");
+        expected.extend_from_slice(&(T_CHAR as i32).to_le_bytes());
+        expected.push(IS_VARCHAR | IS_UTF8);
+        expected.extend_from_slice(&2_000_000i32.to_le_bytes());
+        expected.extend_from_slice(&(2_000_000i32 * 4).to_le_bytes());
+        // Row 0 then row 1, each holding both columns
+        expected.extend_from_slice(&[1, 1]);
+        expected.extend_from_slice(&[1]);
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(b"a");
+        expected.extend_from_slice(&[1, 0]);
+        expected.extend_from_slice(&[1]);
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(b"b");
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn prepared_payload_writes_decimal_precision_and_scales_its_values() {
+        let handle = PreparedStatementHandle::new(
+            1,
+            1,
+            vec![super::super::messages::DataType::decimal(12, 2)],
+            vec![Some("AMOUNT".to_string())],
+        );
+        let parameters = vec![vec![serde_json::json!(1.23)]];
+
+        let payload =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)).unwrap();
+
+        let mut expected = 1i32.to_le_bytes().to_vec();
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.push(1u8);
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(&1i64.to_le_bytes());
+        expected.extend_from_slice(&1i64.to_le_bytes());
+        expected.extend_from_slice(&6i32.to_le_bytes());
+        expected.extend_from_slice(b"AMOUNT");
+        expected.extend_from_slice(&(T_DECIMAL as i32).to_le_bytes());
+        expected.extend_from_slice(&12i32.to_le_bytes()); // precision
+        expected.extend_from_slice(&2i32.to_le_bytes()); // scale
+        expected.push(1u8);
+        expected.extend_from_slice(&123i64.to_le_bytes());
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn reject_exception_reports_the_context_message_and_sql_state() {
+        let message = "invalid credentials";
+        let mut payload = 1i32.to_le_bytes().to_vec();
+        payload.push(constants::R_EXCEPTION as u8);
+        payload.extend_from_slice(&(message.len() as i32).to_le_bytes());
+        payload.extend_from_slice(message.as_bytes());
+        payload.extend_from_slice(b"08004");
+
+        let err = reject_exception("Authentication failed", &payload).unwrap_err();
+
+        match err {
+            TransportError::ProtocolError(msg) => assert_eq!(
+                msg,
+                "Authentication failed: invalid credentials (SQL state: 08004)"
+            ),
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
     }
 }

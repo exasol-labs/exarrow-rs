@@ -1406,4 +1406,275 @@ mod tests {
         let dt = DataType::infer_from_json(&serde_json::json!({"key": "value"}));
         assert_eq!(dt.type_name, "VARCHAR");
     }
+
+    // ========================================================================
+    // Request Default Impls
+    // ========================================================================
+
+    #[test]
+    fn test_login_init_request_default_equals_new() {
+        let from_default = LoginInitRequest::default();
+        let from_new = LoginInitRequest::new();
+
+        assert_eq!(from_default.command, from_new.command);
+        assert_eq!(from_default.protocol_version, from_new.protocol_version);
+    }
+
+    #[test]
+    fn test_disconnect_request_default_equals_new() {
+        let from_default = DisconnectRequest::default();
+
+        assert_eq!(from_default.command, DisconnectRequest::new().command);
+        assert_eq!(from_default.command, "disconnect");
+    }
+
+    // ========================================================================
+    // AuthRequest Builders
+    // ========================================================================
+
+    #[test]
+    fn test_auth_request_new_defaults_driver_name_to_client_name() {
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "cipher".to_string(),
+            "exarrow-rs".to_string(),
+        );
+
+        assert_eq!(request.driver_name, "exarrow-rs");
+        assert_eq!(request.client_version, env!("CARGO_PKG_VERSION"));
+        assert!(!request.use_compression);
+        assert!(request.client_os_username.is_none());
+        assert!(request.attributes.is_none());
+    }
+
+    #[test]
+    fn test_auth_request_with_driver_name_overrides_the_default() {
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "cipher".to_string(),
+            "exarrow-rs".to_string(),
+        )
+        .with_driver_name("exapump".to_string());
+
+        assert_eq!(request.driver_name, "exapump");
+        assert_eq!(request.client_name, "exarrow-rs");
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"driverName\":\"exapump\""));
+    }
+
+    #[test]
+    fn test_auth_request_with_client_version_overrides_the_crate_version() {
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "cipher".to_string(),
+            "exarrow-rs".to_string(),
+        )
+        .with_client_version("9.9.9".to_string());
+
+        assert_eq!(request.client_version, "9.9.9");
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"clientVersion\":\"9.9.9\""));
+    }
+
+    #[test]
+    fn test_auth_request_with_os_username_serializes_as_camel_case() {
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "cipher".to_string(),
+            "exarrow-rs".to_string(),
+        )
+        .with_os_username("alice".to_string());
+
+        assert_eq!(request.client_os_username, Some("alice".to_string()));
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"clientOsUsername\":\"alice\""));
+    }
+
+    #[test]
+    fn test_auth_request_with_attributes_serializes_the_map() {
+        let mut attributes = HashMap::new();
+        attributes.insert("autocommit".to_string(), serde_json::Value::Bool(false));
+
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "cipher".to_string(),
+            "exarrow-rs".to_string(),
+        )
+        .with_attributes(attributes);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"attributes\""));
+        assert!(json.contains("\"autocommit\":false"));
+    }
+
+    #[test]
+    fn test_auth_request_builders_chain_without_losing_earlier_settings() {
+        let request = AuthRequest::new(
+            "sys".to_string(),
+            "cipher".to_string(),
+            "exarrow-rs".to_string(),
+        )
+        .with_driver_name("exapump".to_string())
+        .with_client_version("1.2.3".to_string())
+        .with_os_username("bob".to_string());
+
+        assert_eq!(request.driver_name, "exapump");
+        assert_eq!(request.client_version, "1.2.3");
+        assert_eq!(request.client_os_username, Some("bob".to_string()));
+        assert_eq!(request.username, "sys");
+        assert_eq!(request.password, "cipher");
+    }
+
+    // ========================================================================
+    // Result Set / Prepared Statement Request Constructors
+    // ========================================================================
+
+    #[test]
+    fn test_close_result_set_request_serializes_every_handle() {
+        let request = CloseResultSetRequest::new(vec![1, 2, 3]);
+
+        assert_eq!(request.command, "closeResultSet");
+        assert_eq!(request.result_set_handles, vec![1, 2, 3]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"command\":\"closeResultSet\""));
+        assert!(json.contains("\"resultSetHandles\":[1,2,3]"));
+    }
+
+    #[test]
+    fn test_close_result_set_request_accepts_an_empty_handle_list() {
+        let request = CloseResultSetRequest::new(vec![]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"resultSetHandles\":[]"));
+    }
+
+    #[test]
+    fn test_create_prepared_statement_request_with_attributes_serializes_them() {
+        let request = CreatePreparedStatementRequest::new("SELECT 1")
+            .with_attributes(serde_json::json!({"autocommit": true}));
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"attributes\":{\"autocommit\":true}"));
+    }
+
+    #[test]
+    fn test_execute_prepared_statement_request_with_empty_data_reports_zero_rows() {
+        let request = ExecutePreparedStatementRequest::new(7).with_data(vec![], vec![]);
+
+        assert_eq!(request.num_columns, 0);
+        assert_eq!(request.num_rows, 0);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"numRows\":0"));
+        assert!(json.contains("\"data\":[]"));
+    }
+
+    #[test]
+    fn test_execute_prepared_statement_request_with_attributes_serializes_them() {
+        let request = ExecutePreparedStatementRequest::new(7)
+            .with_attributes(serde_json::json!({"queryTimeout": 30}));
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"attributes\":{\"queryTimeout\":30}"));
+    }
+
+    #[test]
+    fn test_set_attributes_request_autocommit_serializes_the_flag() {
+        let enabled = SetAttributesRequest::autocommit(true);
+        let disabled = SetAttributesRequest::autocommit(false);
+
+        assert_eq!(enabled.command, "setAttributes");
+        assert_eq!(
+            enabled.attributes.get("autocommit"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let json = serde_json::to_string(&disabled).unwrap();
+        assert!(json.contains("\"command\":\"setAttributes\""));
+        assert!(json.contains("\"autocommit\":false"));
+    }
+
+    // ========================================================================
+    // ResultPayload
+    // ========================================================================
+
+    fn int_record_batch(values: Vec<i32>) -> RecordBatch {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ID",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
+            .expect("single Int32 column matches the schema")
+    }
+
+    #[test]
+    fn test_result_payload_json_reports_emptiness_and_row_count() {
+        let empty = ResultPayload::Json(vec![]);
+        let two_rows =
+            ResultPayload::Json(vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]]);
+
+        assert!(empty.is_empty());
+        assert_eq!(empty.num_rows(), 0);
+        assert!(!two_rows.is_empty());
+        assert_eq!(two_rows.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_result_payload_arrow_reports_emptiness_and_row_count() {
+        let empty = ResultPayload::Arrow(int_record_batch(vec![]));
+        let three_rows = ResultPayload::Arrow(int_record_batch(vec![10, 20, 30]));
+
+        assert!(empty.is_empty());
+        assert_eq!(empty.num_rows(), 0);
+        assert!(!three_rows.is_empty());
+        assert_eq!(three_rows.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_result_payload_json_exposes_rows_only_through_as_json() {
+        let payload = ResultPayload::Json(vec![vec![serde_json::json!("a")]]);
+
+        assert_eq!(payload.as_json(), Some(&vec![vec![serde_json::json!("a")]]));
+        assert!(payload.as_arrow().is_none());
+        assert!(payload.clone().into_arrow().is_none());
+    }
+
+    #[test]
+    fn test_result_payload_arrow_exposes_batch_only_through_as_arrow() {
+        let payload = ResultPayload::Arrow(int_record_batch(vec![42]));
+
+        assert!(payload.as_json().is_none());
+        assert_eq!(payload.as_arrow().map(RecordBatch::num_rows), Some(1));
+
+        let owned = payload
+            .into_arrow()
+            .expect("Arrow payload yields its batch");
+        assert_eq!(owned.num_rows(), 1);
+        assert_eq!(owned.num_columns(), 1);
+    }
+
+    #[test]
+    fn test_result_data_carries_columns_alongside_an_arrow_payload() {
+        let data = ResultData {
+            columns: vec![ColumnInfo {
+                name: "ID".to_string(),
+                data_type: DataType::decimal(18, 0),
+            }],
+            data: ResultPayload::Arrow(int_record_batch(vec![1, 2])),
+            total_rows: 2,
+        };
+
+        assert_eq!(data.columns.len(), 1);
+        assert_eq!(data.total_rows, 2);
+        assert_eq!(data.data.num_rows(), 2);
+    }
 }
