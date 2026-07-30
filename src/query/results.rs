@@ -8,10 +8,23 @@ use crate::transport::messages::{ColumnInfo, ResultData, ResultPayload, ResultSe
 use crate::transport::protocol::QueryResult as TransportQueryResult;
 use crate::transport::TransportProtocol;
 use crate::types::TypeMapper;
-use arrow::array::RecordBatch;
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{
+    new_empty_array, Array, BooleanArray, BooleanBuilder, Decimal128Array, Decimal128Builder,
+    PrimitiveArray, PrimitiveBuilder, RecordBatch, StringArray, StringBuilder,
+};
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Date32Type, Field, Float64Type, Int32Type, Int64Type, Schema,
+    TimestampMicrosecondType,
+};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+const SECONDS_PER_MINUTE: i64 = 60;
+const SECONDS_PER_HOUR: i64 = 3600;
+const SECONDS_PER_DAY: i64 = 86400;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_FRACTION_DIGITS: usize = 6;
 
 /// Metadata about a query execution.
 #[derive(Debug, Clone)]
@@ -191,68 +204,82 @@ impl ResultSet {
     /// # Errors
     /// Returns `QueryError` if fetching fails or if this is not a streaming result.
     pub async fn fetch_all(mut self) -> Result<Vec<RecordBatch>, QueryError> {
-        match &mut self.inner {
-            ResultSetInner::Stream {
-                handle,
-                metadata,
-                batches,
-                complete,
-            } => {
-                let all_batches = if *complete {
-                    batches.clone()
-                } else {
-                    let mut all_batches = batches.clone();
-
-                    // Fetch remaining data
-                    if let Some(handle_val) = handle {
-                        loop {
-                            let mut transport = self.transport.lock().await;
-                            let result_data = transport
-                                .fetch_results(*handle_val)
-                                .await
-                                .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-
-                            if result_data.data.is_empty() {
-                                *complete = true;
-                                break;
-                            }
-
-                            let batch =
-                                Self::payload_to_record_batch(&result_data, &metadata.schema)
-                                    .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-
-                            all_batches.push(batch);
-
-                            // Use the known total from query metadata so that per-batch
-                            // total_rows values from the transport don't cause early exit.
-                            let known_total = metadata.total_rows.unwrap_or(0);
-                            if known_total > 0
-                                && all_batches.iter().map(|b| b.num_rows()).sum::<usize>()
-                                    >= known_total as usize
-                            {
-                                *complete = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    *batches = all_batches.clone();
-                    all_batches
-                };
-
-                // Close the result set handle on the server to release resources
-                if let Some(handle_val) = handle.take() {
-                    let mut transport = self.transport.lock().await;
-                    // Ignore close errors - we've already fetched the data
-                    let _ = transport.close_result_set(handle_val).await;
-                }
-
-                Ok(all_batches)
-            }
-            ResultSetInner::RowCount { .. } => Err(QueryError::NoResultSet(
+        let ResultSetInner::Stream {
+            handle,
+            metadata,
+            batches,
+            complete,
+        } = &mut self.inner
+        else {
+            return Err(QueryError::NoResultSet(
                 "Cannot fetch batches from row count result".to_string(),
-            )),
+            ));
+        };
+
+        if !*complete {
+            if let Some(handle_val) = *handle {
+                *batches = Self::paginate_remaining(
+                    &self.transport,
+                    handle_val,
+                    metadata,
+                    batches.clone(),
+                )
+                .await?;
+                *complete = true;
+            }
         }
+        let all_batches = batches.clone();
+
+        // Close the result set handle on the server to release resources
+        if let Some(handle_val) = handle.take() {
+            let mut transport = self.transport.lock().await;
+            // Ignore close errors - we've already fetched the data
+            let _ = transport.close_result_set(handle_val).await;
+        }
+
+        Ok(all_batches)
+    }
+
+    /// Fetch every remaining page of a result set, appending to `collected`.
+    ///
+    /// Pagination ends either when the transport returns an empty page or when
+    /// the row count known from the query metadata has been reached. The
+    /// per-page `total_rows` reported by the transport is deliberately ignored:
+    /// it describes that page, so trusting it would end pagination early.
+    async fn paginate_remaining(
+        transport: &Arc<Mutex<dyn TransportProtocol>>,
+        handle: ResultSetHandle,
+        metadata: &QueryMetadata,
+        mut collected: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let known_total = metadata.total_rows.unwrap_or(0);
+
+        loop {
+            // The guard deliberately spans the whole iteration, matching the
+            // locking window the transport has always been given.
+            let mut locked = transport.lock().await;
+            let result_data = locked
+                .fetch_results(handle)
+                .await
+                .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
+
+            if result_data.data.is_empty() {
+                return Ok(collected);
+            }
+
+            collected.push(
+                Self::payload_to_record_batch(&result_data, &metadata.schema)
+                    .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?,
+            );
+
+            if known_total > 0 && Self::row_count_of(&collected) >= known_total as usize {
+                return Ok(collected);
+            }
+        }
+    }
+
+    fn row_count_of(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
     }
 
     /// Build Arrow schema from column information.
@@ -331,7 +358,6 @@ impl ResultSet {
     /// from the result set's column metadata, which is present even with no
     /// rows).
     fn empty_record_batch(schema: &Arc<Schema>) -> Result<RecordBatch, ConversionError> {
-        use arrow::array::{new_empty_array, Array};
         let arrays: Vec<Arc<dyn Array>> = schema
             .fields()
             .iter()
@@ -346,192 +372,172 @@ impl ResultSet {
         data: &ResultData,
         schema: &Arc<Schema>,
     ) -> Result<RecordBatch, ConversionError> {
-        use arrow::array::*;
-        use serde_json::Value;
-
         let rows = match &data.data {
             ResultPayload::Json(rows) => rows,
             ResultPayload::Arrow(batch) => return Ok(batch.clone()),
         };
 
         if rows.is_empty() {
-            let empty_arrays: Vec<Arc<dyn Array>> = schema
-                .fields()
-                .iter()
-                .map(|field| new_empty_array(field.data_type()))
-                .collect();
-
-            return RecordBatch::try_new(Arc::clone(schema), empty_arrays)
-                .map_err(|e| ConversionError::ArrowError(e.to_string()));
+            return Self::empty_record_batch(schema);
         }
 
-        let num_columns = schema.fields().len();
-        let column_values: Vec<Vec<&Value>> = (0..num_columns)
-            .map(|col_idx| {
-                rows.iter()
-                    .map(|row| row.get(col_idx).unwrap_or(&Value::Null))
-                    .collect()
+        let arrays: Vec<Arc<dyn Array>> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(column_index, field)| {
+                let values = Self::column_of(rows, column_index);
+                Self::json_column_to_array(field.data_type(), &values)
             })
-            .collect();
-
-        let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
-
-        for (col_idx, field) in schema.fields().iter().enumerate() {
-            use arrow::datatypes::DataType;
-
-            // Get the column data (all values for this column)
-            let col_values = &column_values[col_idx];
-
-            // Build array based on data type
-            let array: Arc<dyn Array> = match field.data_type() {
-                DataType::Boolean => {
-                    let mut builder = BooleanBuilder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(b) = value.as_bool() {
-                            builder.append_value(b);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Int32 => {
-                    let mut builder = Int32Builder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(i) = value.as_i64() {
-                            builder.append_value(i as i32);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Int64 => {
-                    let mut builder = Int64Builder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(i) = value.as_i64() {
-                            builder.append_value(i);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Float64 => {
-                    let mut builder = Float64Builder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(f) = value.as_f64() {
-                            builder.append_value(f);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Utf8 => {
-                    let mut builder = StringBuilder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(s) = value.as_str() {
-                            builder.append_value(s);
-                        } else {
-                            // Convert to string
-                            builder.append_value(value.to_string());
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Decimal128(precision, scale) => {
-                    let mut builder = Decimal128Builder::new()
-                        .with_precision_and_scale(*precision, *scale)
-                        .map_err(|e| ConversionError::ArrowError(e.to_string()))?;
-
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(s) = value.as_str() {
-                            // Parse string decimal (most common format from Exasol)
-                            let scaled = Self::parse_string_to_decimal(s, *scale)?;
-                            builder.append_value(scaled);
-                        } else if let Some(i) = value.as_i64() {
-                            // Scale the integer value
-                            let scaled = i * 10i64.pow(*scale as u32);
-                            builder.append_value(scaled as i128);
-                        } else if let Some(f) = value.as_f64() {
-                            let scaled = (f * 10f64.powi(*scale as i32)) as i128;
-                            builder.append_value(scaled);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Date32 => {
-                    let mut builder = Date32Builder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(s) = value.as_str() {
-                            // Parse date string "YYYY-MM-DD" to days since Unix epoch
-                            match Self::parse_date_to_days(s) {
-                                Ok(days) => builder.append_value(days),
-                                Err(_) => builder.append_null(),
-                            }
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-                DataType::Timestamp(_, tz) => {
-                    let mut builder = TimestampMicrosecondBuilder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else if let Some(s) = value.as_str() {
-                            match Self::parse_timestamp_to_micros(s) {
-                                Ok(micros) => builder.append_value(micros),
-                                Err(_) => builder.append_null(),
-                            }
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                    let array = builder.finish();
-                    if tz.is_some() {
-                        Arc::new(array.with_timezone("UTC"))
-                    } else {
-                        Arc::new(array)
-                    }
-                }
-                _ => {
-                    // Fallback to string for unsupported types
-                    let mut builder = StringBuilder::new();
-                    for value in col_values {
-                        if value.is_null() {
-                            builder.append_null();
-                        } else {
-                            builder.append_value(value.to_string());
-                        }
-                    }
-                    Arc::new(builder.finish())
-                }
-            };
-
-            arrays.push(array);
-        }
+            .collect::<Result<_, _>>()?;
 
         RecordBatch::try_new(Arc::clone(schema), arrays)
             .map_err(|e| ConversionError::ArrowError(e.to_string()))
+    }
+
+    /// Slice one column out of row-major JSON rows, padding short rows with NULL.
+    fn column_of(rows: &[Vec<Value>], column_index: usize) -> Vec<&Value> {
+        rows.iter()
+            .map(|row| row.get(column_index).unwrap_or(&Value::Null))
+            .collect()
+    }
+
+    /// Build the Arrow array for one result column from its JSON values.
+    ///
+    /// A value that does not fit the target Arrow type becomes NULL instead of
+    /// failing the batch: Exasol renders the same logical type differently
+    /// depending on transport and column width, so a single unexpected shape
+    /// must not discard an otherwise valid result set. Only a structurally
+    /// impossible column (an out-of-range DECIMAL precision/scale, or a decimal
+    /// string that cannot be scaled) is reported as an error.
+    fn json_column_to_array(
+        data_type: &DataType,
+        values: &[&Value],
+    ) -> Result<Arc<dyn Array>, ConversionError> {
+        Ok(match data_type {
+            DataType::Boolean => Arc::new(Self::json_to_boolean_array(values)),
+            DataType::Int32 => Arc::new(Self::json_to_primitive_array::<Int32Type, _>(
+                values,
+                |value| value.as_i64().map(|i| i as i32),
+            )),
+            DataType::Int64 => Arc::new(Self::json_to_primitive_array::<Int64Type, _>(
+                values,
+                |value| value.as_i64(),
+            )),
+            DataType::Float64 => Arc::new(Self::json_to_primitive_array::<Float64Type, _>(
+                values,
+                |value| value.as_f64(),
+            )),
+            DataType::Utf8 => Arc::new(Self::json_to_string_array(values, Self::render_as_text)),
+            DataType::Decimal128(precision, scale) => {
+                Arc::new(Self::json_to_decimal_array(values, *precision, *scale)?)
+            }
+            DataType::Date32 => Arc::new(Self::json_to_primitive_array::<Date32Type, _>(
+                values,
+                |value| {
+                    value
+                        .as_str()
+                        .and_then(|s| Self::parse_date_to_days(s).ok())
+                },
+            )),
+            DataType::Timestamp(_, timezone) => {
+                let array =
+                    Self::json_to_primitive_array::<TimestampMicrosecondType, _>(values, |value| {
+                        value
+                            .as_str()
+                            .and_then(|s| Self::parse_timestamp_to_micros(s).ok())
+                    });
+                match timezone {
+                    Some(_) => Arc::new(array.with_timezone("UTC")),
+                    None => Arc::new(array),
+                }
+            }
+            // Every remaining Arrow type is rendered as its JSON text form.
+            _ => Arc::new(Self::json_to_string_array(values, Value::to_string)),
+        })
+    }
+
+    /// Build a primitive Arrow array, treating any value `extract` rejects as NULL.
+    fn json_to_primitive_array<T, F>(values: &[&Value], extract: F) -> PrimitiveArray<T>
+    where
+        T: ArrowPrimitiveType,
+        F: Fn(&Value) -> Option<T::Native>,
+    {
+        let mut builder = PrimitiveBuilder::<T>::with_capacity(values.len());
+        for value in values {
+            builder.append_option(extract(value));
+        }
+        builder.finish()
+    }
+
+    /// Build a boolean Arrow array, treating any non-boolean value as NULL.
+    fn json_to_boolean_array(values: &[&Value]) -> BooleanArray {
+        let mut builder = BooleanBuilder::with_capacity(values.len());
+        for value in values {
+            builder.append_option(value.as_bool());
+        }
+        builder.finish()
+    }
+
+    /// Build a UTF-8 Arrow array, rendering every non-NULL value via `render`.
+    fn json_to_string_array<F>(values: &[&Value], render: F) -> StringArray
+    where
+        F: Fn(&Value) -> String,
+    {
+        let mut builder = StringBuilder::new();
+        for value in values {
+            if value.is_null() {
+                builder.append_null();
+            } else {
+                builder.append_value(render(value));
+            }
+        }
+        builder.finish()
+    }
+
+    /// Render a value destined for a VARCHAR/CHAR column.
+    ///
+    /// JSON strings are taken verbatim; anything else falls back to its JSON
+    /// text form so that a mistyped column still round-trips its content.
+    fn render_as_text(value: &Value) -> String {
+        value
+            .as_str()
+            .map_or_else(|| value.to_string(), String::from)
+    }
+
+    /// Build a DECIMAL Arrow array at the column's declared precision and scale.
+    fn json_to_decimal_array(
+        values: &[&Value],
+        precision: u8,
+        scale: i8,
+    ) -> Result<Decimal128Array, ConversionError> {
+        let mut builder = Decimal128Builder::new()
+            .with_precision_and_scale(precision, scale)
+            .map_err(|e| ConversionError::ArrowError(e.to_string()))?;
+
+        for value in values {
+            builder.append_option(Self::scale_to_decimal(value, scale)?);
+        }
+
+        Ok(builder.finish())
+    }
+
+    /// Scale a single JSON value into the i128 representation of a DECIMAL column.
+    ///
+    /// Exasol sends decimals as strings when they exceed the JSON number range
+    /// and as numbers otherwise, so all three shapes are accepted; a value of
+    /// any other shape becomes NULL.
+    fn scale_to_decimal(value: &Value, scale: i8) -> Result<Option<i128>, ConversionError> {
+        if let Some(text) = value.as_str() {
+            return Self::parse_string_to_decimal(text, scale).map(Some);
+        }
+        if let Some(integer) = value.as_i64() {
+            return Ok(Some((integer * 10i64.pow(scale as u32)) as i128));
+        }
+        if let Some(float) = value.as_f64() {
+            return Ok(Some((float * 10f64.powi(scale as i32)) as i128));
+        }
+        Ok(None)
     }
 
     /// Parse a date string "YYYY-MM-DD" to days since Unix epoch (1970-01-01).
@@ -576,51 +582,69 @@ impl ResultSet {
     }
 
     /// Parse a timestamp string to microseconds since Unix epoch.
+    ///
+    /// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY-MM-DD HH:MM:SS` and
+    /// `YYYY-MM-DD HH:MM:SS.ffffff`. Anything after the time component is
+    /// ignored; a time component that is not `HH:MM`-shaped contributes nothing.
     fn parse_timestamp_to_micros(timestamp_str: &str) -> Result<i64, ()> {
-        // Split date and time
+        // `str::split` always yields at least one element, so the date part is
+        // never absent and needs no emptiness guard.
         let parts: Vec<&str> = timestamp_str.split(' ').collect();
-        if parts.is_empty() {
-            return Err(());
-        }
 
-        // Parse date part
         let days = Self::parse_date_to_days(parts[0])?;
-        let mut micros = days as i64 * 86400 * 1_000_000;
+        let mut micros = days as i64 * SECONDS_PER_DAY * MICROS_PER_SECOND;
 
-        // Parse time part if present
-        if parts.len() > 1 {
-            let time_parts: Vec<&str> = parts[1].split(':').collect();
-            if time_parts.len() >= 2 {
-                let hours: i64 = time_parts[0].parse().map_err(|_| ())?;
-                let minutes: i64 = time_parts[1].parse().map_err(|_| ())?;
-
-                micros += hours * 3600 * 1_000_000;
-                micros += minutes * 60 * 1_000_000;
-
-                if time_parts.len() >= 3 {
-                    // Parse seconds and microseconds
-                    let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
-                    let seconds: i64 = sec_parts[0].parse().map_err(|_| ())?;
-
-                    micros += seconds * 1_000_000;
-
-                    if sec_parts.len() > 1 {
-                        // Parse fractional seconds (microseconds)
-                        let frac = sec_parts[1];
-                        let frac_micros = if frac.len() <= 6 {
-                            let padding = 6 - frac.len();
-                            let padded = format!("{}{}", frac, "0".repeat(padding));
-                            padded.parse::<i64>().unwrap_or(0)
-                        } else {
-                            frac[..6].parse::<i64>().unwrap_or(0)
-                        };
-                        micros += frac_micros;
-                    }
-                }
-            }
+        if let Some(time_str) = parts.get(1) {
+            micros += Self::parse_time_of_day_to_micros(time_str)?;
         }
 
         Ok(micros)
+    }
+
+    /// Parse the `HH:MM[:SS[.ffffff]]` part of a timestamp into microseconds.
+    fn parse_time_of_day_to_micros(time_str: &str) -> Result<i64, ()> {
+        let time_parts: Vec<&str> = time_str.split(':').collect();
+        let (Some(hours_str), Some(minutes_str)) = (time_parts.first(), time_parts.get(1)) else {
+            return Ok(0);
+        };
+
+        let hours: i64 = hours_str.parse().map_err(|_| ())?;
+        let minutes: i64 = minutes_str.parse().map_err(|_| ())?;
+        let mut micros = hours * SECONDS_PER_HOUR * MICROS_PER_SECOND
+            + minutes * SECONDS_PER_MINUTE * MICROS_PER_SECOND;
+
+        if let Some(seconds_str) = time_parts.get(2) {
+            micros += Self::parse_seconds_to_micros(seconds_str)?;
+        }
+
+        Ok(micros)
+    }
+
+    /// Parse the `SS[.ffffff]` part of a timestamp into microseconds.
+    fn parse_seconds_to_micros(seconds_str: &str) -> Result<i64, ()> {
+        let seconds_parts: Vec<&str> = seconds_str.split('.').collect();
+        let seconds: i64 = seconds_parts[0].parse().map_err(|_| ())?;
+        let fraction = seconds_parts
+            .get(1)
+            .map_or(0, |frac| Self::fractional_seconds_to_micros(frac));
+
+        Ok(seconds * MICROS_PER_SECOND + fraction)
+    }
+
+    /// Interpret the digits after the decimal point as a microsecond fraction.
+    ///
+    /// Shorter fractions are right-padded, longer ones truncated to microsecond
+    /// resolution; anything unparsable contributes nothing.
+    fn fractional_seconds_to_micros(fraction: &str) -> i64 {
+        if fraction.len() <= MICROS_FRACTION_DIGITS {
+            let padding = MICROS_FRACTION_DIGITS - fraction.len();
+            let padded = format!("{}{}", fraction, "0".repeat(padding));
+            padded.parse::<i64>().unwrap_or(0)
+        } else {
+            fraction[..MICROS_FRACTION_DIGITS]
+                .parse::<i64>()
+                .unwrap_or(0)
+        }
     }
 
     /// Parse a decimal string to i128 scaled value.
@@ -799,33 +823,118 @@ impl Iterator for ResultSetIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TransportError;
     use crate::transport::messages::{ColumnInfo, DataType, ResultPayload};
-    use crate::transport::protocol::{
-        PreparedStatementHandle, QueryResult as TransportQueryResult,
-    };
+    use crate::transport::test_support::MockTransport;
     use arrow::array::Array;
-    use async_trait::async_trait;
-    use mockall::mock;
+    use mockall::predicate::eq;
+    use serde_json::json;
 
-    // Mock transport for testing
-    mock! {
-        pub Transport {}
+    // =========================================================================
+    // Shared test fixtures
+    // =========================================================================
 
-        #[async_trait]
-        impl TransportProtocol for Transport {
-            async fn connect(&mut self, params: &crate::transport::protocol::ConnectionParams) -> Result<(), crate::error::TransportError>;
-            async fn authenticate(&mut self, credentials: &crate::transport::protocol::Credentials) -> Result<crate::transport::messages::SessionInfo, crate::error::TransportError>;
-            async fn execute_query(&mut self, sql: &str) -> Result<TransportQueryResult, crate::error::TransportError>;
-            async fn fetch_results(&mut self, handle: ResultSetHandle) -> Result<ResultData, crate::error::TransportError>;
-            async fn close_result_set(&mut self, handle: ResultSetHandle) -> Result<(), crate::error::TransportError>;
-            async fn create_prepared_statement(&mut self, sql: &str) -> Result<PreparedStatementHandle, crate::error::TransportError>;
-            async fn execute_prepared_statement(&mut self, handle: &PreparedStatementHandle, parameters: Option<Vec<Vec<serde_json::Value>>>) -> Result<TransportQueryResult, crate::error::TransportError>;
-            async fn close_prepared_statement(&mut self, handle: &PreparedStatementHandle) -> Result<(), crate::error::TransportError>;
-            async fn close(&mut self) -> Result<(), crate::error::TransportError>;
-            fn is_connected(&self) -> bool;
-            async fn set_autocommit(&mut self, enabled: bool) -> Result<(), crate::error::TransportError>;
-            async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), crate::error::TransportError>;
+    /// An Exasol type descriptor carrying no modifiers.
+    fn plain_type(type_name: &str) -> DataType {
+        DataType {
+            type_name: type_name.to_string(),
+            precision: None,
+            scale: None,
+            size: None,
+            character_set: None,
+            with_local_time_zone: None,
+            fraction: None,
         }
+    }
+
+    fn decimal_column(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: DataType {
+                precision: Some(18),
+                scale: Some(0),
+                ..plain_type("DECIMAL")
+            },
+        }
+    }
+
+    fn varchar_column(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: DataType {
+                size: Some(100),
+                character_set: Some("UTF8".to_string()),
+                ..plain_type("VARCHAR")
+            },
+        }
+    }
+
+    fn boolean_column(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: plain_type("BOOLEAN"),
+        }
+    }
+
+    /// A transport that serves one further page holding `values`, then reports
+    /// exhaustion with an empty page.
+    fn transport_serving_one_more_page(values: &'static [i64]) -> MockTransport {
+        let mut transport = MockTransport::new();
+        let mut call = 0;
+        transport
+            .expect_fetch_results()
+            .times(2)
+            .returning(move |_| {
+                call += 1;
+                Ok(if call == 1 {
+                    single_column_result_data(values, 0)
+                } else {
+                    single_column_result_data(&[], 0)
+                })
+            });
+        transport
+    }
+
+    fn single_column_result_data(values: &[i64], total_rows: i64) -> ResultData {
+        ResultData {
+            columns: vec![decimal_column("id")],
+            data: ResultPayload::Json(values.iter().map(|v| vec![json!(v)]).collect()),
+            total_rows,
+        }
+    }
+
+    fn streaming_result_set(
+        transport: MockTransport,
+        values: &[i64],
+        total_rows: i64,
+        handle: Option<ResultSetHandle>,
+    ) -> ResultSet {
+        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(transport));
+        ResultSet::from_transport_result(
+            TransportQueryResult::ResultSet {
+                handle,
+                data: single_column_result_data(values, total_rows),
+            },
+            transport,
+        )
+        .unwrap()
+    }
+
+    fn streaming_iterator(
+        transport: MockTransport,
+        values: &[i64],
+        total_rows: i64,
+        handle: Option<ResultSetHandle>,
+    ) -> ResultSetIterator {
+        streaming_result_set(transport, values, total_rows, handle)
+            .into_iterator()
+            .unwrap()
+    }
+
+    fn entered_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime")
     }
 
     #[tokio::test]
@@ -850,32 +959,7 @@ mod tests {
         // Row 0: [1, "Alice"]
         // Row 1: [2, "Bob"]
         let data = ResultData {
-            columns: vec![
-                ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: DataType {
-                        type_name: "DECIMAL".to_string(),
-                        precision: Some(18),
-                        scale: Some(0),
-                        size: None,
-                        character_set: None,
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
-                ColumnInfo {
-                    name: "name".to_string(),
-                    data_type: DataType {
-                        type_name: "VARCHAR".to_string(),
-                        precision: None,
-                        scale: None,
-                        size: Some(100),
-                        character_set: Some("UTF8".to_string()),
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
-            ],
+            columns: vec![decimal_column("id"), varchar_column("name")],
             data: ResultPayload::Json(vec![
                 vec![serde_json::json!(1), serde_json::json!("Alice")],
                 vec![serde_json::json!(2), serde_json::json!("Bob")],
@@ -908,32 +992,7 @@ mod tests {
         let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(mock_transport));
 
         let data = ResultData {
-            columns: vec![
-                ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: DataType {
-                        type_name: "DECIMAL".to_string(),
-                        precision: Some(18),
-                        scale: Some(0),
-                        size: None,
-                        character_set: None,
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
-                ColumnInfo {
-                    name: "name".to_string(),
-                    data_type: DataType {
-                        type_name: "VARCHAR".to_string(),
-                        precision: None,
-                        scale: None,
-                        size: Some(100),
-                        character_set: Some("UTF8".to_string()),
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
-            ],
+            columns: vec![decimal_column("id"), varchar_column("name")],
             data: ResultPayload::Json(vec![]),
             total_rows: 0,
         };
@@ -1080,40 +1139,13 @@ mod tests {
     #[tokio::test]
     async fn test_schema_building() {
         let columns = vec![
-            ColumnInfo {
-                name: "id".to_string(),
-                data_type: DataType {
-                    type_name: "DECIMAL".to_string(),
-                    precision: Some(18),
-                    scale: Some(0),
-                    size: None,
-                    character_set: None,
-                    with_local_time_zone: None,
-                    fraction: None,
-                },
-            },
-            ColumnInfo {
-                name: "name".to_string(),
-                data_type: DataType {
-                    type_name: "VARCHAR".to_string(),
-                    precision: None,
-                    scale: None,
-                    size: Some(100),
-                    character_set: Some("UTF8".to_string()),
-                    with_local_time_zone: None,
-                    fraction: None,
-                },
-            },
+            decimal_column("id"),
+            varchar_column("name"),
             ColumnInfo {
                 name: "created_at".to_string(),
                 data_type: DataType {
-                    type_name: "TIMESTAMP".to_string(),
-                    precision: None,
-                    scale: None,
-                    size: None,
-                    character_set: None,
                     with_local_time_zone: Some(false),
-                    fraction: None,
+                    ..plain_type("TIMESTAMP")
                 },
             },
         ];
@@ -1439,15 +1471,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_boolean() {
-        let data_type = DataType {
-            type_name: "BOOLEAN".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("BOOLEAN");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Boolean);
@@ -1456,13 +1480,8 @@ mod tests {
     #[test]
     fn test_exasol_datatype_to_arrow_char() {
         let data_type = DataType {
-            type_name: "CHAR".to_string(),
-            precision: None,
-            scale: None,
             size: Some(10),
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
+            ..plain_type("CHAR")
         };
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
@@ -1471,15 +1490,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_char_default_size() {
-        let data_type = DataType {
-            type_name: "CHAR".to_string(),
-            precision: None,
-            scale: None,
-            size: None, // Should default to 1
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("CHAR");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Utf8);
@@ -1488,13 +1499,8 @@ mod tests {
     #[test]
     fn test_exasol_datatype_to_arrow_varchar() {
         let data_type = DataType {
-            type_name: "VARCHAR".to_string(),
-            precision: None,
-            scale: None,
             size: Some(100),
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
+            ..plain_type("VARCHAR")
         };
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
@@ -1503,15 +1509,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_varchar_default_size() {
-        let data_type = DataType {
-            type_name: "VARCHAR".to_string(),
-            precision: None,
-            scale: None,
-            size: None, // Should default to 2000000
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("VARCHAR");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Utf8);
@@ -1520,13 +1518,9 @@ mod tests {
     #[test]
     fn test_exasol_datatype_to_arrow_decimal() {
         let data_type = DataType {
-            type_name: "DECIMAL".to_string(),
             precision: Some(18),
             scale: Some(2),
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
+            ..plain_type("DECIMAL")
         };
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
@@ -1535,15 +1529,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_decimal_default_precision_scale() {
-        let data_type = DataType {
-            type_name: "DECIMAL".to_string(),
-            precision: None, // Should default to 18
-            scale: None,     // Should default to 0
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("DECIMAL");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Decimal128(18, 0));
@@ -1551,15 +1537,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_double() {
-        let data_type = DataType {
-            type_name: "DOUBLE".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("DOUBLE");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Float64);
@@ -1567,15 +1545,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_date() {
-        let data_type = DataType {
-            type_name: "DATE".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("DATE");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Date32);
@@ -1584,13 +1554,8 @@ mod tests {
     #[test]
     fn test_exasol_datatype_to_arrow_timestamp_without_tz() {
         let data_type = DataType {
-            type_name: "TIMESTAMP".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
             with_local_time_zone: Some(false),
-            fraction: None,
+            ..plain_type("TIMESTAMP")
         };
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
@@ -1603,13 +1568,8 @@ mod tests {
     #[test]
     fn test_exasol_datatype_to_arrow_timestamp_with_tz() {
         let data_type = DataType {
-            type_name: "TIMESTAMP".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
             with_local_time_zone: Some(true),
-            fraction: None,
+            ..plain_type("TIMESTAMP")
         };
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
@@ -1621,15 +1581,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_timestamp_default_tz() {
-        let data_type = DataType {
-            type_name: "TIMESTAMP".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None, // Should default to false
-            fraction: None,
-        };
+        let data_type = plain_type("TIMESTAMP");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert!(matches!(
@@ -1640,15 +1592,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_interval_year_to_month() {
-        let data_type = DataType {
-            type_name: "INTERVAL YEAR TO MONTH".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("INTERVAL YEAR TO MONTH");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert!(matches!(
@@ -1660,13 +1604,8 @@ mod tests {
     #[test]
     fn test_exasol_datatype_to_arrow_interval_day_to_second() {
         let data_type = DataType {
-            type_name: "INTERVAL DAY TO SECOND".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
             fraction: Some(6),
+            ..plain_type("INTERVAL DAY TO SECOND")
         };
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
@@ -1678,15 +1617,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_interval_day_to_second_default_fraction() {
-        let data_type = DataType {
-            type_name: "INTERVAL DAY TO SECOND".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None, // Should default to 3
-        };
+        let data_type = plain_type("INTERVAL DAY TO SECOND");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert!(matches!(
@@ -1697,15 +1628,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_geometry() {
-        let data_type = DataType {
-            type_name: "GEOMETRY".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("GEOMETRY");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Binary);
@@ -1713,15 +1636,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_hashtype() {
-        let data_type = DataType {
-            type_name: "HASHTYPE".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("HASHTYPE");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Binary);
@@ -1729,15 +1644,7 @@ mod tests {
 
     #[test]
     fn test_exasol_datatype_to_arrow_unsupported_type() {
-        let data_type = DataType {
-            type_name: "UNKNOWN_TYPE".to_string(),
-            precision: None,
-            scale: None,
-            size: None,
-            character_set: None,
-            with_local_time_zone: None,
-            fraction: None,
-        };
+        let data_type = plain_type("UNKNOWN_TYPE");
 
         let result = ResultSet::exasol_datatype_to_arrow(&data_type);
         assert!(result.is_err());
@@ -2280,18 +2187,7 @@ mod tests {
         let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(mock_transport));
 
         let data = ResultData {
-            columns: vec![ColumnInfo {
-                name: "id".to_string(),
-                data_type: DataType {
-                    type_name: "DECIMAL".to_string(),
-                    precision: Some(18),
-                    scale: Some(0),
-                    size: None,
-                    character_set: None,
-                    with_local_time_zone: None,
-                    fraction: None,
-                },
-            }],
+            columns: vec![decimal_column("id")],
             data: ResultPayload::Json(vec![vec![serde_json::json!(1)]]),
             total_rows: 1,
         };
@@ -2317,42 +2213,9 @@ mod tests {
 
         let data = ResultData {
             columns: vec![
-                ColumnInfo {
-                    name: "id".to_string(),
-                    data_type: DataType {
-                        type_name: "DECIMAL".to_string(),
-                        precision: Some(18),
-                        scale: Some(0),
-                        size: None,
-                        character_set: None,
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
-                ColumnInfo {
-                    name: "name".to_string(),
-                    data_type: DataType {
-                        type_name: "VARCHAR".to_string(),
-                        precision: None,
-                        scale: None,
-                        size: Some(100),
-                        character_set: Some("UTF8".to_string()),
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
-                ColumnInfo {
-                    name: "active".to_string(),
-                    data_type: DataType {
-                        type_name: "BOOLEAN".to_string(),
-                        precision: None,
-                        scale: None,
-                        size: None,
-                        character_set: None,
-                        with_local_time_zone: None,
-                        fraction: None,
-                    },
-                },
+                decimal_column("id"),
+                varchar_column("name"),
+                boolean_column("active"),
             ],
             data: ResultPayload::Json(vec![vec![
                 serde_json::json!(1),
@@ -2382,5 +2245,574 @@ mod tests {
         ));
         assert!(matches!(types[1], arrow::datatypes::DataType::Utf8));
         assert!(matches!(types[2], arrow::datatypes::DataType::Boolean));
+    }
+
+    // =========================================================================
+    // Tests for ResultSet::fetch_all pagination
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_fetch_all_paginates_until_empty_payload() {
+        let handle = ResultSetHandle::new(7);
+        let mut transport = transport_serving_one_more_page(&[2]);
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let batches = streaming_result_set(transport, &[1], 0, Some(handle))
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(ResultSet::row_count_of(&batches), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_stops_once_known_total_is_reached() {
+        let handle = ResultSetHandle::new(1);
+        let mut transport = MockTransport::new();
+        // Each page reports its own `total_rows`; only the metadata total (3)
+        // may end pagination, so exactly one extra fetch must happen.
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[2, 3], 2)));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let batches = streaming_result_set(transport, &[1], 3, Some(handle))
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(ResultSet::row_count_of(&batches), 3);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_skips_pagination_when_first_page_is_complete() {
+        let handle = ResultSetHandle::new(3);
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let batches = streaming_result_set(transport, &[1, 2], 2, Some(handle))
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(ResultSet::row_count_of(&batches), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_without_handle_returns_buffered_batches_only() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        transport.expect_close_result_set().times(0);
+
+        let batches = streaming_result_set(transport, &[1], 5, None)
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(ResultSet::row_count_of(&batches), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_propagates_fetch_error() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "page fetch failed".to_string(),
+            ))
+        });
+
+        let err = streaming_result_set(transport, &[1], 0, Some(ResultSetHandle::new(1)))
+            .fetch_all()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        assert!(err.to_string().contains("page fetch failed"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_ignores_close_result_set_error() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Err(TransportError::IoError("socket gone".to_string())));
+
+        let batches = streaming_result_set(transport, &[1], 1, Some(ResultSetHandle::new(1)))
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_on_row_count_result_reports_no_result_set() {
+        let transport: Arc<Mutex<dyn TransportProtocol>> =
+            Arc::new(Mutex::new(MockTransport::new()));
+        let result_set = ResultSet::from_transport_result(
+            TransportQueryResult::RowCount { count: 5 },
+            transport,
+        )
+        .unwrap();
+
+        let err = result_set.fetch_all().await.unwrap_err();
+
+        assert!(matches!(err, QueryError::NoResultSet(_)));
+        assert!(err.to_string().contains("Cannot fetch batches"));
+    }
+
+    #[test]
+    fn test_into_iterator_on_row_count_result_reports_no_result_set() {
+        let transport: Arc<Mutex<dyn TransportProtocol>> =
+            Arc::new(Mutex::new(MockTransport::new()));
+        let result_set = ResultSet::from_transport_result(
+            TransportQueryResult::RowCount { count: 5 },
+            transport,
+        )
+        .unwrap();
+
+        let err = match result_set.into_iterator() {
+            Err(err) => err,
+            Ok(_) => panic!("row count result must not yield an iterator"),
+        };
+
+        assert!(matches!(err, QueryError::NoResultSet(_)));
+        assert!(err.to_string().contains("Cannot iterate"));
+    }
+
+    // =========================================================================
+    // Tests for Debug on ResultSet
+    // =========================================================================
+
+    #[test]
+    fn test_result_set_debug_redacts_transport() {
+        let rendered = format!(
+            "{:?}",
+            streaming_result_set(MockTransport::new(), &[1], 1, None)
+        );
+
+        assert!(rendered.starts_with("ResultSet {"), "got: {}", rendered);
+        assert!(rendered.contains("Stream"));
+        assert!(rendered.contains("<TransportProtocol>"));
+    }
+
+    #[test]
+    fn test_result_set_debug_shows_row_count_variant() {
+        let transport: Arc<Mutex<dyn TransportProtocol>> =
+            Arc::new(Mutex::new(MockTransport::new()));
+        let result_set = ResultSet::from_transport_result(
+            TransportQueryResult::RowCount { count: 42 },
+            transport,
+        )
+        .unwrap();
+
+        let rendered = format!("{:?}", result_set);
+
+        assert!(rendered.contains("RowCount"));
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains("<TransportProtocol>"));
+    }
+
+    // =========================================================================
+    // Tests for ResultSetIterator batch fetching
+    // =========================================================================
+
+    #[test]
+    fn test_next_batch_serves_buffered_page_then_fetches_the_next() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let transport = transport_serving_one_more_page(&[2]);
+
+        let mut iterator = streaming_iterator(transport, &[1], 0, Some(ResultSetHandle::new(1)));
+
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert!(iterator.next_batch().is_none());
+        // Once exhausted the iterator must not fetch again.
+        assert!(iterator.next_batch().is_none());
+    }
+
+    #[test]
+    fn test_next_batch_propagates_fetch_error() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Err(TransportError::ReceiveError("no page".to_string())));
+
+        let mut iterator = streaming_iterator(transport, &[1], 0, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+
+        let err = iterator.next_batch().unwrap().unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        assert!(err.to_string().contains("no page"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_next_batch_short_circuits_once_the_stream_is_complete() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(transport));
+
+        let mut iterator = ResultSetIterator {
+            handle: Some(ResultSetHandle::new(1)),
+            transport,
+            metadata: QueryMetadata::new(
+                ResultSet::build_schema(&[decimal_column("id")]).unwrap(),
+                Some(1),
+            ),
+            batches: Vec::new(),
+            current_index: 0,
+            complete: true,
+        };
+
+        assert!(iterator.fetch_next_batch().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_next_batch_reports_exhausted_when_handle_was_already_released() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(transport));
+
+        let mut iterator = ResultSetIterator {
+            handle: None,
+            transport,
+            metadata: QueryMetadata::new(
+                ResultSet::build_schema(&[decimal_column("id")]).unwrap(),
+                Some(1),
+            ),
+            batches: Vec::new(),
+            current_index: 0,
+            complete: false,
+        };
+
+        assert!(iterator.next_batch().is_none());
+    }
+
+    #[test]
+    fn test_next_batch_without_async_runtime_reports_invalid_state() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+
+        let mut iterator = streaming_iterator(transport, &[1], 0, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+
+        let err = iterator.next_batch().unwrap().unwrap_err();
+
+        assert!(matches!(err, QueryError::InvalidState(_)));
+        assert!(err.to_string().contains("No async runtime available"));
+    }
+
+    #[test]
+    fn test_iterator_trait_yields_every_page_until_exhausted() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[], 0)));
+
+        let iterator = streaming_iterator(transport, &[1, 2], 0, Some(ResultSetHandle::new(1)));
+        let batches: Vec<RecordBatch> = iterator.collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(ResultSet::row_count_of(&batches), 2);
+    }
+
+    // =========================================================================
+    // Tests for ResultSetIterator::close
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_iterator_close_releases_the_handle() {
+        let handle = ResultSetHandle::new(9);
+        let mut transport = MockTransport::new();
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        streaming_iterator(transport, &[1], 1, Some(handle))
+            .close()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_iterator_close_without_handle_is_a_no_op() {
+        let mut transport = MockTransport::new();
+        transport.expect_close_result_set().times(0);
+
+        streaming_iterator(transport, &[1], 1, None)
+            .close()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_iterator_close_propagates_transport_error() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Err(TransportError::IoError("closed twice".to_string())));
+
+        let err = streaming_iterator(transport, &[1], 1, Some(ResultSetHandle::new(1)))
+            .close()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        assert!(err.to_string().contains("closed twice"));
+    }
+
+    // =========================================================================
+    // Tests for Arrow payload pass-through
+    // =========================================================================
+
+    fn int64_batch(values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(values))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_column_major_to_record_batch_returns_arrow_payload_unchanged() {
+        let batch = int64_batch(vec![1, 2, 3]);
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Arrow(batch.clone()),
+            total_rows: 3,
+        };
+
+        let converted = ResultSet::column_major_to_record_batch(&data, &batch.schema()).unwrap();
+
+        assert_eq!(converted.num_rows(), 3);
+        assert_eq!(converted.schema(), batch.schema());
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_returns_arrow_payload_unchanged() {
+        let batch = int64_batch(vec![7]);
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Arrow(batch.clone()),
+            total_rows: 1,
+        };
+
+        let converted = ResultSet::payload_to_record_batch(&data, &batch.schema()).unwrap();
+
+        assert_eq!(converted.num_rows(), 1);
+    }
+
+    // =========================================================================
+    // Tests for the parse_date_to_days month table
+    // =========================================================================
+
+    #[test]
+    fn test_parse_date_to_days_covers_every_month_of_a_common_year() {
+        // 1970 is a common year, so the first of each month lands exactly on
+        // the cumulative day offsets of the month table.
+        let first_of_month_offsets = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+        for (index, expected) in first_of_month_offsets.iter().enumerate() {
+            let date = format!("1970-{:02}-01", index + 1);
+            assert_eq!(
+                ResultSet::parse_date_to_days(&date),
+                Ok(*expected),
+                "unexpected day offset for {}",
+                date
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_date_to_days_adds_the_leap_day_only_after_february() {
+        // 1972 is a leap year: February has 29 days, so March 1st sits 29 days
+        // after February 1st (28 in a common year).
+        let february = ResultSet::parse_date_to_days("1972-02-01").unwrap();
+        let march = ResultSet::parse_date_to_days("1972-03-01").unwrap();
+
+        assert_eq!(march - february, 29);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_always_has_a_date_part_to_parse() {
+        // `str::split` always yields at least one element, so the date part is
+        // never absent: an empty timestamp reaches (and fails) date parsing.
+        assert_eq!("".split(' ').count(), 1);
+        assert!(ResultSet::parse_date_to_days("").is_err());
+        assert!(ResultSet::parse_timestamp_to_micros("").is_err());
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_ignores_a_trailing_third_space_part() {
+        // Only the first two space-separated parts are interpreted; anything
+        // after the time is discarded.
+        assert_eq!(
+            ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:01 UTC"),
+            Ok(1_000_000)
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_empty_fractional_part_contributes_nothing() {
+        assert_eq!(
+            ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:01."),
+            Ok(1_000_000)
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_rejects_non_numeric_time_parts() {
+        assert!(ResultSet::parse_timestamp_to_micros("1970-01-01 aa:00").is_err());
+        assert!(ResultSet::parse_timestamp_to_micros("1970-01-01 00:bb").is_err());
+        assert!(ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:cc").is_err());
+    }
+
+    // =========================================================================
+    // Remaining type-mapping and parsing branches
+    // =========================================================================
+
+    #[test]
+    fn test_exasol_datatype_to_arrow_named_timestamp_with_local_time_zone() {
+        // Exasol may spell the type out instead of setting the flag; both must
+        // map to a timezone-carrying Arrow timestamp.
+        let data_type = plain_type("TIMESTAMP WITH LOCAL TIME ZONE");
+
+        let arrow_type = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+
+        assert!(matches!(
+            arrow_type,
+            arrow::datatypes::DataType::Timestamp(_, Some(_))
+        ));
+    }
+
+    #[test]
+    fn test_column_major_to_record_batch_stamps_utc_on_zoned_timestamps() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        )]));
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Json(vec![vec![json!("1970-01-01 00:00:01")], vec![Value::Null]]),
+            total_rows: 2,
+        };
+
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("timestamp column");
+        assert_eq!(column.value(0), 1_000_000);
+        assert!(column.is_null(1));
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            )
+        );
+    }
+
+    #[test]
+    fn test_column_major_to_record_batch_decimal_from_unsupported_shape_is_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            arrow::datatypes::DataType::Decimal128(18, 2),
+            true,
+        )]));
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Json(vec![
+                vec![Value::Null],
+                vec![json!(true)],
+                vec![json!([1, 2])],
+            ]),
+            total_rows: 3,
+        };
+
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 3);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_time_part_without_a_colon_adds_nothing() {
+        assert_eq!(
+            ResultSet::parse_timestamp_to_micros("1970-01-02 12"),
+            Ok(SECONDS_PER_DAY * MICROS_PER_SECOND)
+        );
+    }
+
+    #[test]
+    fn test_parse_string_to_decimal_rejects_a_non_numeric_fractional_part() {
+        let err = ResultSet::parse_string_to_decimal("1.ab", 2).unwrap_err();
+
+        assert!(matches!(err, ConversionError::InvalidFormat(_)));
+        assert_eq!(
+            err.to_string(),
+            "Invalid data format: Invalid decimal part: ab"
+        );
+    }
+
+    #[test]
+    fn test_query_metadata_with_execution_time() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let metadata = QueryMetadata::new(schema, Some(3)).with_execution_time(17);
+
+        assert_eq!(metadata.execution_time_ms, Some(17));
+        assert_eq!(metadata.total_rows, Some(3));
+        assert_eq!(metadata.column_count, 1);
     }
 }

@@ -17,6 +17,11 @@ tmp
 # Coverage artifacts (cargo-llvm-cov)
 lcov-*.info
 *.profraw
+coverage-summary.json
+
+# Python bytecode cache (scripts/)
+__pycache__/
+*.pyc
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

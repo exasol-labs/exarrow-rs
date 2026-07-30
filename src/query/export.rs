@@ -6,6 +6,8 @@
 //! # Example
 //!
 
+use super::clauses;
+
 /// Row separator options for CSV export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowSeparator {
@@ -136,24 +138,11 @@ impl ExportQuery {
     /// # Example
     ///
     pub fn from_table(table: &str) -> Self {
-        Self {
-            source: ExportSource::Table {
-                schema: None,
-                name: table.to_string(),
-                columns: Vec::new(),
-            },
-            address: String::new(),
-            public_key: None,
-            file_name: "001.csv".to_string(),
-            column_separator: ',',
-            column_delimiter: '"',
-            row_separator: RowSeparator::default(),
-            encoding: "UTF-8".to_string(),
-            null_value: None,
-            delimit_mode: DelimitMode::default(),
-            compression: Compression::default(),
-            with_column_names: false,
-        }
+        Self::with_source(ExportSource::Table {
+            schema: None,
+            name: table.to_string(),
+            columns: Vec::new(),
+        })
     }
 
     /// Create an export query from a SQL query.
@@ -165,10 +154,15 @@ impl ExportQuery {
     /// # Example
     ///
     pub fn from_query(sql: &str) -> Self {
+        Self::with_source(ExportSource::Query {
+            sql: sql.to_string(),
+        })
+    }
+
+    /// The destination and CSV defaults, which do not depend on the source kind.
+    fn with_source(source: ExportSource) -> Self {
         Self {
-            source: ExportSource::Query {
-                sql: sql.to_string(),
-            },
+            source,
             address: String::new(),
             public_key: None,
             file_name: "001.csv".to_string(),
@@ -357,93 +351,64 @@ impl ExportQuery {
     ///
     /// The complete EXPORT SQL statement as a string.
     pub fn build(&self) -> String {
-        let mut sql = String::new();
+        let mut sql = self.source_clause();
+        sql.push_str(&self.destination_clause());
+        sql.push_str(&self.format_option_clauses());
+        sql
+    }
 
-        // Build the source part
+    /// `EXPORT [schema.]table [(col, ...)]` or `EXPORT (<query>)`.
+    fn source_clause(&self) -> String {
         match &self.source {
             ExportSource::Table {
                 schema,
                 name,
                 columns,
             } => {
-                sql.push_str("EXPORT ");
+                let mut clause = String::from("EXPORT ");
                 if let Some(s) = schema {
-                    sql.push_str(s);
-                    sql.push('.');
+                    clause.push_str(s);
+                    clause.push('.');
                 }
-                sql.push_str(name);
+                clause.push_str(name);
                 if !columns.is_empty() {
-                    sql.push_str(" (");
-                    sql.push_str(&columns.join(", "));
-                    sql.push(')');
+                    clause.push_str(" (");
+                    clause.push_str(&columns.join(", "));
+                    clause.push(')');
                 }
+                clause
             }
-            ExportSource::Query { sql: query } => {
-                sql.push_str("EXPORT (");
-                sql.push_str(query);
-                sql.push(')');
-            }
+            ExportSource::Query { sql: query } => format!("EXPORT ({})", query),
         }
+    }
 
-        // Build the destination part
-        sql.push_str("\nINTO CSV AT '");
+    /// `INTO CSV AT '<url>' [PUBLIC KEY '...']` followed by the `FILE` clause.
+    fn destination_clause(&self) -> String {
+        format!(
+            "\nINTO CSV AT {}\nFILE '{}{}'",
+            clauses::quoted_endpoint(&self.address, "", self.public_key.as_deref()),
+            self.file_name,
+            self.compression.extension()
+        )
+    }
 
-        // Determine protocol based on public key
-        if self.public_key.is_some() {
-            sql.push_str("https://");
-        } else {
-            sql.push_str("http://");
+    /// The CSV format clauses, in the order Exasol expects them.
+    fn format_option_clauses(&self) -> String {
+        let mut clause = clauses::CsvFraming {
+            encoding: &self.encoding,
+            column_separator: self.column_separator,
+            column_delimiter: self.column_delimiter,
+            row_separator: self.row_separator.as_sql(),
         }
-        sql.push_str(&self.address);
-        sql.push('\'');
+        .to_sql();
 
-        // Add PUBLIC KEY clause if set
-        if let Some(ref fingerprint) = self.public_key {
-            sql.push_str(" PUBLIC KEY '");
-            sql.push_str(fingerprint);
-            sql.push('\'');
-        }
-
-        // Add file name with compression extension
-        sql.push_str("\nFILE '");
-        sql.push_str(&self.file_name);
-        sql.push_str(self.compression.extension());
-        sql.push('\'');
-
-        // Add format options
-        sql.push_str("\nENCODING = '");
-        sql.push_str(&self.encoding);
-        sql.push('\'');
-
-        sql.push_str("\nCOLUMN SEPARATOR = '");
-        sql.push(self.column_separator);
-        sql.push('\'');
-
-        sql.push_str("\nCOLUMN DELIMITER = '");
-        sql.push(self.column_delimiter);
-        sql.push('\'');
-
-        sql.push_str("\nROW SEPARATOR = '");
-        sql.push_str(self.row_separator.as_sql());
-        sql.push('\'');
-
-        // Add NULL value if set
-        if let Some(ref null_val) = self.null_value {
-            sql.push_str("\nNULL = '");
-            sql.push_str(null_val);
-            sql.push('\'');
-        }
-
-        // Add WITH COLUMN NAMES if enabled
+        clause.push_str(&clauses::null_clause(self.null_value.as_deref()));
         if self.with_column_names {
-            sql.push_str("\nWITH COLUMN NAMES");
+            clause.push_str("\nWITH COLUMN NAMES");
         }
-
-        // Add DELIMIT mode
-        sql.push_str("\nDELIMIT = ");
-        sql.push_str(self.delimit_mode.as_sql());
-
-        sql
+        clause.push_str("\nDELIMIT = ");
+        clause.push_str(self.delimit_mode.as_sql());
+        clause
     }
 }
 
@@ -725,5 +690,80 @@ mod tests {
         assert!(sql.starts_with("EXPORT (SELECT 1)"));
         assert!(!sql.contains("ignored_schema"));
         assert!(!sql.contains("ignored_col"));
+    }
+
+    // =========================================================================
+    // Whole-statement characterization: exact text, exact clause order
+    // =========================================================================
+
+    #[test]
+    fn test_build_renders_the_full_default_statement_verbatim() {
+        let sql = ExportQuery::from_table("users")
+            .at_address("192.168.1.100:8080")
+            .build();
+
+        assert_eq!(
+            sql,
+            "EXPORT users\n\
+             INTO CSV AT 'http://192.168.1.100:8080'\n\
+             FILE '001.csv'\n\
+             ENCODING = 'UTF-8'\n\
+             COLUMN SEPARATOR = ','\n\
+             COLUMN DELIMITER = '\"'\n\
+             ROW SEPARATOR = 'LF'\n\
+             DELIMIT = AUTO"
+        );
+    }
+
+    #[test]
+    fn test_build_renders_every_option_in_order() {
+        let sql = ExportQuery::from_table("orders")
+            .schema("sales")
+            .columns(vec!["order_id", "customer_id", "total"])
+            .at_address("10.0.0.1:3000")
+            .with_public_key("SHA256:fingerprint123")
+            .file_name("orders_export.csv")
+            .column_separator('|')
+            .column_delimiter('\'')
+            .row_separator(RowSeparator::CRLF)
+            .encoding("ISO-8859-1")
+            .null_value("\\N")
+            .with_column_names(true)
+            .delimit_mode(DelimitMode::Always)
+            .compressed(Compression::Gzip)
+            .build();
+
+        assert_eq!(
+            sql,
+            "EXPORT sales.orders (order_id, customer_id, total)\n\
+             INTO CSV AT 'https://10.0.0.1:3000' PUBLIC KEY 'SHA256:fingerprint123'\n\
+             FILE 'orders_export.csv.gz'\n\
+             ENCODING = 'ISO-8859-1'\n\
+             COLUMN SEPARATOR = '|'\n\
+             COLUMN DELIMITER = ''''\n\
+             ROW SEPARATOR = 'CRLF'\n\
+             NULL = '\\N'\n\
+             WITH COLUMN NAMES\n\
+             DELIMIT = ALWAYS"
+        );
+    }
+
+    #[test]
+    fn test_build_renders_the_full_query_source_statement_verbatim() {
+        let sql = ExportQuery::from_query("SELECT 1")
+            .at_address("127.0.0.1:9000")
+            .build();
+
+        assert_eq!(
+            sql,
+            "EXPORT (SELECT 1)\n\
+             INTO CSV AT 'http://127.0.0.1:9000'\n\
+             FILE '001.csv'\n\
+             ENCODING = 'UTF-8'\n\
+             COLUMN SEPARATOR = ','\n\
+             COLUMN DELIMITER = '\"'\n\
+             ROW SEPARATOR = 'LF'\n\
+             DELIMIT = AUTO"
+        );
     }
 }

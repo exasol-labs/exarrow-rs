@@ -147,6 +147,72 @@ impl WebSocketTransport {
         Ok(())
     }
 
+    /// Turn an `execute` / `executePreparedStatement` response into a
+    /// [`QueryResult`].
+    ///
+    /// Both statement paths receive the same `ExecuteResponse` shape and owe
+    /// callers the same `QueryResult`, so the status check, the first-result
+    /// selection, and the result-type dispatch live here once.
+    fn query_result_from_response(
+        &self,
+        response: ExecuteResponse,
+    ) -> Result<QueryResult, TransportError> {
+        self.check_status(&response.status, &response.exception)?;
+
+        let response_data = response
+            .response_data
+            .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
+
+        if response_data.results.is_empty() {
+            return Err(TransportError::InvalidResponse(
+                "No results returned".to_string(),
+            ));
+        }
+
+        // Process first result (multi-result statements not fully supported yet)
+        let result = &response_data.results[0];
+
+        match result.result_type.as_str() {
+            "resultSet" => {
+                // SELECT query with result set - data is nested in result_set field
+                let result_set = result.result_set.as_ref().ok_or_else(|| {
+                    TransportError::InvalidResponse(format!(
+                        "Missing result_set data. Result: {:?}",
+                        result
+                    ))
+                })?;
+
+                let columns = result_set.columns.clone().ok_or_else(|| {
+                    TransportError::InvalidResponse("Missing columns".to_string())
+                })?;
+
+                // Data is in column-major format from Exasol
+                let data_values = result_set.data.clone().unwrap_or_default();
+                let total_rows = result_set.num_rows.unwrap_or(0);
+
+                let data = ResultData {
+                    columns,
+                    data: ResultPayload::Json(data_values),
+                    total_rows,
+                };
+
+                // Handle may be None when all data fits in one response
+                let handle = result_set.result_set_handle.map(ResultSetHandle::new);
+
+                Ok(QueryResult::result_set(handle, data))
+            }
+            "rowCount" => {
+                // INSERT/UPDATE/DELETE query
+                let count = result.row_count.unwrap_or(0);
+                Ok(QueryResult::row_count(count))
+            }
+            other => Err(TransportError::InvalidResponse(format!(
+                "Unknown result type: {}",
+                other
+            ))),
+        }
+    }
+
     /// Encrypt password using RSA with PKCS#1 v1.5 padding.
     ///
     /// The password is encrypted using the server's public key and then
@@ -468,62 +534,7 @@ impl TransportProtocol for WebSocketTransport {
         let request = ExecuteRequest::new(sql.to_string());
         let response: ExecuteResponse = self.send_receive(&request).await?;
 
-        // Check response status
-        self.check_status(&response.status, &response.exception)?;
-
-        // Extract result data
-        let response_data = response
-            .response_data
-            .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
-
-        if response_data.results.is_empty() {
-            return Err(TransportError::InvalidResponse(
-                "No results returned".to_string(),
-            ));
-        }
-
-        // Process first result (multi-result statements not fully supported yet)
-        let result = &response_data.results[0];
-
-        match result.result_type.as_str() {
-            "resultSet" => {
-                // SELECT query with result set - data is nested in result_set field
-                let result_set = result.result_set.as_ref().ok_or_else(|| {
-                    TransportError::InvalidResponse(format!(
-                        "Missing result_set data. Result: {:?}",
-                        result
-                    ))
-                })?;
-
-                let columns = result_set.columns.clone().ok_or_else(|| {
-                    TransportError::InvalidResponse("Missing columns".to_string())
-                })?;
-
-                // Data is in column-major format from Exasol
-                let data_values = result_set.data.clone().unwrap_or_default();
-                let total_rows = result_set.num_rows.unwrap_or(0);
-
-                let data = ResultData {
-                    columns,
-                    data: ResultPayload::Json(data_values),
-                    total_rows,
-                };
-
-                // Handle may be None when all data fits in one response
-                let handle = result_set.result_set_handle.map(ResultSetHandle::new);
-
-                Ok(QueryResult::result_set(handle, data))
-            }
-            "rowCount" => {
-                // INSERT/UPDATE/DELETE query
-                let count = result.row_count.unwrap_or(0);
-                Ok(QueryResult::row_count(count))
-            }
-            other => Err(TransportError::InvalidResponse(format!(
-                "Unknown result type: {}",
-                other
-            ))),
-        }
+        self.query_result_from_response(response)
     }
 
     async fn fetch_results(
@@ -676,59 +687,7 @@ impl TransportProtocol for WebSocketTransport {
         // Send execute prepared statement request
         let response: ExecuteResponse = self.send_receive(&request).await?;
 
-        // Check response status
-        self.check_status(&response.status, &response.exception)?;
-
-        // Extract result data (same processing as execute_query)
-        let response_data = response
-            .response_data
-            .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
-
-        if response_data.results.is_empty() {
-            return Err(TransportError::InvalidResponse(
-                "No results returned".to_string(),
-            ));
-        }
-
-        // Process first result
-        let result = &response_data.results[0];
-
-        match result.result_type.as_str() {
-            "resultSet" => {
-                let result_set = result.result_set.as_ref().ok_or_else(|| {
-                    TransportError::InvalidResponse(format!(
-                        "Missing result_set data. Result: {:?}",
-                        result
-                    ))
-                })?;
-
-                let columns = result_set.columns.clone().ok_or_else(|| {
-                    TransportError::InvalidResponse("Missing columns".to_string())
-                })?;
-
-                // Data is in column-major format from Exasol
-                let data_values = result_set.data.clone().unwrap_or_default();
-                let total_rows = result_set.num_rows.unwrap_or(0);
-
-                let data = ResultData {
-                    columns,
-                    data: ResultPayload::Json(data_values),
-                    total_rows,
-                };
-
-                let handle = result_set.result_set_handle.map(ResultSetHandle::new);
-
-                Ok(QueryResult::result_set(handle, data))
-            }
-            "rowCount" => {
-                let count = result.row_count.unwrap_or(0);
-                Ok(QueryResult::row_count(count))
-            }
-            other => Err(TransportError::InvalidResponse(format!(
-                "Unknown result type: {}",
-                other
-            ))),
-        }
+        self.query_result_from_response(response)
     }
 
     async fn close_prepared_statement(

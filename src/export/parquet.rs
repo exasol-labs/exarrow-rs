@@ -1427,4 +1427,195 @@ mod tests {
         let content = fs::read(&file_path).unwrap();
         assert_eq!(&content[0..4], b"PAR1");
     }
+
+    #[test]
+    fn test_from_arrow_error_wraps_message() {
+        let arrow_err = arrow::error::ArrowError::ComputeError("bad compute".to_string());
+
+        let err: ParquetExportError = arrow_err.into();
+
+        assert!(matches!(err, ParquetExportError::Arrow(_)), "got: {err}");
+        assert!(err.to_string().contains("bad compute"), "got: {err}");
+    }
+
+    #[test]
+    fn test_from_parquet_error_wraps_message() {
+        let parquet_err = parquet::errors::ParquetError::General("bad footer".to_string());
+
+        let err: ParquetExportError = parquet_err.into();
+
+        assert!(matches!(err, ParquetExportError::Parquet(_)), "got: {err}");
+        assert!(err.to_string().contains("bad footer"), "got: {err}");
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_rejects_invalid_utf8() {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let options = ParquetExportOptions::default().with_column_names(false);
+
+        let err = csv_to_record_batches(&[0xF0, 0x28, 0x8C, 0x28], &schema, &options).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 0, .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("Invalid UTF-8"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_array_from_csv_column_rejects_unsupported_type() {
+        let field = Field::new("b", DataType::Binary, true);
+        let options = ParquetExportOptions::default();
+
+        let err = build_array_from_csv_column(&[Some("x")], &field, 0, &options).unwrap_err();
+
+        assert!(matches!(err, ParquetExportError::Schema(_)), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("Unsupported data type for Parquet export"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_dispatches_every_supported_type() {
+        use arrow::array::{
+            BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+            TimestampMicrosecondArray,
+        };
+
+        let schema = Schema::new(vec![
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new("day", DataType::Date32, true),
+            Field::new(
+                "moment",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("count", DataType::Int64, true),
+        ]);
+        let options = ParquetExportOptions::default().with_column_names(false);
+        let csv = b"true,hello,1.5,123.45,1970-01-02,1970-01-01 00:00:01,42\n";
+
+        let batches = csv_to_record_batches(csv, &schema, &options).expect("batches");
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert!(batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .value(0));
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "hello"
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            1.5
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            12345
+        );
+        assert_eq!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1_000_000
+        );
+        assert_eq!(
+            batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_reports_row_and_column() {
+        let err = parse_timestamp_to_micros("not-a-timestamp", 7, 3).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 7, .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("at column 3"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_date_to_days_reports_row_and_column() {
+        let err = parse_date_to_days("not-a-date", 4, 2).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 4, .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("at column 2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_decimal_to_i128_reports_row_and_column() {
+        let err = parse_decimal_to_i128("not-a-decimal", 2, 5, 1).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 5, .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("at column 1"), "got: {err}");
+    }
+
+    #[test]
+    fn test_exasol_type_to_arrow_rejects_types_parquet_cannot_hold() {
+        for exasol_type in [
+            ExasolType::IntervalYearToMonth,
+            ExasolType::IntervalDayToSecond { precision: 3 },
+            ExasolType::Geometry { srid: Some(4326) },
+            ExasolType::Hashtype { byte_size: 16 },
+        ] {
+            let err = exasol_type_to_arrow(&exasol_type).unwrap_err();
+
+            assert!(matches!(err, ParquetExportError::Schema(_)), "got: {err}");
+            assert!(
+                err.to_string()
+                    .contains("Unsupported Exasol type for Parquet export"),
+                "got: {err}"
+            );
+        }
+    }
 }

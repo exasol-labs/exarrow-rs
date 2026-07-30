@@ -6,6 +6,8 @@
 //! # Example
 //!
 
+use super::clauses;
+
 /// Row separator options for CSV import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowSeparator {
@@ -377,148 +379,107 @@ impl ImportQuery {
     ///
     pub fn build(&self) -> String {
         let mut sql = String::with_capacity(512);
-
-        // IMPORT INTO clause
-        sql.push_str("IMPORT INTO ");
-        if let Some(ref schema) = self.schema {
-            sql.push_str(schema);
-            sql.push('.');
-        }
-        sql.push_str(&self.table);
-
-        // Column list
-        if let Some(ref cols) = self.columns {
-            sql.push_str(" (");
-            sql.push_str(&cols.join(", "));
-            sql.push(')');
-        }
-
-        // FROM <FORMAT> clause - either multi-file or single-file mode.
-        // The format keyword (CSV vs PARQUET) and per-URL suffix differ;
-        // the rest of the address/PUBLIC KEY/FILE structure is shared.
-        let is_parquet = matches!(self.format, ImportFormat::Parquet);
-        let format_keyword = if is_parquet { "PARQUET" } else { "CSV" };
-
-        if let Some(ref entries) = self.file_entries {
-            // Multi-file mode: FROM <FORMAT> AT 'addr1' FILE '001.csv' AT 'addr2' FILE '002.csv' ...
-            sql.push_str("\nFROM ");
-            sql.push_str(format_keyword);
-
-            for entry in entries {
-                sql.push_str(" AT '");
-
-                // Use https:// if public_key is set, otherwise http://
-                if entry.public_key.is_some() {
-                    sql.push_str("https://");
-                } else {
-                    sql.push_str("http://");
-                }
-                sql.push_str(&entry.address);
-                // The `;MaxConcurrentReads=1` suffix is appended INSIDE the
-                // quoted URL string for native Parquet imports, mirroring the
-                // JDBC reference driver's on-the-wire shape.
-                if is_parquet {
-                    sql.push_str(";MaxConcurrentReads=1");
-                }
-                sql.push('\'');
-
-                // PUBLIC KEY clause for this entry
-                if let Some(ref pk) = entry.public_key {
-                    sql.push_str(" PUBLIC KEY '");
-                    sql.push_str(pk);
-                    sql.push('\'');
-                }
-
-                // FILE clause for this entry
-                sql.push_str(" FILE '");
-                sql.push_str(&self.get_file_name_for(&entry.file_name));
-                sql.push('\'');
-            }
-        } else {
-            // Single-file mode: FROM <FORMAT> AT 'addr' FILE '001.csv'
-            sql.push_str("\nFROM ");
-            sql.push_str(format_keyword);
-            sql.push_str(" AT '");
-
-            // Use https:// if public_key is set, otherwise http://
-            if self.public_key.is_some() {
-                sql.push_str("https://");
-            } else {
-                sql.push_str("http://");
-            }
-
-            if let Some(ref addr) = self.address {
-                sql.push_str(addr);
-            }
-            // The `;MaxConcurrentReads=1` suffix is appended INSIDE the
-            // quoted URL string for native Parquet imports.
-            if is_parquet {
-                sql.push_str(";MaxConcurrentReads=1");
-            }
-            sql.push('\'');
-
-            // PUBLIC KEY clause
-            if let Some(ref pk) = self.public_key {
-                sql.push_str(" PUBLIC KEY '");
-                sql.push_str(pk);
-                sql.push('\'');
-            }
-
-            // FILE clause
-            sql.push_str("\nFILE '");
-            sql.push_str(&self.get_file_name_for(&self.file_name));
-            sql.push('\'');
-        }
-
+        sql.push_str(&self.target_clause());
+        sql.push_str(&self.source_clause());
         // Format options apply ONLY to CSV. For PARQUET the server reads the
         // schema from the file directly, so emitting any of these clauses
         // (ENCODING, COLUMN SEPARATOR, COLUMN DELIMITER, ROW SEPARATOR, SKIP,
         // NULL, TRIM, REJECT LIMIT) would either be rejected or ignored.
-        if !is_parquet {
-            sql.push_str("\nENCODING = '");
-            sql.push_str(&self.encoding);
-            sql.push('\'');
+        if !self.is_parquet() {
+            sql.push_str(&self.csv_option_clauses());
+        }
+        sql
+    }
 
-            sql.push_str("\nCOLUMN SEPARATOR = '");
-            sql.push(self.column_separator);
-            sql.push('\'');
+    /// `IMPORT INTO [schema.]table [(col, ...)]`
+    fn target_clause(&self) -> String {
+        let mut clause = String::from("IMPORT INTO ");
+        if let Some(ref schema) = self.schema {
+            clause.push_str(schema);
+            clause.push('.');
+        }
+        clause.push_str(&self.table);
 
-            sql.push_str("\nCOLUMN DELIMITER = '");
-            sql.push(self.column_delimiter);
-            sql.push('\'');
+        if let Some(ref cols) = self.columns {
+            clause.push_str(" (");
+            clause.push_str(&cols.join(", "));
+            clause.push(')');
+        }
+        clause
+    }
 
-            sql.push_str("\nROW SEPARATOR = '");
-            sql.push_str(self.row_separator.to_sql());
-            sql.push('\'');
+    /// `FROM <FORMAT> AT '<url>' [PUBLIC KEY '...'] FILE '...'`, once per file.
+    ///
+    /// Multi-file mode keeps every `AT`/`FILE` pair on the `FROM` line so the
+    /// server can read the files in parallel; single-file mode puts `FILE` on
+    /// its own line. Only that layout differs between the two modes.
+    fn source_clause(&self) -> String {
+        let mut clause = String::from("\nFROM ");
+        clause.push_str(if self.is_parquet() { "PARQUET" } else { "CSV" });
 
-            // Optional SKIP
-            if self.skip > 0 {
-                sql.push_str("\nSKIP = ");
-                sql.push_str(&self.skip.to_string());
+        match self.file_entries {
+            Some(ref entries) => {
+                for entry in entries {
+                    clause.push_str(" AT ");
+                    clause.push_str(&self.endpoint_of(&entry.address, entry.public_key.as_deref()));
+                    clause.push_str(" FILE '");
+                    clause.push_str(&self.file_name_for(&entry.file_name));
+                    clause.push('\'');
+                }
             }
-
-            // Optional NULL value
-            if let Some(ref null_val) = self.null_value {
-                sql.push_str("\nNULL = '");
-                sql.push_str(null_val);
-                sql.push('\'');
-            }
-
-            // Optional TRIM
-            if let Some(trim_sql) = self.trim.to_sql() {
-                sql.push_str("\nTRIM = '");
-                sql.push_str(trim_sql);
-                sql.push('\'');
-            }
-
-            // Optional REJECT LIMIT
-            if let Some(limit) = self.reject_limit {
-                sql.push_str("\nREJECT LIMIT ");
-                sql.push_str(&limit.to_string());
+            None => {
+                clause.push_str(" AT ");
+                clause.push_str(&self.endpoint_of(
+                    self.address.as_deref().unwrap_or_default(),
+                    self.public_key.as_deref(),
+                ));
+                clause.push_str("\nFILE '");
+                clause.push_str(&self.file_name_for(&self.file_name));
+                clause.push('\'');
             }
         }
+        clause
+    }
 
-        sql
+    /// Render one quoted source URL plus its optional `PUBLIC KEY` clause.
+    ///
+    /// The `;MaxConcurrentReads=1` option is appended INSIDE the quoted URL for
+    /// native Parquet imports, mirroring the JDBC reference driver's
+    /// on-the-wire shape.
+    fn endpoint_of(&self, address: &str, public_key: Option<&str>) -> String {
+        let url_suffix = if self.is_parquet() {
+            ";MaxConcurrentReads=1"
+        } else {
+            ""
+        };
+        clauses::quoted_endpoint(address, url_suffix, public_key)
+    }
+
+    /// The CSV-only clauses, in the order Exasol expects them.
+    fn csv_option_clauses(&self) -> String {
+        let mut clause = clauses::CsvFraming {
+            encoding: &self.encoding,
+            column_separator: self.column_separator,
+            column_delimiter: self.column_delimiter,
+            row_separator: self.row_separator.to_sql(),
+        }
+        .to_sql();
+
+        if self.skip > 0 {
+            clause.push_str(&format!("\nSKIP = {}", self.skip));
+        }
+        clause.push_str(&clauses::null_clause(self.null_value.as_deref()));
+        if let Some(trim_sql) = self.trim.to_sql() {
+            clause.push_str(&format!("\nTRIM = '{}'", trim_sql));
+        }
+        if let Some(limit) = self.reject_limit {
+            clause.push_str(&format!("\nREJECT LIMIT {}", limit));
+        }
+        clause
+    }
+
+    fn is_parquet(&self) -> bool {
+        matches!(self.format, ImportFormat::Parquet)
     }
 
     /// Get a file name with the appropriate extension for the configured format.
@@ -526,7 +487,7 @@ impl ImportQuery {
     /// For `ImportFormat::Parquet`, the extension is always `.parquet` and
     /// any configured compression suffix is bypassed. For `ImportFormat::Csv`,
     /// the extension reflects the configured `Compression`.
-    fn get_file_name_for(&self, base_name: &str) -> String {
+    fn file_name_for(&self, base_name: &str) -> String {
         let base = strip_known_extensions(base_name);
         match self.format {
             ImportFormat::Parquet => format!("{}.parquet", base),
@@ -948,5 +909,118 @@ mod tests {
         assert!(sql.contains("FROM CSV AT 'http://192.168.1.1:8080'"));
         assert!(sql.contains("ENCODING = 'UTF-8'"));
         assert!(sql.contains("COLUMN SEPARATOR = ','"));
+    }
+
+    // =========================================================================
+    // Whole-statement characterization: exact text, exact clause order
+    // =========================================================================
+
+    #[test]
+    fn test_build_renders_the_full_default_csv_statement_verbatim() {
+        let sql = ImportQuery::new("users")
+            .at_address("192.168.1.1:8080")
+            .build();
+
+        assert_eq!(
+            sql,
+            "IMPORT INTO users\n\
+             FROM CSV AT 'http://192.168.1.1:8080'\n\
+             FILE '001.csv'\n\
+             ENCODING = 'UTF-8'\n\
+             COLUMN SEPARATOR = ','\n\
+             COLUMN DELIMITER = '\"'\n\
+             ROW SEPARATOR = 'LF'"
+        );
+    }
+
+    #[test]
+    fn test_build_renders_every_csv_option_in_order() {
+        let sql = ImportQuery::new("data")
+            .schema("hr")
+            .columns(vec!["a", "b"])
+            .at_address("10.0.0.1:9000")
+            .with_public_key("SHA256:fp")
+            .column_separator(';')
+            .column_delimiter('|')
+            .row_separator(RowSeparator::CRLF)
+            .encoding("ISO-8859-1")
+            .skip(2)
+            .null_value("\\N")
+            .trim(TrimMode::Trim)
+            .reject_limit(100)
+            .compressed(Compression::Gzip)
+            .build();
+
+        assert_eq!(
+            sql,
+            "IMPORT INTO hr.data (a, b)\n\
+             FROM CSV AT 'https://10.0.0.1:9000' PUBLIC KEY 'SHA256:fp'\n\
+             FILE '001.csv.gz'\n\
+             ENCODING = 'ISO-8859-1'\n\
+             COLUMN SEPARATOR = ';'\n\
+             COLUMN DELIMITER = '|'\n\
+             ROW SEPARATOR = 'CRLF'\n\
+             SKIP = 2\n\
+             NULL = '\\N'\n\
+             TRIM = 'TRIM'\n\
+             REJECT LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn test_build_renders_multi_file_entries_on_one_from_line() {
+        let entries = vec![
+            ImportFileEntry::new("10.0.0.5:8563".to_string(), "001.csv".to_string(), None),
+            ImportFileEntry::new(
+                "10.0.0.6:8564".to_string(),
+                "002.csv".to_string(),
+                Some("sha256//fp2".to_string()),
+            ),
+        ];
+
+        let sql = ImportQuery::new("my_table").with_files(entries).build();
+
+        assert_eq!(
+            sql,
+            "IMPORT INTO my_table\n\
+             FROM CSV AT 'http://10.0.0.5:8563' FILE '001.csv' \
+             AT 'https://10.0.0.6:8564' PUBLIC KEY 'sha256//fp2' FILE '002.csv'\n\
+             ENCODING = 'UTF-8'\n\
+             COLUMN SEPARATOR = ','\n\
+             COLUMN DELIMITER = '\"'\n\
+             ROW SEPARATOR = 'LF'"
+        );
+    }
+
+    #[test]
+    fn test_build_renders_the_full_parquet_statement_verbatim() {
+        let sql = ImportQuery::new("my_table")
+            .at_address("10.0.0.5:8563")
+            .with_format(ImportFormat::Parquet)
+            .build();
+
+        assert_eq!(
+            sql,
+            "IMPORT INTO my_table\n\
+             FROM PARQUET AT 'http://10.0.0.5:8563;MaxConcurrentReads=1'\n\
+             FILE '001.parquet'"
+        );
+    }
+
+    #[test]
+    fn test_build_without_address_still_renders_a_scheme_only_url() {
+        let sql = ImportQuery::new("t").build();
+
+        assert!(sql.contains("FROM CSV AT 'http://'"), "got: {}", sql);
+    }
+
+    #[test]
+    fn test_strip_known_extensions_unwinds_stacked_suffixes() {
+        assert_eq!(strip_known_extensions("001"), "001");
+        assert_eq!(strip_known_extensions("001.csv"), "001");
+        assert_eq!(strip_known_extensions("001.csv.gz"), "001");
+        assert_eq!(strip_known_extensions("001.csv.bz2"), "001");
+        assert_eq!(strip_known_extensions("001.parquet"), "001");
+        assert_eq!(strip_known_extensions("archive.tar"), "archive.tar");
     }
 }

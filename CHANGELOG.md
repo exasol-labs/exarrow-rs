@@ -1,8 +1,17 @@
 # Changelog
 
-## 0.14.1
+## 0.15.1
 
 - Fix: the ADBC driver now exports its init symbol as `AdbcDriverExasolInit`, matching the ADBC C API naming convention `AdbcDriver<Name>Init`. The previous symbol, `ExarrowDriverInit`, is kept as a backward-compatible alias.
+
+## 0.15.0
+
+- Fix: `exasol_encode_pwd` no longer panics when handed an empty random phrase. It returned the result of indexing the phrase directly, so an empty phrase aborted the process instead of reporting a failure; it now returns a `TransportError`.
+- CI: coverage is measured on production code only. `cargo llvm-cov` instruments `#[cfg(test)]` modules like any other code, so the previous metric counted the unit tests in their own denominator — with test code making up roughly two thirds of the instrumented lines, the reported figure was inflated by about 8 percentage points. `scripts/strip_test_coverage.py` now removes test-module line entries (and whole records for out-of-line test modules) and recomputes the per-file totals; SonarQube Cloud's Quality Gate reads the stripped report. The `websocket` feature is deliberately left out of the coverage command — see `AGENTS.md`.
+- CI: the `unit-tests` job fails when total production line coverage drops below 80%, or when any single file drops below 50%. Per-file exemptions are named explicitly in the script rather than lowering the floor.
+- Refactor: cognitive-complexity reductions across the crate — long branching functions split into focused helpers with guard clauses, and duplicated logic consolidated (including a single shared `TransportProtocol` test double in place of independently drifting per-module mocks).
+- Refactor: wildcard imports replaced with explicit item imports.
+- No breaking changes; the public API is unchanged.
 
 ## 0.14.0
 

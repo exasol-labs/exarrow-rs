@@ -1006,114 +1006,20 @@ where
     loop {
         let request = match parse_http_request(stream).await {
             Ok(req) => req,
-            // Peer closed the connection cleanly (or with a stream-level I/O
-            // error). Treat as end-of-conversation.
-            Err(TransportError::IoError(_)) => return Ok(()),
-            // A malformed/empty request line at this stage usually signals
-            // peer close without another request — treat the same as IoError.
-            Err(TransportError::ProtocolError(_)) => return Ok(()),
+            // A stream-level I/O error means the peer closed the connection
+            // cleanly; a malformed/empty request line at this stage usually
+            // signals the same. Either way, end the conversation.
+            Err(TransportError::IoError(_) | TransportError::ProtocolError(_)) => return Ok(()),
             Err(e) => return Err(e),
         };
 
         match request.method {
-            HttpMethod::Head => {
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                    file_bytes.len()
-                );
-                stream.write_all(response.as_bytes()).await.map_err(|e| {
-                    TransportError::IoError(format!("Failed to write HEAD response: {e}"))
-                })?;
-                stream.flush().await.map_err(|e| {
-                    TransportError::IoError(format!("Failed to flush HEAD response: {e}"))
-                })?;
-            }
-            HttpMethod::Get => {
-                if let Some(range_header) = request.headers.get("range") {
-                    // Parse "bytes=<start>-<end>". Anything malformed (missing
-                    // prefix, missing dash, non-numeric, end < start, or
-                    // start >= file_len) yields a 400 and the loop continues
-                    // — Exasol may try again or just close the connection.
-                    let parsed_range = range_header
-                        .strip_prefix("bytes=")
-                        .and_then(|s| s.split_once('-'))
-                        .and_then(|(start_str, end_str)| {
-                            let start = start_str.trim().parse::<usize>().ok()?;
-                            let end = end_str.trim().parse::<usize>().ok()?;
-                            Some((start, end))
-                        });
-
-                    if let Some((start, end)) = parsed_range {
-                        if file_bytes.is_empty() || start >= file_bytes.len() {
-                            stream
-                                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                                .await
-                                .map_err(|e| {
-                                    TransportError::IoError(format!("Failed to write 400: {e}"))
-                                })?;
-                            stream.flush().await.map_err(|e| {
-                                TransportError::IoError(format!("Failed to flush 400: {e}"))
-                            })?;
-                            continue;
-                        }
-                        let clamped_end = end.min(file_bytes.len().saturating_sub(1));
-                        if clamped_end < start {
-                            stream
-                                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                                .await
-                                .map_err(|e| {
-                                    TransportError::IoError(format!("Failed to write 400: {e}"))
-                                })?;
-                            stream.flush().await.map_err(|e| {
-                                TransportError::IoError(format!("Failed to flush 400: {e}"))
-                            })?;
-                            continue;
-                        }
-                        let slice = &file_bytes[start..=clamped_end];
-                        let response = format!(
-                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
-                            slice.len(),
-                            start,
-                            clamped_end,
-                            file_bytes.len()
-                        );
-                        stream.write_all(response.as_bytes()).await.map_err(|e| {
-                            TransportError::IoError(format!("Failed to write 206 headers: {e}"))
-                        })?;
-                        stream.write_all(slice).await.map_err(|e| {
-                            TransportError::IoError(format!("Failed to write 206 body: {e}"))
-                        })?;
-                        stream.flush().await.map_err(|e| {
-                            TransportError::IoError(format!("Failed to flush 206 response: {e}"))
-                        })?;
-                    } else {
-                        stream
-                            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                            .await
-                            .map_err(|e| {
-                                TransportError::IoError(format!("Failed to write 400: {e}"))
-                            })?;
-                        stream.flush().await.map_err(|e| {
-                            TransportError::IoError(format!("Failed to flush 400: {e}"))
-                        })?;
-                    }
-                } else {
-                    // Full GET without Range header — rare but legal.
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        file_bytes.len()
-                    );
-                    stream.write_all(response.as_bytes()).await.map_err(|e| {
-                        TransportError::IoError(format!("Failed to write GET headers: {e}"))
-                    })?;
-                    stream.write_all(file_bytes).await.map_err(|e| {
-                        TransportError::IoError(format!("Failed to write GET body: {e}"))
-                    })?;
-                    stream.flush().await.map_err(|e| {
-                        TransportError::IoError(format!("Failed to flush GET response: {e}"))
-                    })?;
-                }
-            }
+            HttpMethod::Head => write_file_size_response(stream, file_bytes.len()).await?,
+            HttpMethod::Get => match request.headers.get("range") {
+                Some(range_header) => serve_byte_range(stream, file_bytes, range_header).await?,
+                // Full GET without Range header — rare but legal.
+                None => write_whole_file_response(stream, file_bytes).await?,
+            },
             HttpMethod::Put => {
                 let _ = stream
                     .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
@@ -1125,6 +1031,136 @@ where
             }
         }
     }
+}
+
+/// Answers one `Range` request: `206 Partial Content` with the requested slice,
+/// or `400 Bad Request` for any range this file cannot satisfy.
+///
+/// A rejected range is not an error for the caller — Exasol may retry with a
+/// different range or just close the connection — so both outcomes return `Ok`.
+async fn serve_byte_range<S>(
+    stream: &mut S,
+    file_bytes: &[u8],
+    range_header: &str,
+) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some((start, end)) = parse_byte_range(range_header) else {
+        return write_bad_request_response(stream).await;
+    };
+
+    if file_bytes.is_empty() || start >= file_bytes.len() {
+        return write_bad_request_response(stream).await;
+    }
+
+    let clamped_end = end.min(file_bytes.len().saturating_sub(1));
+    if clamped_end < start {
+        return write_bad_request_response(stream).await;
+    }
+
+    write_partial_content_response(stream, file_bytes, start, clamped_end).await
+}
+
+/// Parses a `Range: bytes=<start>-<end>` header value into inclusive bounds.
+///
+/// Returns `None` for anything malformed: a missing `bytes=` prefix, a missing
+/// dash, or a non-numeric bound.
+fn parse_byte_range(range_header: &str) -> Option<(usize, usize)> {
+    let (start_str, end_str) = range_header.strip_prefix("bytes=")?.split_once('-')?;
+    let start = start_str.trim().parse::<usize>().ok()?;
+    let end = end_str.trim().parse::<usize>().ok()?;
+    Some((start, end))
+}
+
+/// Writes `200 OK` with a `Content-Length` and no body, answering a `HEAD`
+/// probe for the file size.
+async fn write_file_size_response<S>(stream: &mut S, file_len: usize) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {file_len}\r\n\r\n");
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to write HEAD response: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to flush HEAD response: {e}")))
+}
+
+/// Writes `200 OK` followed by the complete file body.
+async fn write_whole_file_response<S>(
+    stream: &mut S,
+    file_bytes: &[u8],
+) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+        file_bytes.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to write GET headers: {e}")))?;
+    stream
+        .write_all(file_bytes)
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to write GET body: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to flush GET response: {e}")))
+}
+
+/// Writes `206 Partial Content` followed by `file_bytes[start..=end]`.
+async fn write_partial_content_response<S>(
+    stream: &mut S,
+    file_bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let slice = &file_bytes[start..=end];
+    let response = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+        slice.len(),
+        start,
+        end,
+        file_bytes.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to write 206 headers: {e}")))?;
+    stream
+        .write_all(slice)
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to write 206 body: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to flush 206 response: {e}")))
+}
+
+/// Writes a bare `400 Bad Request` with no body.
+async fn write_bad_request_response<S>(stream: &mut S) -> Result<(), TransportError>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream
+        .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to write 400: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TransportError::IoError(format!("Failed to flush 400: {e}")))
 }
 
 /// HTTP method enum for parsed requests.
@@ -1913,7 +1949,7 @@ mod tests {
         // Script: HEAD probe → GET Range bytes=0-3 → GET Range bytes=4-7
         // → GET (no Range, full body) → close. Assert each response shape
         // and body slice match the expected bytes from a known file payload.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         // 16 bytes of distinguishable content; large enough for two
         // non-overlapping range slices and one full-file response.
@@ -2018,38 +2054,598 @@ mod tests {
             "handler returned error on connection close: {:?}",
             result
         );
+    }
 
-        // Helper: read N bytes exactly.
-        async fn read_exactly(stream: &mut tokio::io::DuplexStream, n: usize) -> Vec<u8> {
-            let mut buf = vec![0u8; n];
-            stream.read_exact(&mut buf).await.unwrap();
-            buf
-        }
+    /// Reads exactly `n` bytes from the scripted peer.
+    async fn read_exactly(stream: &mut tokio::io::DuplexStream, n: usize) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
 
-        // Helper: read until end of headers (\r\n\r\n), then read the
-        // expected body length. Returns (header_section_as_string, body).
-        async fn read_response_with_body(
-            stream: &mut tokio::io::DuplexStream,
-            body_len: usize,
-        ) -> (String, Vec<u8>) {
-            let mut headers = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                stream.read_exact(&mut byte).await.unwrap();
-                headers.push(byte[0]);
-                if headers.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-                if headers.len() > 4096 {
-                    panic!("headers exceeded sanity limit");
-                }
+        let mut buf = vec![0u8; n];
+        stream.read_exact(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// Reads until end of headers (`\r\n\r\n`), then reads `body_len` body
+    /// bytes. Returns (header_section_as_string, body).
+    async fn read_response_with_body(
+        stream: &mut tokio::io::DuplexStream,
+        body_len: usize,
+    ) -> (String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
             }
-            let header_str = String::from_utf8(headers).unwrap();
-            let mut body = vec![0u8; body_len];
-            if body_len > 0 {
-                stream.read_exact(&mut body).await.unwrap();
+            if headers.len() > 4096 {
+                panic!("headers exceeded sanity limit");
             }
-            (header_str, body)
         }
+        let header_str = String::from_utf8(headers).unwrap();
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            stream.read_exact(&mut body).await.unwrap();
+        }
+        (header_str, body)
+    }
+
+    /// Runs [`serve_parquet_range_requests`] against one end of a
+    /// `tokio::io::duplex` pair, returning the scripted-peer end and the
+    /// handler task. No real socket and no Exasol instance are involved.
+    fn spawn_parquet_handler(
+        file_bytes: Vec<u8>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<(), TransportError>>,
+    ) {
+        let (mut server_side, client_side) = tokio::io::duplex(4096);
+        let handler = tokio::spawn(async move {
+            serve_parquet_range_requests(&mut server_side, &file_bytes).await
+        });
+        (client_side, handler)
+    }
+
+    /// Sends one `GET` carrying `range_header` and asserts the handler answers
+    /// `400 Bad Request`, stays in its loop, and completes cleanly on close.
+    async fn assert_range_header_is_rejected(file_bytes: Vec<u8>, range_header: &str) {
+        let (mut client, handler) = spawn_parquet_handler(file_bytes);
+
+        let request =
+            format!("GET /001.parquet HTTP/1.1\r\nHost: x\r\nRange: {range_header}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let (headers, _) = read_response_with_body(&mut client, 0).await;
+        assert_eq!(
+            headers, "HTTP/1.1 400 Bad Request\r\n\r\n",
+            "range header {range_header:?} should yield a bare 400"
+        );
+
+        drop(client);
+        assert!(
+            handler.await.expect("handler task panicked").is_ok(),
+            "a rejected range must not abort the request loop"
+        );
+    }
+
+    /// Builds a well-formed EXA response packet: reserved i32, port i32, then
+    /// the IP as a null-padded 16-byte field.
+    fn response_packet(ip: &str, port: i32) -> [u8; EXA_RESPONSE_PACKET_SIZE] {
+        assert!(ip.len() <= 16, "the IP field holds at most 16 bytes");
+        let mut packet = [0u8; EXA_RESPONSE_PACKET_SIZE];
+        packet[4..8].copy_from_slice(&port.to_le_bytes());
+        packet[8..8 + ip.len()].copy_from_slice(ip.as_bytes());
+        packet
+    }
+
+    #[tokio::test]
+    async fn test_perform_handshake_sends_the_magic_packet_and_returns_the_internal_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let peer = tokio::spawn(async move {
+            let mut magic = [0u8; EXA_MAGIC_PACKET_SIZE];
+            server.read_exact(&mut magic).await.unwrap();
+            server
+                .write_all(&response_packet("10.0.0.5", 8563))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            magic
+        });
+
+        let (ip, port) = perform_handshake(&mut client)
+            .await
+            .expect("a well-formed response completes the handshake");
+
+        assert_eq!(ip, "10.0.0.5");
+        assert_eq!(port, 8563);
+        assert_eq!(
+            peer.await.unwrap(),
+            generate_magic_packet(),
+            "the peer must receive exactly the magic packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_perform_handshake_fails_when_the_peer_closes_without_responding() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let mut magic = [0u8; EXA_MAGIC_PACKET_SIZE];
+            server.read_exact(&mut magic).await.unwrap();
+        });
+
+        let error = perform_handshake(&mut client)
+            .await
+            .expect_err("no response packet means no handshake");
+
+        let TransportError::IoError(message) = error else {
+            panic!("expected IoError, got {error:?}");
+        };
+        assert!(
+            message.starts_with("Failed to read response packet: "),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_perform_handshake_propagates_an_invalid_response_packet() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let mut magic = [0u8; EXA_MAGIC_PACKET_SIZE];
+            server.read_exact(&mut magic).await.unwrap();
+            // Valid length, but the IP field is all nulls.
+            server
+                .write_all(&[0u8; EXA_RESPONSE_PACKET_SIZE])
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let error = perform_handshake(&mut client)
+            .await
+            .expect_err("an empty IP field is not a usable internal address");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert_eq!(message, "Empty IP address in response packet");
+    }
+
+    #[tokio::test]
+    async fn test_data_pipe_send_reports_a_closed_receiver() {
+        let (writer, reader) = DataPipe::create_pair(1);
+
+        drop(reader);
+
+        let error = writer
+            .send(vec![1, 2, 3])
+            .await
+            .expect_err("sending into a dropped pipe end must fail");
+
+        let TransportError::SendError(message) = error else {
+            panic!("expected SendError, got {error:?}");
+        };
+        assert!(
+            message.starts_with("Failed to send data through pipe: "),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_pipe_recv_returns_none_once_the_sender_is_gone() {
+        let (writer, mut reader) = DataPipe::create_pair(1);
+
+        drop(writer);
+
+        assert!(reader.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_fails_when_the_headers_are_truncated() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            // A request line but no blank line closing the header block.
+            server
+                .write_all(b"GET /001.csv HTTP/1.1\r\nHost: x\r\n")
+                .await
+                .unwrap();
+        });
+
+        let error = parse_http_request(&mut client)
+            .await
+            .expect_err("an unterminated header block is malformed");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert!(
+            message.starts_with("Failed to read header line: "),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_ignores_a_header_line_without_a_colon() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            server
+                .write_all(b"GET /001.csv HTTP/1.1\r\ngarbage-without-colon\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let parsed = parse_http_request(&mut client).await.unwrap();
+
+        assert_eq!(parsed.host(), Some("x"));
+        assert_eq!(parsed.headers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_rejects_a_request_line_with_too_few_parts() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            server.write_all(b"GET /001.csv\r\n\r\n").await.unwrap();
+        });
+
+        let error = parse_http_request(&mut client)
+            .await
+            .expect_err("a request line needs method, path, and version");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert_eq!(message, "Invalid HTTP request line: 'GET /001.csv'");
+    }
+
+    #[test]
+    fn test_build_http_response_keeps_a_caller_supplied_content_length() {
+        let response = build_http_response(200, "OK", &[("content-length", "99")], Some(b"Hello"));
+
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(text.matches("ontent-length").count(), 1);
+        assert!(!text.contains("Content-Length: 5"));
+        assert!(text.ends_with("Hello"));
+    }
+
+    #[test]
+    fn test_parse_byte_range_reads_inclusive_bounds() {
+        assert_eq!(parse_byte_range("bytes=0-3"), Some((0, 3)));
+        assert_eq!(parse_byte_range("bytes=7-7"), Some((7, 7)));
+        assert_eq!(parse_byte_range("bytes=1024-2047"), Some((1024, 2047)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_tolerates_whitespace_around_the_bounds() {
+        assert_eq!(parse_byte_range("bytes= 4 - 8 "), Some((4, 8)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_accepts_bounds_out_of_order() {
+        // Ordering is the caller's concern: it decides whether to answer 400.
+        assert_eq!(parse_byte_range("bytes=8-3"), Some((8, 3)));
+    }
+
+    #[test]
+    fn test_parse_byte_range_rejects_malformed_headers() {
+        assert_eq!(parse_byte_range("0-3"), None, "missing bytes= prefix");
+        assert_eq!(parse_byte_range("items=0-3"), None, "wrong unit");
+        assert_eq!(parse_byte_range("bytes=0"), None, "missing dash");
+        assert_eq!(
+            parse_byte_range("bytes=abc-def"),
+            None,
+            "non-numeric bounds"
+        );
+        assert_eq!(parse_byte_range("bytes=-3"), None, "missing start");
+        assert_eq!(parse_byte_range("bytes=0-"), None, "missing end");
+        assert_eq!(parse_byte_range("bytes=-1--2"), None, "negative bounds");
+        assert_eq!(parse_byte_range(""), None, "empty header");
+    }
+
+    #[test]
+    fn test_parse_response_packet_rejects_a_negative_port() {
+        let mut packet = [0u8; EXA_RESPONSE_PACKET_SIZE];
+        packet[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        packet[8..24].copy_from_slice(b"10.0.0.5\0\0\0\0\0\0\0\0");
+
+        let error = parse_response_packet(&packet).expect_err("negative port is invalid");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert_eq!(message, "Invalid port in response packet: -1");
+    }
+
+    #[test]
+    fn test_parse_response_packet_rejects_a_port_above_u16_max() {
+        let mut packet = [0u8; EXA_RESPONSE_PACKET_SIZE];
+        packet[4..8].copy_from_slice(&65_536i32.to_le_bytes());
+        packet[8..24].copy_from_slice(b"10.0.0.5\0\0\0\0\0\0\0\0");
+
+        let error = parse_response_packet(&packet).expect_err("65536 does not fit in a u16");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert_eq!(message, "Invalid port in response packet: 65536");
+    }
+
+    #[test]
+    fn test_parse_response_packet_accepts_the_maximum_port() {
+        let mut packet = [0u8; EXA_RESPONSE_PACKET_SIZE];
+        packet[4..8].copy_from_slice(&i32::from(u16::MAX).to_le_bytes());
+        packet[8..24].copy_from_slice(b"10.0.0.5\0\0\0\0\0\0\0\0");
+
+        let (ip, port) = parse_response_packet(&packet).expect("65535 is a valid port");
+
+        assert_eq!(ip, "10.0.0.5");
+        assert_eq!(port, u16::MAX);
+    }
+
+    #[test]
+    fn test_parse_response_packet_rejects_an_all_null_ip_field() {
+        let mut packet = [0u8; EXA_RESPONSE_PACKET_SIZE];
+        packet[4..8].copy_from_slice(&8563i32.to_le_bytes());
+
+        let error = parse_response_packet(&packet).expect_err("an empty IP is unusable");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert_eq!(message, "Empty IP address in response packet");
+    }
+
+    #[tokio::test]
+    async fn test_read_line_keeps_a_carriage_return_not_followed_by_a_newline() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            server.write_all(b"a\rb\r\n").await.unwrap();
+        });
+
+        let line = read_line(&mut client).await.unwrap();
+
+        assert_eq!(
+            line, "a\rb",
+            "a lone CR belongs to the line, together with the byte after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_line_keeps_consecutive_carriage_returns() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            server.write_all(b"\r\r\r\n").await.unwrap();
+        });
+
+        let line = read_line(&mut client).await.unwrap();
+
+        assert_eq!(line, "\r\r");
+    }
+
+    #[tokio::test]
+    async fn test_read_line_returns_an_empty_string_for_a_bare_crlf() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            server.write_all(b"\r\n").await.unwrap();
+        });
+
+        let line = read_line(&mut client).await.unwrap();
+
+        assert!(line.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_line_rejects_a_line_that_is_not_valid_utf8() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            server.write_all(b"\xff\xfe\r\n").await.unwrap();
+        });
+
+        let error = read_line(&mut client)
+            .await
+            .expect_err("0xff 0xfe is not valid UTF-8");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_read_line_fails_when_the_stream_ends_before_a_newline() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            server.write_all(b"no terminator").await.unwrap();
+        });
+
+        let error = read_line(&mut client)
+            .await
+            .expect_err("an unterminated line cannot be read");
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_rejects_a_range_without_the_bytes_prefix() {
+        assert_range_header_is_rejected((0u8..16u8).collect(), "0-3").await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_rejects_a_range_without_a_dash() {
+        assert_range_header_is_rejected((0u8..16u8).collect(), "bytes=0").await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_rejects_a_non_numeric_range() {
+        assert_range_header_is_rejected((0u8..16u8).collect(), "bytes=abc-def").await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_rejects_a_start_beyond_the_last_byte() {
+        assert_range_header_is_rejected((0u8..16u8).collect(), "bytes=16-20").await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_rejects_any_range_on_an_empty_file() {
+        assert_range_header_is_rejected(vec![], "bytes=0-3").await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_rejects_an_end_before_the_start() {
+        assert_range_header_is_rejected((0u8..16u8).collect(), "bytes=8-3").await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_clamps_a_range_end_past_the_last_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let file_bytes: Vec<u8> = (0u8..16u8).collect();
+        let (mut client, handler) = spawn_parquet_handler(file_bytes.clone());
+
+        client
+            .write_all(b"GET /001.parquet HTTP/1.1\r\nHost: x\r\nRange: bytes=12-99\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let (headers, body) = read_response_with_body(&mut client, 4).await;
+
+        assert!(headers.starts_with("HTTP/1.1 206 Partial Content\r\n"));
+        assert!(
+            headers.contains("Content-Range: bytes 12-15/16\r\n"),
+            "end should be clamped to the last byte: {headers:?}"
+        );
+        assert_eq!(body, file_bytes[12..=15]);
+
+        drop(client);
+        assert!(handler.await.expect("handler task panicked").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_serves_a_single_byte_range() {
+        use tokio::io::AsyncWriteExt;
+
+        let file_bytes: Vec<u8> = (0u8..16u8).collect();
+        let (mut client, handler) = spawn_parquet_handler(file_bytes.clone());
+
+        client
+            .write_all(b"GET /001.parquet HTTP/1.1\r\nHost: x\r\nRange: bytes=7-7\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let (headers, body) = read_response_with_body(&mut client, 1).await;
+
+        assert!(headers.contains("Content-Length: 1\r\n"), "{headers:?}");
+        assert!(
+            headers.contains("Content-Range: bytes 7-7/16\r\n"),
+            "{headers:?}"
+        );
+        assert_eq!(body, vec![7u8]);
+
+        drop(client);
+        assert!(handler.await.expect("handler task panicked").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_answers_a_put_with_405_and_an_error() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, handler) = spawn_parquet_handler((0u8..16u8).collect());
+
+        client
+            .write_all(b"PUT /001.parquet HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let (headers, _) = read_response_with_body(&mut client, 0).await;
+        assert_eq!(headers, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+
+        let error = handler
+            .await
+            .expect("handler task panicked")
+            .expect_err("a PUT must abort the Parquet import handler");
+
+        let TransportError::ProtocolError(message) = error else {
+            panic!("expected ProtocolError, got {error:?}");
+        };
+        assert_eq!(message, "Unexpected PUT in Parquet import handler");
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_completes_when_the_peer_closes_first() {
+        let (client, handler) = spawn_parquet_handler((0u8..16u8).collect());
+
+        drop(client);
+
+        assert!(
+            handler.await.expect("handler task panicked").is_ok(),
+            "an immediate close is a normal end of conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_completes_on_an_unparseable_request() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, handler) = spawn_parquet_handler((0u8..16u8).collect());
+
+        client.write_all(b"garbage\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        assert!(
+            handler.await.expect("handler task panicked").is_ok(),
+            "a malformed request line is treated as peer close"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_serves_an_empty_file_for_head_and_full_get() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, handler) = spawn_parquet_handler(vec![]);
+
+        client
+            .write_all(b"HEAD /001.parquet HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let (head_headers, _) = read_response_with_body(&mut client, 0).await;
+        assert_eq!(head_headers, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+        client
+            .write_all(b"GET /001.parquet HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let (get_headers, body) = read_response_with_body(&mut client, 0).await;
+        assert_eq!(get_headers, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(body.is_empty());
+
+        drop(client);
+        assert!(handler.await.expect("handler task panicked").is_ok());
     }
 }

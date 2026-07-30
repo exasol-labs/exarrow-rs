@@ -153,3 +153,131 @@ impl From<::parquet::errors::ParquetError> for ImportError {
         ImportError::ParquetError(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ImportError;
+
+    #[test]
+    fn test_import_error_from_arrow_error_keeps_the_arrow_message() {
+        let arrow_error =
+            ::arrow::error::ArrowError::SchemaError("column NAME missing".to_string());
+        let arrow_message = arrow_error.to_string();
+
+        let err: ImportError = arrow_error.into();
+
+        assert!(matches!(err, ImportError::ArrowError(_)));
+        assert_eq!(err.to_string(), format!("Arrow error: {}", arrow_message));
+    }
+
+    #[test]
+    fn test_import_error_from_parquet_error_keeps_the_parquet_message() {
+        let parquet_error = ::parquet::errors::ParquetError::General("bad footer".to_string());
+        let parquet_message = parquet_error.to_string();
+
+        let err: ImportError = parquet_error.into();
+
+        assert!(matches!(err, ImportError::ParquetError(_)));
+        assert_eq!(
+            err.to_string(),
+            format!("Parquet error: {}", parquet_message)
+        );
+    }
+
+    #[test]
+    fn test_import_error_from_io_error_keeps_the_io_message() {
+        let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "data.csv");
+
+        let err: ImportError = io_error.into();
+
+        assert!(matches!(err, ImportError::IoError(_)));
+        assert_eq!(err.to_string(), "IO error: data.csv");
+    }
+
+    #[test]
+    fn test_import_error_from_transport_error_keeps_the_transport_message() {
+        let transport_error = crate::error::TransportError::IoError("socket closed".to_string());
+
+        let err: ImportError = transport_error.into();
+
+        assert!(matches!(err, ImportError::TransportError(_)));
+        assert_eq!(
+            err.to_string(),
+            "Transport error: Network I/O error: socket closed"
+        );
+    }
+
+    #[test]
+    fn test_every_import_error_variant_renders_its_context() {
+        let cases: Vec<(ImportError, &str)> = vec![
+            (
+                ImportError::ParquetError("bad footer".to_string()),
+                "Parquet error: bad footer",
+            ),
+            (
+                ImportError::ArrowError("schema".to_string()),
+                "Arrow error: schema",
+            ),
+            (
+                ImportError::QueryError("IMPORT rejected".to_string()),
+                "Query error: IMPORT rejected",
+            ),
+            (
+                ImportError::ConversionError("i128 overflow".to_string()),
+                "Conversion error: i128 overflow",
+            ),
+            (
+                ImportError::InvalidConfig("no columns".to_string()),
+                "Invalid configuration: no columns",
+            ),
+            (
+                ImportError::CsvWriteError("disk full".to_string()),
+                "CSV write error: disk full",
+            ),
+            (
+                ImportError::ArrowIpcError("truncated".to_string()),
+                "Arrow IPC error: truncated",
+            ),
+            (
+                ImportError::SqlError("syntax".to_string()),
+                "SQL execution failed: syntax",
+            ),
+            (
+                ImportError::HttpTransportError("bind failed".to_string()),
+                "HTTP transport failed: bind failed",
+            ),
+            (
+                ImportError::StreamError("reset".to_string()),
+                "Data streaming error: reset",
+            ),
+            (
+                ImportError::CompressionError("gzip".to_string()),
+                "Compression error: gzip",
+            ),
+            (
+                ImportError::InvalidSessionState("not connected".to_string()),
+                "Invalid session state: not connected",
+            ),
+            (
+                ImportError::ChannelError("receiver dropped".to_string()),
+                "Channel error: receiver dropped",
+            ),
+            (
+                ImportError::ParallelImportError("worker 2 failed".to_string()),
+                "Parallel import error: worker 2 failed",
+            ),
+            (
+                ImportError::SchemaInferenceError("no metadata".to_string()),
+                "Schema inference failed: no metadata",
+            ),
+            (
+                ImportError::SchemaMismatchError("file 2 differs".to_string()),
+                "Schema mismatch between files: file 2 differs",
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+}
