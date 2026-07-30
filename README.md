@@ -5,9 +5,12 @@
 [![Crates.io](https://img.shields.io/crates/v/exarrow-rs.svg)](https://crates.io/crates/exarrow-rs)
 [![Documentation](https://docs.rs/exarrow-rs/badge.svg)](https://docs.rs/exarrow-rs)
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 [![CI](https://github.com/exasol-labs/exarrow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/exarrow-rs/actions/workflows/ci.yml)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=exasol-labs_exarrow-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=exasol-labs_exarrow-rs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=exasol-labs_exarrow-rs&metric=coverage)](https://sonarcloud.io/summary/new_code?id=exasol-labs_exarrow-rs)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=exasol-labs_exarrow-rs&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=exasol-labs_exarrow-rs)
 
 ADBC-compatible driver for Exasol with Apache Arrow data format support.
 
@@ -23,6 +26,9 @@ cargo add tokio --features rt-multi-thread,macros
 ```
 
 ## Quick Start
+
+> [!INFO]
+> Prefer a CLI install over building from source? Use the [ADBC Driver Foundry](https://github.com/adbc-drivers/exasol): `dbc install exasol`.
 
 ```rust
 use exarrow_rs::adbc::Driver;
