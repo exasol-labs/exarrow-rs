@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1
+
+- Fix: the ADBC driver now exports its init symbol as `AdbcDriverExasolInit`, matching the ADBC C API naming convention `AdbcDriver<Name>Init`. The previous symbol, `ExarrowDriverInit`, is kept as a backward-compatible alias.
+
 ## 0.15.0
 
 - Fix: `exasol_encode_pwd` no longer panics when handed an empty random phrase. It returned the result of indexing the phrase directly, so an empty phrase aborted the process instead of reporting a failure; it now returns a `TransportError`.
