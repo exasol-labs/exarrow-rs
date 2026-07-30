@@ -27,7 +27,7 @@ cargo add tokio --features rt-multi-thread,macros
 
 ## Quick Start
 
-> [!INFO]
+> [!TIP]
 > Prefer a CLI install over building from source? Use the [ADBC Driver Foundry](https://github.com/adbc-drivers/exasol): `dbc install exasol`.
 
 ```rust
