@@ -29,7 +29,7 @@ No live interview took place. `/speq:plan-pr` ran this plan in headless mode, so
 
 - **Decision:** `Some(ms)` still arms a client-side `tokio::time::timeout` around SQL execution, tunnel transfer, and the callback. Only the default changes.
 - **Alternatives:** Delete `timeout_ms` and `ExportError::Timeout` entirely and rely on the server-enforced `queryTimeout` session attribute, which is what ADR `server-enforced-query-timeout` did for query execution. Also considered: reinterpret `Some(ms)` as a server attribute set before the EXPORT statement, mirroring 0.14.0's mechanism exactly.
-- **Rationale:** The client-side timer bounds work a server attribute cannot reach: the caller's callback, and a tunnel that stalls while the EXPORT statement still runs server-side. `src/transport/http_transport.rs` has no read timeout, so nothing else bounds either case. That reason is verifiable in this repo and carries the decision on its own. The server-attribute variant was rejected for a second reason: `export_to_callback` receives only a `&mut dyn TransportProtocol` and cannot reconcile the session's applied `queryTimeout` value, so setting the attribute behind `execute_statement`'s back would leak a stale timeout onto the next statement. ADR `query-timeout-bidirectional-reconcile` records that exact defect as a plan-review blocker.
+- **Rationale:** The client-side timer bounds work a server attribute cannot reach: the caller's callback, and a tunnel that stalls while the EXPORT statement still runs server-side. `src/transport/http_transport.rs` has no read timeout, so nothing else bounds either case. That reason is verifiable in this repo and carries the decision on its own. The server-attribute variant was rejected for a second reason: `export_to_callback` receives only a `&mut T` bounded by `TransportProtocol` and cannot reconcile the session's applied `queryTimeout` value, so setting the attribute behind `execute_statement`'s back would leak a stale timeout onto the next statement. ADR `query-timeout-bidirectional-reconcile` records that exact defect as a plan-review blocker.
 - **Assumption:** assumes exasol-labs/exapump#38 binds a CLI flag to `CsvExportOptions::timeout_ms` rather than to the `query_timeout=` connection parameter. Unverified from this repo: issue #52 says only that exapump#38 "tracks the matching CLI option". This assumption is supporting, not load-bearing.
 - **Scope of the prior ADR:** ADR `query-timeout-option-semantics` closes with "No arm constructs a client-side timer". That clause is scoped to `ConnectionParams::query_timeout` and `Statement::timeout_ms`, which both map onto the server-enforced `queryTimeout` session attribute. CSV export has no equivalent attribute of its own, so this decision keeps a client-side arm and does not reverse that ADR.
 - **Promotes to ADR:** yes
@@ -39,6 +39,7 @@ No live interview took place. `/speq:plan-pr` ran this plan in headless mode, so
 - **Decision:** Add a required trait method `fn terminate(&mut self)` that drops the socket and marks the transport disconnected without any protocol round-trip. `export_to_callback` calls it when the export timer elapses, before returning `ExportError::Timeout`.
 - **Alternatives:** Call the existing `close()`. Rejected because `close()` sends a disconnect command and awaits its response, so after an abandoned EXPORT it would wait for that EXPORT's response and block for as long as the statement keeps running. Also considered: bound the disconnect round-trip inside both `close()` implementations with a short timer. Rejected because it changes every connection-close path and invents a magic wait value, and because it would leave the export path depending on an undocumented property of `close()`.
 - **Rationale:** ADR `client-give-up-terminates-connection` requires that any client-side give-up terminate the connection rather than abandon the in-flight request. Until now no code path implemented that rule, because 0.14.0 removed the only give-up path that existed. `terminate()` gives the rule an implementation that the unimplemented `cancel` path can reuse. It is additive, so no existing behavior changes.
+- **Assumption:** assumes Exasol releases a session when the client socket closes. This is load-bearing for the ADR's stated benefit, "release the server session immediately instead of leaking it until idle-reap", because `terminate()` deliberately sends no disconnect command and tells the server nothing. Unverified when this plan was written. Task 4.3 checks it against `SYS.EXA_ALL_SESSIONS` and escalates if the abandoned session survives, in which case `terminate()` satisfies the ADR's letter and not its purpose.
 - **Promotes to ADR:** yes
 
 ### [4] Put CSV-export scenario tests in `tests/integration_tests.rs`, not `tests/import_export_tests.rs`
@@ -62,11 +63,11 @@ No live interview took place. `/speq:plan-pr` ran this plan in headless mode, so
 - **Rationale:** It is the only test that distinguishes the old behavior from the new one end to end. Gating it keeps that proof available as a named manual command without taxing every run.
 - **Promotes to ADR:** no
 
-### [7] Leave `Connection::is_closed()` reporting session state
+### [7] Make `Connection::is_closed()` read the transport as well as the session
 
-- **Decision:** After an export timeout terminates the transport, `Connection::is_closed()` still returns `false`. The scenario requires only that a subsequent operation fail.
-- **Alternatives:** Mark the session closed from the `Connection` export methods. Rejected because six entry points reach the export module (`export_csv_to_file`, `export_csv_to_stream`, `export_csv_to_list`, `export_to_parquet`, `export_to_record_batches`, `export_to_arrow_ipc`), so the mutation would spread one decision across six call sites.
-- **Rationale:** `is_closed()` reads `Session::is_closed()`, and the session-versus-transport split predates this plan. Widening it here would trade a documented limitation for scattered state mutation. The plan's Impact section records the limitation.
+- **Decision:** `Connection::is_closed()` becomes `self.session.is_closed().await || !self.transport.lock().await.is_connected()`, so a terminated transport reports the connection as closed. The caller also learns the outcome directly from `ExportError::Timeout::transport_terminated`, so no caller needs to probe.
+- **Alternatives:** Leave `is_closed()` reading session state alone and specify the disagreement, which earlier revisions of this plan did. Rejected: it would freeze a `SHALL NOT` into the permanent library making one fact, this connection is dead, have two owners that must disagree by spec, and a library `SHALL NOT` is far more expensive to undo than one method body. Also considered: mark the session closed from all six `Connection` export entry points (`export_csv_to_file`, `export_csv_to_stream`, `export_csv_to_list`, `export_to_parquet`, `export_to_record_batches`, `export_to_arrow_ipc`). Rejected because it spreads one decision across six call sites.
+- **Rationale:** The cheap option was missed in earlier revisions. `is_closed()` is a two-line `async fn` (`src/adbc/connection.rs:1053-1055`) and `self.transport` is an `Arc<Mutex<dyn TransportProtocol>>` reachable from `&self`, so the fix is one edit in one method plus one test update. No internal caller holds the transport lock while calling `is_closed()`, so the added `lock().await` introduces no deadlock: `is_closed()` takes `&self` while every operation takes `&mut self`, which Rust already serializes.
 - **Promotes to ADR:** no
 
 ### [8] Add no timeout knob to `ArrowExportOptions` or `ParquetExportOptions`
@@ -119,5 +120,89 @@ No live interview took place. `/speq:plan-pr` ran this plan in headless mode, so
 ### [5] [plan-review] Splitting the type change from its only consumer left the crate uncompilable
 
 - **Finding:** Task 3.1 changed `timeout_ms` to `Option<u64>` in Group A, while its only consumers at `src/export/csv.rs:486` and `:505` were fixed two sequential groups later. The crate would not compile between the two, so neither Group B task could verify its own unit test green.
-- **Direction change:** The type change and the `export_to_callback` rework merged into one `[expert]` task, now the sole member of Group C. Group A contains 0.1, 1.1, and 2.1. The Parallelization section records why Group C holds one task.
+- **Direction change:** The type change and the `export_to_callback` rework merged into one `[expert]` task. Round 2 found the same defect relocated one seam earlier and merged the transport tasks too; see finding [6].
 - **Promotes to ADR:** no
+
+### [6] [plan-review] Round 2: the same compile break relocated to the Group A seam
+
+- **Finding:** `plan-reviewer` found that round 1's fix moved the defect rather than removing it. Task 2.1 added `terminate()` as a required trait method with no default body and updated only the mock, leaving both real implementors incomplete: `NativeTcpTransport` (`src/transport/native/mod.rs:760`) in task 2.2 and `WebSocketTransport` (`src/transport/websocket.rs:403`) in task 2.3. `cargo build` would fail at the Group A boundary, and the Parallelization section asserted the opposite. Both Group B tasks specify a unit test, so each agent would have had to write a failing test in a tree that does not compile and could not attribute its own red. The reviewer's premortem names the likely unblock: give `terminate()` a default no-op body and ship a WebSocket transport that never terminates anything, undetected because its unit tests are compile-checked only in CI.
+- **Direction change:** Tasks 2.1, 2.2, and 2.3 merged into one `[expert]` task 2.1 that declares the method, adds it to the mock, and implements it on both transports with one unit test each. Group B is deleted, the merged task joins Group A, the remaining groups are renumbered A to D, and the compile claim now covers both merged tasks. The human approved this merge on PR #54.
+- **Promotes to ADR:** no
+
+### [7] [plan-review] Round 2: `ExportError::Timeout` discarded the branch the driver knew
+
+- **Finding:** A caller catching `ExportError::Timeout` could not tell which branch fired. The variant carries no discriminator, decision [7] leaves `Connection::is_closed()` returning `false` after termination, and task 3.2 resolved the gap in prose with "the connection may have been terminated". The driver knows the answer when it constructs the error, so the hedge discarded information the code held, forcing every caller to either reconnect defensively or issue a probe statement whose failure is indistinguishable from any other failure.
+- **Direction change:** The field was added to `ExportError::Timeout`, set from the same flag that gates the `terminate()` call, with `Display` stating the outcome. The "Explicit export timeout stops the export" scenario requires the error to report it, Impact carries it as a breaking change, the Migration table gains a row, and both branch tests assert the field. Round 3 renamed it `transport_terminated` and folded the work into task 3.1; see finding [17].
+- **Promotes to ADR:** no
+
+### [8] [plan-review] Round 2: task 4.4 had no timing margin for the SQL leg
+
+- **Finding:** The timer starts before `sql_task.await`, so task 4.4's 2-second bound had to cover the tunnel connect, the EXPORT statement, the full tunnel read, and the HTTP 200 before any budget was left for the callback. On a cold container the SQL leg alone can exceed 2 seconds, leaving `sql_done` false at elapse. The driver would terminate, and the test would fail asserting a usable connection. Task 4.4 is the only coverage of the non-terminating branch, so a flake there would quarantine the exact behavior round-1 finding [3] was raised to protect.
+- **Direction change:** The bound rises to 10 seconds and the writer stall to 30 seconds, the task states why each margin exists, and the test performs one small throwaway export first to warm the tunnel path.
+- **Promotes to ADR:** no
+
+### [9] [plan-review] Round 2: the borrow region for the progress flag was unstated
+
+- **Finding:** The plan said the flag is "owned outside the timed block" but not which borrow region it must survive. The elapse path needs the flag and `&mut ws_transport` back, and `sql_task` holds `&mut *ws_transport` for the whole timed future (`src/export/csv.rs:472-479`). Writing `match tokio::time::timeout(dur, work).await { ... }` keeps the temporary alive across the arms, so both the flag read and the `terminate()` reborrow fail borrow-check, and an implementer would be tempted to move `terminate()` into the `map_err` closure where the same borrow is still held.
+- **Direction change:** Task 3.1 bullet 4 now requires binding the timeout result to its own `let` statement so every borrow is released before the elapse handling runs, and names `std::cell::Cell<bool>` borrowed immutably as the preferred shape, which removes the conflict outright.
+- **Promotes to ADR:** no
+
+### [10] [plan-review] Round 2: the recorded "Query timeout" scenario would contradict this plan
+
+- **Finding:** The recorded scenario ends "the driver MUST NOT wrap query execution in a client-side timer" under a GIVEN that includes the `query_timeout=` connection-string parameter. A caller who sets both `query_timeout=` and `timeout_ms` puts `ws_transport.execute_query(&export_sql)` inside `tokio::time::timeout` while that GIVEN holds. The scoping argument existed only in plan.md and the decision log, both of which `/speq:record` archives, so the permanent library would carry the contradiction.
+- **Direction change:** The session-and-lifecycle delta now wraps the recorded "Query timeout" scenario in `<!-- DELTA:CHANGED -->` and narrows the prohibition to query execution through `Connection::execute_statement()`, stating in the same bullet that an explicit `CsvExportOptions::timeout_ms` bounds an export's combined SQL, transfer, and callback and is outside the prohibition. The scoping now lands in the permanent library rather than in an archived artifact.
+- **Promotes to ADR:** yes
+
+### [11] [plan-review] Round 2: the Migration table still stated unconditional termination
+
+- **Finding:** Round-1 finding [3]'s fix reached Impact and Consequences but not Migration, whose last row still read "Export timeout terminates the transport; reconnect before the next operation". Migration is the row a CHANGELOG author and an upgrading caller read first, so the one artifact stating the superseded behavior was the one aimed at the audience that acts on it.
+- **Direction change:** The row now states that termination happens only when the timeout elapses before the EXPORT response is read.
+- **Promotes to ADR:** no
+
+### [12] [plan-review] Round 2: task 3.3 would have given one decision two owners
+
+- **Finding:** Task 3.3 planned one extracted function per module, but `src/export/arrow.rs:739-746` and `src/export/parquet.rs:758-765` hold a character-for-character identical builder chain over the same five inputs. Extracting twice would promote an accidental duplication into a deliberate one, with nothing keeping the two owners in agreement, and would pay for it again with two unit tests.
+- **Direction change:** The task now adds one `pub(crate)` function in `src/export/csv.rs` that both modules call, with one unit test. Round 3 restated its rationale as duplication removal rather than service to a spec bullet the plan itself introduced, replaced the five positional parameters with one named-field struct, and renumbered it 3.2; see finding [18].
+- **Promotes to ADR:** no
+
+### [13] [plan-review] Round 2: Group E scheduled four concurrent writes to one file
+
+- **Finding:** Group E ran tasks 4.1 to 4.4 in parallel, and all four append a test to the same Query Timeout Tests section of `tests/integration_tests.rs`.
+- **Direction change:** Those four now run sequentially in that order. The accompanying claim that "every other group in the plan is file-disjoint by construction" was wrong: round 3 found the same defect still live in Group C, where tasks 3.2 and 3.3 both wrote `src/export/csv.rs`. See finding [19].
+- **Promotes to ADR:** no
+
+### [14] [plan-review] Round 2: three Impact sentences exceeded the 25-word cap
+
+- **Finding:** Governed Impact prose carried a 42-word sentence holding two ideas, plus a 26-word and a 27-word sentence.
+- **Direction change:** The 42-word sentence split into two, ", which 0.14.0 introduced" was cut, and the 27-word sentence split at its semicolon.
+- **Promotes to ADR:** no
+
+### [15] [plan-review] Round 3: the unscoped prohibition survived in `## Background`
+
+- **Finding:** Round 2's fix narrowed the "Query timeout" scenario but left the session-and-lifecycle `## Background` byte-identical to the recorded one, still reading "the driver SHALL NOT wrap query execution in a client-side timer". Background prose has no `WHEN` to scope it and governs every scenario in the feature unconditionally, so the conflict was stronger there than in the scenario that was fixed. Finding [10]'s claim that "the scoping now lands in the permanent library" was half true, and the untouched half was the normative prose `/speq:record` carries forward. The reviewer's premortem is concrete: a future planner reads the recorded Background, deletes the export timer as a spec violation, and reintroduces the inverse of issue #52.
+- **Direction change:** `## Background` is now wrapped in `<!-- DELTA:CHANGED -->` markers, the clause is narrowed to "through `Connection::execute_statement()`", and one sentence points to the export-scoped setting in `import-export/csv-export`. plan.md § Features states that this delta changes Background prose and that the amendment MUST be merged, since `/speq:record` merges marked `## Scenarios` by default and this repo's CLAUDE.md flags unmarked Background edits as a known hazard.
+- **Promotes to ADR:** yes
+
+### [16] [plan-review] Round 3: Group C still had two concurrent writers on one file
+
+- **Finding:** Tasks 3.2 and 3.3 both edited `src/export/csv.rs`, the identical defect finding [13] fixed for the old Group E. The loss would have been silent, because whichever write survived still compiles, and it would have surfaced two groups later as four tests failing on a missing error field.
+- **Direction change:** Task 3.2's error-field work merged into task 3.1, which already reworks `export_to_callback` and already sets the flag the field reports. The former task 3.3 is renumbered 3.2 and holds Group C alone with the documentation task. Finding [13]'s over-broad file-disjointness claim is corrected, and the Parallelization section now names the disjoint files per group instead of asserting disjointness.
+- **Promotes to ADR:** no
+
+### [17] [plan-review] Round 3: the plan's central claim had no test that runs anywhere
+
+- **Finding:** The "No client-side export timeout by default" scenario required an export running longer than 300 seconds, but its mapped test exports about 13 seconds of work by the plan's own scaling model, missing the condition by a factor of 20. The only test that could satisfy it was `#[ignore]`d and gated on `EXARROW_LONG_EXPORT_CHECK`, which no Checklist command set. The mutation `options.timeout_ms.unwrap_or(300_000)` would have survived every automated check the plan defined.
+- **Direction change:** The scenario's `WHEN` is rewritten to "however long its combined SQL execution and data transfer run", so the requirement is the timer's absence rather than a duration threshold. The Checklist "Export tests" row now sets `EXARROW_LONG_EXPORT_CHECK=1`, so the documented verification executes task 4.5. The first Coverage-limits bullet states plainly that no automatically-run test crosses the former bound and names the one command that does. The Arrow and Parquet construction fact moved out of that scenario into its own `DELTA:NEW` scenario, since it is static and runs no export.
+- **Promotes to ADR:** no
+
+### [18] [plan-review] Round 3: eight further advisories
+
+- **Finding:** The reviewer raised eight non-blocking findings, all verified against the tree before acting: `ExportError::Timeout`'s field name contradicted the plan's own spec wording and both `Display` strings were unspecified; task 4.3's assertion pattern was stale and its conventional `conn.close()` cleanup would panic on a terminated transport; the WebSocket half of `terminate()` had zero executed CI coverage, since `Cargo.toml` sets `default = ["native"]` and `tests/websocket_integration_tests.rs` contains no export test; task 0.1 raced tasks 1.1 and 2.1 for the target-directory lock and its failure branch had no owner; the blocking export wrappers were absent from Impact; the prescribed `terminate()` body duplicated the tail of `close()` and its "performs no I/O" test was not writable; the shared-options helper's five positional parameters included two transposable adjacent `char`s; and governed Testing and Parallelization prose still broke the 25-word cap.
+- **Direction change:** Field renamed `transport_terminated` with both `Display` texts specified verbatim; task 4.3 gains the correct pattern, a no-`close()` instruction, and a `SYS.EXA_ALL_SESSIONS` check for decision [3]'s new assumption; task 2.2 adds an executed WebSocket integration test; task 0.1 runs alone ahead of Group A with an explicit escalate-on-failure branch and a conditional task 6.1 for the approved fallback; Impact names `blocking_export_csv_to_file` and `blocking_export_to_parquet`; task 2.1 requires `close()` to delegate to `terminate()` and states the non-async signature in the trait doc comment instead of asserting it in a test; the helper takes one named-field struct; and the three long sentences are split.
+- **Promotes to ADR:** no
+
+### [19] [plan-review] Round 3: the AND-step warning was not a reason to fold a requirement
+
+- **Finding:** Round 2 folded the export carve-out into the "Query timeout" prohibition bullet to avoid a four-AND-step validator warning. The reviewer showed the reasoning was wrong: the threshold is a non-blocking `WARN`, and the library already carries it, confirmed by `speq feature validate adbc-driver/transactions` reporting exactly that warning today. The fold produced a 38-word bullet carrying a prohibition and a carve-out, with the carve-out stated in no RFC-2119 keyword and unreachable from the scenario's own `GIVEN`.
+- **Direction change:** The carve-out is cut from the bullet, leaving one singular prohibition. It now lives only in the Background amendment from finding [15], which is where it is reachable. Avoiding an advisory warning is not a reason to write a non-singular requirement, and future rounds should not treat a clean validator run as evidence of requirement quality.
+- **Promotes to ADR:** yes
