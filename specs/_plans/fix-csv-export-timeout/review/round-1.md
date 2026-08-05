@@ -1,0 +1,99 @@
+# Plan Review Findings: fix-csv-export-timeout (round 1)
+
+## Summary
+- Axes checked: 6/6
+- Total findings: 13 (Blockers: 5, Advisory: 8)
+- Intent Fidelity blockers: 0
+
+## Premortem
+
+Three failure stories, six months out:
+
+1. **A production export hangs forever.** A user upgrades, keeps default options, and runs an export whose EXPORT statement is aborted server-side. `export_to_callback` awaits the spawned HTTP task before propagating the SQL error, the tunnel read has no timeout, and the 300-second bound that formerly forced a return is gone. The call never returns. Routed to Feasibility, `[UNSTATED_ASSUMPTION]`.
+2. **`timeout_ms` becomes unusable.** A caller sets a 30-second bound to guard a slow callback. The bound elapses while the callback drains the receiver, long after the EXPORT response was read. The driver terminates a healthy transport and the caller must reconnect on every slow callback. Routed to Requirement Quality, `[COMPLETENESS_GAP]`.
+3. **The change ships unverified.** Tasks 4.2 and 4.3 reuse an existing query text, hit Exasol's result cache, return in 0.1 s, and pass without ever exercising a timeout. Nobody notices because task 4.4, the only real regression proof, is double-gated off. Routed to Requirement Quality, `[COMPLETENESS_GAP]`.
+
+Verified against the real tree before scoring: both cited ADRs exist in `specs/_decision/008-remove-query-timeout.md` with the content the plan claims (`query-timeout-option-semantics` at line 30, `client-give-up-terminates-connection` at line 81); `src/export/csv.rs:103`, `:125`, `:188`, `:486`, `:849` all match; `.github/workflows/ci.yml` runs `integration_tests` (line 246), `websocket_integration_tests` (252), `driver_manager_tests` (263) and never `import_export_tests`; the websocket unit tests are compile-checked only (line 255); `speq plan validate` exists; `create_statement` seeds the statement timeout from `params.query_timeout` (`src/adbc/connection.rs:324-330`), so an untimed helper statement does **not** reset the session `queryTimeout` on a `query_timeout=`-configured connection, and task 4.2's premise survives that check.
+
+## Intent Fidelity
+
+The plan implements issue #52's stated proposed fix without substitution: `CsvExportOptions.timeout_ms` becomes `Option<u64>`, default `None`, keeping the millisecond field the issue names. Non-Goals trace to the issue's own text (exapump#38 declared out of scope there). No `[INTENT_DRIFT]` and no `[SCOPE_REDUCTION]` found — axis checked against the verbatim issue body.
+
+On the additional-scrutiny question: `TransportProtocol::terminate()` is **not** scope creep against intent. The issue asks for the knob to survive as an opt-in (`"Change CsvExportOptions.timeout_ms to an optional value"`), so a client-side give-up path remains reachable, and recorded ADR `client-give-up-terminates-connection` (verified at `specs/_decision/008-remove-query-timeout.md:81-102`) requires that any such path terminate the connection. The naive field-only fix would knowingly retain the desync `src/export/csv.rs:488-506` produces today. One caveat below.
+
+#### [SCOPE_CREEP] ADVISORY
+- Location: decision-log.md § Design Decisions [2]; plan.md § Consequences row 2
+- Issue: four of eleven tasks (2.1, 2.2, 2.3, and the `terminate()` half of 3.2), a breaking public-trait change, and an entire second spec delta exist only because the knob is retained. Decision [2] rejects deleting the knob partly on an unverified cross-repo claim: "exapump#38 plans a CLI option that binds to this knob, so removing it breaks a known downstream consumer". Issue #52 says only that exapump#38 "tracks the matching CLI option"; nothing in this repo confirms that option binds to a client-side timer rather than to `query_timeout=`. The second reason given (bounding the callback and a stalled tunnel) is sound and load-bearing on its own.
+- Fix: In decision-log.md decision [2], demote the exapump#38 sentence to a stated assumption ("assumes exapump#38 binds a CLI flag to `CsvExportOptions::timeout_ms`; unverified from this repo") and make the callback/stalled-tunnel argument the primary rationale, so the `terminate()` work rests only on a claim verifiable in-tree.
+
+## Feasibility
+
+#### [UNSTATED_ASSUMPTION] BLOCKER
+- Location: plan.md § Implementation Tasks 3.2; plan.md § Impact paragraph 2; `import-export/csv-export/spec.md` § "Server-enforced timeout governs an export"
+- Issue: nothing bounds the default path. `src/export/csv.rs:490-496` awaits `sql_task` first, then `tokio::join!(http_task, callback_task)` at line 493, and only propagates the SQL error at line 496 — *after* the HTTP task has been awaited to completion. That task blocks in `handle_export_request()` → `read_http_request()` (`src/transport/http_transport.rs:780`, `:517`), and `src/transport/http_transport.rs` contains no read timeout at all (grep for `timeout` in that file returns nothing). Today the 300-second wrap guarantees a return. With `timeout_ms: None` the export returns only if Exasol closes the tunnel socket when it aborts an EXPORT — an unstated, unverified assumption about server behavior. The spec delta asserts the outcome ("the driver SHALL surface the abort as `ExportError::SqlExecutionError`", "the connection SHALL remain usable") while task 3.2 adds no mechanism that guarantees it. Task 4.2 is the test that would expose this, and it runs in the CI integration job under `timeout-minutes: 30` (`.github/workflows/ci.yml:206`), so the failure mode is a whole-job hang, not a test failure. plan.md § Impact describes the new default only as "now runs until the server finishes the EXPORT statement" and never states that the call may not return.
+- Fix: Add a task to plan.md § Implementation Tasks under 3 that makes a failed `sql_result` short-circuit the wait: abort `http_task` and drop the callback future before returning `ExportError::SqlExecutionError`, instead of awaiting `tokio::join!` first. Add a matching `*AND*` bullet to the "Server-enforced timeout governs an export" scenario in `import-export/csv-export/spec.md`: the driver MUST return the SQL error without waiting for the HTTP transport task. Add one sentence to plan.md § Impact paragraph 2 stating that a stalled tunnel with no configured timeout no longer has a client-side bound.
+
+#### [COMPLETENESS_GAP] BLOCKER
+- Location: plan.md § Implementation Tasks 3.2; plan.md § Patterns row 4
+- Issue: task 3.2 says "keep the HTTP `JoinHandle` outside the timed block" and defines its disposition on exactly one exit — "on elapse abort that task". Today the handle is moved into `tokio::join!` (`src/export/csv.rs:493`), so it is awaited on *every* path. Once it is borrowed rather than moved, the three non-elapse early returns — `sql_result?` (line 496), `http_result...??` (497-499), and a `callback_result` error (501) — leave the handle neither awaited nor aborted. Dropping a `JoinHandle` detaches the task, so the restructure introduces the exact detached-task-holding-the-tunnel-socket leak that plan.md § Context cites as a current defect, on paths that do not leak today.
+- Fix: Extend task 3.2 in plan.md to state the invariant for every exit: each return path out of `export_to_callback` MUST either await or abort `http_task`, and name the three non-elapse paths (`sql_result?`, HTTP join error, callback error) explicitly so the implementer covers them.
+
+#### [HIDDEN_DEPENDENCY] ADVISORY
+- Location: plan.md § Implementation Tasks 1.1; plan.md § Verification § Checklist row "Lint"
+- Issue: task 1.1 moves `long_running_count_query` and `disable_query_cache` into `tests/common/mod.rs` "as public items". That file is compiled into five test binaries (`mod common;` in `driver_manager_tests.rs:37`, `import_export_tests.rs:48`, `integration_tests.rs:72`, `native_protocol_tests.rs:6`, `websocket_integration_tests.rs:15`). CI lints with `cargo clippy --all-targets --all-features -- -D warnings` (`.github/workflows/ci.yml:80`), so items unused by three of those binaries fail the Lint job on `dead_code` — which is why three existing items in that file already carry `#[allow(dead_code)]` (lines 152, 170, 211). Separately, the plan's own checklist quotes the weaker `-W clippy::all` form, so following the checklist would not reproduce the CI failure locally.
+- Fix: In plan.md task 1.1, state that both promoted items carry `#[allow(dead_code)]`, matching the existing convention at `tests/common/mod.rs:152`. Change the § Checklist "Lint" command to `cargo clippy --all-targets --all-features -- -D warnings` to match `.github/workflows/ci.yml:80`.
+
+#### [UNSTATED_ASSUMPTION] ADVISORY
+- Location: plan.md § Verification § Scenario Coverage, coverage-limit notes 2 and 3
+- Issue: the plan concedes "HTTP-tunnel export has never run in the CI integration job", then makes tasks 4.1-4.3 — the only CI-visible proof of both new behaviors — depend on it working there. The stated fallback ("must move to `tests/import_export_tests.rs` and the move must be recorded as a review finding") reduces CI verification of this change to zero, because decision [4] separately rejects adding a CI step for that suite. Recording the degradation is not mitigating it. The claim's citation is also loose: `ci.yml:246-259` covers `integration_tests` and `websocket_integration_tests`, but `driver_manager_tests` is at line 263, outside the cited range.
+- Fix: Add a task 0.1 to plan.md § Implementation Tasks that confirms an HTTP-tunnel export succeeds against the CI container image (`exasol/docker-db:2025.2.0`, `.github/workflows/ci.yml:229-237`) before tasks 4.1-4.3 are written, and state in the fallback note that moving the tests to `import_export_tests.rs` requires adding a CI step scoped to those tests. Correct the citation to `ci.yml:246-263`.
+
+## Requirement Quality
+
+#### [COMPLETENESS_GAP] BLOCKER
+- Location: `import-export/csv-export/spec.md` § "Explicit export timeout terminates the connection", bullet 2; plan.md § Implementation Tasks 3.2
+- Issue: the scenario mandates termination unconditionally and justifies it with a premise that is false for a reachable case: "the driver MUST terminate the transport before returning, **because the abandoned EXPORT response can no longer be matched to a request**". The timed region spans SQL execution, tunnel transfer, *and* the callback (`src/export/csv.rs:488-502`). When the timer elapses after `sql_task.await` returned at line 490 — the SQL response already consumed, transport in sync — nothing is abandoned and nothing is unmatchable, yet the plan terminates a healthy connection. This is not an exotic case: decision-log.md decision [2] names bounding "the caller's callback" as a primary reason to keep the knob at all, so a slow callback is the knob's intended use, and the plan makes that use destroy the connection every time it fires.
+- Fix: In `import-export/csv-export/spec.md`, split the scenario's bullet 2 by state: the driver MUST terminate the transport when the timer elapses before the EXPORT response is consumed, and SHALL leave the transport usable when it elapses after. Update plan.md task 3.2 to track whether the SQL await completed and to call `terminate()` only in the former case, and correct plan.md § Impact paragraph 3, which currently states termination as unconditional.
+
+#### [COMPLETENESS_GAP] BLOCKER
+- Location: plan.md § Implementation Tasks 4.1, 4.2, 4.3
+- Issue: all three tests are added to the Query Timeout Tests section of `tests/integration_tests.rs`, whose Background states the mandatory precondition — "Exasol's own query result cache would otherwise make a second run of the exact same cartesian-product query near-instant (verified manually: a cold run of the 60k x 60k COUNT(*) below takes ~4s, a cached repeat ~0.1s) ... Every test below disables it for its own session first" (`tests/integration_tests.rs:2949-2954`). None of tasks 4.1-4.3 says to call `disable_query_cache`. Worse, 4.2 and 4.3 both specify `long_running_count_query(100_000)`, the *same* query text already used by the existing `test_explicit_query_timeout_is_enforced` (`:3017`) and `test_reconcile_clears_stale_timeout_for_default_statement` (`:3066`), the latter running it to completion. Both new tests depend on that query genuinely taking minutes; a cache hit returns in ~0.1 s and both pass vacuously — 4.3 would then fail outright, having never armed a 1-second elapse. That leaves the plan with no working proof of either new behavior, since 4.1 passes on pre-fix code by construction and 4.4 is double-gated off.
+- Fix: In plan.md tasks 4.1, 4.2, and 4.3, state that each test calls `disable_query_cache(&mut conn)` immediately after connecting, and assign each test a distinct `side_rows` value not used elsewhere in the file (for example 110_000, 120_000, 130_000) so no test can consume another's cached result.
+
+#### [REQUIREMENT_CONFLICT] ADVISORY
+- Location: plan.md § Context bullet 1; decision-log.md § Design Decisions [2]
+- Issue: plan.md states that ADR `query-timeout-option-semantics` "constrain[s] this plan", then contradicts a normative sentence of it. That ADR's Decision ends "No arm constructs a client-side timer" (`specs/_decision/008-remove-query-timeout.md:40`), while this plan's `Some(ms)` arm constructs exactly one. The divergence is defensible — the ADR is scoped to `ConnectionParams::query_timeout` and `Statement::timeout_ms`, and decision [2] gives real reasons export differs — but citing the ADR as constraining while silently inverting its mechanism invites a future reader to treat the new export ADR as reversing the old one.
+- Fix: In plan.md § Context bullet 1, narrow the citation to the choice the ADR actually settles (`Option` over a sentinel) and add one sentence recording that its "no client-side timer" clause is scoped to query execution. Add the same scoping sentence to decision-log.md decision [2] so it carries into the promoted ADR.
+
+#### [AMBIGUOUS_REQUIREMENT] ADVISORY
+- Location: plan.md § Implementation Tasks 4.4; plan.md § Verification § Manual Testing row 1
+- Issue: the plan's only genuine regression proof is calibrated by wall clock on unspecified hardware — "a cartesian-product query calibrated to run for roughly eight minutes" asserting "the elapsed time exceeds 300 seconds". The scale factor is unstated and machine-dependent in both directions: the existing 60k x 60k run is documented at ~4 s, so eight minutes needs roughly a 120x work increase, and a faster machine drops the same query under 300 s and fails the assertion for the wrong reason. "Roughly eight minutes" and "about 300 seconds" are not verifiable as written.
+- Fix: In plan.md task 4.4, replace the wall-clock calibration with a named `side_rows` value plus an env override (`EXARROW_LONG_EXPORT_SIDE_ROWS`, defaulting to the named value), and change the assertion to "the export completes without `ExportError::Timeout`" with the elapsed-time check reported rather than asserted. Update the § Manual Testing expected output to match.
+
+## Task Breakdown
+
+#### [TASK_GRANULARITY] BLOCKER
+- Location: plan.md § Implementation Tasks 3.1 and 3.2; plan.md § Parallelization
+- Issue: task 3.1 changes `timeout_ms` to `Option<u64>` and is scheduled in Group A. Its only consumer, `src/export/csv.rs:486` (`Duration::from_millis(options.timeout_ms)`) and `:505` (`timeout_ms: options.timeout_ms`), is fixed by task 3.2 in Group C — two sequential groups later, behind `Group A -> Group B -> Group C`. Task 3.1 as written updates only the two option unit tests, so the crate does not compile from the completion of 3.1 until the completion of 3.2, and neither Group B task (2.2, 2.3, each requiring "a unit test asserting...") can be verified green in between.
+- Fix: In plan.md, merge task 3.1 into task 3.2 as a single `[expert]` task, and delete 3.1 from Group A in § Parallelization. Group A then contains 1.1 and 2.1 only.
+
+#### [TRACEABILITY_GAP] ADVISORY
+- Location: plan.md § Verification § Scenario Coverage; `import-export/csv-export/spec.md` bullets
+- Issue: two normative bullets have no mapped test, and neither is testable as phrased. (a) "the driver MUST abort the pending HTTP transport task, so the tunnel socket is released instead of leaking as a detached task" — the coverage table maps this scenario only to `test_csv_export_explicit_timeout_terminates_connection` (error variant plus a failing follow-up query) and two `is_connected()` unit tests; nothing observes the task or the socket. `JoinHandle::abort()` is also not synchronous, so "the socket is released" does not follow from the abort call. (b) "the Arrow and Parquet export paths ... SHALL likewise arm no client-side timer" — verified true in code (`src/export/arrow.rs:740`, `src/export/parquet.rs:759` both build from `CsvExportOptions::default()`), but the constructed `csv_options` is a local, so the bullet is observable only through a >300 s Arrow or Parquet export, and no task provides one.
+- Fix: In `import-export/csv-export/spec.md`, reword bullet (a) to the observable outcome — the driver MUST abort the pending HTTP transport task rather than detach it — and drop the unverifiable "so the tunnel socket is released" clause. Reword bullet (b) to state that both paths construct their CSV options from the defaults and therefore configure no timeout, which a unit test can assert. Add that unit test to plan.md task 3.1/3.2 and to the § Scenario Coverage table.
+
+## Design Depth
+
+`terminate()` is a deep addition, not classitis: one new method, one owning module per transport, no caller-visible protocol knowledge, and the plan verified the alternative correctly — `close()` awaits a disconnect response (`src/transport/websocket.rs:722-726`, native equivalent at `src/transport/native/mod.rs:1201-1213`), so it would block behind the abandoned EXPORT exactly as decision [3] claims. Both transports already carry a `Closed` state, so tasks 2.2 and 2.3 have a real landing place. No `[SHALLOW_DESIGN]`, `[INFORMATION_LEAKAGE]`, or `[BOUNDARY_VIOLATION]` found — axis checked against both transport implementations and the trait at `src/transport/protocol.rs:136-292`.
+
+#### [TACTICAL_SHORTCUT] ADVISORY
+- Location: decision-log.md § Design Decisions [7]; plan.md § Impact paragraph 3
+- Issue: decision [7] accepts that `Connection::is_closed()` returns `false` after `terminate()` has dropped the socket, leaving the only public health signal reporting the opposite of reality. The reasoning against threading state through six entry points is sound, but the shortcut is recorded only in plan.md § Impact — an artifact `/speq:record` archives — and no follow-up is scheduled, so the permanent spec library will carry the terminate requirement with no trace of the limitation.
+- Fix: Add an `*AND*` bullet to the "Terminate a connection whose in-flight response is no longer trusted" scenario in `connection-management/session-and-lifecycle/spec.md` stating that termination does not change reported session state, so `Connection::is_closed()` still reports the session as open and callers MUST detect termination from the next operation's failure.
+
+## Prose Quality
+
+#### [PROSE_BLOAT] ADVISORY
+- Location: plan.md § Summary; plan.md § Verification § Scenario Coverage; plan.md § Impact
+- Issue: three guardrail breaches. (a) Both Summary sentences exceed the 25-word cap (29 and 26 words). (b) "Notes on coverage limits, stated so a reviewer can judge the gap rather than infer it:" is meta-commentary about the document instead of content. (c) "This release breaks the public API in four ways, and callers must read all four before upgrading" — the trailing clause instructs the reader instead of informing them.
+- Fix: In plan.md, cut both Summary sentences to 25 words or fewer. Replace the coverage-notes lead-in with "Coverage limits:". Cut ", and callers must read all four before upgrading" from § Impact.
