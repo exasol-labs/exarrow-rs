@@ -18,6 +18,7 @@ use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{generate_test_schema_name, get_host, get_password, get_port, get_user};
 use exarrow_rs::adbc::{Connection, Driver};
+use exarrow_rs::transport::{ConnectionParams, Credentials, TransportProtocol, WebSocketTransport};
 
 // Helper: build a connection string that forces the WebSocket transport.
 fn ws_connection_string() -> String {
@@ -195,6 +196,43 @@ async fn test_ws_connection_health_check() {
     assert_eq!(batches[0].num_rows(), 1, "Health check should return 1 row");
 
     conn.close().await.expect("Failed to close connection");
+}
+
+/// 2.5 `terminate()` drops the WebSocket transport's socket without a
+/// protocol round-trip: `is_connected()` reports `false` immediately, and
+/// the next operation fails instead of reusing the abandoned socket.
+#[tokio::test]
+async fn test_terminate_marks_websocket_transport_disconnected() {
+    skip_if_no_exasol!();
+
+    let params = ConnectionParams::new(get_host(), get_port())
+        .with_tls(true)
+        .with_validate_server_certificate(false);
+    let creds = Credentials::new(get_user(), get_password());
+    let mut transport = WebSocketTransport::new();
+
+    transport.connect(&params).await.expect("connect failed");
+    transport
+        .authenticate(&creds)
+        .await
+        .expect("authenticate failed");
+    assert!(
+        transport.is_connected(),
+        "transport should be connected after authenticate"
+    );
+
+    transport.terminate();
+
+    assert!(
+        !transport.is_connected(),
+        "terminate() should mark the transport disconnected"
+    );
+
+    let result = transport.execute_query("SELECT 1").await;
+    assert!(
+        result.is_err(),
+        "an operation after terminate() should fail instead of reusing the dropped socket"
+    );
 }
 
 // ── Section 3: Basic Queries ──────────────────────────────────────────────────

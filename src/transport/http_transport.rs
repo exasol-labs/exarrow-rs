@@ -1367,6 +1367,7 @@ pub fn build_ok_response() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_support::exa_response_packet;
 
     #[test]
     fn test_generate_magic_packet() {
@@ -2132,16 +2133,6 @@ mod tests {
         );
     }
 
-    /// Builds a well-formed EXA response packet: reserved i32, port i32, then
-    /// the IP as a null-padded 16-byte field.
-    fn response_packet(ip: &str, port: i32) -> [u8; EXA_RESPONSE_PACKET_SIZE] {
-        assert!(ip.len() <= 16, "the IP field holds at most 16 bytes");
-        let mut packet = [0u8; EXA_RESPONSE_PACKET_SIZE];
-        packet[4..8].copy_from_slice(&port.to_le_bytes());
-        packet[8..8 + ip.len()].copy_from_slice(ip.as_bytes());
-        packet
-    }
-
     #[tokio::test]
     async fn test_perform_handshake_sends_the_magic_packet_and_returns_the_internal_address() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2151,7 +2142,7 @@ mod tests {
             let mut magic = [0u8; EXA_MAGIC_PACKET_SIZE];
             server.read_exact(&mut magic).await.unwrap();
             server
-                .write_all(&response_packet("10.0.0.5", 8563))
+                .write_all(&exa_response_packet("10.0.0.5", 8563))
                 .await
                 .unwrap();
             server.flush().await.unwrap();

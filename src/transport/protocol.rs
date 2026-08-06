@@ -266,6 +266,23 @@ pub trait TransportProtocol: Send + Sync {
     /// Returns `TransportError` if disconnect fails.
     async fn close(&mut self) -> Result<(), TransportError>;
 
+    /// Drop the connection's socket without any protocol round-trip.
+    ///
+    /// This exists for the case where the driver gives up on an in-flight
+    /// request and can no longer match a response to the request that produced
+    /// it. A graceful [`close`](Self::close) is unusable there: it sends a
+    /// disconnect command and waits for a reply that would arrive behind the
+    /// abandoned response, so it blocks for as long as the abandoned request
+    /// keeps running on the server. Terminating instead abandons the socket and
+    /// leaves the server to reap the session when that socket closes.
+    ///
+    /// The non-async signature is what forbids awaited I/O here, so no
+    /// implementation can reintroduce a round-trip.
+    ///
+    /// Afterwards [`is_connected`](Self::is_connected) reports `false` and every
+    /// other operation fails instead of reading the abandoned response.
+    fn terminate(&mut self);
+
     /// Check if the connection is still active.
     fn is_connected(&self) -> bool;
 

@@ -50,16 +50,19 @@ mod common;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::{generate_test_schema_name, get_test_connection};
+use common::{
+    disable_query_cache, generate_test_schema_name, get_test_connection, long_running_count_query,
+};
 use exarrow_rs::adbc::Connection;
 use exarrow_rs::export::arrow::ArrowExportOptions;
-use exarrow_rs::export::csv::CsvExportOptions;
+use exarrow_rs::export::csv::{CsvExportOptions, ExportError};
 use exarrow_rs::export::parquet::ParquetExportOptions;
 use exarrow_rs::import::arrow::ArrowImportOptions;
 use exarrow_rs::import::csv::CsvImportOptions;
 use exarrow_rs::import::parquet::ParquetImportOptions;
 use exarrow_rs::query::export::ExportSource;
 use std::sync::Arc;
+use std::time::Instant;
 use tempfile::TempDir;
 
 // Helper Functions
@@ -2701,5 +2704,84 @@ async fn test_parquet_import_forced_csv_path_fallback_works() {
     assert_eq!(batches[0].num_rows(), 3, "Data should round-trip correctly");
 
     cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Opt-in long-running proof that the default `CsvExportOptions` arms no
+/// client-side export timer. Before the fix, `timeout_ms` defaulted to
+/// `300_000` and any export running longer than five minutes failed with
+/// `ExportError::Timeout` regardless of how healthy the connection was. This
+/// test drives a single-query export well past that former bound and asserts
+/// it still completes.
+///
+/// `side_rows` defaults to 650,000. The Query Timeout Tests section
+/// (`tests/integration_tests.rs`) establishes that a 60,000-per-side
+/// `long_running_count_query` takes about 4 seconds once the query cache is
+/// disabled; the cartesian join means work scales with the square of
+/// `side_rows`, so 650,000 is roughly (650_000 / 60_000)^2 ≈ 120 times that
+/// work, or about 8 minutes. Machine speed moves the actual wall clock in
+/// both directions, so the elapsed time is printed, never asserted on.
+/// `EXARROW_LONG_EXPORT_SIDE_ROWS` overrides the row count for a machine
+/// where 8 minutes runs far short or long.
+///
+/// Kept `#[ignore]` and gated on `EXARROW_LONG_EXPORT_CHECK` because an
+/// eight-minute test has no place in a suite run by default: it never runs
+/// in CI today (`import_export_tests` is not part of the CI job), and even a
+/// local `cargo test --test import_export_tests -- --ignored` should not
+/// eat eight minutes without being asked for it by name.
+#[tokio::test]
+#[ignore]
+async fn test_csv_export_runs_past_the_former_five_minute_limit() {
+    if std::env::var("EXARROW_LONG_EXPORT_CHECK").is_err() {
+        eprintln!(
+            "Skipping test_csv_export_runs_past_the_former_five_minute_limit: opt-in long \
+             check, set EXARROW_LONG_EXPORT_CHECK=1 to run it"
+        );
+        return;
+    }
+
+    skip_if_no_exasol!();
+
+    let side_rows: u32 = std::env::var("EXARROW_LONG_EXPORT_SIDE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(650_000);
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    disable_query_cache(&mut conn).await;
+
+    let started = Instant::now();
+    let result = conn
+        .export_csv_to_list(
+            ExportSource::Query {
+                sql: long_running_count_query(side_rows),
+            },
+            CsvExportOptions::default().use_tls(false),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    match result {
+        Ok(rows) => {
+            eprintln!(
+                "test_csv_export_runs_past_the_former_five_minute_limit: side_rows={} \
+                 completed in {:.1}s",
+                side_rows,
+                elapsed.as_secs_f64()
+            );
+            assert_eq!(rows.len(), 1, "COUNT(*) should return one row");
+        }
+        Err(ExportError::Timeout { timeout_ms, .. }) => panic!(
+            "Export timed out after {}ms at {:.1}s elapsed — the default CsvExportOptions \
+             must arm no client-side export timer",
+            timeout_ms,
+            elapsed.as_secs_f64()
+        ),
+        Err(other) => panic!(
+            "Expected the long-running export to complete, got a different error: {:?}",
+            other
+        ),
+    }
+
     conn.close().await.expect("Failed to close connection");
 }

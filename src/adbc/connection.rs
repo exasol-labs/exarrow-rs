@@ -1047,11 +1047,17 @@ impl Connection {
 
     /// Check if the connection is closed.
     ///
+    /// Reports closed when either the session has been closed or the transport
+    /// has been terminated. A terminating export timeout
+    /// (`ExportError::Timeout { transport_terminated: true }`) is what makes the
+    /// transport half of this check fire even while the session still believes
+    /// it is open.
+    ///
     /// # Returns
     ///
     /// `true` if the connection is closed, `false` otherwise.
     pub async fn is_closed(&self) -> bool {
-        self.session.is_closed().await
+        self.session.is_closed().await || !self.transport.lock().await.is_connected()
     }
 
     /// Close the connection.
@@ -2046,6 +2052,13 @@ impl Connection {
     /// This is a synchronous wrapper around [`export_csv_to_file`](Self::export_csv_to_file)
     /// for use in non-async contexts.
     ///
+    /// # Blocking behavior
+    ///
+    /// No client-side timeout is armed by default, so a stalled HTTP tunnel
+    /// blocks the calling OS thread indefinitely with no cancellation path.
+    /// Bound the wait with `CsvExportOptions::timeout_ms`, or with the
+    /// server-enforced `query_timeout` connection parameter.
+    ///
     /// # Arguments
     ///
     /// * `source` - The data source (table or query)
@@ -2076,6 +2089,13 @@ impl Connection {
     /// This is a synchronous wrapper around [`export_to_parquet`](Self::export_to_parquet)
     /// for use in non-async contexts.
     ///
+    /// # Blocking behavior
+    ///
+    /// No client-side timeout is armed by default, so a stalled HTTP tunnel
+    /// blocks the calling OS thread indefinitely with no cancellation path.
+    /// `ParquetExportOptions` exposes no `timeout_ms`, so the only available
+    /// bound is the server-enforced `query_timeout` connection parameter.
+    ///
     /// # Arguments
     ///
     /// * `source` - The data source (table or query)
@@ -2105,6 +2125,13 @@ impl Connection {
     ///
     /// This is a synchronous wrapper around [`export_to_record_batches`](Self::export_to_record_batches)
     /// for use in non-async contexts.
+    ///
+    /// # Blocking behavior
+    ///
+    /// No client-side timeout is armed by default, so a stalled HTTP tunnel
+    /// blocks the calling OS thread indefinitely with no cancellation path.
+    /// `ArrowExportOptions` exposes no `timeout_ms`, so the only available
+    /// bound is the server-enforced `query_timeout` connection parameter.
     ///
     /// # Arguments
     ///
@@ -3007,6 +3034,7 @@ mod tests {
                 "schema FOO not found [line 1, column 13] (SQL state: 42000)".to_string(),
             ))
         });
+        transport.expect_is_connected().returning(|| true);
 
         let conn = Connection::connect_with_transport(params_with_schema("FOO"), transport)
             .await
@@ -3960,6 +3988,7 @@ mod tests {
             .expect_authenticate()
             .returning(|_| Ok(transport_session_info()));
         transport.expect_close().returning(|| Ok(()));
+        transport.expect_is_connected().returning(|| true);
 
         let conn = Connection::connect_with_transport(test_params(), transport)
             .await
@@ -3967,6 +3996,25 @@ mod tests {
 
         assert!(!conn.is_closed().await);
         conn.shutdown().await.expect("shutdown");
+        assert!(conn.is_closed().await);
+    }
+
+    /// `is_closed()` must report a terminated transport as closed even while
+    /// the session itself still believes it is open, so callers see one
+    /// consistent answer instead of a stale "open" from session state alone.
+    #[tokio::test]
+    async fn is_closed_reports_true_when_the_transport_is_terminated() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_is_connected().returning(|| false);
+
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
         assert!(conn.is_closed().await);
     }
 

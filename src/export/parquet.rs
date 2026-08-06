@@ -751,20 +751,16 @@ pub async fn export_to_parquet_via_transport<T: TransportProtocol + ?Sized>(
     file_path: &Path,
     options: ParquetExportOptions,
 ) -> Result<u64, crate::export::csv::ExportError> {
-    use crate::export::csv::{export_to_list, CsvExportOptions};
+    use crate::export::csv::{export_to_list, shared_csv_export_options, SharedCsvExportParams};
 
-    // Get the data as CSV via the existing export function
-    // Note: We always disable column names in the CSV export for Parquet
-    // because we don't want header rows mixed with data rows.
-    let csv_options = CsvExportOptions::default()
-        .column_separator(options.column_separator)
-        .column_delimiter(options.column_delimiter)
-        .with_column_names(false)
-        .exasol_host(&options.host)
-        .exasol_port(options.port)
-        .use_tls(options.use_tls);
+    let csv_options = shared_csv_export_options(SharedCsvExportParams {
+        column_separator: options.column_separator,
+        column_delimiter: options.column_delimiter,
+        host: &options.host,
+        port: options.port,
+        use_tls: options.use_tls,
+    });
 
-    // Get the CSV data as a list of rows
     let rows = export_to_list(transport, source, csv_options).await?;
 
     if rows.is_empty() {
@@ -803,6 +799,9 @@ pub async fn export_to_parquet_via_transport<T: TransportProtocol + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::protocol::QueryResult;
+    use crate::transport::test_support::{FakeExasolServer, MockTransport};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     // ==========================================================================
     // Tests for ParquetCompression
@@ -1617,5 +1616,93 @@ mod tests {
                 "got: {err}"
             );
         }
+    }
+
+    // ==========================================================================
+    // Tests for export_to_parquet_via_transport
+    // ==========================================================================
+
+    fn tunnel_options(server: &FakeExasolServer) -> ParquetExportOptions {
+        ParquetExportOptions::default()
+            .exasol_host(&server.host)
+            .exasol_port(server.port)
+            .use_tls(false)
+    }
+
+    fn succeeding_transport() -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(QueryResult::row_count(2)));
+        transport
+    }
+
+    fn read_back(file_path: &Path) -> Vec<RecordBatch> {
+        let file = std::fs::File::open(file_path).expect("the export must have created the file");
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("the export must have written a readable Parquet file")
+            .build()
+            .expect("the Parquet reader must accept the written schema")
+            .map(|batch| batch.expect("every written row group must decode"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_writes_the_tunnel_rows_as_parquet() {
+        let server = FakeExasolServer::serving_csv("1,alice\n2,bob\n").await;
+        let mut transport = succeeding_transport();
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("users.parquet");
+
+        let rows_written = export_to_parquet_via_transport(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT id, name FROM users".to_string(),
+            },
+            &file_path,
+            tunnel_options(&server),
+        )
+        .await
+        .expect("a completed tunnel export must produce a Parquet file");
+
+        assert_eq!(rows_written, 2);
+        let batches = read_back(&file_path);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[0].num_columns(), 2);
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("a transport export types every column as Utf8");
+        assert_eq!((names.value(0), names.value(1)), ("alice", "bob"));
+    }
+
+    /// An EXPORT that matches no rows is a success with nothing to write, so
+    /// the function must stop before inventing a schema from a first row that
+    /// does not exist.
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_writes_no_file_for_an_empty_export() {
+        let server = FakeExasolServer::serving_csv("").await;
+        let mut transport = succeeding_transport();
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("users.parquet");
+
+        let rows_written = export_to_parquet_via_transport(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT id, name FROM users WHERE 1 = 0".to_string(),
+            },
+            &file_path,
+            tunnel_options(&server),
+        )
+        .await
+        .expect("an empty export is not a failure");
+
+        assert_eq!(rows_written, 0);
+        assert!(
+            !file_path.exists(),
+            "an empty export must not leave a Parquet file behind"
+        );
     }
 }
