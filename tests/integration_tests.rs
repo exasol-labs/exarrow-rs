@@ -3071,11 +3071,16 @@ async fn test_reconcile_clears_stale_timeout_for_default_statement() {
 }
 
 /// With no `query_timeout` configured and default `CsvExportOptions`, a CSV
-/// export of a multi-second server-side query runs to completion. The client
-/// arms no timer of its own — `timeout_ms` defaults to `None` — so only the
-/// server's own `QUERY_TIMEOUT` (unset here) could bound it.
+/// export of a multi-second server-side query runs to completion against a
+/// real server.
+///
+/// A smoke test, not the guard on `No client-side export timeout by default`:
+/// roughly 13s of server work would pass just as well under the removed
+/// five-minute bound. That guard is the unit test
+/// `test_export_to_callback_arms_no_timer_when_the_deadline_is_left_unset`
+/// (`src/export/csv.rs`).
 #[tokio::test]
-async fn test_csv_export_default_arms_no_client_side_timer() {
+async fn test_csv_export_default_completes_a_multi_second_query() {
     skip_if_no_exasol!();
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
@@ -3164,26 +3169,16 @@ async fn test_csv_export_server_timeout_aborts_and_keeps_connection_usable() {
 /// transport in `Closed`, so `close()` succeeds without attempting the
 /// disconnect round-trip the abandoned EXPORT would still be occupying.
 ///
-/// After teardown, the test also polls `SYS.EXA_ALL_SESSIONS` on a second
-/// connection to confirm the abandoned session does not linger server-side —
-/// the only check on the assumption that Exasol releases a session when the
-/// client socket closes. If it never disappears, `terminate()` satisfies the
-/// letter of the connection-termination requirement but not its purpose.
-/// Exasol detects the closed socket on its own schedule, not the instant it
-/// happens: measured manually against this container, the session
-/// consistently disappears from `EXA_ALL_SESSIONS` around 2.1s after the
-/// client drops the connection, never immediately. A single, unretried check
-/// would therefore fail on every run regardless of whether `terminate()`
-/// works, so the poll uses a bound generous enough to absorb that
-/// server-side detection latency while still failing hard — not silently
-/// passing — if the session never goes away.
+/// Whether Exasol then reaps the abandoned session is a property of the
+/// server, not of `terminate()`, so it is checked by the `#[ignore]`d
+/// `test_terminated_export_session_is_reaped_server_side` below rather than
+/// here, where a drifting reap latency would fail a required check.
 #[tokio::test]
 async fn test_csv_export_explicit_timeout_terminates_connection() {
     skip_if_no_exasol!();
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     disable_query_cache(&mut conn).await;
-    let session_id = conn.session_id().to_string();
 
     assert!(
         !conn.is_closed().await,
@@ -3237,12 +3232,61 @@ async fn test_csv_export_explicit_timeout_terminates_connection() {
     conn.close()
         .await
         .expect("close() on a terminated connection must succeed without a protocol round-trip");
+}
+
+/// Checks the server-side half of the assumption behind `terminate()`: that
+/// Exasol releases a session once the client socket closes, rather than
+/// leaking it until idle-reap. Measured against this container the session
+/// disappears around 2.1s after the socket drops, so the poll waits 30s.
+///
+/// ```text
+/// cargo test --test integration_tests \
+///     test_terminated_export_session_is_reaped_server_side -- --ignored --nocapture
+/// ```
+///
+/// `--nocapture` prints the observed latency, and reading it is the point: a
+/// reap near 2s is the socket-close reap this test is about, while one near
+/// 19s says only that the abandoned query finished on its own.
+#[tokio::test]
+#[ignore = "measures Exasol's server-side session reap latency, not driver behavior"]
+async fn test_terminated_export_session_is_reaped_server_side() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    disable_query_cache(&mut conn).await;
+    let session_id = conn.session_id().to_string();
+
+    let result = conn
+        .export_csv_to_list(
+            ExportSource::Query {
+                sql: long_running_count_query(130_000),
+            },
+            CsvExportOptions::default().use_tls(false).timeout_ms(1_000),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ExportError::Timeout {
+                transport_terminated: true,
+                ..
+            })
+        ),
+        "This test only says something about reaping if the transport was actually \
+         terminated, got: {:?}",
+        result.map(|rows| rows.len())
+    );
+
+    conn.close()
+        .await
+        .expect("close() on a terminated connection must succeed without a protocol round-trip");
 
     let mut conn2 = get_test_connection()
         .await
         .expect("Failed to open a second connection");
 
-    let poll_bound = std::time::Duration::from_secs(15);
+    let poll_bound = std::time::Duration::from_secs(30);
     let poll_interval = std::time::Duration::from_millis(500);
     let start = std::time::Instant::now();
     let mut remaining_sessions = 1;
@@ -3271,6 +3315,12 @@ async fn test_csv_export_explicit_timeout_terminates_connection() {
         "The abandoned session {} is still listed in SYS.EXA_ALL_SESSIONS {:?} after \
          terminate() closed the client socket — Exasol has not reaped the server-side session",
         session_id, poll_bound,
+    );
+
+    eprintln!(
+        "session {} left SYS.EXA_ALL_SESSIONS {:?} after the client socket closed",
+        session_id,
+        start.elapsed()
     );
 
     conn2.close().await.expect("Failed to close connection");

@@ -856,6 +856,9 @@ mod tests {
     /// Far beyond the test's own lifetime: whatever awaits it never finishes.
     const NEVER: Duration = Duration::from_secs(3600);
 
+    /// The fixed five-minute default bound this release removed (#52).
+    const REMOVED_DEFAULT_BOUND_MS: u64 = 300_000;
+
     fn tunnel_options(server: &FakeExasolServer) -> CsvExportOptions {
         CsvExportOptions::default()
             .exasol_host(&server.host)
@@ -910,6 +913,58 @@ mod tests {
         .expect("an export with no deadline must run to completion");
 
         assert_eq!(delivered, "1,alice\n2,bob\n");
+    }
+
+    /// The unset default arms no timer at all, not merely a longer one — the
+    /// executable guard on `No client-side export timeout by default`
+    /// (`specs/import-export/csv-export-timeout`), which asserting the field
+    /// alone would not provide.
+    ///
+    /// The clock is paused only after the export has had real time to open its
+    /// tunnel and enter the SQL leg: auto-advance would otherwise jump past a
+    /// timer that was not armed yet. Starting late cannot turn this red, since
+    /// `StalledQueryTransport::execute_query` never resolves.
+    #[tokio::test]
+    async fn test_export_to_callback_arms_no_timer_when_the_deadline_is_left_unset() {
+        let server = FakeExasolServer::silent_after_handshake().await;
+        let mut mock = MockTransport::new();
+        // Only reached if the guard regresses; allowed so the panic below
+        // reports that rather than an unexpected mock call.
+        mock.expect_terminate().return_const(());
+        let mut transport = StalledQueryTransport::new(mock);
+
+        let options = tunnel_options(&server);
+        assert_eq!(
+            options.timeout_ms, None,
+            "the export below only tests the unset default if the options carry it"
+        );
+
+        let export = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            options,
+            collect_body,
+        );
+        tokio::pin!(export);
+
+        let started = tokio::time::timeout(Duration::from_millis(500), &mut export).await;
+        assert!(
+            started.is_err(),
+            "an EXPORT statement that never responds cannot let the export finish"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(REMOVED_DEFAULT_BOUND_MS * 2)).await;
+
+        if let Ok(outcome) = tokio::time::timeout(Duration::from_millis(50), &mut export).await {
+            panic!(
+                "the export stopped waiting after {}ms, so an unset timeout_ms still armed a \
+                 client-side timer: {outcome:?}",
+                REMOVED_DEFAULT_BOUND_MS * 2
+            );
+        }
     }
 
     #[tokio::test]

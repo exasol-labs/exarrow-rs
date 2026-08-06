@@ -101,6 +101,8 @@ polars = { version = "0.46", features = ["lazy", "ipc_streaming", "dtype-decimal
 [dev-dependencies]
 # Mocking for tests
 mockall = "0.14.0"
+# Virtual clock (tokio::time::pause/advance) for tests asserting on long deadlines
+tokio = { version = "1.42", features = ["test-util"] }
 # ADBC driver manager and core for integration testing
 adbc_driver_manager = "0.23"
 adbc_core = "0.23"
