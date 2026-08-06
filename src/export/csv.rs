@@ -542,25 +542,31 @@ where
             Ok::<(), ExportError>(())
         });
 
+    let sql_response_read = AtomicBool::new(false);
+
     // Execute the EXPORT SQL in parallel
     // This triggers Exasol to send data through the established connection
+    //
+    // The flag is set here, inside `sql_task` itself, rather than after
+    // `sql_task.await` resolves in `work` below. Setting it as part of
+    // `sql_task` completing (success or error) rules out any dependence on
+    // `work` reaching the next statement before a cancellation could
+    // intervene, regardless of how `work`'s composition evolves later.
     let sql_task = async {
-        ws_transport
-            .execute_query(&export_sql)
-            .await
-            .map_err(|e| ExportError::SqlExecutionError {
+        let result = ws_transport.execute_query(&export_sql).await.map_err(|e| {
+            ExportError::SqlExecutionError {
                 message: e.to_string(),
-            })
+            }
+        });
+        sql_response_read.store(true, Ordering::Relaxed);
+        result
     };
 
     // Run callback with the receiver
     let callback_task = callback(receiver);
 
-    let sql_response_read = AtomicBool::new(false);
-
     let work = async {
         let sql_result = sql_task.await;
-        sql_response_read.store(true, Ordering::Relaxed);
 
         if let Err(sql_error) = sql_result {
             http_task.abort();
