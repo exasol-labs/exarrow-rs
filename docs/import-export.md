@@ -240,6 +240,44 @@ ExportSource::Table {
 ExportSource::Query("SELECT * FROM users WHERE active = true".into())
 ```
 
+## CSV Export
+
+```rust
+use exarrow_rs::export::CsvExportOptions;
+use exarrow_rs::ExportSource;
+use std::path::Path;
+
+let source = ExportSource::Table { schema: None, name: "my_table".into(), columns: vec![] };
+let options = CsvExportOptions::default().with_column_names(true);
+
+let rows = connection.export_csv_to_file(source, Path::new("/tmp/export.csv"), options).await?;
+```
+
+### Export Timeout
+
+By default, `CsvExportOptions::default()` arms no client-side timer. The export runs for as long as the EXPORT statement takes on the server, and completes even if that takes longer than five minutes.
+
+Call `.timeout_ms(ms)` to opt in to a client-side bound on the whole export (SQL execution, HTTP transfer, and your callback, together):
+
+```rust
+let options = CsvExportOptions::default().timeout_ms(30_000); // 30-second client-side bound
+```
+
+When the timeout elapses, the export returns `ExportError::Timeout { timeout_ms, transport_terminated }`. `transport_terminated` tells you whether the connection is still usable:
+
+- `transport_terminated: true` — the timeout fired before the driver had read the EXPORT response. The driver can no longer match that response to a later one, so it terminates the transport. Reconnect before issuing another statement on this connection.
+- `transport_terminated: false` — the timeout fired later, for example while your callback was still processing data already received. The EXPORT response was already read, so the connection remains usable for the next statement.
+
+In both cases, treat any output already written to your file, stream, or callback as an incomplete CSV document and discard it. The driver gives no guarantee that a timed-out export left a complete file behind.
+
+`Connection::is_closed()` returns `true` once the transport has been terminated this way.
+
+Arrow and Parquet exports (`ParquetExportOptions`, `ArrowExportOptions`) build their underlying CSV export from `CsvExportOptions::default()` internally and inherit the same behavior: no client-side timeout unless you route through the CSV path yourself.
+
+### Server-Enforced Alternative
+
+If you want a bound that never leaves the connection in an uncertain state, set `query_timeout` on the connection instead — either `?query_timeout=<seconds>` in the connection URI or `ConnectionParams::query_timeout(Duration)` when building the connection. Exasol enforces this on the server: an export that runs past it fails with `ExportError::SqlExecutionError`, not `ExportError::Timeout`, and the connection always remains usable for the next statement, because the driver never has to guess whether the response is still in flight.
+
 ## Parallel Import
 
 For large datasets, import multiple files in parallel:

@@ -74,11 +74,14 @@ mod common;
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    generate_test_schema_name, get_host, get_port, get_test_connection, get_test_connection_string,
-    get_user, is_exasol_available,
+    disable_query_cache, generate_test_schema_name, get_host, get_port, get_test_connection,
+    get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
 };
 use exarrow_rs::adbc::Connection;
+use exarrow_rs::export::csv::{CsvExportOptions, ExportError};
+use exarrow_rs::query::export::ExportSource;
 use exarrow_rs::{Parameter, QueryError};
+use std::future::Future;
 
 // Infrastructure Tests
 // These tests validate that the test infrastructure itself works correctly.
@@ -2952,25 +2955,6 @@ async fn test_execute_batch_update_rejects_result_set() {
 // multi-second, server-side-only query. Every test below disables it for its
 // own session first.
 
-/// Build a `COUNT(*)` over a cartesian-product `VALUES BETWEEN` join large
-/// enough to force a genuinely multi-second, server-side-only query — there
-/// is no client-side timer left to race against.
-fn long_running_count_query(side_rows: u32) -> String {
-    format!(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM (VALUES BETWEEN 1 AND {n}) a CROSS JOIN (VALUES BETWEEN 1 AND {n}) b)",
-        n = side_rows
-    )
-}
-
-/// Disable Exasol's query result cache for the current session so a
-/// cartesian-product query genuinely recomputes every time it runs, instead
-/// of returning a cached result from a prior invocation with the same text.
-async fn disable_query_cache(conn: &mut Connection) {
-    conn.execute_update("ALTER SESSION SET QUERY_CACHE='OFF'")
-        .await
-        .expect("Failed to disable QUERY_CACHE for the test session");
-}
-
 /// With no `query_timeout` configured, a multi-second server-side query runs
 /// to completion. The client imposes no timer of its own; only the server's
 /// own `QUERY_TIMEOUT` (unset here) would apply.
@@ -3080,6 +3064,324 @@ async fn test_reconcile_clears_stale_timeout_for_default_statement() {
         .fetch_all()
         .await
         .expect("Failed to fetch results");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// With no `query_timeout` configured and default `CsvExportOptions`, a CSV
+/// export of a multi-second server-side query runs to completion. The client
+/// arms no timer of its own — `timeout_ms` defaults to `None` — so only the
+/// server's own `QUERY_TIMEOUT` (unset here) could bound it.
+#[tokio::test]
+async fn test_csv_export_default_arms_no_client_side_timer() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    disable_query_cache(&mut conn).await;
+
+    let rows = conn
+        .export_csv_to_list(
+            ExportSource::Query {
+                sql: long_running_count_query(110_000),
+            },
+            CsvExportOptions::default().use_tls(false),
+        )
+        .await
+        .expect(
+            "CSV export of a long-running query should complete — no client-side \
+             export timeout is armed by default",
+        );
+
+    assert_eq!(rows.len(), 1, "COUNT(*) should return one row");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// A server-enforced `query_timeout` aborts the EXPORT statement itself, not
+/// the client-side export timer (which is unarmed by default). The error
+/// surfaces as `ExportError::SqlExecutionError`, not `ExportError::Timeout` —
+/// the latter would wrongly imply the client gave up. This also guards the
+/// short-circuit requirement on a failed `sql_task`: without it, awaiting the
+/// stalled HTTP task before propagating the SQL error can hang forever, since
+/// the HTTP tunnel read has no timeout of its own.
+#[tokio::test]
+async fn test_csv_export_server_timeout_aborts_and_keeps_connection_usable() {
+    skip_if_no_exasol!();
+
+    let conn_str = format!("{}&query_timeout=2", get_test_connection_string());
+    let driver = exarrow_rs::adbc::Driver::new();
+    let database = driver.open(&conn_str).expect("open should succeed");
+    let mut conn = database
+        .connect()
+        .await
+        .expect("Connection with an explicit query_timeout should succeed");
+    disable_query_cache(&mut conn).await;
+
+    let result = conn
+        .export_csv_to_list(
+            ExportSource::Query {
+                sql: long_running_count_query(120_000),
+            },
+            CsvExportOptions::default().use_tls(false),
+        )
+        .await;
+
+    match result {
+        Err(ExportError::SqlExecutionError { .. }) => {}
+        Err(other) => panic!(
+            "Expected ExportError::SqlExecutionError from the server-enforced query_timeout, \
+             got a different error: {:?}",
+            other
+        ),
+        Ok(_) => panic!(
+            "Expected the long-running EXPORT to be aborted by the 2s server-side timeout, \
+             but it completed"
+        ),
+    }
+
+    let batches = conn.query("SELECT 1").await.expect(
+        "Follow-up query on the same Connection should succeed after a server-side timeout \
+         aborted the EXPORT statement",
+    );
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// An explicit, short `timeout_ms` fires long before the EXPORT response
+/// arrives, so the driver terminates the transport per
+/// `client-give-up-terminates-connection`: the response can no longer be
+/// matched to a request. The connection must therefore report itself closed
+/// and refuse further queries instead of serving rows read off the abandoned
+/// response.
+///
+/// Teardown still goes through `close()`, like every other test in this
+/// section. `Session::close()` only mutates in-memory state, and
+/// `NativeTcpTransport::close()` returns early once `terminate()` has left the
+/// transport in `Closed`, so `close()` succeeds without attempting the
+/// disconnect round-trip the abandoned EXPORT would still be occupying.
+///
+/// After teardown, the test also polls `SYS.EXA_ALL_SESSIONS` on a second
+/// connection to confirm the abandoned session does not linger server-side —
+/// the only check on the assumption that Exasol releases a session when the
+/// client socket closes. If it never disappears, `terminate()` satisfies the
+/// letter of the connection-termination requirement but not its purpose.
+/// Exasol detects the closed socket on its own schedule, not the instant it
+/// happens: measured manually against this container, the session
+/// consistently disappears from `EXA_ALL_SESSIONS` around 2.1s after the
+/// client drops the connection, never immediately. A single, unretried check
+/// would therefore fail on every run regardless of whether `terminate()`
+/// works, so the poll uses a bound generous enough to absorb that
+/// server-side detection latency while still failing hard — not silently
+/// passing — if the session never goes away.
+#[tokio::test]
+async fn test_csv_export_explicit_timeout_terminates_connection() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    disable_query_cache(&mut conn).await;
+    let session_id = conn.session_id().to_string();
+
+    assert!(
+        !conn.is_closed().await,
+        "A freshly opened connection must report itself open, otherwise the post-timeout \
+         assertion below proves nothing"
+    );
+
+    let result = conn
+        .export_csv_to_list(
+            ExportSource::Query {
+                sql: long_running_count_query(130_000),
+            },
+            CsvExportOptions::default().use_tls(false).timeout_ms(1_000),
+        )
+        .await;
+
+    match result {
+        Err(ExportError::Timeout {
+            timeout_ms,
+            transport_terminated,
+        }) => {
+            assert_eq!(timeout_ms, 1_000);
+            assert!(
+                transport_terminated,
+                "1s elapses long before the EXPORT response arrives, so the transport \
+                 must be reported terminated"
+            );
+        }
+        Err(other) => panic!(
+            "Expected ExportError::Timeout from the explicit 1s export timeout, got a \
+             different error: {:?}",
+            other
+        ),
+        Ok(_) => panic!(
+            "Expected the export to be stopped by the 1s client-side timeout, but it completed"
+        ),
+    }
+
+    assert!(
+        conn.is_closed().await,
+        "is_closed() must report the connection closed once a terminating export timeout \
+         tore its transport down, even though nothing has closed the session"
+    );
+
+    conn.query("SELECT 1").await.expect_err(
+        "A query issued after a terminating export timeout must fail — returning rows here \
+         would mean the driver matched the response to the wrong request and served data \
+         read off the abandoned EXPORT",
+    );
+
+    conn.close()
+        .await
+        .expect("close() on a terminated connection must succeed without a protocol round-trip");
+
+    let mut conn2 = get_test_connection()
+        .await
+        .expect("Failed to open a second connection");
+
+    let poll_bound = std::time::Duration::from_secs(15);
+    let poll_interval = std::time::Duration::from_millis(500);
+    let start = std::time::Instant::now();
+    let mut remaining_sessions = 1;
+    while start.elapsed() < poll_bound {
+        let batches = conn2
+            .query(format!(
+                "SELECT COUNT(*) AS cnt FROM SYS.EXA_ALL_SESSIONS WHERE SESSION_ID = {}",
+                session_id
+            ))
+            .await
+            .expect("Session lookup query should succeed");
+        let cnt_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("COUNT(*) should map to Decimal128Array");
+        remaining_sessions = cnt_col.value(0);
+        if remaining_sessions == 0 {
+            break;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    assert_eq!(
+        remaining_sessions, 0,
+        "The abandoned session {} is still listed in SYS.EXA_ALL_SESSIONS {:?} after \
+         terminate() closed the client socket — Exasol has not reaped the server-side session",
+        session_id, poll_bound,
+    );
+
+    conn2.close().await.expect("Failed to close connection");
+}
+
+/// An `AsyncWrite` whose `poll_write` never returns `Ready` before a fixed
+/// delay elapses — used to stall the callback leg of an export well after
+/// the SQL response and tunnel transfer have already completed.
+struct SlowWriter {
+    delay: std::time::Duration,
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl SlowWriter {
+    fn new(delay: std::time::Duration) -> Self {
+        Self { delay, sleep: None }
+    }
+}
+
+impl tokio::io::AsyncWrite for SlowWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let delay = self.delay;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+        match sleep.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => std::task::Poll::Ready(Ok(buf.len())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// The non-terminating branch of the elapse handling: when the timer fires
+/// during a stalled callback, well after the EXPORT response has already
+/// been read, the transport stays in sync and must not be terminated. A
+/// throwaway export warms the tunnel path first, because the bound must
+/// comfortably exceed a cold-container EXPORT plus tunnel handshake — a slow
+/// first connection would otherwise let the timer elapse in the SQL leg
+/// instead of the callback, asserting the terminating branch by accident.
+#[tokio::test]
+async fn test_csv_export_timeout_during_callback_keeps_connection_usable() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    conn.export_csv_to_list(
+        ExportSource::Query {
+            sql: "SELECT 1".to_string(),
+        },
+        CsvExportOptions::default().use_tls(false),
+    )
+    .await
+    .expect("Warm-up export should succeed");
+
+    let result = conn
+        .export_csv_to_stream(
+            ExportSource::Query {
+                sql: "SELECT 1".to_string(),
+            },
+            SlowWriter::new(std::time::Duration::from_secs(30)),
+            CsvExportOptions::default()
+                .use_tls(false)
+                .timeout_ms(10_000),
+        )
+        .await;
+
+    match result {
+        Err(ExportError::Timeout {
+            timeout_ms,
+            transport_terminated,
+        }) => {
+            assert_eq!(timeout_ms, 10_000);
+            assert!(
+                !transport_terminated,
+                "The EXPORT response was already read when the timer elapsed in the \
+                 callback, so the transport must stay in sync and not be terminated"
+            );
+        }
+        Err(other) => panic!(
+            "Expected ExportError::Timeout from the 10s export timeout elapsing during the \
+             stalled callback, got a different error: {:?}",
+            other
+        ),
+        Ok(_) => panic!(
+            "Expected the 30s writer stall to exceed the 10s export timeout, but the export \
+             completed"
+        ),
+    }
+
+    let batches = conn.query("SELECT 1").await.expect(
+        "Follow-up query on the same Connection should succeed — a non-terminating export \
+         timeout must leave the connection usable",
+    );
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
 

@@ -29,6 +29,7 @@ mock! {
         async fn execute_prepared_statement(&mut self, handle: &PreparedStatementHandle, parameters: Option<Vec<Vec<serde_json::Value>>>) -> Result<QueryResult, TransportError>;
         async fn close_prepared_statement(&mut self, handle: &PreparedStatementHandle) -> Result<(), TransportError>;
         async fn close(&mut self) -> Result<(), TransportError>;
+        fn terminate(&mut self);
         fn is_connected(&self) -> bool;
         async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError>;
         async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError>;

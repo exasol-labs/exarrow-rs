@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.0
+
+- Breaking: `CsvExportOptions::timeout_ms` is now `Option<u64>` (was `u64`, silently defaulting to 300,000ms). CSV export arms no client-side timer by default; a long export now runs until the server finishes the EXPORT statement instead of always failing at 300 seconds. The builder method keeps its `u64` argument and wraps it in `Some`, so existing `.timeout_ms(60_000)` call sites are unaffected. Arrow and Parquet exports build their CSV options from the same default and lose the same implicit bound. Callers that relied on the 300-second wrap as a safety net must set `timeout_ms` explicitly, or set the server-enforced `query_timeout=` connection parameter.
+- Breaking: `ExportError::Timeout` gains a `transport_terminated: bool` field, reporting whether the elapsed timeout terminated the transport (and therefore requires a reconnect before the next operation) or left it usable (an elapse during a slow callback, after the EXPORT response was already read). Code that constructs or exhaustively destructures the variant no longer compiles.
+- Breaking: `TransportProtocol` gains a required method, `terminate()`, which drops the socket without a protocol round-trip for use when the driver gives up on an in-flight request it can no longer match a response to. Any external implementor of the public trait must add it.
+- Breaking: `Connection::is_closed()` now also reports `true` once its transport has been terminated, not only when the session itself is closed, so one fact about connection liveness has one answer.
+- Fix: an elapsed explicit export timeout no longer leaves the connection open with an unread EXPORT response, which the next statement on that connection used to read as if it belonged to itself. The driver now terminates the transport when the timeout elapses before the EXPORT response was read, and leaves it open when the elapse happens later (for example during a slow callback, when the response was already consumed).
+- Fix: the default CSV export path (`timeout_ms: None`) now returns promptly on a failed EXPORT statement instead of also waiting on the HTTP tunnel task, which has no read timeout of its own and could otherwise hang indefinitely.
+
 ## 0.15.1
 
 - Fix: the ADBC driver now exports its init symbol as `AdbcDriverExasolInit`, matching the ADBC C API naming convention `AdbcDriver<Name>Init`. The previous symbol, `ExarrowDriverInit`, is kept as a backward-compatible alias.

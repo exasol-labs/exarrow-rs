@@ -347,6 +347,27 @@ pub fn generate_test_schema_name() -> String {
     generate_unique_test_name("TEST_INTEGRATION")
 }
 
+/// Build a `COUNT(*)` over a cartesian-product `VALUES BETWEEN` join whose
+/// server-side runtime grows with the square of `side_rows`. Callers use it
+/// to hold a statement open long enough to observe timeout behavior.
+#[allow(dead_code)]
+pub fn long_running_count_query(side_rows: u32) -> String {
+    format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM (VALUES BETWEEN 1 AND {n}) a CROSS JOIN (VALUES BETWEEN 1 AND {n}) b)",
+        n = side_rows
+    )
+}
+
+/// Disable Exasol's query result cache for the current session so a
+/// cartesian-product query genuinely recomputes every time it runs, instead
+/// of returning a cached result from a prior invocation with the same text.
+#[allow(dead_code)]
+pub async fn disable_query_cache(conn: &mut Connection) {
+    conn.execute_update("ALTER SESSION SET QUERY_CACHE='OFF'")
+        .await
+        .expect("Failed to disable QUERY_CACHE for the test session");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

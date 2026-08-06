@@ -734,18 +734,16 @@ pub async fn export_to_record_batches<T: TransportProtocol + ?Sized>(
     source: ExportSource,
     options: ArrowExportOptions,
 ) -> Result<Vec<RecordBatch>, crate::export::csv::ExportError> {
-    use crate::export::csv::{export_to_list, CsvExportOptions};
+    use crate::export::csv::{export_to_list, shared_csv_export_options, SharedCsvExportParams};
 
-    // First, get the data as CSV via the existing export function
-    let csv_options = CsvExportOptions::default()
-        .column_separator(options.column_separator)
-        .column_delimiter(options.column_delimiter)
-        .with_column_names(false)
-        .exasol_host(&options.host)
-        .exasol_port(options.port)
-        .use_tls(options.use_tls);
+    let csv_options = shared_csv_export_options(SharedCsvExportParams {
+        column_separator: options.column_separator,
+        column_delimiter: options.column_delimiter,
+        host: &options.host,
+        port: options.port,
+        use_tls: options.use_tls,
+    });
 
-    // Get the CSV data as a list of rows
     let rows = export_to_list(transport, source, csv_options).await?;
 
     // If schema is provided, use it; otherwise return empty result

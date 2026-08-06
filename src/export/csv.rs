@@ -17,6 +17,7 @@
 use std::future::Future;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
@@ -63,9 +64,27 @@ pub enum ExportError {
     #[error("Channel error: {0}")]
     ChannelError(String),
 
-    /// Export timeout.
-    #[error("Export timed out after {timeout_ms}ms")]
-    Timeout { timeout_ms: u64 },
+    /// An explicitly configured export timeout elapsed.
+    ///
+    /// `transport_terminated` reports whether the driver had to terminate the
+    /// transport, so a caller decides whether to reconnect without probing the
+    /// connection. It is `true` when the timeout elapsed before the EXPORT
+    /// response was read, because that response can no longer be matched to a
+    /// request.
+    #[error(
+        "Export timed out after {timeout_ms}ms; {}",
+        if *transport_terminated {
+            "the transport was terminated, reconnect before the next operation"
+        } else {
+            "the transport is still usable"
+        }
+    )]
+    Timeout {
+        /// The configured timeout in milliseconds that elapsed.
+        timeout_ms: u64,
+        /// Whether the driver terminated the transport before returning.
+        transport_terminated: bool,
+    },
 
     /// Export was cancelled.
     #[error("Export was cancelled")]
@@ -99,8 +118,15 @@ pub struct CsvExportOptions {
     /// Use TLS for the HTTP transport (default: true).
     pub use_tls: bool,
 
-    /// Timeout in milliseconds for the export operation (default: 300000 = 5 minutes).
-    pub timeout_ms: u64,
+    /// Client-side timeout in milliseconds for the export operation (default: `None`).
+    ///
+    /// `None` arms no timer, so the export runs until the server finishes the
+    /// EXPORT statement and a server-enforced query timeout is the only bound.
+    /// `Some(ms)` bounds SQL execution, tunnel transfer, and the caller's
+    /// callback together. When such a bound elapses before the EXPORT response
+    /// has been read, the driver terminates the transport, because that
+    /// response can no longer be matched to a request.
+    pub timeout_ms: Option<u64>,
 
     /// Exasol host for HTTP transport connection.
     /// This is typically the same host as the WebSocket connection.
@@ -122,7 +148,7 @@ impl Default for CsvExportOptions {
             compression: Compression::None,
             with_column_names: false,
             use_tls: false,
-            timeout_ms: 300_000, // 5 minutes
+            timeout_ms: None,
             host: String::new(),
             port: 0,
         }
@@ -184,9 +210,13 @@ impl CsvExportOptions {
         self
     }
 
+    /// Bounds the whole export with a client-side timer.
+    ///
+    /// Unset by default. An elapsed bound can terminate the transport; see the
+    /// `timeout_ms` field for when that happens.
     #[must_use]
     pub fn timeout_ms(mut self, timeout: u64) -> Self {
-        self.timeout_ms = timeout;
+        self.timeout_ms = Some(timeout);
         self
     }
 
@@ -207,6 +237,35 @@ impl CsvExportOptions {
         self.port = port;
         self
     }
+}
+
+/// Fields the Arrow and Parquet export paths share when they build the
+/// `CsvExportOptions` for their underlying CSV export. Named fields, rather
+/// than five positional parameters, because two of the five are adjacent
+/// `char`s and a transposed pair would compile while silently producing wrong
+/// CSV.
+pub(crate) struct SharedCsvExportParams<'a> {
+    pub column_separator: char,
+    pub column_delimiter: char,
+    pub host: &'a str,
+    pub port: u16,
+    pub use_tls: bool,
+}
+
+/// Builds the `CsvExportOptions` shared by the Arrow and Parquet export
+/// paths, which pipe their own export through a CSV export and then
+/// reinterpret the rows. Column headers are always disabled, because the
+/// caller reinterprets rows positionally rather than by name, and no export
+/// timeout is set, because neither `ArrowExportOptions` nor
+/// `ParquetExportOptions` exposes one for its caller to configure.
+pub(crate) fn shared_csv_export_options(params: SharedCsvExportParams<'_>) -> CsvExportOptions {
+    CsvExportOptions::default()
+        .column_separator(params.column_separator)
+        .column_delimiter(params.column_delimiter)
+        .with_column_names(false)
+        .exasol_host(params.host)
+        .exasol_port(params.port)
+        .use_tls(params.use_tls)
 }
 
 /// Receiver end of the data pipe for processing exported data.
@@ -364,6 +423,21 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
 /// This is the most flexible export method, allowing you to process the data
 /// stream however you need.
 ///
+/// # Timeout behavior
+///
+/// `options.timeout_ms` is the only client-side bound on the whole operation,
+/// and it is unset by default: the HTTP tunnel read has no timeout of its own,
+/// so a failing EXPORT statement aborts the pending transport task instead of
+/// being awaited alongside it.
+///
+/// A configured bound spans SQL execution, tunnel transfer, and the callback.
+/// When it elapses, the transport is terminated only if the EXPORT response
+/// had not been read yet, because an elapse during the callback leaves the
+/// transport in sync and terminating it would break a healthy connection.
+/// Tracking that with an `AtomicBool` rather than a `Cell` is deliberate:
+/// `&Cell<bool>` is not `Send`, which would make this future `!Send` and stop
+/// callers from spawning a long export.
+///
 /// # Arguments
 ///
 /// * `ws_transport` - WebSocket transport for executing SQL
@@ -448,7 +522,7 @@ where
     // 1. Waits for HTTP PUT request from Exasol
     // 2. Reads CSV data from PUT request body (chunked or content-length)
     // 3. Sends HTTP 200 OK response after receiving all data
-    let http_task =
+    let mut http_task =
         tokio::spawn(async move {
             // Use handle_export_request() to properly handle the EXPORT protocol
             let (_request, body) = client.handle_export_request().await.map_err(|e| {
@@ -482,30 +556,47 @@ where
     // Run callback with the receiver
     let callback_task = callback(receiver);
 
-    // Use tokio::select to run all tasks concurrently
-    let timeout = tokio::time::Duration::from_millis(options.timeout_ms);
+    let sql_response_read = AtomicBool::new(false);
 
-    let result = tokio::time::timeout(timeout, async {
-        // Execute SQL first (this triggers Exasol to send data through our connection)
+    let work = async {
         let sql_result = sql_task.await;
+        sql_response_read.store(true, Ordering::Relaxed);
 
-        // Then wait for HTTP task and callback
-        let (http_result, callback_result) = tokio::join!(http_task, callback_task);
+        if let Err(sql_error) = sql_result {
+            http_task.abort();
+            return Err(sql_error);
+        }
 
-        // Check for errors
-        sql_result?;
+        let (http_result, callback_result) = tokio::join!(&mut http_task, callback_task);
+
         http_result.map_err(|e| ExportError::HttpTransportError {
-            message: format!("HTTP task panicked: {}", e),
+            message: format!("HTTP task panicked: {e}"),
         })??;
 
         callback_result
-    })
-    .await
-    .map_err(|_| ExportError::Timeout {
-        timeout_ms: options.timeout_ms,
-    })?;
+    };
 
-    result
+    let outcome = match options.timeout_ms {
+        Some(bound_ms) => tokio::time::timeout(tokio::time::Duration::from_millis(bound_ms), work)
+            .await
+            .map_err(|_| bound_ms),
+        None => Ok(work.await),
+    };
+
+    match outcome {
+        Ok(result) => result,
+        Err(bound_ms) => {
+            http_task.abort();
+            let transport_terminated = !sql_response_read.load(Ordering::Relaxed);
+            if transport_terminated {
+                ws_transport.terminate();
+            }
+            Err(ExportError::Timeout {
+                timeout_ms: bound_ms,
+                transport_terminated,
+            })
+        }
+    }
 }
 
 /// Decompresses a buffer according to the configured compression.
@@ -659,6 +750,7 @@ pub(crate) fn parse_csv_row(line: &str, separator: char, delimiter: char) -> (Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_support::MockTransport;
 
     // Tests for CsvExportOptions
 
@@ -674,7 +766,7 @@ mod tests {
         assert_eq!(options.compression, Compression::None);
         assert!(!options.with_column_names);
         assert!(!options.use_tls);
-        assert_eq!(options.timeout_ms, 300_000);
+        assert_eq!(options.timeout_ms, None);
         assert_eq!(options.host, "");
         assert_eq!(options.port, 0);
     }
@@ -702,9 +794,45 @@ mod tests {
         assert_eq!(options.compression, Compression::Gzip);
         assert!(options.with_column_names);
         assert!(!options.use_tls);
-        assert_eq!(options.timeout_ms, 60_000);
+        assert_eq!(options.timeout_ms, Some(60_000));
         assert_eq!(options.host, "exasol.example.com");
         assert_eq!(options.port, 8563);
+    }
+
+    #[test]
+    fn test_shared_csv_options_configure_no_export_timeout() {
+        let options = shared_csv_export_options(SharedCsvExportParams {
+            column_separator: ';',
+            column_delimiter: '\'',
+            host: "exasol.example.com",
+            port: 8563,
+            use_tls: true,
+        });
+
+        assert_eq!(options.timeout_ms, None);
+    }
+
+    // Tests for export_to_callback
+
+    /// Pins the `Send` guarantee of the export future, which every public
+    /// `Connection::export_*` method awaits and which a caller may hand to
+    /// `tokio::spawn`. The type check is the whole assertion: the future is
+    /// never polled, so no transport call happens.
+    #[test]
+    fn test_export_to_callback_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let mut transport = MockTransport::new();
+        let export = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT 1".to_string(),
+            },
+            CsvExportOptions::default(),
+            |_receiver: DataPipeReceiver| async { Ok::<(), ExportError>(()) },
+        );
+
+        assert_send(export);
     }
 
     // Tests for CSV parsing
@@ -846,8 +974,24 @@ mod tests {
         assert!(err.to_string().contains("row 5"));
         assert!(err.to_string().contains("invalid data"));
 
-        let err = ExportError::Timeout { timeout_ms: 5000 };
-        assert!(err.to_string().contains("5000ms"));
+        let err = ExportError::Timeout {
+            timeout_ms: 5000,
+            transport_terminated: true,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Export timed out after 5000ms; the transport was terminated, \
+             reconnect before the next operation"
+        );
+
+        let err = ExportError::Timeout {
+            timeout_ms: 5000,
+            transport_terminated: false,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Export timed out after 5000ms; the transport is still usable"
+        );
     }
 
     #[test]

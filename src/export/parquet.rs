@@ -751,20 +751,16 @@ pub async fn export_to_parquet_via_transport<T: TransportProtocol + ?Sized>(
     file_path: &Path,
     options: ParquetExportOptions,
 ) -> Result<u64, crate::export::csv::ExportError> {
-    use crate::export::csv::{export_to_list, CsvExportOptions};
+    use crate::export::csv::{export_to_list, shared_csv_export_options, SharedCsvExportParams};
 
-    // Get the data as CSV via the existing export function
-    // Note: We always disable column names in the CSV export for Parquet
-    // because we don't want header rows mixed with data rows.
-    let csv_options = CsvExportOptions::default()
-        .column_separator(options.column_separator)
-        .column_delimiter(options.column_delimiter)
-        .with_column_names(false)
-        .exasol_host(&options.host)
-        .exasol_port(options.port)
-        .use_tls(options.use_tls);
+    let csv_options = shared_csv_export_options(SharedCsvExportParams {
+        column_separator: options.column_separator,
+        column_delimiter: options.column_delimiter,
+        host: &options.host,
+        port: options.port,
+        use_tls: options.use_tls,
+    });
 
-    // Get the CSV data as a list of rows
     let rows = export_to_list(transport, source, csv_options).await?;
 
     if rows.is_empty() {

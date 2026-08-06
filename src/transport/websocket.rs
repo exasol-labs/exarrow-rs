@@ -745,10 +745,15 @@ impl TransportProtocol for WebSocketTransport {
             }
         }
 
-        self.state = ConnectionState::Closed;
-        self.session_info = None;
+        self.terminate();
 
         Ok(())
+    }
+
+    fn terminate(&mut self) {
+        self.ws_stream = None;
+        self.state = ConnectionState::Closed;
+        self.session_info = None;
     }
 
     fn is_connected(&self) -> bool {
@@ -816,6 +821,26 @@ mod tests {
 
         transport.state = ConnectionState::Closed;
         assert!(!transport.is_connected());
+    }
+
+    #[test]
+    fn terminate_drops_the_session_and_reports_the_transport_disconnected() {
+        let mut transport = WebSocketTransport::new();
+        transport.state = ConnectionState::Authenticated;
+        transport.session_info = Some(SessionInfo {
+            session_id: "12345".to_string(),
+            protocol_version: 3,
+            release_version: "7.1.0".to_string(),
+            database_name: "test_db".to_string(),
+            product_name: "EXASolution".to_string(),
+            max_data_message_size: 1024 * 1024,
+            time_zone: Some("UTC".to_string()),
+        });
+
+        transport.terminate();
+
+        assert!(!transport.is_connected());
+        assert!(transport.session_info.is_none());
     }
 
     // Integration-style tests would require a real or mocked WebSocket server
