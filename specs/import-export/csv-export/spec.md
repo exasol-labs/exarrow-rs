@@ -57,3 +57,7 @@ CSV export operations receive data from Exasol through the HTTP transport tunnel
 * *WHEN* user calls export_to_callback with a data-receiving callback
 * *THEN* system SHALL invoke callback with data chunks as received
 * *AND* callback SHALL process data in streaming fashion
+
+## See Also
+
+Export timeout behavior — client-side timers, server-enforced timeouts, and `CsvExportOptions::timeout_ms` — is specified in `import-export/csv-export-timeout`.
