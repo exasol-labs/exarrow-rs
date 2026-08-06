@@ -114,9 +114,7 @@ python3 scripts/strip_test_coverage.py check --summary coverage-summary.json
 - The script's own unit tests (`scripts/test_strip_test_coverage.py`) run in the `unit-tests` job before the coverage step: `python3 -m unittest discover --start-directory scripts --pattern 'test_*.py'`.
 - The `Upload unit coverage` step is `if: always()`, so a run that trips a floor still publishes the report needed to diagnose it.
 
-**Per-file floor exemptions** live in `PER_FILE_FLOOR_EXEMPTIONS` in the script. Lowering the global 50% floor to accommodate one file is not acceptable; name the file instead, with a reason. Currently exempt:
-
-- `src/export/csv.rs` (48.4%) — remove the exemption once its uncovered write paths are unit-tested.
+**Per-file floor exemptions** live in `PER_FILE_FLOOR_EXEMPTIONS` in the script. Lowering the global 50% floor to accommodate one file is not acceptable; name the file instead, with a reason. Currently empty: `src/export/csv.rs` cleared the floor on its own once its CSV write paths got unit-tested (78.17%, up from 48.4%) and its exemption was deleted.
 
 Re-check the list whenever coverage work lands: an exemption that is no longer needed is stale and should be deleted, since exemptions only waive the floor and never cap a file.
 

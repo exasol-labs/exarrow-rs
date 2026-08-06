@@ -750,7 +750,10 @@ pub(crate) fn parse_csv_row(line: &str, separator: char, delimiter: char) -> (Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::test_support::MockTransport;
+    use crate::error::TransportError;
+    use crate::transport::protocol::QueryResult;
+    use crate::transport::test_support::{FakeExasolServer, MockTransport, StalledQueryTransport};
+    use std::time::Duration;
 
     // Tests for CsvExportOptions
 
@@ -833,6 +836,186 @@ mod tests {
         );
 
         assert_send(export);
+    }
+
+    /// Short enough to keep the deadline tests quick, yet orders of magnitude
+    /// above the loopback round trip they race against, so which side wins is
+    /// decided by the scenario and not by scheduling noise.
+    const SHORT_DEADLINE_MS: u64 = 50;
+
+    /// Longer than any loopback exchange these tests perform, so an export
+    /// that completes normally can never trip it.
+    const UNREACHABLE_DEADLINE_MS: u64 = 30_000;
+
+    /// Far beyond the test's own lifetime: whatever awaits it never finishes.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    fn tunnel_options(server: &FakeExasolServer) -> CsvExportOptions {
+        CsvExportOptions::default()
+            .exasol_host(&server.host)
+            .exasol_port(server.port)
+            .use_tls(false)
+    }
+
+    async fn collect_body(mut receiver: DataPipeReceiver) -> Result<String, ExportError> {
+        let mut collected = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            collected.extend_from_slice(&chunk);
+        }
+        String::from_utf8(collected).map_err(|e| ExportError::CsvParseError {
+            row: 0,
+            message: e.to_string(),
+        })
+    }
+
+    fn succeeding_transport() -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(QueryResult::row_count(1)));
+        transport
+    }
+
+    fn unwrap_timeout(error: ExportError) -> (u64, bool) {
+        let ExportError::Timeout {
+            timeout_ms,
+            transport_terminated,
+        } = error
+        else {
+            panic!("expected a Timeout, got {error:?}");
+        };
+        (timeout_ms, transport_terminated)
+    }
+
+    #[tokio::test]
+    async fn test_export_to_callback_without_a_deadline_delivers_the_tunnel_body() {
+        let server = FakeExasolServer::serving_csv("1,alice\n2,bob\n").await;
+        let mut transport = succeeding_transport();
+
+        let delivered = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            tunnel_options(&server),
+            collect_body,
+        )
+        .await
+        .expect("an export with no deadline must run to completion");
+
+        assert_eq!(delivered, "1,alice\n2,bob\n");
+    }
+
+    #[tokio::test]
+    async fn test_export_to_callback_within_its_deadline_delivers_the_tunnel_body() {
+        let server = FakeExasolServer::serving_csv("1,alice\n").await;
+        let mut transport = succeeding_transport();
+
+        let delivered = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            tunnel_options(&server).timeout_ms(UNREACHABLE_DEADLINE_MS),
+            collect_body,
+        )
+        .await
+        .expect("an export that beats its deadline must not report a timeout");
+
+        assert_eq!(delivered, "1,alice\n");
+    }
+
+    /// The tunnel read has no deadline of its own, so a failing EXPORT
+    /// statement has to abort the tunnel task instead of being awaited
+    /// alongside it. The peer here never sends the `PUT`, so anything less
+    /// than a hard abort hangs.
+    #[tokio::test]
+    async fn test_export_to_callback_abandons_the_tunnel_when_the_export_statement_fails() {
+        let server = FakeExasolServer::silent_after_handshake().await;
+        let mut transport = MockTransport::new();
+        transport.expect_execute_query().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "object USERS not found".to_string(),
+            ))
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            export_to_callback(
+                &mut transport,
+                ExportSource::Query {
+                    sql: "SELECT * FROM users".to_string(),
+                },
+                tunnel_options(&server),
+                collect_body,
+            ),
+        )
+        .await
+        .expect("a failed EXPORT statement must not leave the export waiting on the tunnel")
+        .expect_err("a failed EXPORT statement must fail the export");
+
+        let ExportError::SqlExecutionError { message } = error else {
+            panic!("expected a SqlExecutionError, got {error:?}");
+        };
+        assert!(
+            message.contains("object USERS not found"),
+            "the statement failure must reach the caller intact: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_to_callback_terminates_the_transport_when_the_deadline_precedes_the_sql_response(
+    ) {
+        let server = FakeExasolServer::silent_after_handshake().await;
+        let mut mock = MockTransport::new();
+        mock.expect_terminate().times(1).return_const(());
+        let mut transport = StalledQueryTransport::new(mock);
+
+        let error = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            tunnel_options(&server).timeout_ms(SHORT_DEADLINE_MS),
+            collect_body,
+        )
+        .await
+        .expect_err("an outstanding EXPORT statement must fail once the deadline elapses");
+
+        let (timeout_ms, transport_terminated) = unwrap_timeout(error);
+        assert_eq!(timeout_ms, SHORT_DEADLINE_MS);
+        assert!(
+            transport_terminated,
+            "an unread EXPORT response can no longer be matched to a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_to_callback_keeps_the_transport_when_the_deadline_falls_in_the_callback() {
+        let server = FakeExasolServer::serving_csv("1,alice\n").await;
+        let mut transport = succeeding_transport();
+        transport.expect_terminate().never();
+
+        let error = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            tunnel_options(&server).timeout_ms(SHORT_DEADLINE_MS),
+            |_receiver: DataPipeReceiver| async {
+                tokio::time::sleep(NEVER).await;
+                Ok::<String, ExportError>(String::new())
+            },
+        )
+        .await
+        .expect_err("a callback that outlives the deadline must fail the export");
+
+        let (timeout_ms, transport_terminated) = unwrap_timeout(error);
+        assert_eq!(timeout_ms, SHORT_DEADLINE_MS);
+        assert!(
+            !transport_terminated,
+            "the EXPORT response was already read, so the transport is still in sync"
+        );
     }
 
     // Tests for CSV parsing

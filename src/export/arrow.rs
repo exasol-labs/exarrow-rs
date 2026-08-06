@@ -854,6 +854,9 @@ pub async fn export_to_arrow_ipc<T: TransportProtocol + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::csv::ExportError as CsvExportError;
+    use crate::transport::protocol::QueryResult;
+    use crate::transport::test_support::{FakeExasolServer, MockTransport};
     use arrow::datatypes::Field;
     use tokio::io::BufReader;
 
@@ -1837,5 +1840,82 @@ mod tests {
         assert_eq!(strings.null_count(), 1);
         assert_eq!(strings.value(0), "a");
         assert_eq!(strings.value(2), "c");
+    }
+
+    // ==========================================================================
+    // Tests for export_to_record_batches
+    // ==========================================================================
+
+    fn tunnel_options(server: &FakeExasolServer) -> ArrowExportOptions {
+        ArrowExportOptions::default()
+            .exasol_host(&server.host)
+            .exasol_port(server.port)
+            .use_tls(false)
+    }
+
+    fn succeeding_transport() -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_execute_query()
+            .returning(|_| Ok(QueryResult::row_count(2)));
+        transport
+    }
+
+    #[tokio::test]
+    async fn test_export_to_record_batches_maps_the_tunnel_rows_onto_the_given_schema() {
+        let server = FakeExasolServer::serving_csv("1,alice\n2,bob\n").await;
+        let mut transport = succeeding_transport();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batches = export_to_record_batches(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT id, name FROM users".to_string(),
+            },
+            tunnel_options(&server).with_schema(Arc::clone(&schema)),
+        )
+        .await
+        .expect("a completed tunnel export must yield record batches");
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.schema(), schema);
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("column 0 was declared Int64");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("column 1 was declared Utf8");
+        assert_eq!((ids.value(0), names.value(0)), (1, "alice"));
+        assert_eq!((ids.value(1), names.value(1)), (2, "bob"));
+    }
+
+    #[tokio::test]
+    async fn test_export_to_record_batches_rejects_an_export_without_a_schema() {
+        let server = FakeExasolServer::serving_csv("1,alice\n").await;
+        let mut transport = succeeding_transport();
+
+        let error = export_to_record_batches(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT id, name FROM users".to_string(),
+            },
+            tunnel_options(&server),
+        )
+        .await
+        .expect_err("rows alone do not describe Arrow columns");
+
+        let CsvExportError::CsvParseError { message, .. } = error else {
+            panic!("expected a CsvParseError, got {error:?}");
+        };
+        assert_eq!(message, "Schema required for Arrow export");
     }
 }

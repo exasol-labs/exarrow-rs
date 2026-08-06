@@ -32,13 +32,7 @@ DEFAULT_MIN_PER_FILE = 50.0
 # Files exempt from the per-file floor. Each entry needs a reason: the floor
 # exists to stop coverage rotting, so a silent blanket lowering is worse than a
 # named, reviewable exception. See AGENTS.md for the removal criteria.
-PER_FILE_FLOOR_EXEMPTIONS: tuple[str, ...] = (
-    # 48.4% production-only. Its uncovered lines are the CSV write paths, which
-    # are reachable without I/O and so should be unit-tested; the exemption is
-    # a temporary acknowledgement of that debt, not a permanent carve-out.
-    # Delete this entry once the file clears the floor on its own.
-    "src/export/csv.rs",
-)
+PER_FILE_FLOOR_EXEMPTIONS: tuple[str, ...] = ()
 
 RAW_STRING_PREFIX = re.compile(r'(?:b|c)?r(#*)"')
 CFG_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(")
