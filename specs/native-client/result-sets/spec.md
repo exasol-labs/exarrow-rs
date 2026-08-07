@@ -1,6 +1,6 @@
 # Feature: Binary Result Set to Arrow Conversion
 
-The native TCP protocol returns query results as column-major binary data, which maps directly to Arrow's columnar memory format. The system parses binary result set frames into Arrow RecordBatches without intermediate JSON representation, achieving zero-copy columnar transfer for supported types.
+The native TCP protocol returns query results as column-major binary data, which maps directly to Arrow's columnar memory format. The system parses binary result set frames and their column metadata; per-type conversion into Arrow arrays is specified in `native-client/type-conversion`.
 
 ## Background
 
@@ -14,50 +14,17 @@ Native protocol result sets contain: a result type marker (1 byte), result set h
 * *AND* a query has returned an `R_ResultSet` (1)
 * *WHEN* parsing the result set header
 * *THEN* the system SHALL extract the result set handle, column count, total rows, and rows received
-* *AND* for each column the system SHALL parse: column name length, column name, type ID, and type-specific metadata (precision, scale, varchar flag, max length)
+* *AND* for each column the system SHALL parse: column name length, column name, type ID, and type-specific metadata (precision, scale, the vcFlag byte whose varchar indicator is bit `0x01`, max length)
 * *AND* the system SHALL build an Arrow Schema from the parsed column metadata
 
-### Scenario: Direct binary to Arrow conversion for numeric types
+### Scenario: VARCHAR is distinguished from CHAR by the vcFlag varchar bit
 
-* *GIVEN* a result set contains columns of type `T_double` (8), `T_decimal` (6), `T_integer` (5), `T_smallint` (4), or `T_real` (7)
-* *WHEN* parsing column data
-* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128, `T_integer` → Int64, `T_smallint` → Int32)
-* *AND* the system SHALL handle little-endian to native byte order conversion
-* *AND* decimal values SHALL preserve precision and scale
-
-### Scenario: Direct binary to Arrow conversion for string types
-
-* *GIVEN* a result set contains columns of type `T_char` (10) with or without the `IS_VARCHAR` flag
-* *WHEN* parsing column data
-* *THEN* the system SHALL read length-prefixed UTF-8 strings into Arrow Utf8 or LargeUtf8 arrays
-* *AND* the system SHALL respect the `IS_UTF8` flag for encoding
-
-### Scenario: Direct binary to Arrow conversion for temporal types
-
-* *GIVEN* a result set contains columns of type `T_date` (14), `T_timestamp` (21), or `T_timestamp_utc` (125)
-* *WHEN* parsing column data
-* *THEN* the system SHALL convert dates to Arrow Date32 arrays
-* *AND* the system SHALL convert timestamps to Arrow Timestamp arrays with appropriate time unit
-* *AND* `T_timestamp_utc` SHALL map to Arrow Timestamp with UTC timezone
-
-### Scenario: Direct binary to Arrow conversion for interval types
-
-* *GIVEN* a result set contains columns of type `T_interval_year` (16) or `T_interval_day` (17)
-* *WHEN* parsing column data
-* *THEN* the system SHALL convert interval values to Arrow Utf8 arrays (string representation)
-
-### Scenario: Direct binary to Arrow conversion for binary and geometry types
-
-* *GIVEN* a result set contains columns of type `T_binary` (15), `T_hashtype` (126), or `T_geometry` (123)
-* *WHEN* parsing column data
-* *THEN* `T_binary` SHALL map to Arrow Binary arrays
-* *AND* `T_hashtype` and `T_geometry` SHALL map to Arrow Utf8 arrays
-
-### Scenario: Boolean type conversion
-
-* *GIVEN* a result set contains columns of type `T_boolean`
-* *WHEN* parsing column data
-* *THEN* the system SHALL convert boolean values to Arrow Boolean arrays
+* *GIVEN* a result set contains a column of type `T_char` (10)
+* *WHEN* parsing that column's metadata
+* *THEN* a vcFlag byte of `0x11`, which Exasol sends for `VARCHAR(n)` with character set UTF8, SHALL be reported as `VARCHAR(n)`
+* *AND* a vcFlag byte of `0x10`, which Exasol sends for `CHAR(n)` with character set UTF8, SHALL be reported as `CHAR(n)`
+* *AND* a vcFlag byte of `0x00`, for a `T_char` column with the varchar bit clear, SHALL NOT be reported as `VARCHAR`
+* *AND* the reported Exasol type name MUST match the type name the WebSocket transport reports for the identical column
 
 ### Scenario: NULL handling in column data
 

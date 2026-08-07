@@ -1,21 +1,12 @@
 # Feature: Protocol
 
-Specifies the WebSocket protocol implementation for the Exasol WebSocket API, including connection establishment, protocol handshake, command execution, and message serialization.
+Specifies command execution, message serialization, and error handling for the Exasol WebSocket API, once a session has been established (see `websocket-client/handshake`).
 
 ## Background
 
-The system implements the Exasol WebSocket API protocol as defined in https://github.com/exasol/websocket-api. Connections use secure WebSocket (wss://) when TLS is enabled. All commands are serialized to JSON format with required fields (command type, attributes) and responses are deserialized to structured objects with validation. Error responses from Exasol are parsed into appropriate Rust error types with error codes and messages.
+The system implements the Exasol WebSocket API protocol as defined in https://github.com/exasol/websocket-api. All commands are serialized to JSON format with required fields (command type, attributes) and responses are deserialized to structured objects with validation. Error responses from Exasol are parsed into appropriate Rust error types with error codes and messages. `createPreparedStatement` request/response handling is specified separately in `websocket-client/prepared-statements`.
 
 ## Scenarios
-
-### Scenario: WebSocket connection establishment
-
-* *GIVEN* a WebSocket endpoint is reachable
-* *WHEN* connecting to an Exasol database
-* *THEN* it SHALL establish a WebSocket connection to the specified host and port
-* *AND* it SHALL use secure WebSocket (wss://) when TLS is enabled
-* *AND* it SHALL handle connection timeouts gracefully
-* *AND* it SHALL configure the WebSocket with no frame size limit and no message size limit
 
 ### Scenario: Large result set transfer via WebSocket
 
@@ -24,20 +15,6 @@ The system implements the Exasol WebSocket API protocol as defined in https://gi
 * *WHEN* executing a SELECT query that returns the full result set
 * *THEN* the system SHALL receive the complete response without frame size errors
 * *AND* the system SHALL return all rows as Arrow RecordBatches
-
-### Scenario: Protocol handshake
-
-* *GIVEN* a WebSocket endpoint is reachable
-* *WHEN* WebSocket connection is established
-* *THEN* it SHALL perform the Exasol-specific protocol handshake
-* *AND* it SHALL negotiate protocol version compatibility
-
-### Scenario: Login command
-
-* *GIVEN* a WebSocket endpoint is reachable
-* *WHEN* authenticating with the database
-* *THEN* it SHALL send a login command with credentials
-* *AND* it SHALL handle authentication success and failure responses
 
 ### Scenario: Execute SQL command
 

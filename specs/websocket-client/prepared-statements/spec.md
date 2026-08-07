@@ -1,14 +1,13 @@
-# Feature: Protocol
+# Feature: Prepared Statement Responses
 
-Specifies the WebSocket protocol implementation for the Exasol WebSocket API, including connection establishment, protocol handshake, command execution, and message serialization.
+Specifies how `createPreparedStatement` responses are deserialized over the WebSocket protocol, including reading result-set column metadata alongside parameter metadata.
 
 ## Background
 
-The system implements the Exasol WebSocket API protocol as defined in https://github.com/exasol/websocket-api. Connections use secure WebSocket (wss://) when TLS is enabled. All commands are serialized to JSON format with required fields (command type, attributes) and responses are deserialized to structured objects with validation. Error responses from Exasol are parsed into appropriate Rust error types with error codes and messages.
+A `createPreparedStatement` response carries `responseData.parameterData` and, for a result-set-producing statement, a `responseData.results` entry whose `resultType` is `"resultSet"`. `prepared-statements/result-columns` specifies the transport-agnostic requirements this metadata must satisfy.
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: Create prepared statement response carries result-set column metadata
 
 * *GIVEN* an authenticated WebSocket session exists
@@ -17,9 +16,7 @@ The system implements the Exasol WebSocket API protocol as defined in https://gi
 * *AND* the system SHALL take column metadata from the `resultSet.columns` of the first entry whose `resultType` equals `"resultSet"`, preserving column order
 * *AND* the system SHALL ignore any later `"resultSet"` entry, because a `createPreparedStatement` reply describes exactly one result set
 * *AND* each column SHALL retain the `name` and `dataType` Exasol reported, including derived and aliased names such as `UPPER(T.NAME)`
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:NEW -->
 ### Scenario: Create prepared statement response without a result set
 
 * *GIVEN* an authenticated WebSocket session exists
@@ -27,4 +24,3 @@ The system implements the Exasol WebSocket API protocol as defined in https://gi
 * *THEN* the system SHALL report zero result-set columns
 * *AND* the system MUST NOT read `resultSet` from a `"rowCount"` entry, because such an entry carries no `resultSet` key
 * *AND* the system SHALL NOT return an error
-<!-- /DELTA:NEW -->

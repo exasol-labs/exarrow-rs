@@ -1,10 +1,10 @@
 # Feature: Binding and Execution
 
-Specifies the native prepared statement protocol, type-safe parameter binding, and execution behavior for Exasol, enabling secure and efficient parameterized query execution with SQL injection prevention by protocol design.
+Specifies prepared statement creation and execution behavior for Exasol: creating a statement over the active transport, running it once or repeatedly, and executing it through the ADBC FFI bind/execute paths. Parameter counting, type validation, and wire encoding are specified in `prepared-statements/parameter-binding`; result-set column metadata is specified in `prepared-statements/result-columns`.
 
 ## Background
 
-The system implements Exasol's native prepared statement protocol for secure parameterized query execution. Parameters are sent separately from SQL text via the wire protocol, preventing SQL injection by design. Parameter binding is positional (1-indexed) and type-safe, with validation against expected parameter types. Prepared statements can be reused across multiple executions with different parameter values without re-parsing SQL.
+The system implements Exasol's native prepared statement protocol for secure parameterized query execution. Parameters are sent separately from SQL text via the wire protocol, preventing SQL injection by design. Prepared statements can be reused across multiple executions with different parameter values without re-parsing SQL.
 
 ## Scenarios
 
@@ -12,40 +12,10 @@ The system implements Exasol's native prepared statement protocol for secure par
 
 * *GIVEN* a connection to Exasol is established
 * *WHEN* a SQL statement with parameters is prepared
-* *THEN* it SHALL send a createPreparedStatement request to Exasol via WebSocket
-* *AND* it SHALL receive a statement handle and parameter metadata
-* *AND* it SHALL store parameter type information for validation
-
-### Scenario: Parameter metadata retrieval
-
-* *GIVEN* a connection to Exasol is established
-* *WHEN* a prepared statement is created
-* *THEN* it SHALL provide parameter count
-* *AND* it SHALL provide parameter types when available from the database
-* *AND* it SHALL allow querying parameter information before binding
-
-### Scenario: Parameter value binding
-
-* *GIVEN* a connection to Exasol is established
-* *WHEN* binding parameter values to a prepared statement
-* *THEN* it SHALL validate value types match expected parameter types
-* *AND* it SHALL convert Rust types to Exasol wire format
-* *AND* it SHALL send parameters separately from SQL text
-* *AND* it MUST count only `?` characters that occur outside single-quoted string literals, double-quoted identifiers, line comments (`-- ...`), and block comments (`/* ... */`) when determining the positional placeholder index
-
-### Scenario: NULL parameter binding
-
-* *GIVEN* a connection to Exasol is established
-* *WHEN* binding a NULL value to a parameter
-* *THEN* it SHALL correctly represent NULL in the wire protocol
-* *AND* it SHALL handle typed NULLs appropriately
-
-### Scenario: Multiple parameter binding
-
-* *GIVEN* a connection to Exasol is established
-* *WHEN* binding multiple parameters
-* *THEN* it SHALL bind parameters by position (1-indexed)
-* *AND* it SHALL validate all required parameters are bound before execution
+* *THEN* it SHALL send a createPreparedStatement request to Exasol over the active transport
+* *AND* it SHALL receive a statement handle, parameter metadata, and result-set column metadata from that single response
+* *AND* it SHALL store the parameter type information and the result-set column metadata on the prepared statement handle
+* *AND* it SHALL NOT issue an additional round-trip, catalog lookup, or probe query to obtain the result-set column metadata
 
 ### Scenario: Single execution with parameters
 
@@ -85,10 +55,3 @@ The system implements Exasol's native prepared statement protocol for secure par
 * *THEN* the driver SHALL prepare the statement if not already prepared
 * *AND* the driver SHALL extract parameter values from the bound RecordBatch
 * *AND* the driver SHALL return the result set as Arrow RecordBatches
-
-### Scenario: Prepared statement with question mark inside a string literal
-
-* *GIVEN* a connection to Exasol is established
-* *WHEN* preparing a statement whose SQL text contains `?` inside a single-quoted string literal (for example `SELECT 'a?b'`)
-* *THEN* the system MUST report zero positional parameters
-* *AND* the system MUST NOT include the embedded `?` in the parameter count returned by parameter metadata
