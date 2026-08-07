@@ -25,8 +25,8 @@ use super::messages::{
     CloseResultSetRequest, CloseResultSetResponse, CreatePreparedStatementRequest,
     CreatePreparedStatementResponse, DisconnectRequest, DisconnectResponse,
     ExecutePreparedStatementRequest, ExecuteRequest, ExecuteResponse, FetchRequest, FetchResponse,
-    LoginInitRequest, LoginResponse, PublicKeyResponse, ResultData, ResultPayload, ResultSetHandle,
-    SessionInfo, SetAttributesRequest, SetAttributesResponse,
+    LoginInitRequest, LoginResponse, PublicKeyResponse, ResultData, ResultEntryKind, ResultPayload,
+    ResultSetHandle, SessionInfo, SetAttributesRequest, SetAttributesResponse,
 };
 use super::protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult, TransportProtocol,
@@ -172,9 +172,8 @@ impl WebSocketTransport {
         // Process first result (multi-result statements not fully supported yet)
         let result = &response_data.results[0];
 
-        match result.result_type.as_str() {
-            "resultSet" => {
-                // SELECT query with result set - data is nested in result_set field
+        match result.kind() {
+            ResultEntryKind::ResultSet => {
                 let result_set = result.result_set.as_ref().ok_or_else(|| {
                     TransportError::InvalidResponse(format!(
                         "Missing result_set data. Result: {:?}",
@@ -201,14 +200,13 @@ impl WebSocketTransport {
 
                 Ok(QueryResult::result_set(handle, data))
             }
-            "rowCount" => {
-                // INSERT/UPDATE/DELETE query
+            ResultEntryKind::RowCount => {
                 let count = result.row_count.unwrap_or(0);
                 Ok(QueryResult::row_count(count))
             }
-            other => Err(TransportError::InvalidResponse(format!(
+            ResultEntryKind::Unknown => Err(TransportError::InvalidResponse(format!(
                 "Unknown result type: {}",
-                other
+                result.result_type
             ))),
         }
     }
@@ -615,6 +613,8 @@ impl TransportProtocol for WebSocketTransport {
             .response_data
             .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
 
+        let result_columns = response_data.result_set_columns();
+
         // Extract parameter types from parameter_data if present
         let (num_params, parameter_types, parameter_names) =
             if let Some(param_data) = response_data.parameter_data {
@@ -634,7 +634,8 @@ impl TransportProtocol for WebSocketTransport {
             num_params,
             parameter_types,
             parameter_names,
-        ))
+        )
+        .with_result_columns(result_columns))
     }
 
     async fn execute_prepared_statement(

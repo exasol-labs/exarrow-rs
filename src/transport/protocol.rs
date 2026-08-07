@@ -7,7 +7,7 @@
 use crate::error::TransportError;
 use async_trait::async_trait;
 
-use super::messages::{DataType, ResultData, ResultSetHandle, SessionInfo};
+use super::messages::{ColumnInfo, DataType, ResultData, ResultSetHandle, SessionInfo};
 
 /// Connection parameters for establishing a transport connection.
 #[derive(Debug, Clone)]
@@ -109,6 +109,8 @@ pub struct PreparedStatementHandle {
     pub parameter_types: Vec<DataType>,
     /// Parameter names from Exasol metadata (if available)
     pub parameter_names: Vec<Option<String>>,
+    /// Result-set column metadata, empty for row-count-producing statements
+    pub result_columns: Vec<ColumnInfo>,
 }
 
 impl PreparedStatementHandle {
@@ -124,7 +126,14 @@ impl PreparedStatementHandle {
             num_params,
             parameter_types,
             parameter_names,
+            result_columns: Vec::new(),
         }
+    }
+
+    /// Attach result-set column metadata decoded from the same reply as the parameters.
+    pub(crate) fn with_result_columns(mut self, result_columns: Vec<ColumnInfo>) -> Self {
+        self.result_columns = result_columns;
+        self
     }
 }
 
@@ -476,6 +485,35 @@ mod tests {
         assert_eq!(handle.handle, 1);
         assert_eq!(handle.num_params, 0);
         assert!(handle.parameter_types.is_empty());
+    }
+
+    #[test]
+    fn prepared_statement_handle_result_columns_default_empty() {
+        let handle = PreparedStatementHandle::new(1, 0, vec![], vec![]);
+        assert!(handle.result_columns.is_empty());
+    }
+
+    #[test]
+    fn prepared_statement_handle_with_result_columns_sets_them() {
+        let columns = vec![ColumnInfo {
+            name: "ID".to_string(),
+            data_type: DataType {
+                type_name: "DECIMAL".to_string(),
+                precision: Some(18),
+                scale: Some(0),
+                size: None,
+                character_set: None,
+                with_local_time_zone: None,
+                fraction: None,
+            },
+        }];
+
+        let handle =
+            PreparedStatementHandle::new(1, 0, vec![], vec![]).with_result_columns(columns.clone());
+
+        assert_eq!(handle.result_columns.len(), 1);
+        assert_eq!(handle.result_columns[0].name, "ID");
+        assert_eq!(handle.result_columns[0].data_type.type_name, "DECIMAL");
     }
 
     #[test]

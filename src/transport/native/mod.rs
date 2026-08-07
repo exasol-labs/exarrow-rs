@@ -29,9 +29,9 @@ use self::constants::{
     ATTR_RELEASE_VERSION, ATTR_SESSIONID, ATTR_TIMEZONE, CMD_CLOSE_PREPARED, CMD_CLOSE_RESULTSET,
     CMD_CREATE_PREPARED, CMD_DISCONNECT, CMD_EXECUTE, CMD_EXECUTE_PREPARED, CMD_FETCH2,
     CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
-    MAX_DATA_MESSAGE_SIZE, PARAMETER_DESCRIPTION, PROTOCOL_VERSION, SMALL_RESULTSET, T_BOOLEAN,
-    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR,
-    T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
+    MAX_DATA_MESSAGE_SIZE, PROTOCOL_VERSION, SMALL_RESULTSET, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL,
+    T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_TIMESTAMP,
+    T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
 };
 use self::encryption::ChaCha20Encryptor;
 use self::framing::{MessageHeader, SerialCounter};
@@ -345,9 +345,9 @@ impl NativeTcpTransport {
             }
             NativeResponse::RowCount(count) => Ok(QueryResult::row_count(count)),
             NativeResponse::Empty => Ok(QueryResult::row_count(0)),
-            _ => Err(TransportError::ProtocolError(
-                "Unexpected response type".into(),
-            )),
+            other => Err(TransportError::ProtocolError(format!(
+                "Unexpected native response where a query result was expected: {other:?}"
+            ))),
         }
     }
 
@@ -1062,9 +1062,9 @@ impl TransportProtocol for NativeTcpTransport {
                 )),
                 total_rows: 0,
             }),
-            _ => Err(TransportError::ProtocolError(
-                "Expected result set from fetch".into(),
-            )),
+            other => Err(TransportError::ProtocolError(format!(
+                "Expected a result set or more-rows response from CMD_FETCH2, got {other:?}"
+            ))),
         }
     }
 
@@ -1111,40 +1111,32 @@ impl TransportProtocol for NativeTcpTransport {
         let response = Self::check_response(&header, &payload)?.terminal;
 
         match response {
-            NativeResponse::ResultSet {
+            NativeResponse::PreparedStatement {
                 handle: stmt_handle,
-                columns,
-                total_rows: sub_handle_indicator,
-                ..
+                parameters,
+                result_columns,
             } => {
-                // sub_handle_indicator carries the sub-result handle from R_HANDLE:
-                // PARAMETER_DESCRIPTION (-5) means parameter metadata.
-                // Any other value (e.g. SMALL_RESULTSET = -3) means result column metadata.
-                if sub_handle_indicator == PARAMETER_DESCRIPTION as i64 {
-                    let param_types: Vec<_> = columns
-                        .iter()
-                        .map(arrow_builder::native_meta_to_data_type)
-                        .collect();
-                    let param_names: Vec<_> = columns
-                        .iter()
-                        .map(|c| {
-                            if c.name.is_empty() {
-                                None
-                            } else {
-                                Some(c.name.clone())
-                            }
-                        })
-                        .collect();
-                    Ok(PreparedStatementHandle::new(
-                        stmt_handle,
-                        columns.len() as i32,
-                        param_types,
-                        param_names,
-                    ))
-                } else {
-                    // Result column metadata, not parameters
-                    Ok(PreparedStatementHandle::new(stmt_handle, 0, vec![], vec![]))
-                }
+                let param_types: Vec<_> = parameters
+                    .iter()
+                    .map(arrow_builder::native_meta_to_data_type)
+                    .collect();
+                let param_names: Vec<_> = parameters
+                    .iter()
+                    .map(|c| {
+                        if c.name.is_empty() {
+                            None
+                        } else {
+                            Some(c.name.clone())
+                        }
+                    })
+                    .collect();
+                Ok(PreparedStatementHandle::new(
+                    stmt_handle,
+                    parameters.len() as i32,
+                    param_types,
+                    param_names,
+                )
+                .with_result_columns(Self::to_column_info(&result_columns)))
             }
             NativeResponse::Empty => Ok(PreparedStatementHandle::new(0, 0, vec![], vec![])),
             _ => Err(TransportError::ProtocolError(
@@ -1637,7 +1629,27 @@ mod tests {
             .unwrap_err();
 
         match err {
-            TransportError::ProtocolError(msg) => assert_eq!(msg, "Unexpected response type"),
+            TransportError::ProtocolError(msg) => {
+                assert!(msg.contains("Unexpected native response"), "{msg}")
+            }
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_prepared_statement_response_is_not_a_query_result() {
+        let response = NativeResponse::PreparedStatement {
+            handle: 9,
+            parameters: vec![column_meta("P1", T_DECIMAL)],
+            result_columns: vec![column_meta("ID", T_DECIMAL)],
+        };
+
+        let err = NativeTcpTransport::native_result_to_query_result(response).unwrap_err();
+
+        match err {
+            TransportError::ProtocolError(msg) => {
+                assert!(msg.contains("PreparedStatement"), "{msg}")
+            }
             other => panic!("expected ProtocolError, got {other:?}"),
         }
     }
@@ -1938,7 +1950,9 @@ mod tests {
         expected.extend_from_slice(&4i32.to_le_bytes());
         expected.extend_from_slice(b"NAME");
         expected.extend_from_slice(&(T_CHAR as i32).to_le_bytes());
-        expected.push(IS_VARCHAR | IS_UTF8);
+        // Literal, not IS_VARCHAR | IS_UTF8: building the expectation from the
+        // same constants the production write uses would pass for any values.
+        expected.push(0x11u8);
         expected.extend_from_slice(&2_000_000i32.to_le_bytes());
         expected.extend_from_slice(&(2_000_000i32 * 4).to_le_bytes());
         // Row 0 then row 1, each holding both columns

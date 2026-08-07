@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.0
+
+- Breaking: `PreparedStatementHandle` gains a public field, `result_columns`, so struct-literal construction outside the crate no longer compiles. `new()` is unchanged.
+- Breaking: `NativeResponse` gains a variant, `PreparedStatement`, so external exhaustive `match` no longer compiles.
+- Breaking: `IS_VARCHAR` and `IS_UTF8` change value (`IS_VARCHAR`: `0x80` → `0x01`; `IS_UTF8`: `0x01` → `0x10`).
+- Fix: native-transport callers now see corrected Exasol type names. A `VARCHAR(n)` column now reports `VARCHAR(n)` where it previously reported `CHAR(n)`, because the varchar bit in the native vcFlag was wrong. Arrow types are unaffected — both map to `Utf8`.
+- Fix: both transports now decode and surface result-set column metadata from `createPreparedStatement` replies, instead of discarding it. Fixes #60.
+
 ## 0.16.0
 
 - Breaking: `CsvExportOptions::timeout_ms` is now `Option<u64>` (was `u64`, silently defaulting to 300,000ms). CSV export arms no client-side timer by default; a long export now runs until the server finishes the EXPORT statement instead of always failing at 300 seconds. The builder method keeps its `u64` argument and wraps it in `Some`, so existing `.timeout_ms(60_000)` call sites are unaffected. Arrow and Parquet exports build their CSV options from the same default and lose the same implicit bound. Callers that relied on the 300-second wrap as a safety net must set `timeout_ms` explicitly, or set the server-enforced `query_timeout=` connection parameter.

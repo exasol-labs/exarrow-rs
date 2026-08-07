@@ -309,6 +309,31 @@ pub struct ResultSetInfo {
     pub result_set: Option<ResultSetData>,
 }
 
+/// Classification of a `resultType` discriminator value.
+///
+/// The sole owner of the `"resultSet"`/`"rowCount"` string comparison, so
+/// callers branch on this instead of duplicating the string match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultEntryKind {
+    /// A SELECT-shaped entry carrying result-set columns and rows
+    ResultSet,
+    /// A DML-shaped entry carrying only an affected-row count
+    RowCount,
+    /// Any other `resultType` value the server might send
+    Unknown,
+}
+
+impl ResultSetInfo {
+    /// Classify this entry's `result_type` discriminator.
+    pub fn kind(&self) -> ResultEntryKind {
+        match self.result_type.as_str() {
+            "resultSet" => ResultEntryKind::ResultSet,
+            "rowCount" => ResultEntryKind::RowCount,
+            _ => ResultEntryKind::Unknown,
+        }
+    }
+}
+
 /// Result set data (nested inside ResultSetInfo for SELECT queries).
 ///
 /// **Note**: Data is deserialized from Exasol's column-major format to row-major format.
@@ -619,6 +644,25 @@ pub struct PreparedStatementResponseData {
     pub num_results: Option<i32>,
     /// Result metadata (for SELECT statements)
     pub results: Option<Vec<ResultSetInfo>>,
+}
+
+impl PreparedStatementResponseData {
+    /// Result-set column metadata from the first `ResultSet`-kind entry, in column order.
+    ///
+    /// A `createPreparedStatement` reply describes exactly one result set, so any
+    /// later entry is ignored. Returns an empty vector when `results` is absent,
+    /// every entry is `RowCount`/`Unknown`, or the matching entry carries no
+    /// `result_set` or no `columns`.
+    pub fn result_set_columns(&self) -> Vec<ColumnInfo> {
+        self.results
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|entry| entry.kind() == ResultEntryKind::ResultSet)
+            .and_then(|entry| entry.result_set.as_ref())
+            .and_then(|result_set| result_set.columns.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Request to execute a prepared statement.
@@ -1246,6 +1290,161 @@ mod tests {
         assert_eq!(param_data.num_columns, 1);
         assert_eq!(param_data.columns.len(), 1);
         assert_eq!(param_data.columns[0].data_type.type_name, "DECIMAL");
+    }
+
+    #[test]
+    fn prepare_response_result_set_columns_are_read() {
+        let json = r#"{
+            "status": "ok",
+            "responseData": {
+                "statementHandle": 42,
+                "results": [
+                    {
+                        "resultType": "resultSet",
+                        "resultSet": {
+                            "columns": [
+                                {
+                                    "name": "ID",
+                                    "dataType": {
+                                        "type": "DECIMAL",
+                                        "precision": 18,
+                                        "scale": 0
+                                    }
+                                },
+                                {
+                                    "name": "NAME",
+                                    "dataType": {
+                                        "type": "VARCHAR",
+                                        "size": 50
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }"#;
+
+        let response: CreatePreparedStatementResponse = serde_json::from_str(json).unwrap();
+        let columns = response.response_data.unwrap().result_set_columns();
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "ID");
+        assert_eq!(columns[0].data_type.type_name, "DECIMAL");
+        assert_eq!(columns[0].data_type.precision, Some(18));
+        assert_eq!(columns[0].data_type.scale, Some(0));
+        assert_eq!(columns[1].name, "NAME");
+        assert_eq!(columns[1].data_type.type_name, "VARCHAR");
+        assert_eq!(columns[1].data_type.size, Some(50));
+    }
+
+    #[test]
+    fn prepare_response_without_a_result_set_yields_no_columns() {
+        let json = r#"{
+            "status": "ok",
+            "responseData": {
+                "statementHandle": 42,
+                "results": [
+                    {
+                        "resultType": "rowCount",
+                        "rowCount": 1
+                    }
+                ]
+            }
+        }"#;
+
+        let response: CreatePreparedStatementResponse = serde_json::from_str(json).unwrap();
+        let columns = response.response_data.unwrap().result_set_columns();
+
+        assert!(columns.is_empty());
+    }
+
+    #[test]
+    fn prepare_response_with_absent_results_yields_no_columns() {
+        let json = r#"{
+            "status": "ok",
+            "responseData": {
+                "statementHandle": 42
+            }
+        }"#;
+
+        let response: CreatePreparedStatementResponse = serde_json::from_str(json).unwrap();
+        let columns = response.response_data.unwrap().result_set_columns();
+
+        assert!(columns.is_empty());
+    }
+
+    #[test]
+    fn prepare_response_result_set_without_columns_yields_no_columns() {
+        let json = r#"{
+            "status": "ok",
+            "responseData": {
+                "statementHandle": 42,
+                "results": [
+                    {
+                        "resultType": "resultSet",
+                        "resultSet": {
+                            "numColumns": 0
+                        }
+                    }
+                ]
+            }
+        }"#;
+
+        let response: CreatePreparedStatementResponse = serde_json::from_str(json).unwrap();
+        let columns = response.response_data.unwrap().result_set_columns();
+
+        assert!(columns.is_empty());
+    }
+
+    #[test]
+    fn prepare_response_with_two_result_sets_takes_the_first() {
+        let json = r#"{
+            "status": "ok",
+            "responseData": {
+                "statementHandle": 42,
+                "results": [
+                    {
+                        "resultType": "resultSet",
+                        "resultSet": {
+                            "columns": [
+                                {
+                                    "name": "FIRST",
+                                    "dataType": {
+                                        "type": "DECIMAL",
+                                        "precision": 18,
+                                        "scale": 0
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "resultType": "resultSet",
+                        "resultSet": {
+                            "columns": [
+                                {
+                                    "name": "SECOND",
+                                    "dataType": {
+                                        "type": "VARCHAR",
+                                        "size": 10
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }"#;
+
+        let response: CreatePreparedStatementResponse = serde_json::from_str(json).unwrap();
+        let columns = response.response_data.unwrap().result_set_columns();
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "FIRST");
+        assert_eq!(columns[0].data_type.type_name, "DECIMAL");
+        assert_eq!(columns[0].data_type.precision, Some(18));
+        assert_eq!(columns[0].data_type.scale, Some(0));
     }
 
     #[test]

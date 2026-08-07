@@ -1915,3 +1915,78 @@ async fn test_ws_connect_with_certificate_fingerprint() {
 
     conn.close().await.expect("Failed to close connection");
 }
+
+// ── Section: Prepared Statement Result Columns (Transport Parity) ────────────
+
+/// Result-set column metadata for a parameterized SELECT prepared over the raw
+/// `WebSocketTransport` must match what the native transport reports for the
+/// identically-defined table (see `test_prepared_result_columns_native_parameterized_select`
+/// in `tests/integration_tests.rs`): `ID`/`DECIMAL` precision 18 scale 0, and
+/// `NAME`/`VARCHAR` size 50.
+#[tokio::test]
+async fn test_prepared_result_columns_websocket_matches_native() {
+    skip_if_no_exasol!();
+
+    let params = ConnectionParams::new(get_host(), get_port())
+        .with_tls(true)
+        .with_validate_server_certificate(false);
+    let creds = Credentials::new(get_user(), get_password());
+    let mut transport = WebSocketTransport::new();
+
+    transport.connect(&params).await.expect("connect failed");
+    transport
+        .authenticate(&creds)
+        .await
+        .expect("authenticate failed");
+
+    let schema_name = generate_test_schema_name();
+
+    transport
+        .execute_query(&format!("CREATE SCHEMA {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    transport
+        .execute_query(&format!(
+            "CREATE TABLE {}.T (ID DECIMAL(18,0), NAME VARCHAR(50))",
+            schema_name
+        ))
+        .await
+        .expect("CREATE TABLE should succeed");
+
+    let handle = transport
+        .create_prepared_statement(&format!(
+            "SELECT ID, NAME FROM {}.T WHERE ID = ? AND NAME = ?",
+            schema_name
+        ))
+        .await
+        .expect("create_prepared_statement should succeed");
+
+    assert_eq!(
+        handle.result_columns.len(),
+        2,
+        "parameterized SELECT should report 2 result columns"
+    );
+
+    let id_column = &handle.result_columns[0];
+    assert_eq!(id_column.name, "ID");
+    assert_eq!(id_column.data_type.type_name, "DECIMAL");
+    assert_eq!(id_column.data_type.precision, Some(18));
+    assert_eq!(id_column.data_type.scale, Some(0));
+
+    let name_column = &handle.result_columns[1];
+    assert_eq!(name_column.name, "NAME");
+    assert_eq!(name_column.data_type.type_name, "VARCHAR");
+    assert_eq!(name_column.data_type.size, Some(50));
+
+    transport
+        .close_prepared_statement(&handle)
+        .await
+        .expect("close_prepared_statement should succeed");
+
+    let _ = transport
+        .execute_query(&format!("DROP SCHEMA {} CASCADE", schema_name))
+        .await;
+
+    transport.close().await.expect("close failed");
+}
