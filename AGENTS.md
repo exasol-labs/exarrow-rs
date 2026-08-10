@@ -132,6 +132,8 @@ When a CI test hangs:
 
 ## Changelog
 
-- `CHANGELOG.md` must be updated with every version bump
-- Format: `## <version>` header followed by bullet points describing changes
-- Entries should be concise, user-facing descriptions (not internal implementation details)
+- `CHANGELOG.md` must be updated in the same PR as any user-facing change.
+- PR without a version bump → add entries under a `## [Unreleased]` header. Merging it does not release.
+- PR that bumps the `Cargo.toml` version → put entries under a `## X.Y.Z` header matching the version exactly (fold in `[Unreleased]`). Merging it makes the CI `release` job tag, release, and publish to crates.io automatically.
+- Entries should be concise, user-facing descriptions (not internal implementation details).
+- Full release procedure: see `CONTRIBUTING.md` § Releasing.
