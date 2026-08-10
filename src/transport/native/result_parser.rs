@@ -41,6 +41,14 @@ pub enum NativeResponse {
         total_rows: i64,
         rows_received: i64,
     },
+    /// Reply to `CMD_CREATE_PREPARED`: two independent column descriptions and no
+    /// row data. This is a shape of its own because `ResultSet` holds a single
+    /// column list, which forced one of the two descriptions to be discarded.
+    PreparedStatement {
+        handle: i32,
+        parameters: Vec<NativeColumnMeta>,
+        result_columns: Vec<NativeColumnMeta>,
+    },
     RowCount(i64),
     Empty,
     StillExecuting,
@@ -124,8 +132,9 @@ fn try_parse_counted_envelope(
                 assign_terminal_result(&mut terminal, response)?;
             }
             R_HANDLE => {
-                let response = parse_handle_only_at(data, &mut offset)?;
-                assign_terminal_result(&mut terminal, response)?;
+                let handle_envelope = parse_handle_only_at(data, &mut offset)?;
+                warnings.extend(handle_envelope.warnings);
+                assign_terminal_result(&mut terminal, handle_envelope.terminal)?;
             }
             R_ROW_COUNT => {
                 let response = parse_row_count_at(data, &mut offset)?;
@@ -203,10 +212,7 @@ fn parse_legacy_response_body(
             warnings: Vec::new(),
             terminal: parse_result_set_at(data, offset)?,
         }),
-        R_HANDLE => Ok(NativeResponseEnvelope {
-            warnings: Vec::new(),
-            terminal: parse_handle_only_at(data, offset)?,
-        }),
+        R_HANDLE => parse_handle_only_at(data, offset),
         R_ROW_COUNT => Ok(NativeResponseEnvelope {
             warnings: Vec::new(),
             terminal: parse_row_count_at(data, offset)?,
@@ -294,55 +300,55 @@ fn assign_terminal_result(
     Ok(())
 }
 
-/// Parse a handle-only response (R_HANDLE = 2).
+/// Parse a handle-only response (R_HANDLE = 2), sent in reply to CREATE PREPARED.
 ///
-/// Used for CREATE PREPARED responses containing the statement handle
-/// and optional column/parameter metadata as a sub-result.
-/// Format: [statement_handle:4 LE] [sub_result_type:1] [sub_result_data...]
-fn parse_handle_only_at(data: &[u8], offset: &mut usize) -> Result<NativeResponse, TransportError> {
+/// Format: [statement_handle:4 LE] [sub_result...]
+///
+/// A result-set sub-result whose handle is `PARAMETER_DESCRIPTION` describes the
+/// parameters; any other describes the statement's result-set columns. An
+/// exception sub-result is reported as an error rather than as a handle with
+/// empty metadata, which the caller would otherwise bind against as though the
+/// server had confirmed it.
+fn parse_handle_only_at(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<NativeResponseEnvelope, TransportError> {
     let statement_handle = read_i32(data, offset)?;
 
-    // Check for sub-result (parameter/column metadata)
-    let mut parameter_description = None;
-    let mut result_columns = None;
-    if *offset < data.len() {
-        while *offset < data.len() {
-            let sub_response = parse_legacy_response_at(data, offset)?;
-            if let NativeResponse::ResultSet {
+    let mut warnings = Vec::new();
+    let mut parameters = Vec::new();
+    let mut result_columns = Vec::new();
+    while *offset < data.len() {
+        let sub_response = parse_legacy_response_at(data, offset)?;
+        warnings.extend(sub_response.warnings);
+        match sub_response.terminal {
+            NativeResponse::ResultSet {
                 handle: sub_handle,
                 columns,
                 ..
-            } = sub_response.terminal
-            {
+            } => {
                 if sub_handle == PARAMETER_DESCRIPTION {
-                    parameter_description = Some((sub_handle, columns));
+                    parameters = columns;
                 } else {
-                    result_columns = Some((sub_handle, columns));
+                    result_columns = columns;
                 }
             }
+            NativeResponse::Exception { message, sql_state } => {
+                return Err(TransportError::ProtocolError(format!(
+                    "Exasol reported an exception in a prepared-statement reply sub-result: {message} (SQLSTATE {sql_state})"
+                )));
+            }
+            _ => {}
         }
     }
 
-    if let Some((sub_handle, columns)) = parameter_description.or(result_columns) {
-        // The sub-result's handle indicates the kind of metadata:
-        // - PARAMETER_DESCRIPTION (-5): parameter metadata
-        // - SMALL_RESULTSET (-3): result column metadata
-        return Ok(NativeResponse::ResultSet {
+    Ok(NativeResponseEnvelope {
+        warnings,
+        terminal: NativeResponse::PreparedStatement {
             handle: statement_handle,
-            columns,
-            batch: None,
-            total_rows: sub_handle as i64,
-            rows_received: 0,
-        });
-    }
-
-    // No parameter metadata
-    Ok(NativeResponse::ResultSet {
-        handle: statement_handle,
-        columns: Vec::new(),
-        batch: None,
-        total_rows: 0,
-        rows_received: 0,
+            parameters,
+            result_columns,
+        },
     })
 }
 
@@ -1044,6 +1050,7 @@ fn read_i128(data: &[u8], offset: &mut usize) -> Result<i128, TransportError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::arrow_builder::native_meta_to_data_type;
     use super::super::constants::{IS_UTF8, SMALL_RESULTSET};
     use super::*;
 
@@ -1374,6 +1381,31 @@ mod tests {
             }
             _ => panic!("Expected ResultSet"),
         }
+    }
+
+    #[test]
+    fn varchar_flag_bit_discriminates_varchar_from_char() {
+        // Literal vcFlag bytes, not the constants the parser reads them with:
+        // building the input from IS_VARCHAR would pass for any mask value.
+        let reported_type = |vc_flag: u8| {
+            let mut extra = vec![vc_flag];
+            extra.extend_from_slice(&50i32.to_le_bytes()); // maxLen
+            extra.extend_from_slice(&200i32.to_le_bytes()); // octetLen
+            let mut data = Vec::new();
+            write_col_meta(&mut data, "NAME", T_CHAR, &extra);
+            let mut offset = 0;
+            native_meta_to_data_type(&parse_column_meta(&data, &mut offset).unwrap())
+        };
+
+        let varchar = reported_type(0x11);
+        assert_eq!(varchar.type_name, "VARCHAR");
+        assert_eq!(varchar.size, Some(50));
+
+        let char_utf8 = reported_type(0x10);
+        assert_eq!(char_utf8.type_name, "CHAR");
+        assert_eq!(char_utf8.size, Some(50));
+
+        assert_ne!(reported_type(0x00).type_name, "VARCHAR");
     }
 
     #[test]
@@ -1970,20 +2002,16 @@ mod tests {
         let resp = parse_legacy_response(&handle_part(77, &[])).unwrap();
 
         match resp.terminal {
-            NativeResponse::ResultSet {
+            NativeResponse::PreparedStatement {
                 handle,
-                columns,
-                batch,
-                total_rows,
-                rows_received,
+                parameters,
+                result_columns,
             } => {
                 assert_eq!(handle, 77);
-                assert!(columns.is_empty());
-                assert!(batch.is_none());
-                assert_eq!(total_rows, 0);
-                assert_eq!(rows_received, 0);
+                assert!(parameters.is_empty());
+                assert!(result_columns.is_empty());
             }
-            other => panic!("Expected ResultSet, got {other:?}"),
+            other => panic!("Expected PreparedStatement, got {other:?}"),
         }
     }
 
@@ -2100,18 +2128,17 @@ mod tests {
         let resp = parse_legacy_response(&handle_part(5, &[sub])).unwrap();
 
         match resp.terminal {
-            NativeResponse::ResultSet {
+            NativeResponse::PreparedStatement {
                 handle,
-                columns,
-                total_rows,
-                ..
+                parameters,
+                result_columns,
             } => {
                 assert_eq!(handle, 5);
-                assert_eq!(total_rows, SMALL_RESULTSET as i64);
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "C1");
+                assert!(parameters.is_empty());
+                assert_eq!(result_columns.len(), 1);
+                assert_eq!(result_columns[0].name, "C1");
             }
-            other => panic!("Expected ResultSet, got {other:?}"),
+            other => panic!("Expected PreparedStatement, got {other:?}"),
         }
     }
 
@@ -2125,44 +2152,55 @@ mod tests {
         let resp = parse_legacy_response(&handle_part(5, &[sub])).unwrap();
 
         match resp.terminal {
-            NativeResponse::ResultSet {
-                total_rows,
-                columns,
-                ..
+            NativeResponse::PreparedStatement {
+                handle,
+                parameters,
+                result_columns,
             } => {
-                assert_eq!(total_rows, PARAMETER_DESCRIPTION as i64);
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "P1");
-                assert!(columns[0].is_varchar);
+                assert_eq!(handle, 5);
+                assert_eq!(parameters.len(), 1);
+                assert_eq!(parameters[0].name, "P1");
+                assert!(parameters[0].is_varchar);
+                assert!(result_columns.is_empty());
             }
-            other => panic!("Expected ResultSet, got {other:?}"),
+            other => panic!("Expected PreparedStatement, got {other:?}"),
         }
     }
 
     #[test]
-    fn handle_with_both_sub_results_prefers_the_parameter_description() {
-        let result_columns = result_set_part(build_result_set_header_with_handle(
+    fn handle_with_both_sub_results_keeps_parameters_and_result_columns() {
+        let first_result_set = result_set_part(build_result_set_header_with_handle(
             SMALL_RESULTSET,
             &[("C1", T_INTEGER, Vec::new())],
         ));
-        let parameters = result_set_part(build_result_set_header_with_handle(
+        let parameter_description = result_set_part(build_result_set_header_with_handle(
             PARAMETER_DESCRIPTION,
             &[("P1", T_INTEGER, Vec::new())],
         ));
+        let last_result_set = result_set_part(build_result_set_header_with_handle(
+            7,
+            &[("C2", T_INTEGER, Vec::new())],
+        ));
 
-        let resp = parse_legacy_response(&handle_part(5, &[result_columns, parameters])).unwrap();
+        let resp = parse_legacy_response(&handle_part(
+            5,
+            &[first_result_set, parameter_description, last_result_set],
+        ))
+        .unwrap();
 
         match resp.terminal {
-            NativeResponse::ResultSet {
-                total_rows,
-                columns,
-                ..
+            NativeResponse::PreparedStatement {
+                handle,
+                parameters,
+                result_columns,
             } => {
-                assert_eq!(total_rows, PARAMETER_DESCRIPTION as i64);
-                assert_eq!(columns.len(), 1);
-                assert_eq!(columns[0].name, "P1");
+                assert_eq!(handle, 5);
+                assert_eq!(parameters.len(), 1);
+                assert_eq!(parameters[0].name, "P1");
+                assert_eq!(result_columns.len(), 1);
+                assert_eq!(result_columns[0].name, "C2");
             }
-            other => panic!("Expected ResultSet, got {other:?}"),
+            other => panic!("Expected PreparedStatement, got {other:?}"),
         }
     }
 
@@ -2171,16 +2209,64 @@ mod tests {
         let resp = parse_legacy_response(&handle_part(5, &[empty_part()])).unwrap();
 
         match resp.terminal {
-            NativeResponse::ResultSet {
-                columns,
-                total_rows,
-                ..
+            NativeResponse::PreparedStatement {
+                handle,
+                parameters,
+                result_columns,
             } => {
-                assert!(columns.is_empty());
-                assert_eq!(total_rows, 0);
+                assert_eq!(handle, 5);
+                assert!(parameters.is_empty());
+                assert!(result_columns.is_empty());
             }
-            other => panic!("Expected ResultSet, got {other:?}"),
+            other => panic!("Expected PreparedStatement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_sub_result_carrying_an_exception_is_rejected() {
+        let data = handle_part(5, &[exception_part("prepare refused", "42000")]);
+
+        let msg = legacy_error(&data);
+
+        assert!(msg.contains("prepare refused"), "{msg}");
+        assert!(msg.contains("42000"), "{msg}");
+    }
+
+    #[test]
+    fn handle_sub_result_warning_is_propagated() {
+        let data = handle_part(5, &[warning_part("truncated", "01004")]);
+
+        let resp = parse_legacy_response(&data).unwrap();
+
+        assert_eq!(resp.warnings.len(), 1);
+        assert_eq!(resp.warnings[0].message, "truncated");
+        assert_eq!(resp.warnings[0].sql_state, "01004");
+        match resp.terminal {
+            NativeResponse::PreparedStatement {
+                handle,
+                parameters,
+                result_columns,
+            } => {
+                assert_eq!(handle, 5);
+                assert!(parameters.is_empty());
+                assert!(result_columns.is_empty());
+            }
+            other => panic!("Expected PreparedStatement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn counted_envelope_handle_part_propagates_a_sub_result_warning() {
+        let data = envelope(&[handle_part(31, &[warning_part("careful", "01000")])]);
+
+        let resp = parse_response(&data).unwrap();
+
+        assert_eq!(resp.warnings.len(), 1);
+        assert_eq!(resp.warnings[0].message, "careful");
+        assert!(matches!(
+            resp.terminal,
+            NativeResponse::PreparedStatement { handle: 31, .. }
+        ));
     }
 
     // --- Counted envelope framing ---
@@ -2254,8 +2340,16 @@ mod tests {
         let resp = parse_response(&data).unwrap();
 
         match resp.terminal {
-            NativeResponse::ResultSet { handle, .. } => assert_eq!(handle, 31),
-            other => panic!("Expected ResultSet, got {other:?}"),
+            NativeResponse::PreparedStatement {
+                handle,
+                parameters,
+                result_columns,
+            } => {
+                assert_eq!(handle, 31);
+                assert!(parameters.is_empty());
+                assert!(result_columns.is_empty());
+            }
+            other => panic!("Expected PreparedStatement, got {other:?}"),
         }
     }
 

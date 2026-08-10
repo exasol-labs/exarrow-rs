@@ -77,9 +77,13 @@ use common::{
     disable_query_cache, generate_test_schema_name, get_host, get_port, get_test_connection,
     get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
 };
+#[cfg(feature = "native")]
+use common::{get_password, get_test_connection_with_transport};
 use exarrow_rs::adbc::Connection;
 use exarrow_rs::export::csv::{CsvExportOptions, ExportError};
 use exarrow_rs::query::export::ExportSource;
+#[cfg(feature = "native")]
+use exarrow_rs::transport::{ConnectionParams, Credentials, NativeTcpTransport, TransportProtocol};
 use exarrow_rs::{Parameter, QueryError};
 use std::future::Future;
 
@@ -719,6 +723,49 @@ async fn cleanup_schema(conn: &mut Connection, schema_name: &str) {
     let _ = conn
         .execute_update(&format!("DROP SCHEMA {} CASCADE", schema_name))
         .await;
+}
+
+/// Connects a native transport, authenticates, and creates `{schema_name}.T
+/// (ID DECIMAL(18,0), NAME VARCHAR(50))` — the shared fixture the native
+/// result-column tests and the WebSocket parity test must stay aligned with.
+#[cfg(feature = "native")]
+async fn connect_native_with_test_table(schema_name: &str) -> NativeTcpTransport {
+    let params = ConnectionParams::new(get_host(), get_port())
+        .with_tls(true)
+        .with_validate_server_certificate(false);
+    let creds = Credentials::new(get_user(), get_password());
+
+    let mut transport = NativeTcpTransport::new();
+    transport.connect(&params).await.expect("Failed to connect");
+    transport
+        .authenticate(&creds)
+        .await
+        .expect("Failed to authenticate");
+
+    transport
+        .execute_query(&format!("CREATE SCHEMA {}", schema_name))
+        .await
+        .expect("Failed to create schema");
+    transport
+        .execute_query(&format!(
+            "CREATE TABLE {}.T (ID DECIMAL(18,0), NAME VARCHAR(50))",
+            schema_name
+        ))
+        .await
+        .expect("Failed to create table");
+
+    transport
+}
+
+/// Drops `schema_name` and closes the transport, mirroring `cleanup_schema`
+/// for the native-transport result-column tests.
+#[cfg(feature = "native")]
+async fn drop_native_schema(transport: &mut NativeTcpTransport, schema_name: &str) {
+    transport
+        .execute_query(&format!("DROP SCHEMA {} CASCADE", schema_name))
+        .await
+        .expect("Failed to drop schema");
+    transport.close().await.expect("Failed to close connection");
 }
 
 /// 5.1 Test INSERT single row into table
@@ -1999,6 +2046,230 @@ async fn test_prepared_statement_parameter_types() {
         .await
         .expect("Failed to drop schema");
     conn.close().await.expect("Failed to close connection");
+}
+
+/// 8.5 Test a non-ASCII VARCHAR parameter round-trips unchanged.
+///
+/// Sole guard for the outbound vcFlag byte written on `T_CHAR` parameter column
+/// headers. Verified to have teeth: writing `0x00` there instead makes Exasol
+/// reject the parameter data with "too large character string type". Pinned to
+/// the native transport since that byte is only written on that path.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_prepared_non_ascii_varchar_parameter_round_trip() {
+    skip_if_no_exasol!();
+
+    const NON_ASCII_NAME: &str = "Grüße 世界 café ☕ 😀";
+
+    let mut conn = get_test_connection_with_transport("native")
+        .await
+        .expect("Failed to connect");
+
+    let schema_name = generate_test_schema_name();
+
+    conn.execute_update(&format!("CREATE SCHEMA {}", schema_name))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    conn.execute_update(&format!(
+        "CREATE TABLE {}.non_ascii_params (NAME VARCHAR(50))",
+        schema_name
+    ))
+    .await
+    .expect("Failed to create table");
+
+    let mut prepared = conn
+        .prepare(&format!(
+            "INSERT INTO {}.non_ascii_params VALUES (?)",
+            schema_name
+        ))
+        .await
+        .expect("Failed to prepare insert");
+
+    prepared
+        .bind(0, NON_ASCII_NAME)
+        .expect("Failed to bind non-ASCII parameter");
+
+    let rows = conn
+        .execute_prepared_update(&prepared)
+        .await
+        .expect("Exasol should accept the parameter data");
+
+    assert_eq!(rows, 1, "Insert should affect exactly one row");
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+
+    let batches = conn
+        .query(&format!(
+            "SELECT NAME FROM {}.non_ascii_params",
+            schema_name
+        ))
+        .await
+        .expect("SELECT should succeed");
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "The stored row should be readable back");
+
+    let name_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("NAME column should be StringArray");
+
+    assert_eq!(
+        name_col.value(0),
+        NON_ASCII_NAME,
+        "The bound string should return unchanged, byte for byte"
+    );
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// 8.6 A parameterized SELECT's prepared-statement reply reports its result-set
+/// column metadata: names, Exasol type names, precision/scale, and size.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_prepared_result_columns_native_parameterized_select() {
+    skip_if_no_exasol!();
+
+    let schema_name = generate_test_schema_name();
+    let mut transport = connect_native_with_test_table(&schema_name).await;
+
+    let handle = transport
+        .create_prepared_statement(&format!(
+            "SELECT ID, NAME FROM {}.T WHERE ID = ? AND NAME = ?",
+            schema_name
+        ))
+        .await
+        .expect("Failed to prepare parameterized select");
+
+    assert_eq!(
+        handle.result_columns.len(),
+        2,
+        "Parameterized SELECT should report 2 result columns"
+    );
+
+    let id_col = &handle.result_columns[0];
+    assert_eq!(id_col.name, "ID");
+    assert_eq!(id_col.data_type.type_name, "DECIMAL");
+    assert_eq!(id_col.data_type.precision, Some(18));
+    assert_eq!(id_col.data_type.scale, Some(0));
+
+    let name_col = &handle.result_columns[1];
+    assert_eq!(name_col.name, "NAME");
+    assert_eq!(name_col.data_type.type_name, "VARCHAR");
+    assert_eq!(name_col.data_type.size, Some(50));
+
+    transport
+        .close_prepared_statement(&handle)
+        .await
+        .expect("Failed to close prepared statement");
+
+    drop_native_schema(&mut transport, &schema_name).await;
+}
+
+/// 8.7 A derived select list's prepared-statement reply reports the widened
+/// arithmetic precision and the transport's derived column name.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_prepared_result_columns_native_derived_select_list() {
+    skip_if_no_exasol!();
+
+    let schema_name = generate_test_schema_name();
+    let mut transport = connect_native_with_test_table(&schema_name).await;
+
+    let handle = transport
+        .create_prepared_statement(&format!(
+            "SELECT ID*2 AS DOUBLED, UPPER(NAME) FROM {}.T",
+            schema_name
+        ))
+        .await
+        .expect("Failed to prepare derived select list");
+
+    assert_eq!(
+        handle.num_params, 0,
+        "Derived select list has no parameters"
+    );
+    assert_eq!(
+        handle.result_columns.len(),
+        2,
+        "Derived select list should report 2 result columns"
+    );
+
+    let doubled_col = &handle.result_columns[0];
+    assert_eq!(doubled_col.name, "DOUBLED");
+    assert_eq!(doubled_col.data_type.type_name, "DECIMAL");
+    assert_eq!(
+        doubled_col.data_type.precision,
+        Some(19),
+        "ID*2 widens precision from 18 to 19"
+    );
+    assert_eq!(doubled_col.data_type.scale, Some(0));
+
+    let upper_col = &handle.result_columns[1];
+    assert_eq!(upper_col.name, "UPPER(T.NAME)");
+    assert_eq!(upper_col.data_type.type_name, "VARCHAR");
+    assert_eq!(upper_col.data_type.size, Some(50));
+
+    transport
+        .close_prepared_statement(&handle)
+        .await
+        .expect("Failed to close prepared statement");
+
+    drop_native_schema(&mut transport, &schema_name).await;
+}
+
+/// 8.8 A row-count-producing statement's prepared-statement reply reports zero
+/// result columns while still reporting its parameters.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_prepared_result_columns_native_row_count_statements() {
+    skip_if_no_exasol!();
+
+    let schema_name = generate_test_schema_name();
+    let mut transport = connect_native_with_test_table(&schema_name).await;
+
+    let insert_handle = transport
+        .create_prepared_statement(&format!("INSERT INTO {}.T VALUES (?, ?)", schema_name))
+        .await
+        .expect("Failed to prepare insert");
+
+    assert!(
+        insert_handle.result_columns.is_empty(),
+        "INSERT should report no result columns"
+    );
+    assert_eq!(
+        insert_handle.num_params, 2,
+        "INSERT should still report its 2 parameters"
+    );
+
+    transport
+        .close_prepared_statement(&insert_handle)
+        .await
+        .expect("Failed to close insert prepared statement");
+
+    let delete_handle = transport
+        .create_prepared_statement(&format!("DELETE FROM {}.T WHERE ID = ?", schema_name))
+        .await
+        .expect("Failed to prepare delete");
+
+    assert!(
+        delete_handle.result_columns.is_empty(),
+        "DELETE should report no result columns"
+    );
+    assert_eq!(
+        delete_handle.num_params, 1,
+        "DELETE should still report its 1 parameter"
+    );
+
+    transport
+        .close_prepared_statement(&delete_handle)
+        .await
+        .expect("Failed to close delete prepared statement");
+
+    drop_native_schema(&mut transport, &schema_name).await;
 }
 
 // Section 9: WebSocket Transport Regression Tests

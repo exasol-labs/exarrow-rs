@@ -161,11 +161,14 @@ pub const T_SMALLDECIMAL: u32 = 63;
 /// Wire type: big decimal.
 pub const T_BIGDECIMAL: u32 = 64;
 
-/// VCFlag: is varchar.
-pub const IS_VARCHAR: u8 = 0x80;
+/// VCFlag bit `0x01`: the column is `VARCHAR` rather than `CHAR`.
+///
+/// Exasol sends `0x11` for `VARCHAR(n)` with character set UTF8 and `0x10` for
+/// `CHAR(n)`, so the varchar bit is the low bit.
+pub const IS_VARCHAR: u8 = 0x01;
 
-/// VCFlag: is UTF-8.
-pub const IS_UTF8: u8 = 0x01;
+/// VCFlag bit `0x10`: the column's character set is UTF-8.
+pub const IS_UTF8: u8 = 0x10;
 
 /// Size of the binary message header in bytes.
 pub const HEADER_SIZE: usize = 21;
