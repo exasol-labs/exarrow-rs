@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.17.0
+## [Unreleased]
 
 - Breaking: `PreparedStatementHandle` gains a public field, `result_columns`, so struct-literal construction outside the crate no longer compiles. `new()` is unchanged.
 - Breaking: `NativeResponse` gains a variant, `PreparedStatement`, so external exhaustive `match` no longer compiles.
