@@ -102,6 +102,25 @@ Driver manager tests (`tests/driver_manager_tests.rs`) load `target/release/libe
 
 ## Changelog
 
-- `CHANGELOG.md` must be updated with every version bump.
-- Format: `## <version>` header followed by bullet points describing changes.
-- Entries should be concise and user-facing — avoid internal implementation details.
+`CHANGELOG.md` must be updated in the same PR as any user-facing change. A PR falls into one of two cases:
+
+- **No version bump (the common case).** Add entries under a `## [Unreleased]` header at the top of the file, creating it if it does not exist. Merging such a PR does not release anything.
+- **Version bump (cuts a release).** The PR bumps the version in `Cargo.toml`, so merging it releases (see [Releasing](#releasing)). Put the entries under a `## X.Y.Z` header whose version matches `Cargo.toml` **exactly**, folding in anything currently under `## [Unreleased]`.
+
+Entries should be concise and user-facing — avoid internal implementation details.
+
+## Releasing
+
+Releasing is automated by the `release` job in `.github/workflows/ci.yml`, which runs on every push to `main` (that is, every merge). It reads the version from `Cargo.toml` and, **only if no `vX.Y.Z` git tag exists for that version yet**:
+
+1. creates and pushes the `vX.Y.Z` tag,
+2. creates a GitHub release whose notes are the `## X.Y.Z` section extracted from `CHANGELOG.md`,
+3. publishes the crate to crates.io.
+
+So a release is triggered by **merging a version bump to `main`** — nothing else. Merging a PR that leaves the `Cargo.toml` version unchanged never releases, because the tag already exists and the job no-ops.
+
+To cut a release, in a single PR:
+
+1. Bump `version` in `Cargo.toml` following [SemVer](https://semver.org), then run a build so `Cargo.lock` picks up the new version.
+2. In `CHANGELOG.md`, rename the `## [Unreleased]` header to `## X.Y.Z`, matching `Cargo.toml` exactly. The release job extracts the notes by an exact `## X.Y.Z` header match, so a mismatched version or a leftover `[Unreleased]` header produces empty release notes.
+3. Merge to `main`. CI tags, publishes the GitHub release, and publishes to crates.io automatically.
