@@ -284,6 +284,10 @@ jobs:
     needs: [integration-tests]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Serialize releases; never cancel one mid-publish.
+    concurrency:
+      group: release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -301,7 +305,7 @@ jobs:
       - name: Check if tag already exists
         id: check
         run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          if git rev-parse --verify --quiet "refs/tags/v${{ steps.version.outputs.version }}" >/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -340,14 +344,22 @@ jobs:
         id: crate
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          if curl -sf "https://crates.io/api/v1/crates/exarrow-rs/$VERSION" | grep -q '"num"'; then
+          # Use the sparse index, not the API: it is built for automated
+          # clients. (The API also 403s curl's default User-Agent.)
+          # Fail on an unknown status; never guess.
+          STATUS=$(curl -s -o index.json -w '%{http_code}' "https://index.crates.io/ex/ar/exarrow-rs")
+          if [ "$STATUS" = "200" ] && grep -q "\"vers\":\"$VERSION\"" index.json; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$STATUS" = "200" ] || [ "$STATUS" = "404" ]; then
+            # 404 = crate never published.
             echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unexpected crates.io index status $STATUS" >&2
+            exit 1
           fi
 
       - name: Publish to crates.io
         if: steps.crate.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        run: cargo publish
+        run: cargo publish --locked
