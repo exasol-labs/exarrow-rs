@@ -22,6 +22,7 @@ Project specifics:
 ## Code style
 
 - A comment states a non-obvious why: an invariant, an external-system quirk, or a spec or issue constraint. Keep it to 1 or 2 lines. Never restate the code, narrate history, or add banners. Update or delete comments when behavior changes.
+- A test implementing a spec scenario carries one `/// Scenario: <title>` line per scenario, quoting the title verbatim.
 
 ## Commands
 
