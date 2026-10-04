@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Spec-driven development with mission in: @specs/mission.md
+
 ## Prerequisites
 
 **Before running integration tests or examples**, start the Exasol Docker container yourself (don't ask the user):
@@ -44,14 +46,10 @@ benches/           # Rust benchmarks (feature-gated behind "benchmark")
 docs/              # User-facing documentation (connection, queries, import/export, type mapping, driver manager)
 examples/          # Runnable usage examples (basic_usage, driver_manager_usage, import_export)
 scripts/           # CI helper scripts
-specs/             # Feature specifications (speq format: specs/<domain>/<feature>/spec.md)
+specs/             # Feature specifications
 src/               # Library source code (ADBC driver, transport, import/export, Arrow conversion)
 tests/             # Integration test suites (integration_tests, driver_manager_tests, import_export_tests)
 ```
-
-## Specifications
-
-Specifications live in `specs/` using a `specs/<domain>/<feature>/spec.md` structure. Use the `speq` CLI to explore, search, and validate specs. Use Context7 MCP tools for third-party library research before implementing.
 
 ## Key Design Patterns
 
