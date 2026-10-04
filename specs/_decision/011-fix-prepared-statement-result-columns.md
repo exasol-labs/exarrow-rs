@@ -8,20 +8,20 @@
 
 ### Context
 
-Issue #60 reports that `create_prepared_statement` discards result-set column metadata the server already sends. `parse_handle_only_at` decoded both sub-results of a prepared-statement reply's `R_HANDLE` part into locals, then collapsed them with `parameter_description.or(result_columns)` because the flat `NativeResponse::ResultSet` variant it returned could carry only one column list. The surviving sub-result's handle was also smuggled out through that variant's `total_rows` field, which `create_prepared_statement` read back and compared against `PARAMETER_DESCRIPTION`. `result_parser.rs` and `native/mod.rs` therefore shared an unenforced convention — when a `ResultSet` came from an `R_HANDLE` part, `total_rows` was not a row count — with nothing enforcing agreement between the two modules.
+A prepared-statement reply carries two sub-results in its `R_HANDLE` part: parameter description and result columns. `parse_handle_only_at` returned the flat `NativeResponse::ResultSet`, which holds one column list. It kept one with `parameter_description.or(result_columns)` and dropped the result-column metadata (issue #60). It also passed the handle through `total_rows`, which `create_prepared_statement` compared against `PARAMETER_DESCRIPTION`. `result_parser.rs` and `native/mod.rs` shared this unenforced convention.
 
 ### Decision
 
-Add `NativeResponse::PreparedStatement { handle: i32, parameters: Vec<NativeColumnMeta>, result_columns: Vec<NativeColumnMeta> }` and return it unconditionally from `parse_handle_only_at`, replacing both the `.or()` collapse and the `total_rows` sentinel.
+`NativeResponse::PreparedStatement { handle: i32, parameters: Vec<NativeColumnMeta>, result_columns: Vec<NativeColumnMeta> }` is the unconditional return of `parse_handle_only_at`. It replaces both the `.or()` collapse and the `total_rows` sentinel.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| New `NativeResponse::PreparedStatement` variant carrying both column lists | ✓ Chosen — removes the shared convention outright; every other `match` on `NativeResponse` already has a catch-all arm that correctly rejects a prepare reply where a query result was expected |
-| Add a `result_columns` field to the existing `ResultSet` variant | ✗ Rejected — keeps `total_rows` meaning two different things depending on provenance and adds an always-empty field to every ordinary result set |
-| Add an explicit sub-result-kind field alongside the sentinel | ✗ Rejected — names the convention but still leaves it spread across two modules |
+| New `PreparedStatement` variant with both column lists | ✓ Chosen. It removes the shared convention, and existing catch-all arms already reject it where a query result is expected |
+| `result_columns` field on `ResultSet` | ✗ Rejected. `total_rows` keeps two meanings and every result set gains an empty field |
+| Explicit sub-result-kind field beside the sentinel | ✗ Rejected. The convention stays spread across two modules |
 
 ### Consequences
 
-Sub-result classification has exactly one owner, `parse_handle_only_at`, and `total_rows` means one thing again on the `ResultSet` variant. The change is breaking: `native::result_parser` is `pub mod`, so external exhaustive `match` on `NativeResponse` no longer compiles.
+`parse_handle_only_at` alone classifies sub-results, and `total_rows` always means a row count. The change is breaking: `native::result_parser` is `pub mod`, so external exhaustive matches on `NativeResponse` stop compiling.

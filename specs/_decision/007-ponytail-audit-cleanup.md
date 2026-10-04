@@ -4,7 +4,7 @@
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
 <!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
 
-## ADR-007: In a library, "unused internally" is not "dead" — and tests must not mutate global env
+## ADR-007: In a library, "unused internally" is not "dead", and tests must not mutate global env
 
 **ID:** unused-internally-is-not-dead-tests-must-not-mutate-env
 **Plan:** ponytail-audit-cleanup
@@ -12,26 +12,24 @@
 
 ### Context
 
-A whole-repo over-engineering audit flagged ~3,500 lines as removable. Much of it was a category error: a *library* legitimately exports surface its own internals never call (it exists for downstream consumers), so "zero internal callers" alone does not make a symbol dead. Separately, the audit surfaced a long-standing test-isolation defect: non-`#[ignore]` unit tests in `tests/common/mod.rs` called `env::remove_var` on the `EXASOL_*` connection vars. Because that module compiles into every integration-test binary and the suite runs `--test-threads=1`, those tests wiped the configured connection parameters mid-run, so later tests silently fell back to `localhost:8563` and failed against any non-default container.
+A library exports surface that its own code never calls, because downstream consumers use it. Zero internal callers therefore does not make a symbol dead. Separately, unit tests in `tests/common/mod.rs` called `env::remove_var` on the `EXASOL_*` variables. That module compiles into every integration-test binary, so the tests wiped the connection settings mid-run and later tests fell back to `localhost:8563`.
 
 ### Decision
 
-Two rules, both from this cleanup:
+1. **Deletion criterion.** Remove a symbol only when it has zero non-test callers and is not public API. Public API means re-exported through `lib.rs` or `pub use`, or reachable through a `pub mod`. Exported surface such as `ArrowConverter`, `ResultSetIterator`, the `blocking_*` API, `ArrowToCsvWriter`, and `CsvToArrowReader` stays even when unused internally. Removing it is a separate, deliberate breaking change.
+2. **No env mutation in tests.** No test calls `env::set_var` or `env::remove_var`. Tests exercise env-derived logic through pure helpers with explicit arguments, such as `common::connection_string`.
 
-1. **Deletion criterion.** Only remove a symbol when it has zero non-test callers **and** is not part of the public API (not re-exported via `lib.rs` or any `pub use`, and not reachable through a `pub mod`). Documented or exported surface — `ArrowConverter`, `ResultSetIterator`, the `blocking_*` sync API, `ArrowToCsvWriter`, `CsvToArrowReader` — is retained even when internally unused; its removal is a deliberate, separately-decided breaking change. Genuinely-unreachable internals (e.g. `SessionManager`, dead protocol constants) are removed.
-2. **Tests never mutate the shared process environment.** No test calls `env::set_var`/`remove_var`. Env-derived logic is exercised through pure helpers taking explicit arguments (e.g. `common::connection_string`). See the code-quality scenario "Tests do not mutate shared process environment".
-
-Removing the unreachable public items (`connection::session::SessionManager`, the unused `ExportError` variants) is a breaking change, released as `0.13.0`.
+Removing unreachable public items (`SessionManager`, unused `ExportError` variants) is a breaking change released as `0.13.0`.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Delete only verified-dead, non-exported code; retain public surface | ✓ Chosen — preserves the library's contract with downstreams while still removing genuine bloat |
-| Delete everything with zero internal callers | ✗ Rejected — strips legitimate public API that exists for consumers, not internal use |
-| Fix env-mutating tests via save/restore + a serial mutex | ✗ Rejected — still mutates global env (a window remains; `set_var` is `unsafe` in edition 2024); pure helpers eliminate the hazard entirely |
-| Patch-bump (0.12.9) despite removing public items | ✗ Rejected — removing reachable `pub` API is breaking under Cargo 0.x semver |
+| Delete only verified-dead, non-exported code | ✓ Chosen. Keeps the public contract and removes real bloat |
+| Delete everything with zero internal callers | ✗ Rejected. It strips public API meant for consumers |
+| Save/restore env with a serial mutex | ✗ Rejected. It still mutates global env, and `set_var` is `unsafe` in edition 2024 |
+| Patch bump to 0.12.9 | ✗ Rejected. Removing public API is breaking under 0.x semver |
 
 ### Consequences
 
-Future audits MUST apply the deletion criterion before removing any `pub` symbol. The test suite is now order-independent regardless of thread count or execution order, asserted by the new code-quality scenario. Separately, investigating the full `--include-ignored` run surfaced two pre-existing, `#[ignore]`-gated integration tests (never run by the CI integration stage, which omits `--include-ignored`) that were broken independently of this cleanup and were brought into line with the recorded behavior: `test_connect_with_nonexistent_uri_schema_succeeds` used `use_tls(false)` against the TLS-only container (fixed to accept the self-signed cert), and `test_uri_schema_activation_failure_returns_error` asserted the pre-ADR fatal behavior — it was reconciled with the URI-schema-best-effort decision and renamed `test_uri_schema_missing_is_best_effort_via_adbc`, asserting best-effort success on the ADBC URI path. Because `0.13.0` is breaking for downstreams pinned to `^0.12`, the release chain requires bumping `exapump`'s `exarrow-rs` constraint and advancing the `adbc-driver-exasol` vendored submodule pointer.
+Future audits MUST apply the deletion criterion before removing a `pub` symbol. The test suite is independent of thread count and order. Because `0.13.0` is breaking for `^0.12` users, the `exapump` `exarrow-rs` constraint and the `adbc-driver-exasol` submodule pointer need updating.

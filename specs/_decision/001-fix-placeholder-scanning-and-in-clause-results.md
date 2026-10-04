@@ -12,20 +12,20 @@
 
 ### Context
 
-The naive `sql.find('?')` loop in `Statement::build_sql` treated every `?` character as a positional placeholder, including those inside single-quoted string literals, double-quoted identifiers, line comments, and block comments. This caused incorrect parameter counts and mangled SQL for queries such as `SELECT 'a?b'` or `INSERT INTO t VALUES ('it''s a test?')`.
+`Statement::build_sql` counted every `?` as a positional placeholder, including those inside string literals, quoted identifiers, and comments. That produced wrong parameter counts and mangled SQL.
 
 ### Decision
 
-Replace the naive loop with a private linear-pass state machine `scan_placeholders` that tracks five lexical states — `Normal`, `SingleQuoted`, `DoubleQuoted`, `LineComment`, and `BlockComment` — and only treats `?` in the `Normal` state as a positional placeholder.
+`Statement` scans SQL with a private linear-pass state machine, `scan_placeholders`. It tracks five states: `Normal`, `SingleQuoted`, `DoubleQuoted`, `LineComment`, and `BlockComment`. Only a `?` in the `Normal` state is a placeholder.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Hand-rolled five-state lexer in `src/query/statement.rs` | ✓ Chosen — O(n), allocation-free, no new dependencies, matches the approach used by pyexasol and JDBC |
-| Pull in `sqlparser` crate | ✗ Rejected — heavyweight dependency for a single bug fix; ANSI SQL parsing is overkill for lexical-state tracking |
-| Use a regex to strip strings/comments first | ✗ Rejected — cannot correctly handle SQL standard `''` escaping without becoming a state machine anyway |
+| Hand-rolled five-state lexer | ✓ Chosen. Linear, allocation-free, no new dependency, same approach as pyexasol and JDBC |
+| `sqlparser` crate | ✗ Rejected. Full SQL parsing is too heavy for lexical-state tracking |
+| Regex that strips strings and comments first | ✗ Rejected. It cannot handle `''` escaping without becoming a state machine |
 
 ### Consequences
 
-The scanner is easy to unit-test independently. SQL standard `''` and `""` escape sequences inside string literals are handled correctly. Multi-byte UTF-8 input is safe because the scanner operates on `char_indices()` with explicit ASCII checks. No new crate dependency is introduced.
+The scanner handles `''` and `""` escapes and is safe on multi-byte UTF-8.
