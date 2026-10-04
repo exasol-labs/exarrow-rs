@@ -23,58 +23,7 @@ Enforce a configured query timeout server-side. When a caller configures a timeo
 
 ### Consequences
 
-The connection survives a query timeout and remains usable for subsequent statements. The public `ConnectionParams::query_timeout` field type changes from `Duration` to `Option<Duration>`, a breaking change marked in the CHANGELOG.
-
-## ADR: The `Option` timeout value selects whether the `queryTimeout` attribute is set, not a client timer
-
-**ID:** query-timeout-option-semantics
-**Plan:** remove-query-timeout
-**Status:** Accepted
-
-### Context
-
-`ConnectionParams::query_timeout` and `Statement::timeout_ms` needed a representation for "a timeout may or may not be configured" once enforcement moved server-side.
-
-### Decision
-
-Keep `ConnectionParams::query_timeout: Option<Duration>` and `Statement::timeout_ms: Option<u64>`. `Some(d)` means "forward `d.as_secs()` to Exasol as the `queryTimeout` session attribute"; `None` means "set no attribute; the server's own `QUERY_TIMEOUT` governs". No arm constructs a client-side timer.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `Option<Duration>` / `Option<u64>`, `None` = no attribute | ✓ Chosen — idiomatic, compiler-checked absence, public type stays stable across the mechanism change |
-| `Duration` sentinel (`MAX` or `ZERO`) for "no attribute" | ✗ Rejected — a magic value is easy to misread as a bug and forces every reader to know it |
-
-### Consequences
-
-The public field type is unchanged in shape from the prior `Option`-based design; only its meaning shifts from "arm/skip a client timer" to "set/skip a server attribute".
-
-## ADR: Set the `queryTimeout` attribute via `setAttributes`, mirroring `set_autocommit`
-
-**ID:** query-timeout-via-set-attributes
-**Plan:** remove-query-timeout
-**Status:** Accepted
-
-### Context
-
-Exasol exposes `queryTimeout` as a session attribute, settable over the WebSocket `setAttributes` command and equivalent to `ALTER SESSION SET QUERY_TIMEOUT = n`. The driver already sets the `autocommit` attribute this way post-authenticate.
-
-### Decision
-
-Add `TransportProtocol::set_query_timeout(timeout_secs: u64)`, implemented on both transports by sending the `queryTimeout` attribute — the WebSocket transport via a `setAttributes` command, the native transport via `CMD_SET_ATTRIBUTES` — exactly as `set_autocommit` already sets `autocommit`. `connect()` calls it once after authentication when the connection configures a timeout; `execute_statement()` reconciles a per-statement override against the session's applied value before executing.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `setAttributes` command, mirroring `set_autocommit` | ✓ Chosen — a proven precedent for a post-authenticate session attribute over the same request/response path; the wire format is confirmed against the Exasol WebSocket API, not guessed |
-| `ALTER SESSION SET QUERY_TIMEOUT = n` SQL | ✗ Rejected — composes session-management SQL instead of using a typed attribute |
-| Set the attribute in the login command's `attributes` object | ✗ Rejected — does not serve the per-statement reconcile path, which needs a post-authenticate call |
-
-### Consequences
-
-One mechanism (`set_query_timeout`) serves both the connection-level initial set and the per-statement reconcile.
+The connection survives a query timeout and remains usable for subsequent statements. The public `ConnectionParams::query_timeout` field type changes from `Duration` to `Option<Duration>`, a breaking change marked in the CHANGELOG. `ConnectionParams::query_timeout` stays `Option<Duration>` and `Statement::timeout_ms` stays `Option<u64>`, where `Some` forwards the value as the `queryTimeout` session attribute and `None` sets no attribute. The attribute is set through `TransportProtocol::set_query_timeout` over `setAttributes` (`CMD_SET_ATTRIBUTES` on the native transport), mirroring `set_autocommit`, and one mechanism serves both the connection-level set and the per-statement reconcile.
 
 ## ADR: Client-side give-up on a running query MUST terminate the connection
 

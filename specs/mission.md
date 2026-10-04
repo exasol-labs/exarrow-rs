@@ -20,13 +20,19 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 2. **Bulk import/export via HTTP tunneling** — high-throughput data transfer for CSV, Parquet, and Arrow RecordBatch formats with parallel file support
 3. **Arrow-native type conversion** — bidirectional mapping between Exasol and Arrow type systems with precision preservation
 4. **FFI export for driver manager integration** — cdylib build target enabling any ADBC driver manager to load and use the driver
-5. **Prepared statement support** — type-safe parameter binding and execution through the Exasol WebSocket protocol
+5. **Prepared statement support** — type-safe parameter binding and execution over the native TCP protocol (default) or the WebSocket protocol
+6. **Metadata lookup** — ADBC catalog, schema, and column discovery through GetObjects, table schema lookup, and parameter schema lookup after prepare
+7. **Transaction control** — autocommit on or off, commit, and rollback on a Connection
+8. **ADBC bulk ingestion** — ingest Arrow data into a target table through the standard Statement with IngestMode Append, Create, CreateAppend, or Replace, generating table DDL from the Arrow schema
+9. **Query execution and server version gating** — SQL execution with placeholder parsing that skips literals, comments, and quoted identifiers, and feature gating on the server release version
 
 ## Out of Scope
 
 - **Connection pooling** — left to the application layer
 - **ORM / query builder** — raw SQL only, no abstraction layer
 - **ETL/ELT transformations** — data is transferred as-is, transformations are the caller's responsibility
+
+Architecture: see specs/architecture.md.
 
 ## Domain Glossary
 
@@ -35,7 +41,11 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 | ADBC | Arrow Database Connectivity — standard API for database access using Apache Arrow |
 | Arrow | Apache Arrow columnar memory format for efficient analytical data processing |
 | RecordBatch | Arrow's unit of columnar data: a collection of equal-length arrays with a shared schema |
-| EXA protocol | Exasol's WebSocket JSON protocol for commands and query execution (default port 8563) |
+| EXA protocol | Exasol's command and query protocol, carried as JSON over WebSocket or as binary frames over native TCP (default port 8563) |
+| Prepared statement | SQL parsed once on the server and executed with bound parameters |
+| Bulk ingestion | ADBC mechanism that loads Arrow data into a target table through a Statement, controlled by IngestMode (Append, Create, CreateAppend, Replace) |
+| GetObjects | ADBC call that returns catalogs, schemas, tables, and columns |
+| Autocommit | Transaction mode in which each statement commits on completion |
 | HTTP tunneling | Reverse-connection pattern where the client opens an outbound TCP connection that Exasol's SQLProcess connects back through for bulk data transfer |
 | Native TCP protocol | Exasol's binary protocol over TCP with ChaCha20 stream encryption, little-endian framing, and direct binary result sets (default transport) |
 | cdylib | Rust C-compatible dynamic library used by ADBC driver managers to load the driver |
@@ -96,32 +106,12 @@ benches/           # Rust benchmarks (feature-gated behind "benchmark")
 docs/              # User-facing documentation (connection, queries, import/export, type mapping, driver manager)
 examples/          # Runnable usage examples (basic_usage, driver_manager_usage, import_export)
 scripts/           # CI helper scripts
-specs/             # Feature specifications (speq format: specs/<domain>/<feature>/spec.md)
+specs/             # Feature specifications
 src/               # Library source code (ADBC driver, transport, import/export, Arrow conversion)
 tests/             # Integration test suites (integration_tests, driver_manager_tests, import_export_tests)
 ```
 
-## Architecture
-
-Layered architecture following the ADBC Driver hierarchy: **Driver -> Database -> Connection -> Statement**.
-
-- **ADBC layer** (`adbc/`) is the public API entry point. Driver creates Databases, Databases create Connections, Connections execute Statements.
-- **Transport layer** (`transport/`) provides two protocol backends: the native TCP transport (`transport/native/`, default) using Exasol's binary protocol with ChaCha20 encryption, and the WebSocket transport (`transport/ws/`, opt-in via `transport=websocket`) using JSON over WebSocket. Both share HTTP tunneling for bulk transfers. Connection owns transport exclusively (no shared state).
-- **Data layer** (`import/`, `export/`, `arrow_conversion/`) handles format conversion and bulk data transfer. Statement is pure data; all execution flows through Connection.
-- All I/O is async-first via Tokio. Import/Export uses reverse-connection HTTP tunneling with the EXA protocol handshake.
-
 ## Constraints
 
-- **Technical**: TLS enabled by default; production Exasol requires it. Credentials MUST NOT be logged or exposed.
 - **Code quality**: Zero `clippy` warnings across all targets/features and a documented, auditable `cargo-deny` advisory-suppression policy (with re-evaluation triggers) are enforced in CI before any code or build-impacting change is considered complete. Spec/doc-only changes (`specs/**`, `docs/**`, `README.md`) are exempt from this CI run per `paths-ignore`.
-- **Performance**: Arrow-native zero-copy where possible. Results streamed as RecordBatches to avoid memory bloat.
 - **Testing**: Integration tests require a running Exasol instance (Docker: `exasol/docker-db:latest` on port 8563, credentials `sys`/`exasol`).
-
-## External Dependencies
-
-| Service | Purpose | Failure Impact |
-|---------|---------|----------------|
-| Exasol Database | Target database (native TCP or WebSocket API on port 8563) | All operations fail — the driver has no offline mode |
-| Docker | Local development and testing (`exasol/docker-db:latest`) | Cannot run integration tests locally |
-| GitHub Actions | CI/CD pipeline | No automated testing or release builds |
-| Codecov | Coverage reporting | No coverage metrics, CI still passes |
