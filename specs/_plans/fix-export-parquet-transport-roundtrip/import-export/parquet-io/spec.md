@@ -50,7 +50,7 @@ The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builder
 ### Scenario: Values containing the separator, the delimiter, or a line break export intact
 
 * *GIVEN* a table with columns `ID DECIMAL(18,0)` and `NAME VARCHAR(100)`
-* *AND* the `NAME` values `Smith, John`, `say "hi"`, a value with an embedded line feed, and a value with an embedded carriage return and line feed, one per row
+* *AND* the `NAME` values `Smith, John`, `say "hi"`, a value with an embedded line feed, a value with an embedded carriage return and line feed, a value with an embedded carriage return that no line feed follows, and a value that ends with a carriage return, one per row
 * *WHEN* the caller exports the table to a Parquet file with the default column separator and column delimiter
 * *THEN* the export SHALL succeed and the file SHALL contain exactly one row per source row
 * *AND* every `NAME` value read back SHALL equal its stored value exactly
@@ -125,7 +125,7 @@ The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builder
 * *WHEN* the caller converts the bytes with `export_to_parquet_stream` and no `null_value` set
 * *THEN* the `NAME` values `  padded  ` and three spaces SHALL read back unchanged and MUST NOT read back as NULL
 * *AND* the empty field SHALL read back as NULL
-* *AND* IF an `ID` field carries leading or trailing whitespace, such as ` 7`, the conversion SHALL fail with `ParquetExportError::CsvParse` naming the row, instead of trimming the field
+* *AND* IF an `ID` field carries leading or trailing whitespace, such as ` 7`, the conversion SHALL fail with `ParquetExportError::CsvParse` whose row is the 0-based index of that data row in the whole input, header excluded, instead of trimming the field
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
