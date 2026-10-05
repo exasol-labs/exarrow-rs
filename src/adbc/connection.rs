@@ -1595,13 +1595,19 @@ impl Connection {
 
     /// Export data from an Exasol table or query to a Parquet file.
     ///
-    /// This method exports data from the specified source to a Parquet file.
-    /// The data is first received as CSV from Exasol, then converted to Parquet format.
+    /// The Parquet file carries the source's column names and Exasol types: the driver prepares
+    /// the source's SELECT statement to read them, then converts the exported CSV to typed
+    /// values. INTERVAL, GEOMETRY, and HASHTYPE columns are written as `Utf8` text, and
+    /// TIMESTAMP WITH LOCAL TIME ZONE columns as timestamps without a time zone that hold the
+    /// session-local value. An empty export writes a file with the schema and no rows. An empty
+    /// field is NULL, so `ParquetExportOptions::null_value` has no effect here. Typed values
+    /// need Exasol's default session formats for numbers, dates, and timestamps.
     ///
     /// # Arguments
     ///
-    /// * `source` - The data source (table or query)
-    /// * `file_path` - Path to the output Parquet file
+    /// * `source` - The data source (table or query); it must produce a result set
+    /// * `file_path` - Path to the output Parquet file; it is created only when the export
+    ///   succeeds
     /// * `options` - Export options
     ///
     /// # Returns
@@ -1610,7 +1616,12 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns `ExportError` if the export fails.
+    /// Returns `ExportError::SqlExecutionError` when the source cannot be prepared, produces no
+    /// result set, or has a column type with no Arrow mapping. Returns
+    /// `ExportError::CsvParseError` when a value does not match its column type, and also, with
+    /// row 0, when the Parquet writer fails. Returns `ExportError::IoError` when the output file
+    /// cannot be created, and `ExportError::TransportError` or another variant for transport
+    /// failures.
     ///
     /// # Example
     ///

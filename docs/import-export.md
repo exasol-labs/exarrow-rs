@@ -221,6 +221,17 @@ let rows = connection.export_to_parquet(
 ).await?;
 ```
 
+### Schema and Types
+
+The Parquet file carries the source's column names and Exasol types. The driver prepares the source's SELECT statement to read them, so the source must produce a result set. A statement such as `DELETE` or `CREATE TABLE` fails with `ExportError::SqlExecutionError` before anything runs.
+
+- Exasol types map to Arrow types as described in [Types](type-mapping.md).
+- INTERVAL, GEOMETRY, and HASHTYPE columns are written as `Utf8` text, in the form Exasol exports.
+- TIMESTAMP WITH LOCAL TIME ZONE columns are written as timestamps without a time zone. They hold the session-local value, for example `12:00:00` for a session in `EUROPE/BERLIN`.
+- An empty field is NULL, and every other value is kept as Exasol wrote it, including surrounding spaces. `ParquetExportOptions::null_value` applies only to the CSV-bytes functions (`export::parquet::export_to_parquet`, `export_to_parquet_stream`, and `csv_to_record_batches`), not to `Connection::export_to_parquet`.
+- An empty export writes a file with the schema and no rows.
+- Typed values need Exasol's default session formats. A session with a custom `NLS_DATE_FORMAT`, `NLS_TIMESTAMP_FORMAT`, or `NLS_NUMERIC_CHARACTERS` fails the export with an error that names the column position and the value.
+
 ### Export Sources
 
 Export from tables or queries:

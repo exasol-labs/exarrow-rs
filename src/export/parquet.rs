@@ -6,9 +6,17 @@
 //!
 //! # Architecture
 //!
-//! 1. Execute EXPORT SQL to receive CSV via HTTP transport
-//! 2. Parse CSV and convert to Arrow RecordBatches
-//! 3. Write RecordBatches to Parquet format
+//! The transport export ([`export_to_parquet_via_transport`]) runs these steps:
+//!
+//! 1. Prepare the export source's SELECT statement, derive the Arrow schema from its
+//!    result-set metadata, and close the prepared statement
+//! 2. Execute EXPORT SQL to receive CSV via HTTP transport
+//! 3. Convert the CSV rows to typed Arrow RecordBatches
+//! 4. Write RecordBatches to Parquet format
+//!
+//! The CSV-bytes entry points ([`export_to_parquet`], [`export_to_parquet_stream`],
+//! [`csv_to_record_batches`]) skip steps 1 and 2: the caller supplies the CSV and the Arrow
+//! schema, and the same conversion and writing steps follow.
 //!
 //! # Example
 //!
@@ -128,7 +136,10 @@ pub struct ParquetExportOptions {
     pub column_separator: char,
     /// Column delimiter for CSV parsing (default: '"')
     pub column_delimiter: char,
-    /// NULL value representation (default: empty string)
+    /// NULL marker of the CSV-bytes entry points (default: an empty field is NULL).
+    ///
+    /// The transport export ignores it and reads an empty field as NULL, because the driver
+    /// passes no NULL clause to the EXPORT statement.
     pub null_value: Option<String>,
     /// Exasol host for HTTP transport connection.
     /// This is typically the same host as the WebSocket connection.
@@ -227,14 +238,12 @@ impl ParquetExportOptions {
     }
 }
 
-/// Export data from Exasol to a Parquet file.
+/// Convert caller-supplied CSV bytes to a Parquet file.
 ///
-/// This function exports data from Exasol (table or query) directly to a Parquet file.
-/// The data flows through the following stages:
-/// 1. Query Exasol for column metadata
-/// 2. Build Arrow schema from metadata
-/// 3. Parse CSV data into RecordBatches
-/// 4. Write RecordBatches to Parquet file
+/// The CSV is parsed against `schema` and written to `file_path`. Fields are kept verbatim,
+/// without trimming. An empty field is NULL when `options.null_value` is unset. Otherwise only a
+/// field equal to `null_value` is NULL. The file is created before the CSV is converted, so a
+/// conversion error leaves it behind.
 ///
 /// # Arguments
 ///
@@ -264,10 +273,12 @@ pub async fn export_to_parquet(
     export_to_parquet_stream(csv_data, schema, file, options).await
 }
 
-/// Export data from Exasol to a Parquet stream.
+/// Convert caller-supplied CSV bytes to a Parquet stream.
 ///
-/// This function exports data from Exasol (table or query) to any writer implementing `Write`.
-/// Useful for writing to network streams, in-memory buffers, or custom destinations.
+/// This function writes to any writer implementing `Write`, such as a network stream or an
+/// in-memory buffer. It does not trim fields: whitespace around a value is kept, and a typed
+/// field with surrounding whitespace fails the conversion. An empty field is NULL when
+/// `options.null_value` is unset. Otherwise only a field equal to `null_value` is NULL.
 ///
 /// # Arguments
 ///
@@ -292,33 +303,40 @@ pub async fn export_to_parquet_stream<W: Write + Send>(
     writer: W,
     options: ParquetExportOptions,
 ) -> Result<u64, ParquetExportError> {
-    // Parse CSV data into record batches
     let batches = csv_to_record_batches(csv_data, &schema, &options)?;
-
-    // Calculate total rows
     let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
 
-    // Create writer properties with compression
-    let props = WriterProperties::builder()
-        .set_compression(options.compression.to_codec())
-        .set_encoding(Encoding::PLAIN)
-        .build();
-
-    // Create Parquet writer
-    let mut parquet_writer = ArrowWriter::try_new(writer, schema.clone(), Some(props))?;
-
-    // Write all batches
-    for batch in batches {
-        parquet_writer.write(&batch)?;
-    }
-
-    // Close the writer to flush remaining data
-    parquet_writer.close()?;
+    write_parquet(writer, &schema, &batches, options.compression)?;
 
     Ok(total_rows)
 }
 
+/// Writes `batches` as one Parquet file to `writer`; an empty list yields a file with no rows.
+fn write_parquet<W: Write + Send>(
+    writer: W,
+    schema: &Arc<Schema>,
+    batches: &[RecordBatch],
+    compression: ParquetCompression,
+) -> Result<(), ParquetExportError> {
+    let props = WriterProperties::builder()
+        .set_compression(compression.to_codec())
+        .set_encoding(Encoding::PLAIN)
+        .build();
+
+    let mut parquet_writer = ArrowWriter::try_new(writer, Arc::clone(schema), Some(props))?;
+    for batch in batches {
+        parquet_writer.write(batch)?;
+    }
+    parquet_writer.close()?;
+
+    Ok(())
+}
+
 /// Convert CSV data to Arrow RecordBatches.
+///
+/// Fields are kept verbatim, including surrounding whitespace. A quoted field may contain the
+/// column separator, the column delimiter, and line breaks. An empty field is NULL when
+/// `options.null_value` is unset. Otherwise only a field equal to `null_value` is NULL.
 ///
 /// # Arguments
 ///
@@ -328,7 +346,13 @@ pub async fn export_to_parquet_stream<W: Write + Send>(
 ///
 /// # Returns
 ///
-/// A vector of RecordBatches.
+/// A vector of RecordBatches, holding one empty batch when the input has no data rows.
+///
+/// # Errors
+///
+/// Returns `ParquetExportError::CsvParse` when the input is not UTF-8, ends inside a quoted
+/// field, or has a row with the wrong number of fields or a value its column cannot hold. Its
+/// `row` is the 0-based index of the data row in the whole input, header excluded.
 pub fn csv_to_record_batches(
     csv_data: &[u8],
     schema: &Schema,
@@ -339,114 +363,117 @@ pub fn csv_to_record_batches(
         message: format!("Invalid UTF-8: {}", e),
     })?;
 
-    let lines: Vec<&str> = csv_str.lines().collect();
-
-    if lines.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(Arc::new(schema.clone()))]);
+    let header_rows = usize::from(options.with_column_names);
+    let mut rows =
+        crate::export::csv::csv_rows(csv_str, options.column_separator, options.column_delimiter);
+    if options.with_column_names {
+        if let Some(Err(e)) = rows.next() {
+            return Err(csv_parse_error(e, header_rows));
+        }
     }
+    let data_rows = rows.map(|row| row.map_err(|e| csv_parse_error(e, header_rows)));
 
-    // Skip header row if present
-    let data_start = if options.with_column_names { 1 } else { 0 };
-    let data_lines = &lines[data_start..];
+    rows_to_record_batches(
+        data_rows,
+        &Arc::new(schema.clone()),
+        options.null_value.as_deref(),
+        options.batch_size,
+    )
+}
 
-    if data_lines.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(Arc::new(schema.clone()))]);
+fn csv_parse_error(
+    error: crate::export::csv::ExportError,
+    header_rows: usize,
+) -> ParquetExportError {
+    match error {
+        crate::export::csv::ExportError::CsvParseError { row, message } => {
+            ParquetExportError::CsvParse {
+                row: row.saturating_sub(header_rows),
+                message,
+            }
+        }
+        other => ParquetExportError::Arrow(other.to_string()),
     }
+}
 
-    // Process data in batches
+/// Convert parsed rows into RecordBatches of at most `batch_size` rows.
+///
+/// Pulls one chunk of rows at a time and drops it before pulling the next, so memory holds one
+/// chunk of parsed fields. A field equal to `null_value` is NULL, and with no `null_value` an
+/// empty field is NULL. Every other field is kept verbatim.
+///
+/// A returned `CsvParse` error carries the 0-based index of the failing row in `rows`.
+fn rows_to_record_batches(
+    rows: impl IntoIterator<Item = Result<Vec<String>, ParquetExportError>>,
+    schema: &Arc<Schema>,
+    null_value: Option<&str>,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, ParquetExportError> {
+    let mut rows = rows.into_iter();
+    let num_columns = schema.fields().len();
     let mut batches = Vec::new();
-    for chunk in data_lines.chunks(options.batch_size) {
-        let batch = csv_chunk_to_record_batch(chunk, schema, options, data_start)?;
+    let mut first_row_of_chunk = 0;
+
+    loop {
+        let mut chunk: Vec<Vec<String>> = Vec::new();
+        for row in rows.by_ref().take(batch_size.max(1)) {
+            let row = row?;
+            if row.len() != num_columns {
+                return Err(ParquetExportError::CsvParse {
+                    row: first_row_of_chunk + chunk.len(),
+                    message: format!("Expected {} columns, found {}", num_columns, row.len()),
+                });
+            }
+            chunk.push(row);
+        }
+        if chunk.is_empty() {
+            break;
+        }
+
+        let batch = chunk_to_record_batch(&chunk, schema, null_value).map_err(|e| match e {
+            ParquetExportError::CsvParse { row, message } => ParquetExportError::CsvParse {
+                row: first_row_of_chunk + row,
+                message,
+            },
+            other => other,
+        })?;
         batches.push(batch);
+        first_row_of_chunk += chunk.len();
     }
 
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
     Ok(batches)
 }
 
-/// Convert a chunk of CSV lines to a RecordBatch.
-fn csv_chunk_to_record_batch(
-    lines: &[&str],
-    schema: &Schema,
-    options: &ParquetExportOptions,
-    row_offset: usize,
+fn chunk_to_record_batch(
+    rows: &[Vec<String>],
+    schema: &Arc<Schema>,
+    null_value: Option<&str>,
 ) -> Result<RecordBatch, ParquetExportError> {
-    let num_columns = schema.fields().len();
-
-    // Parse all rows first
-    let parsed_rows: Result<Vec<Vec<Option<String>>>, ParquetExportError> = lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| parse_csv_line(line, options, row_offset + idx, num_columns))
-        .collect();
-    let parsed_rows = parsed_rows?;
-
-    // Build arrays for each column
-    let arrays: Result<Vec<ArrayRef>, ParquetExportError> = schema
+    let arrays = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(col_idx, field)| {
-            let column_values: Vec<Option<&str>> = parsed_rows
+            let column_values: Vec<Option<&str>> = rows
                 .iter()
-                .map(|row| row.get(col_idx).and_then(|v| v.as_deref()))
+                .map(|row| field_value(&row[col_idx], null_value))
                 .collect();
-
-            build_array_from_csv_column(&column_values, field, col_idx, options)
+            build_array_from_csv_column(&column_values, field, col_idx)
         })
-        .collect();
+        .collect::<Result<Vec<ArrayRef>, _>>()?;
 
-    let arrays = arrays?;
-
-    RecordBatch::try_new(Arc::new(schema.clone()), arrays)
-        .map_err(|e| ParquetExportError::Arrow(e.to_string()))
+    Ok(RecordBatch::try_new(Arc::clone(schema), arrays)?)
 }
 
-/// Parse a CSV line into column values.
-fn parse_csv_line(
-    line: &str,
-    options: &ParquetExportOptions,
-    row_idx: usize,
-    expected_columns: usize,
-) -> Result<Vec<Option<String>>, ParquetExportError> {
-    let (fields, _in_quotes) =
-        crate::export::csv::parse_csv_row(line, options.column_separator, options.column_delimiter);
-    let values: Vec<Option<String>> = fields
-        .iter()
-        .map(|field| parse_csv_value(field, options))
-        .collect();
-
-    // Validate column count
-    if values.len() != expected_columns {
-        return Err(ParquetExportError::CsvParse {
-            row: row_idx,
-            message: format!(
-                "Expected {} columns, found {}",
-                expected_columns,
-                values.len()
-            ),
-        });
-    }
-
-    Ok(values)
-}
-
-/// Parse a single CSV value, handling NULL values.
-fn parse_csv_value(value: &str, options: &ParquetExportOptions) -> Option<String> {
-    let trimmed = value.trim();
-
-    // Check for NULL value
-    if let Some(ref null_val) = options.null_value {
-        if trimmed == null_val {
-            return None;
-        }
-    }
-
-    // Empty string is treated as NULL if no explicit null value is set
-    if trimmed.is_empty() && options.null_value.is_none() {
-        return None;
-    }
-
-    Some(trimmed.to_string())
+fn field_value<'a>(field: &'a str, null_value: Option<&str>) -> Option<&'a str> {
+    let is_null = match null_value {
+        Some(marker) => field == marker,
+        None => field.is_empty(),
+    };
+    (!is_null).then_some(field)
 }
 
 /// Build an Arrow array from CSV column values.
@@ -454,7 +481,6 @@ fn build_array_from_csv_column(
     values: &[Option<&str>],
     field: &Field,
     col_idx: usize,
-    _options: &ParquetExportOptions,
 ) -> Result<ArrayRef, ParquetExportError> {
     match field.data_type() {
         DataType::Boolean => build_boolean_array_from_csv(values, col_idx),
@@ -674,7 +700,10 @@ fn build_int64_array_from_csv(
 
 /// Create an Arrow schema from Exasol column types.
 ///
-/// This function maps Exasol types to Arrow types for Parquet export.
+/// This function maps Exasol types to the Arrow types a Parquet export writes. INTERVAL YEAR TO
+/// MONTH, INTERVAL DAY TO SECOND, GEOMETRY, and HASHTYPE map to `Utf8`, which holds the CSV
+/// text Exasol writes for them. TIMESTAMP WITH LOCAL TIME ZONE maps to
+/// `Timestamp(Microsecond, None)`, which holds the session-local wall-clock value.
 pub fn exasol_types_to_arrow_schema(
     column_names: &[String],
     column_types: &[ExasolType],
@@ -699,42 +728,50 @@ pub fn exasol_types_to_arrow_schema(
     Ok(Schema::new(fields?))
 }
 
-/// Convert an Exasol type to Arrow DataType.
+/// Convert an Exasol type to the Arrow type its CSV text converts to.
 fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, ParquetExportError> {
-    // Check for unsupported types in Parquet export first
     match exasol_type {
+        // No typed conversion exists for these, so the CSV text is kept as Utf8.
         ExasolType::IntervalYearToMonth
         | ExasolType::IntervalDayToSecond { .. }
         | ExasolType::Geometry { .. }
-        | ExasolType::Hashtype { .. } => {
-            return Err(ParquetExportError::Schema(format!(
-                "Unsupported Exasol type for Parquet export: {:?}",
-                exasol_type
-            )));
-        }
-        _ => {}
+        | ExasolType::Hashtype { .. } => Ok(DataType::Utf8),
+        // Exasol writes the session-local wall-clock value, so no UTC label applies.
+        ExasolType::Timestamp {
+            with_local_time_zone: true,
+        } => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        _ => exasol_type_to_arrow_impl(exasol_type).map_err(ParquetExportError::Schema),
     }
-
-    // Use shared implementation for supported types
-    exasol_type_to_arrow_impl(exasol_type).map_err(ParquetExportError::Schema)
 }
 
 // =============================================================================
 // Transport-integrated export functions
 // =============================================================================
 
+use crate::export::csv::ExportError;
 use crate::query::export::ExportSource;
 use crate::transport::TransportProtocol;
 
 /// Exports data from an Exasol table or query to a Parquet file via transport.
 ///
-/// This function exports data from Exasol (table or query) directly to a Parquet file
-/// using the HTTP transport layer.
+/// The export runs in three steps:
+/// 1. Prepare the source's SELECT statement and derive the Arrow schema from its result-set
+///    metadata, so the file carries the source's column names and types. The prepared statement
+///    is closed before the EXPORT statement runs.
+/// 2. Run the EXPORT through the HTTP transport and collect its CSV rows.
+/// 3. Convert the rows to typed batches, then create the file and write them.
+///
+/// An empty export writes a file that carries the schema and no rows. The file is created only
+/// after every batch converts, and a failed write removes it again.
+///
+/// An empty field is NULL and every other field is kept verbatim, so
+/// [`ParquetExportOptions::null_value`] has no effect here. Typed columns need Exasol's default
+/// session formats for numbers, dates, and timestamps.
 ///
 /// # Arguments
 ///
 /// * `transport` - Transport for executing SQL
-/// * `source` - The data source (table or query)
+/// * `source` - The data source (table or query); it must produce a result set
 /// * `file_path` - Path to write the Parquet file
 /// * `options` - Export options
 ///
@@ -744,14 +781,21 @@ use crate::transport::TransportProtocol;
 ///
 /// # Errors
 ///
-/// Returns `ExportError` if the export fails.
+/// Returns `ExportError::SqlExecutionError` when the source cannot be prepared, produces no
+/// result set, or has a column type with no Arrow mapping. Returns
+/// `ExportError::TransportError` when closing the prepared statement fails. Returns
+/// `ExportError::CsvParseError` when a value does not match its column type, and also, with
+/// row 0, when the Parquet writer fails. Returns `ExportError::IoError` when the output file
+/// cannot be created.
 pub async fn export_to_parquet_via_transport<T: TransportProtocol + ?Sized>(
     transport: &mut T,
     source: ExportSource,
     file_path: &Path,
     options: ParquetExportOptions,
-) -> Result<u64, crate::export::csv::ExportError> {
+) -> Result<u64, ExportError> {
     use crate::export::csv::{export_to_list, shared_csv_export_options, SharedCsvExportParams};
+
+    let schema = export_schema(transport, &source).await?;
 
     let csv_options = shared_csv_export_options(SharedCsvExportParams {
         column_separator: options.column_separator,
@@ -760,40 +804,98 @@ pub async fn export_to_parquet_via_transport<T: TransportProtocol + ?Sized>(
         port: options.port,
         use_tls: options.use_tls,
     });
-
     let rows = export_to_list(transport, source, csv_options).await?;
 
-    if rows.is_empty() {
-        return Ok(0);
-    }
+    let batches =
+        rows_to_record_batches(rows.into_iter().map(Ok), &schema, None, options.batch_size)
+            .map_err(export_error)?;
+    let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
 
-    // We need a schema to create Parquet. Without column type info, use strings.
-    let num_columns = rows.first().map(|r| r.len()).unwrap_or(0);
-    let fields: Vec<Field> = (0..num_columns)
-        .map(|i| Field::new(format!("col{}", i), DataType::Utf8, true))
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
+    write_output_file(file_path, |file| {
+        write_parquet(file, &schema, &batches, options.compression)
+    })
+    .map_err(export_error)?;
 
-    // Convert rows to CSV bytes
-    let mut csv_bytes = Vec::new();
-    for row in &rows {
-        let line = row.join(&options.column_separator.to_string());
-        csv_bytes.extend_from_slice(line.as_bytes());
-        csv_bytes.push(b'\n');
-    }
+    Ok(total_rows)
+}
 
-    // Use the existing export function
-    let parquet_options = ParquetExportOptions {
-        with_column_names: false, // We already have data rows
-        ..options
-    };
-
-    export_to_parquet(&csv_bytes, schema, file_path, parquet_options)
+/// Derives the Arrow schema of `source` from the result-set metadata of its prepared SELECT.
+///
+/// The prepared statement is closed before returning, also when the source is rejected. A
+/// rejection takes precedence over a close failure.
+async fn export_schema<T: TransportProtocol + ?Sized>(
+    transport: &mut T,
+    source: &ExportSource,
+) -> Result<Arc<Schema>, ExportError> {
+    let handle = transport
+        .create_prepared_statement(&source.select_statement())
         .await
-        .map_err(|e| crate::export::csv::ExportError::CsvParseError {
-            row: 0,
-            message: e.to_string(),
+        .map_err(|e| ExportError::SqlExecutionError {
+            message: format!("Failed to prepare the export source to read its columns: {e}"),
+        })?;
+
+    let schema = schema_of_result_columns(&handle.result_columns);
+    let closed = transport.close_prepared_statement(&handle).await;
+
+    let schema = schema?;
+    closed?;
+    Ok(Arc::new(schema))
+}
+
+fn schema_of_result_columns(
+    columns: &[crate::transport::messages::ColumnInfo],
+) -> Result<Schema, ExportError> {
+    if columns.is_empty() {
+        return Err(ExportError::SqlExecutionError {
+            message: "The export source produces no result set; export a table or a SELECT query"
+                .to_string(),
+        });
+    }
+
+    let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+    let types = columns
+        .iter()
+        .map(|column| {
+            crate::query::results::exasol_type_of(&column.data_type).map_err(|_| {
+                ExportError::SqlExecutionError {
+                    message: format!(
+                        "Cannot export column {} of Exasol type {}: no Arrow type maps to it",
+                        column.name, column.data_type.type_name
+                    ),
+                }
+            })
         })
+        .collect::<Result<Vec<ExasolType>, _>>()?;
+
+    exasol_types_to_arrow_schema(&names, &types).map_err(|e| ExportError::SqlExecutionError {
+        message: format!("Cannot derive the export schema: {e}"),
+    })
+}
+
+/// Creates `file_path`, runs `write` on it, and removes the file again when `write` fails.
+///
+/// The original error is returned even when the removal fails.
+fn write_output_file<F>(file_path: &Path, write: F) -> Result<(), ParquetExportError>
+where
+    F: FnOnce(std::fs::File) -> Result<(), ParquetExportError>,
+{
+    let file = std::fs::File::create(file_path)?;
+    write(file).inspect_err(|_| {
+        let _ = std::fs::remove_file(file_path);
+    })
+}
+
+fn export_error(error: ParquetExportError) -> ExportError {
+    match error {
+        ParquetExportError::Io(e) => ExportError::IoError(e),
+        ParquetExportError::CsvParse { row, message } => {
+            ExportError::CsvParseError { row, message }
+        }
+        other => ExportError::CsvParseError {
+            row: 0,
+            message: other.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -889,84 +991,179 @@ mod tests {
     // Tests for CSV parsing
     // ==========================================================================
 
+    fn text_column(batch: &RecordBatch, column: usize) -> Vec<Option<String>> {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("the column must be Utf8")
+            .iter()
+            .map(|value| value.map(str::to_string))
+            .collect()
+    }
+
+    fn id_name_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ])
+    }
+
+    fn id_name_flag_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+        ])
+    }
+
+    fn headerless() -> ParquetExportOptions {
+        ParquetExportOptions::default().with_column_names(false)
+    }
+
     #[test]
-    fn test_parse_csv_line_simple() {
+    fn test_csv_to_record_batches_splits_simple_fields() {
+        let batches =
+            csv_to_record_batches(b"1,Alice,true", &id_name_flag_schema(), &headerless()).unwrap();
+
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(text_column(&batches[0], 1), vec![Some("Alice".to_string())]);
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_keeps_separator_inside_quotes() {
+        let csv = b"1,\"Hello, World\",true";
+        let batches = csv_to_record_batches(csv, &id_name_flag_schema(), &headerless()).unwrap();
+
+        assert_eq!(
+            text_column(&batches[0], 1),
+            vec![Some("Hello, World".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_unescapes_doubled_delimiters() {
+        let csv = b"1,\"Say \"\"Hello\"\"\",true";
+        let batches = csv_to_record_batches(csv, &id_name_flag_schema(), &headerless()).unwrap();
+
+        assert_eq!(
+            text_column(&batches[0], 1),
+            vec![Some("Say \"Hello\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_reads_empty_field_as_null_without_null_value() {
+        let batches =
+            csv_to_record_batches(b"1,,true", &id_name_flag_schema(), &headerless()).unwrap();
+
+        assert_eq!(text_column(&batches[0], 1), vec![None]);
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_reads_null_value_marker_as_null() {
+        let options = headerless().with_null_value("\\N");
+        let batches =
+            csv_to_record_batches(b"1,\\N,true", &id_name_flag_schema(), &options).unwrap();
+
+        assert_eq!(text_column(&batches[0], 1), vec![None]);
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_rejects_wrong_column_count() {
+        let err =
+            csv_to_record_batches(b"1,Alice", &id_name_flag_schema(), &headerless()).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 0, .. }),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Expected 3 columns, found 2"),
+            "got: {err}"
+        );
+    }
+
+    /// Scenario: CSV-bytes export accepts line breaks inside quoted fields
+    #[test]
+    fn test_csv_to_record_batches_accepts_line_breaks_in_quoted_fields() {
+        let csv = b"1,\"line one\nline two\"\n2,\"a, b\"\n";
+
+        let batches = csv_to_record_batches(csv, &id_name_schema(), &headerless()).unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(
+            text_column(&batches[0], 1),
+            vec![
+                Some("line one\nline two".to_string()),
+                Some("a, b".to_string())
+            ]
+        );
+    }
+
+    /// Scenario: CSV-bytes export keeps field whitespace
+    #[test]
+    fn test_csv_to_record_batches_reports_the_data_row_of_a_bad_value_in_a_later_batch() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let options = ParquetExportOptions::default().with_batch_size(2);
+
+        let err = csv_to_record_batches(b"id\n1\n2\n3\nx\n5", &schema, &options).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 3, .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_converts_every_row_when_batch_size_is_zero() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let options = headerless().with_batch_size(0);
+
+        let batches = csv_to_record_batches(b"1\n2\n3", &schema, &options).unwrap();
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.num_rows() == 1));
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_reports_the_data_row_of_a_short_row_in_a_later_batch() {
+        let options = headerless().with_batch_size(2);
+
+        let err =
+            csv_to_record_batches(b"1,a\n2,b\n3,c\n4\n", &id_name_schema(), &options).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 3, .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_csv_to_record_batches_reports_the_data_row_of_an_unclosed_quote() {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
         let options = ParquetExportOptions::default();
-        let result = parse_csv_line("1,Alice,true", &options, 0, 3).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], Some("1".to_string()));
-        assert_eq!(result[1], Some("Alice".to_string()));
-        assert_eq!(result[2], Some("true".to_string()));
+
+        let err = csv_to_record_batches(b"name\nx\n\"open", &schema, &options).unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 1, .. }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("Unclosed quote"), "got: {err}");
     }
 
     #[test]
-    fn test_parse_csv_line_with_quotes() {
+    fn test_csv_to_record_batches_reports_an_unclosed_quote_in_the_header() {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
         let options = ParquetExportOptions::default();
-        let result = parse_csv_line("1,\"Hello, World\",true", &options, 0, 3).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], Some("1".to_string()));
-        assert_eq!(result[1], Some("Hello, World".to_string()));
-        assert_eq!(result[2], Some("true".to_string()));
-    }
 
-    #[test]
-    fn test_parse_csv_line_with_escaped_quotes() {
-        let options = ParquetExportOptions::default();
-        let result = parse_csv_line("1,\"Say \"\"Hello\"\"\",true", &options, 0, 3).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[1], Some("Say \"Hello\"".to_string()));
-    }
+        let err = csv_to_record_batches(b"\"name", &schema, &options).unwrap_err();
 
-    #[test]
-    fn test_parse_csv_line_with_empty_value() {
-        let options = ParquetExportOptions::default();
-        let result = parse_csv_line("1,,true", &options, 0, 3).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], Some("1".to_string()));
-        assert_eq!(result[1], None); // Empty value is NULL
-        assert_eq!(result[2], Some("true".to_string()));
-    }
-
-    #[test]
-    fn test_parse_csv_line_with_explicit_null() {
-        let options = ParquetExportOptions {
-            null_value: Some("NULL".to_string()),
-            ..Default::default()
-        };
-        let result = parse_csv_line("1,NULL,true", &options, 0, 3).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[1], None);
-    }
-
-    #[test]
-    fn test_parse_csv_line_wrong_column_count() {
-        let options = ParquetExportOptions::default();
-        let result = parse_csv_line("1,Alice", &options, 0, 3);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_csv_value_null() {
-        let options = ParquetExportOptions::default();
-        let result = parse_csv_value("", &options);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_csv_value_explicit_null() {
-        let options = ParquetExportOptions {
-            null_value: Some("\\N".to_string()),
-            ..Default::default()
-        };
-        let result = parse_csv_value("\\N", &options);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_csv_value_regular() {
-        let options = ParquetExportOptions::default();
-        let result = parse_csv_value("hello", &options);
-        assert_eq!(result, Some("hello".to_string()));
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 0, .. }),
+            "got: {err}"
+        );
     }
 
     // ==========================================================================
@@ -1276,16 +1473,21 @@ mod tests {
         assert_eq!(result, DataType::Timestamp(TimeUnit::Microsecond, None));
     }
 
+    /// Scenario: Date and time types mapping
     #[test]
-    fn test_exasol_type_to_arrow_timestamp_with_tz() {
-        let result = exasol_type_to_arrow(&ExasolType::Timestamp {
-            with_local_time_zone: true,
-        })
+    fn test_exasol_types_to_arrow_schema_maps_timestamp_with_local_time_zone_without_time_zone() {
+        let schema = exasol_types_to_arrow_schema(
+            &["ts_ltz".to_string()],
+            &[ExasolType::Timestamp {
+                with_local_time_zone: true,
+            }],
+        )
         .unwrap();
-        assert!(matches!(
-            result,
-            DataType::Timestamp(TimeUnit::Microsecond, Some(_))
-        ));
+
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     // ==========================================================================
@@ -1464,9 +1666,8 @@ mod tests {
     #[test]
     fn test_build_array_from_csv_column_rejects_unsupported_type() {
         let field = Field::new("b", DataType::Binary, true);
-        let options = ParquetExportOptions::default();
 
-        let err = build_array_from_csv_column(&[Some("x")], &field, 0, &options).unwrap_err();
+        let err = build_array_from_csv_column(&[Some("x")], &field, 0).unwrap_err();
 
         assert!(matches!(err, ParquetExportError::Schema(_)), "got: {err}");
         assert!(
@@ -1599,28 +1800,95 @@ mod tests {
         assert!(err.to_string().contains("at column 1"), "got: {err}");
     }
 
+    /// Scenario: Columns without a typed CSV conversion export as text
+    /// Scenario: Date and time types mapping
     #[test]
-    fn test_exasol_type_to_arrow_rejects_types_parquet_cannot_hold() {
-        for exasol_type in [
+    fn test_exasol_types_to_arrow_schema_maps_text_only_types_to_utf8() {
+        let names: Vec<String> = ["iym", "ids", "g", "h"].map(String::from).to_vec();
+        let types = [
             ExasolType::IntervalYearToMonth,
             ExasolType::IntervalDayToSecond { precision: 3 },
             ExasolType::Geometry { srid: Some(4326) },
             ExasolType::Hashtype { byte_size: 16 },
-        ] {
-            let err = exasol_type_to_arrow(&exasol_type).unwrap_err();
+        ];
 
-            assert!(matches!(err, ParquetExportError::Schema(_)), "got: {err}");
-            assert!(
-                err.to_string()
-                    .contains("Unsupported Exasol type for Parquet export"),
-                "got: {err}"
-            );
-        }
+        let schema = exasol_types_to_arrow_schema(&names, &types).unwrap();
+
+        assert!(schema
+            .fields()
+            .iter()
+            .all(|field| field.data_type() == &DataType::Utf8));
+    }
+
+    async fn stream_to_batches(
+        csv: &[u8],
+        schema: Schema,
+        options: ParquetExportOptions,
+    ) -> Result<Vec<RecordBatch>, ParquetExportError> {
+        let mut buffer = Vec::new();
+        export_to_parquet_stream(csv, Arc::new(schema), &mut buffer, options).await?;
+        Ok(
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buffer))
+                .expect("the stream export must write a readable Parquet file")
+                .build()
+                .expect("the Parquet reader must accept the written schema")
+                .map(|batch| batch.expect("every written row group must decode"))
+                .collect(),
+        )
+    }
+
+    /// Scenario: CSV-bytes export keeps field whitespace
+    #[tokio::test]
+    async fn test_export_to_parquet_stream_keeps_field_whitespace() {
+        let csv = b"id,name\n1,\"  padded  \"\n2,   \n3,\n";
+
+        let batches = stream_to_batches(csv, id_name_schema(), ParquetExportOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            text_column(&batches[0], 1),
+            vec![
+                Some("  padded  ".to_string()),
+                Some("   ".to_string()),
+                None
+            ]
+        );
+
+        let err = stream_to_batches(
+            b"id,name\n1,x\n 7,y\n",
+            id_name_schema(),
+            ParquetExportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ParquetExportError::CsvParse { row: 1, .. }),
+            "got: {err}"
+        );
+    }
+
+    /// Scenario: CSV-bytes export reads only the null_value marker as NULL
+    #[tokio::test]
+    async fn test_export_to_parquet_stream_reads_null_value_marker_as_null() {
+        let options = ParquetExportOptions::default().with_null_value("NULL");
+
+        let batches = stream_to_batches(b"id,name\n1,NULL\n2,\n", id_name_schema(), options)
+            .await
+            .unwrap();
+
+        assert_eq!(text_column(&batches[0], 1), vec![None, Some(String::new())]);
     }
 
     // ==========================================================================
     // Tests for export_to_parquet_via_transport
     // ==========================================================================
+
+    use crate::transport::messages::{ColumnInfo, DataType as TransportDataType};
+    use crate::transport::protocol::PreparedStatementHandle;
+    use mockall::predicate::eq;
+    use mockall::Sequence;
 
     fn tunnel_options(server: &FakeExasolServer) -> ParquetExportOptions {
         ParquetExportOptions::default()
@@ -1629,8 +1897,49 @@ mod tests {
             .use_tls(false)
     }
 
-    fn succeeding_transport() -> MockTransport {
+    fn column(name: &str, data_type: TransportDataType) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type,
+        }
+    }
+
+    fn unknown_type(type_name: &str) -> TransportDataType {
+        TransportDataType {
+            type_name: type_name.to_string(),
+            ..TransportDataType::boolean()
+        }
+    }
+
+    fn id_name_columns() -> Vec<ColumnInfo> {
+        vec![
+            column("ID", TransportDataType::decimal(18, 0)),
+            column("NAME", TransportDataType::varchar(100)),
+        ]
+    }
+
+    fn handle_describing(columns: Vec<ColumnInfo>) -> PreparedStatementHandle {
+        PreparedStatementHandle::new(7, 0, vec![], vec![]).with_result_columns(columns)
+    }
+
+    fn users_source() -> ExportSource {
+        ExportSource::Table {
+            schema: Some("S".to_string()),
+            name: "USERS".to_string(),
+            columns: vec![],
+        }
+    }
+
+    /// A transport whose prepare reports `columns`, whose close succeeds, and whose EXPORT
+    /// statement succeeds.
+    fn describing_transport(columns: Vec<ColumnInfo>) -> MockTransport {
         let mut transport = MockTransport::new();
+        transport
+            .expect_create_prepared_statement()
+            .returning(move |_| Ok(handle_describing(columns.clone())));
+        transport
+            .expect_close_prepared_statement()
+            .returning(|_| Ok(()));
         transport
             .expect_execute_query()
             .returning(|_| Ok(QueryResult::row_count(2)));
@@ -1647,18 +1956,146 @@ mod tests {
             .collect()
     }
 
+    fn read_schema(file_path: &Path) -> Arc<Schema> {
+        let file = std::fs::File::open(file_path).expect("the export must have created the file");
+        ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("the export must have written a readable Parquet file")
+            .schema()
+            .clone()
+    }
+
     #[tokio::test]
-    async fn test_export_to_parquet_via_transport_writes_the_tunnel_rows_as_parquet() {
-        let server = FakeExasolServer::serving_csv("1,alice\n2,bob\n").await;
-        let mut transport = succeeding_transport();
+    async fn test_export_schema_names_fields_after_result_columns_and_closes_the_statement() {
+        let source = users_source();
+        let mut transport = MockTransport::new();
+        transport
+            .expect_create_prepared_statement()
+            .with(eq(source.select_statement()))
+            .times(1)
+            .returning(|_| Ok(handle_describing(id_name_columns())));
+        transport
+            .expect_close_prepared_statement()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let schema = export_schema(&mut transport, &source).await.unwrap();
+
+        assert_eq!(
+            schema.as_ref(),
+            &Schema::new(vec![
+                Field::new("ID", DataType::Decimal128(18, 0), true),
+                Field::new("NAME", DataType::Utf8, true),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_schema_names_column_and_type_it_cannot_map_and_closes_the_statement() {
+        let mut transport = MockTransport::new();
+        transport.expect_create_prepared_statement().returning(|_| {
+            Ok(handle_describing(vec![column(
+                "MYSTERY",
+                unknown_type("FOO"),
+            )]))
+        });
+        transport
+            .expect_close_prepared_statement()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let err = export_schema(&mut transport, &users_source())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ExportError::SqlExecutionError { message }
+                if message.contains("MYSTERY") && message.contains("FOO")),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_schema_returns_close_failure_as_transport_error() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_create_prepared_statement()
+            .returning(|_| Ok(handle_describing(id_name_columns())));
+        transport.expect_close_prepared_statement().returning(|_| {
+            Err(crate::error::TransportError::SendError(
+                "closed".to_string(),
+            ))
+        });
+
+        let err = export_schema(&mut transport, &users_source())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ExportError::TransportError(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_export_schema_returns_rejection_when_close_also_fails() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_create_prepared_statement()
+            .returning(|_| Ok(handle_describing(vec![])));
+        transport.expect_close_prepared_statement().returning(|_| {
+            Err(crate::error::TransportError::SendError(
+                "closed".to_string(),
+            ))
+        });
+
+        let err = export_schema(&mut transport, &users_source())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ExportError::SqlExecutionError { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_write_output_file_removes_the_file_when_the_write_step_fails() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("partial.parquet");
+
+        let err = write_output_file(&file_path, |mut file| {
+            file.write_all(b"PAR1 truncated")?;
+            Err(ParquetExportError::Parquet("close failed".to_string()))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ParquetExportError::Parquet(message) if message == "close failed"),
+            "got: {err}"
+        );
+        assert!(
+            !file_path.exists(),
+            "a failed write must not leave a partial file behind"
+        );
+    }
+
+    #[test]
+    fn test_write_output_file_keeps_the_file_when_the_write_step_succeeds() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("complete.parquet");
+
+        write_output_file(&file_path, |mut file| Ok(file.write_all(b"bytes")?)).unwrap();
+
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"bytes");
+    }
+
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_writes_named_typed_fields_and_quoted_rows() {
+        let server = FakeExasolServer::serving_csv("1,\"Smith, John\"\n2,bob\n").await;
+        let mut transport = describing_transport(id_name_columns());
         let directory = tempfile::TempDir::new().expect("temp dir");
         let file_path = directory.path().join("users.parquet");
 
         let rows_written = export_to_parquet_via_transport(
             &mut transport,
-            ExportSource::Query {
-                sql: "SELECT id, name FROM users".to_string(),
-            },
+            users_source(),
             &file_path,
             tunnel_options(&server),
         )
@@ -1668,31 +2105,52 @@ mod tests {
         assert_eq!(rows_written, 2);
         let batches = read_back(&file_path);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 2);
-        assert_eq!(batches[0].num_columns(), 2);
-        let names = batches[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("a transport export types every column as Utf8");
-        assert_eq!((names.value(0), names.value(1)), ("alice", "bob"));
+        assert_eq!(
+            batches[0].schema().as_ref(),
+            &Schema::new(vec![
+                Field::new("ID", DataType::Decimal128(18, 0), true),
+                Field::new("NAME", DataType::Utf8, true),
+            ])
+        );
+        assert_eq!(
+            text_column(&batches[0], 1),
+            vec![Some("Smith, John".to_string()), Some("bob".to_string())]
+        );
     }
 
-    /// An EXPORT that matches no rows is a success with nothing to write, so
-    /// the function must stop before inventing a schema from a first row that
-    /// does not exist.
     #[tokio::test]
-    async fn test_export_to_parquet_via_transport_writes_no_file_for_an_empty_export() {
+    async fn test_export_to_parquet_via_transport_ignores_null_value_for_the_tunnel_rows() {
+        let server = FakeExasolServer::serving_csv("1,NULL\n2,\n").await;
+        let mut transport = describing_transport(id_name_columns());
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("users.parquet");
+
+        export_to_parquet_via_transport(
+            &mut transport,
+            users_source(),
+            &file_path,
+            tunnel_options(&server).with_null_value("NULL"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            text_column(&read_back(&file_path)[0], 1),
+            vec![Some("NULL".to_string()), None]
+        );
+    }
+
+    /// An EXPORT that matches no rows still carries the source's schema.
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_writes_a_schema_only_file_for_an_empty_export() {
         let server = FakeExasolServer::serving_csv("").await;
-        let mut transport = succeeding_transport();
+        let mut transport = describing_transport(id_name_columns());
         let directory = tempfile::TempDir::new().expect("temp dir");
         let file_path = directory.path().join("users.parquet");
 
         let rows_written = export_to_parquet_via_transport(
             &mut transport,
-            ExportSource::Query {
-                sql: "SELECT id, name FROM users WHERE 1 = 0".to_string(),
-            },
+            users_source(),
             &file_path,
             tunnel_options(&server),
         )
@@ -1700,9 +2158,166 @@ mod tests {
         .expect("an empty export is not a failure");
 
         assert_eq!(rows_written, 0);
+        let schema = read_schema(&file_path);
+        assert_eq!(schema.field(0).name(), "ID");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            read_back(&file_path)
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_leaves_no_file_when_a_value_does_not_convert() {
+        let server = FakeExasolServer::serving_csv("not-a-number,bob\n").await;
+        let mut transport = describing_transport(id_name_columns());
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("users.parquet");
+
+        let err = export_to_parquet_via_transport(
+            &mut transport,
+            users_source(),
+            &file_path,
+            tunnel_options(&server),
+        )
+        .await
+        .unwrap_err();
+
         assert!(
-            !file_path.exists(),
-            "an empty export must not leave a Parquet file behind"
+            matches!(err, ExportError::CsvParseError { row: 0, .. }),
+            "got: {err}"
+        );
+        assert!(!file_path.exists());
+    }
+
+    /// Scenario: Export releases the schema prepared statement before the EXPORT statement runs
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_closes_the_schema_statement_before_the_export() {
+        let server = FakeExasolServer::serving_csv("1,alice\n").await;
+        let mut sequence = Sequence::new();
+        let mut transport = MockTransport::new();
+        transport
+            .expect_create_prepared_statement()
+            .once()
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(handle_describing(id_name_columns())));
+        transport
+            .expect_close_prepared_statement()
+            .once()
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+        transport
+            .expect_execute_query()
+            .once()
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(QueryResult::row_count(1)));
+        let directory = tempfile::TempDir::new().expect("temp dir");
+
+        export_to_parquet_via_transport(
+            &mut transport,
+            users_source(),
+            &directory.path().join("users.parquet"),
+            tunnel_options(&server),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Scenario: Export releases the schema prepared statement before the EXPORT statement runs
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_closes_the_schema_statement_when_the_source_has_no_result_set(
+    ) {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_create_prepared_statement()
+            .once()
+            .returning(|_| Ok(handle_describing(vec![])));
+        transport
+            .expect_close_prepared_statement()
+            .once()
+            .returning(|_| Ok(()));
+        transport.expect_execute_query().never();
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("users.parquet");
+
+        let err = export_to_parquet_via_transport(
+            &mut transport,
+            ExportSource::Query {
+                sql: "CREATE TABLE S.T2 (X DECIMAL(1,0))".to_string(),
+            },
+            &file_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ExportError::SqlExecutionError { message } if message.contains("no result set")),
+            "got: {err}"
+        );
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_maps_prepare_failure_without_running_the_export()
+    {
+        let mut transport = MockTransport::new();
+        transport.expect_create_prepared_statement().returning(|_| {
+            Err(crate::error::TransportError::ProtocolError(
+                "syntax error".to_string(),
+            ))
+        });
+        transport.expect_close_prepared_statement().never();
+        transport.expect_execute_query().never();
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("users.parquet");
+
+        let err = export_to_parquet_via_transport(
+            &mut transport,
+            users_source(),
+            &file_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ExportError::SqlExecutionError { message } if message.contains("syntax error")),
+            "got: {err}"
+        );
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_export_to_parquet_via_transport_returns_io_error_when_the_file_cannot_be_created()
+    {
+        let server = FakeExasolServer::serving_csv("1,alice\n").await;
+        let mut transport = describing_transport(id_name_columns());
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let file_path = directory.path().join("missing").join("users.parquet");
+
+        let err = export_to_parquet_via_transport(
+            &mut transport,
+            users_source(),
+            &file_path,
+            tunnel_options(&server),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ExportError::IoError(_)), "got: {err}");
+    }
+
+    #[test]
+    fn test_export_error_maps_a_parquet_writer_failure_to_csv_parse_error_at_row_zero() {
+        let err = export_error(ParquetExportError::Parquet("close failed".to_string()));
+
+        assert!(
+            matches!(&err, ExportError::CsvParseError { row: 0, message } if message.contains("close failed")),
+            "got: {err}"
         );
     }
 }

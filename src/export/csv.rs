@@ -634,78 +634,85 @@ fn parse_csv(
     separator: char,
     delimiter: char,
 ) -> Result<Vec<Vec<String>>, ExportError> {
-    let mut rows = Vec::new();
-    let mut current_row = Vec::new();
-    let mut current_field = String::new();
-    let mut in_quotes = false;
-    let mut row_num = 0;
+    csv_rows(data, separator, delimiter).collect()
+}
 
-    let chars: Vec<char> = data.chars().collect();
-    let mut i = 0;
+/// Reads CSV text one parsed row at a time.
+///
+/// A row ends at a line feed, a carriage return and line feed pair, or a lone carriage return
+/// outside quotes. Line breaks inside quotes stay in the field. A doubled delimiter inside
+/// quotes is one literal delimiter. The iterator yields an error when the text ends inside a
+/// quote, naming the 0-based index of the row that was open, and ends after that error.
+pub(crate) fn csv_rows(data: &str, separator: char, delimiter: char) -> CsvRows<'_> {
+    CsvRows {
+        chars: data.chars().peekable(),
+        separator,
+        delimiter,
+        rows_yielded: 0,
+    }
+}
 
-    while i < chars.len() {
-        let c = chars[i];
+/// Row iterator returned by [`csv_rows`].
+pub(crate) struct CsvRows<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    separator: char,
+    delimiter: char,
+    rows_yielded: usize,
+}
+
+impl CsvRows<'_> {
+    fn complete_row(&mut self, mut row: Vec<String>, last_field: String) -> Vec<String> {
+        row.push(last_field);
+        self.rows_yielded += 1;
+        row
+    }
+}
+
+impl Iterator for CsvRows<'_> {
+    type Item = Result<Vec<String>, ExportError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut row = Vec::new();
+        let mut field = String::new();
+        let mut in_quotes = false;
+
+        while let Some(c) = self.chars.next() {
+            if in_quotes {
+                if c != self.delimiter {
+                    field.push(c);
+                } else if self.chars.peek() == Some(&self.delimiter) {
+                    field.push(self.delimiter);
+                    self.chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else if c == self.delimiter {
+                in_quotes = true;
+            } else if c == self.separator {
+                row.push(std::mem::take(&mut field));
+            } else if c == '\n' {
+                return Some(Ok(self.complete_row(row, field)));
+            } else if c == '\r' {
+                // A CR before LF belongs to the CRLF pair, and the LF ends the row.
+                if self.chars.peek() != Some(&'\n') {
+                    return Some(Ok(self.complete_row(row, field)));
+                }
+            } else {
+                field.push(c);
+            }
+        }
 
         if in_quotes {
-            if c == delimiter {
-                // Check for escaped delimiter (two consecutive delimiters)
-                if i + 1 < chars.len() && chars[i + 1] == delimiter {
-                    current_field.push(delimiter);
-                    i += 2;
-                    continue;
-                }
-                // End of quoted field
-                in_quotes = false;
-            } else {
-                current_field.push(c);
-            }
-        } else if c == delimiter {
-            // Start of quoted field
-            in_quotes = true;
-        } else if c == separator {
-            // End of field
-            current_row.push(current_field);
-            current_field = String::new();
-        } else if c == '\n' {
-            // End of row
-            current_row.push(current_field);
-            current_field = String::new();
-            rows.push(current_row);
-            current_row = Vec::new();
-            row_num += 1;
-        } else if c == '\r' {
-            // Handle CRLF - skip the CR, the LF will handle the row end
-            if i + 1 < chars.len() && chars[i + 1] == '\n' {
-                // CRLF, skip CR and let LF handle it
-            } else {
-                // Just CR (old Mac-style)
-                current_row.push(current_field);
-                current_field = String::new();
-                rows.push(current_row);
-                current_row = Vec::new();
-                row_num += 1;
-            }
-        } else {
-            current_field.push(c);
+            return Some(Err(ExportError::CsvParseError {
+                row: self.rows_yielded,
+                message: "Unclosed quote at end of data".to_string(),
+            }));
         }
-        i += 1;
+        if field.is_empty() && row.is_empty() {
+            return None;
+        }
+        Some(Ok(self.complete_row(row, field)))
     }
-
-    // Handle the last field/row if not empty
-    if !current_field.is_empty() || !current_row.is_empty() {
-        current_row.push(current_field);
-        rows.push(current_row);
-    }
-
-    // Check for unclosed quotes
-    if in_quotes {
-        return Err(ExportError::CsvParseError {
-            row: row_num,
-            message: "Unclosed quote at end of data".to_string(),
-        });
-    }
-
-    Ok(rows)
 }
 
 /// Parses a single CSV line into its fields, handling RFC-style quoting.
@@ -756,6 +763,38 @@ pub(crate) fn parse_csv_row(line: &str, separator: char, delimiter: char) -> (Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_csv_rows_yields_rows_one_at_a_time_keeping_quoted_line_breaks() {
+        let data = "1,\"a\nb\r c\"\n2,plain\r\n3,last";
+        let mut rows = csv_rows(data, ',', '"');
+
+        assert_eq!(rows.next().unwrap().unwrap(), vec!["1", "a\nb\r c"]);
+        assert_eq!(rows.next().unwrap().unwrap(), vec!["2", "plain"]);
+        assert_eq!(rows.next().unwrap().unwrap(), vec!["3", "last"]);
+        assert!(rows.next().is_none());
+    }
+
+    #[test]
+    fn test_csv_rows_ends_after_an_unclosed_quote_error() {
+        let mut rows = csv_rows("1,x\n2,\"open", ',', '"');
+
+        assert_eq!(rows.next().unwrap().unwrap(), vec!["1", "x"]);
+        match rows.next().unwrap() {
+            Err(ExportError::CsvParseError { row, .. }) => assert_eq!(row, 1),
+            other => panic!("expected an unclosed quote error, got {other:?}"),
+        }
+        assert!(rows.next().is_none());
+    }
+
+    #[test]
+    fn test_csv_rows_ends_a_row_at_a_lone_carriage_return_outside_quotes() {
+        let mut rows = csv_rows("1,a\r2,b\r", ',', '"');
+
+        assert_eq!(rows.next().unwrap().unwrap(), vec!["1", "a"]);
+        assert_eq!(rows.next().unwrap().unwrap(), vec!["2", "b"]);
+        assert!(rows.next().is_none());
+    }
     use crate::error::TransportError;
     use crate::transport::protocol::QueryResult;
     use crate::transport::test_support::{FakeExasolServer, MockTransport, StalledQueryTransport};
