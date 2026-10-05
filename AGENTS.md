@@ -37,7 +37,7 @@ cargo test --test import_export_tests -- --ignored   # needs Exasol
 ## Design
 
 - ADBC hierarchy: Driver → Database → Connection → Statement. A Statement is pure data, and execution goes through the Connection.
-- All I/O is async on Tokio. The Connection owns its transport exclusively, with no `Arc<Mutex<>>`.
+- All I/O is async on Tokio. The Connection holds its transport as `Arc<Mutex<dyn TransportProtocol>>`, shared with `ResultSet` for lazy fetching.
 - Import and export use HTTP tunneling with the EXA protocol handshake.
 - TLS is on by default in the connection-string API, the builder, and the transport struct. Certificate validation is on by default.
 - Never log or expose connection passwords.

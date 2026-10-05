@@ -77,7 +77,7 @@
 - Password encryption uses RSA PKCS#1 v1.5 through num-bigint because Exasol servers can send 1024-bit keys, which aws-lc-rs rejects
 - Credentials are never logged or exposed, and Connection debug output omits the password
 - Results stream as Arrow RecordBatches, and conversion is Arrow-native and zero-copy where possible
-- CI rejects clippy warnings, cargo-deny license and advisory findings, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate, which is required to merge
+- CI rejects clippy warnings, cargo-deny license and advisory findings, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
 - Integration tests require a running Exasol instance on port 8563, and CI uses the image `exasol/docker-db:2025.2.0`
 
 ## External Dependencies
@@ -86,5 +86,5 @@
 - Operating system root certificate store: loaded through rustls-native-certs to validate the Exasol server certificate | failure impact: TLS connections with certificate validation fail unless a fingerprint is set or validation is disabled
 - Docker: runs `exasol/docker-db` for local development and integration tests | failure impact: integration tests cannot run locally
 - GitHub Actions: CI pipeline for build, lint, licenses, unit tests, integration tests, Sonar analysis, and release | failure impact: no automated testing or release builds
-- SonarQube Cloud: static analysis that reads the production-only unit coverage report | failure impact: the quality gate is required to merge, so pull requests cannot merge
+- SonarQube Cloud: static analysis that reads the production-only unit coverage report | failure impact: a failed quality gate is reported on the pull request (intended to become a required check)
 - crates.io: the CI release job publishes new versions with `cargo publish` | failure impact: a version bump cannot be published
