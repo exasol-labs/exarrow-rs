@@ -6,13 +6,13 @@ on:
     paths-ignore:
       - "specs/**"
       - "docs/**"
-      - "README.md"
+      - "**/*.md"
   pull_request:
     branches: [main]
     paths-ignore:
       - "specs/**"
       - "docs/**"
-      - "README.md"
+      - "**/*.md"
   workflow_dispatch:
 
 env:
