@@ -33,18 +33,18 @@ The connection survives a query timeout. `ConnectionParams::query_timeout` is `O
 
 ### Context
 
-Abandoning an in-flight request leaves the server session open until the idle reaper acts. The "Cancel with timeout" scenario in `query-execution/execution` allowed a soft local abort that left the session open.
+Abandoning an in-flight request leaves the server session open until the idle reaper acts. A soft local abort on give-up would leave the session open.
 
 ### Decision
 
-Any client-side decision to give up on a running query MUST terminate the connection and MUST NOT abandon the in-flight request. In "Cancel with timeout", the acknowledgment-timeout fallback MUST close the connection. This changes the spec only. Cancellation is unimplemented, so the rule constrains a future implementation.
+Any client-side decision to give up on a running query MUST terminate the connection and MUST NOT abandon the in-flight request. A cancellation-acknowledgment timeout fallback MUST close the connection. Cancellation is unimplemented and unspecified, so the rule constrains a future implementation.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
 | Close the connection on any client-side give-up | ✓ Chosen. The server session is released immediately |
-| Soft local abort in "Cancel with timeout" | ✗ Rejected. It leaves the session open server-side |
+| Soft local abort on give-up | ✗ Rejected. It leaves the session open server-side |
 
 ### Consequences
 
