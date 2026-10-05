@@ -56,21 +56,6 @@ All SQL execution occurs through Connection-owned transport via the WebSocket pr
 * *AND* it SHALL execute the query
 * *AND* it SHALL return results in Arrow format
 
-### Scenario: Sequential query execution
-
-* *GIVEN* multiple queries are ready for execution
-* *WHEN* multiple queries are submitted for execution
-* *THEN* it SHALL execute them in order
-* *AND* it SHALL return results for each query separately
-* *AND* it SHALL stop on first error if specified
-
-### Scenario: Independent query execution
-
-* *GIVEN* multiple queries are ready for execution
-* *WHEN* queries are marked as independent
-* *THEN* it SHALL execute all queries regardless of individual failures
-* *AND* it SHALL collect results and errors for each query
-
 ### Scenario: Cancel running query
 
 * *GIVEN* a long-running query is executing

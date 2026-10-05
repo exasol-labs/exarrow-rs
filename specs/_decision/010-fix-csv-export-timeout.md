@@ -50,29 +50,4 @@ The export timer and the server-enforced `query_timeout` coexist as separate, sc
 
 ### Consequences
 
-Both transports implement `terminate()` with the same outcome, and `close()` delegates its teardown to it. `Connection::is_closed()` reads the transport as well as the session.
-
-## ADR: Terminate the transport only when the EXPORT response was still unread at elapse
-
-**ID:** export-timeout-terminates-conditionally
-**Plan:** fix-csv-export-timeout
-**Status:** Accepted
-
-### Context
-
-The timed region spans SQL execution, tunnel transfer, and the callback. If the timer elapses after `sql_task.await` returned, the EXPORT response is consumed and the transport is in sync. A slow callback is the primary use case of the timer, so this is the expected case. Terminating there would destroy a healthy connection. Leaving the transport open while the response is unread makes the next statement read the stale response.
-
-### Decision
-
-The driver terminates the transport when the timer elapses before the EXPORT response is consumed. It leaves the transport usable when the timer elapses later, for example during a slow callback. A progress flag set when `sql_task.await` completes, owned outside the timed block, selects the branch. `ExportError::Timeout` carries `transport_terminated: bool` so the caller knows whether to reconnect without probing.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Terminate only when the EXPORT response is unread | ✓ Chosen. It matches the two real states: unmatchable in-flight response or healthy transport |
-| Terminate on every elapse | ✗ Rejected. It breaks a healthy connection on the primary use case |
-
-### Consequences
-
-After a terminating elapse, the next operation fails and the caller reconnects, instead of reading a stale response. `Connection::is_closed()` reports a terminated transport as closed.
+Both transports implement `terminate()` with the same outcome, and `close()` delegates its teardown to it. `Connection::is_closed()` reads the transport as well as the session. `export_to_callback` terminates only when the EXPORT response is still unread at elapse, tracked by a progress flag, and `ExportError::Timeout` carries `transport_terminated: bool`. A timeout during a slow callback leaves the healthy transport open.

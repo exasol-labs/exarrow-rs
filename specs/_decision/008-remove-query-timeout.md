@@ -23,7 +23,7 @@ Exasol enforces the query timeout. The driver forwards a configured timeout as t
 
 ### Consequences
 
-The connection survives a query timeout. `ConnectionParams::query_timeout` is `Option<Duration>` and `Statement::timeout_ms` is `Option<u64>`. `Some` sets the attribute and `None` sets none. The type change from `Duration` is breaking and is noted in the CHANGELOG.
+The connection survives a query timeout. `ConnectionParams::query_timeout` is `Option<Duration>` and `Statement::timeout_ms` is `Option<u64>`. `Some` sets the attribute and `None` sets none. The type change from `Duration` is breaking and is noted in the CHANGELOG. `execute_statement` reconciles the statement timeout against the applied value in `SessionConfig::query_timeout` in both directions, rounds sub-second values up to 1s, and resets with `set_query_timeout(0)` for `None`, so a prior timeout never leaks onto a later untimed statement.
 
 ## ADR: Client-side give-up on a running query MUST terminate the connection
 
@@ -49,30 +49,3 @@ Any client-side decision to give up on a running query MUST terminate the connec
 ### Consequences
 
 A future cancel implementation cannot reintroduce the session leak.
-
-## ADR: Reconcile the per-statement query timeout against the session in both directions, with write-back
-
-**ID:** query-timeout-bidirectional-reconcile
-**Plan:** remove-query-timeout
-**Status:** Accepted
-
-### Context
-
-`queryTimeout` is a session attribute, but `Statement::set_timeout()` is per statement. Statements run sequentially on one connection through `execute_statement(&mut self)`. Forwarding only `Some` values leaves a stale server timeout. A statement with `Some(5s)` followed by a `None` statement would run the second under the 5s limit, which violates the "No query timeout by default" scenario.
-
-### Decision
-
-On every execute, `execute_statement` compares the statement's target seconds with the applied seconds stored in `SessionConfig::query_timeout`. The target for `Some(ms)` is `ms` rounded up with `div_ceil`, at least 1s. The target for `None` is 0, because Exasol treats `queryTimeout=0` as unlimited. When they differ, it calls `set_query_timeout(target_secs)`, including `set_query_timeout(0)` for `None`. It then writes the applied value back to `SessionConfig::query_timeout`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Bidirectional reconcile with write-back | ✓ Chosen. Closes the stale-timeout hole and sends no round-trip when values match |
-| One-directional reconcile without write-back | ✗ Rejected. A prior statement's timeout leaks onto a later untimed statement |
-| Connection-level timeout only | ✗ Rejected. It breaks the public `Statement::set_timeout` API |
-| Send `setAttributes` before every statement | ✗ Rejected. It adds a round-trip when nothing changed |
-
-### Consequences
-
-`SessionConfig::query_timeout` stores the applied value. Sub-second timeouts round up to 1s, because 0 is reserved for the unlimited reset.
