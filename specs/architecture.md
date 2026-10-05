@@ -41,7 +41,7 @@
 - http_transport (src/transport/http_transport.rs): bulk data tunnel that opens an outbound TCP connection to Exasol, runs the EXA magic-packet handshake, wraps the socket in TLS with an ad-hoc certificate, and speaks chunked HTTP and byte-range HTTP | owns: tunnel socket, generated TLS certificate and its fingerprint | depends on: tls, error
 - tls (src/transport/tls.rs): shared rustls certificate verifiers that accept any certificate or match a SHA-256 fingerprint | owns: none | depends on: none
 - import (src/import/): imports CSV, Parquet, Arrow RecordBatches, and Arrow IPC into tables, converts non-CSV input to CSV while streaming or serves Parquet files natively, and runs parallel multi-file imports | owns: ParallelTransportPool of tunnel connections | depends on: http_transport, query, types, error
-- export (src/export/): exports tables or queries to CSV files, streams, lists, callbacks, Parquet, Arrow RecordBatches, and Arrow IPC by parsing the CSV stream that Exasol sends | owns: none | depends on: http_transport, transport core, query, types, error
+- export (src/export/): exports tables or queries to CSV files, streams, lists, callbacks, Parquet, Arrow RecordBatches, and Arrow IPC by parsing the CSV stream that Exasol sends, and takes a Parquet export's column names and types from the prepared-statement result-set metadata of the export source | owns: none | depends on: http_transport, transport core, query, types, error
 - types (src/types/): maps Exasol types to Arrow types, infers table schemas from CSV and Parquet files, and quotes identifiers | owns: ExasolType and TypeMapper definitions | depends on: import, error
 - arrow_conversion (src/arrow_conversion/): public utility that converts Exasol JSON column data into Arrow arrays, with no caller inside the crate | owns: none | depends on: transport core, types, error
 - error (src/error.rs): crate error types for connection, query, conversion, and transport failures | owns: none | depends on: none
@@ -52,6 +52,7 @@
 - SQL text -> Connection::execute_statement -> TransportProtocol::execute_query -> Exasol -> ResultSet: the native transport returns one Arrow RecordBatch per fetch, and the websocket transport returns JSON rows that query converts to RecordBatches with TypeMapper
 - ResultSet -> fetch_results per batch -> caller: batches stream lazily through ResultSetIterator, and Connection::query collects all batches in memory
 - file, stream, or RecordBatch -> import -> http_transport handshake returns an internal address -> IMPORT SQL through the Connection transport -> Exasol pulls CSV chunks, or Parquet byte ranges on servers from 2025.1.11, through the tunnel
+- Parquet export source -> SELECT text -> TransportProtocol::create_prepared_statement -> result-set column metadata -> Arrow schema -> TransportProtocol::close_prepared_statement, all before the EXPORT SQL runs
 - EXPORT SQL through the Connection transport -> Exasol pushes CSV through the http_transport tunnel -> export -> file, stream, list, callback, Parquet, RecordBatches, or Arrow IPC
 - ADBC driver manager -> AdbcDriverExasolInit or ExarrowDriverInit -> adbc_ffi -> adbc Connection on the 2-worker runtime -> RecordBatchReader returned over the C ABI
 

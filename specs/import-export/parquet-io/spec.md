@@ -1,6 +1,6 @@
 # Feature: Parquet I/O
 
-Specifies Parquet file import and export capabilities. Import streams Parquet bytes through the HTTP transport tunnel either natively (Exasol 2025.1.11+) or after CSV conversion (older servers). Export continues to receive CSV from Exasol and convert to Parquet locally.
+Specifies Parquet file import. Import streams Parquet bytes through the HTTP transport tunnel either natively (Exasol 2025.1.11+) or after CSV conversion (older servers). Parquet export is specified in `import-export/parquet-export` and `import-export/parquet-csv-bytes`.
 
 ## Background
 
@@ -11,7 +11,7 @@ Parquet import operates over the same HTTP tunnel as CSV import but selects betw
 
 The Parquet variant of the IMPORT statement omits all CSV format options (no `ENCODING`, `COLUMN SEPARATOR`, `COLUMN DELIMITER`, `ROW SEPARATOR`, `SKIP`, `NULL`, `TRIM`, `REJECT LIMIT`) and never emits the `MULTIPLE LOCAL FILES` tag (Exasol opens one HTTP server per file for native Parquet import). The `;MaxConcurrentReads=1` suffix is appended inside the `AT '...'` URL of every file entry, matching the JDBC reference behavior. Path selection is automatic by default and can be overridden via `ParquetImportOptions::with_native_parquet(Some(true|false))`.
 
-Export continues to receive CSV from Exasol, convert to Parquet locally with schema derived from Exasol metadata, and write to files or streams. The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builders.
+The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builders.
 
 ## Scenarios
 
@@ -63,25 +63,6 @@ Export continues to receive CSV from Exasol, convert to Parquet locally with sch
 * *AND* the SQL MUST NOT contain any `ENCODING`, `COLUMN SEPARATOR`, `COLUMN DELIMITER`, `ROW SEPARATOR`, `SKIP`, `NULL`, `TRIM`, or `REJECT LIMIT` clause
 * *AND* the SQL MUST NOT contain `MULTIPLE LOCAL FILES`, regardless of how many files are listed
 * *AND* when TLS is enabled, every `AT '...'` clause MUST be followed by a matching `PUBLIC KEY '<sha256-fingerprint>'` clause exactly as for the CSV path
-
-### Scenario: Export table to Parquet file
-
-* *GIVEN* an Exasol table contains data to export
-* *WHEN* user calls export_to_parquet with table name and file path
-* *THEN* system SHALL receive CSV from Exasol and convert to Parquet
-* *AND* system SHALL write Parquet file
-
-### Scenario: Export preserves schema
-
-* *GIVEN* an export operation has completed
-* *WHEN* export completes
-* *THEN* Parquet file SHALL contain schema derived from Exasol metadata
-
-### Scenario: Export to Parquet stream
-
-* *GIVEN* an AsyncWrite implementation is available for Parquet output
-* *WHEN* user provides AsyncWrite for Parquet output
-* *THEN* system SHALL stream Parquet data to writer
 
 ### Scenario: TLS for HTTP transport is configured uniformly via use_tls
 
