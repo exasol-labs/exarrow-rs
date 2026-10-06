@@ -7,7 +7,7 @@ use crate::error::{ConversionError, QueryError};
 use crate::transport::messages::{ColumnInfo, ResultData, ResultPayload, ResultSetHandle};
 use crate::transport::protocol::QueryResult as TransportQueryResult;
 use crate::transport::TransportProtocol;
-use crate::types::TypeMapper;
+use crate::types::{ExasolType, TypeMapper};
 use arrow::array::{
     new_empty_array, Array, BooleanArray, BooleanBuilder, Decimal128Array, Decimal128Builder,
     PrimitiveArray, PrimitiveBuilder, RecordBatch, StringArray, StringBuilder,
@@ -103,6 +103,46 @@ enum ResultSetInner {
         /// Whether all data has been fetched
         complete: bool,
     },
+}
+
+/// Resolve the Exasol type that a transport column description names.
+pub(crate) fn exasol_type_of(
+    data_type: &crate::transport::messages::DataType,
+) -> Result<ExasolType, ConversionError> {
+    let exasol_type = match data_type.type_name.as_str() {
+        "BOOLEAN" => ExasolType::Boolean,
+        "CHAR" => ExasolType::Char {
+            size: data_type.size.unwrap_or(1) as usize,
+        },
+        "VARCHAR" => ExasolType::Varchar {
+            size: data_type.size.unwrap_or(2000000) as usize,
+        },
+        "DECIMAL" => ExasolType::Decimal {
+            precision: data_type.precision.unwrap_or(18) as u8,
+            scale: data_type.scale.unwrap_or(0) as i8,
+        },
+        "DOUBLE" => ExasolType::Double,
+        "DATE" => ExasolType::Date,
+        "TIMESTAMP" => ExasolType::Timestamp {
+            with_local_time_zone: data_type.with_local_time_zone.unwrap_or(false),
+        },
+        "TIMESTAMP WITH LOCAL TIME ZONE" => ExasolType::Timestamp {
+            with_local_time_zone: true,
+        },
+        "INTERVAL YEAR TO MONTH" => ExasolType::IntervalYearToMonth,
+        "INTERVAL DAY TO SECOND" => ExasolType::IntervalDayToSecond {
+            precision: data_type.fraction.unwrap_or(3) as u8,
+        },
+        "GEOMETRY" => ExasolType::Geometry { srid: None },
+        "HASHTYPE" => ExasolType::Hashtype { byte_size: 16 },
+        _ => {
+            return Err(ConversionError::UnsupportedType {
+                exasol_type: data_type.type_name.clone(),
+            })
+        }
+    };
+
+    Ok(exasol_type)
 }
 
 impl ResultSet {
@@ -302,42 +342,7 @@ impl ResultSet {
     fn exasol_datatype_to_arrow(
         data_type: &crate::transport::messages::DataType,
     ) -> Result<arrow::datatypes::DataType, ConversionError> {
-        use crate::types::ExasolType;
-
-        let exasol_type = match data_type.type_name.as_str() {
-            "BOOLEAN" => ExasolType::Boolean,
-            "CHAR" => ExasolType::Char {
-                size: data_type.size.unwrap_or(1) as usize,
-            },
-            "VARCHAR" => ExasolType::Varchar {
-                size: data_type.size.unwrap_or(2000000) as usize,
-            },
-            "DECIMAL" => ExasolType::Decimal {
-                precision: data_type.precision.unwrap_or(18) as u8,
-                scale: data_type.scale.unwrap_or(0) as i8,
-            },
-            "DOUBLE" => ExasolType::Double,
-            "DATE" => ExasolType::Date,
-            "TIMESTAMP" => ExasolType::Timestamp {
-                with_local_time_zone: data_type.with_local_time_zone.unwrap_or(false),
-            },
-            "TIMESTAMP WITH LOCAL TIME ZONE" => ExasolType::Timestamp {
-                with_local_time_zone: true,
-            },
-            "INTERVAL YEAR TO MONTH" => ExasolType::IntervalYearToMonth,
-            "INTERVAL DAY TO SECOND" => ExasolType::IntervalDayToSecond {
-                precision: data_type.fraction.unwrap_or(3) as u8,
-            },
-            "GEOMETRY" => ExasolType::Geometry { srid: None },
-            "HASHTYPE" => ExasolType::Hashtype { byte_size: 16 },
-            _ => {
-                return Err(ConversionError::UnsupportedType {
-                    exasol_type: data_type.type_name.clone(),
-                })
-            }
-        };
-
-        TypeMapper::exasol_to_arrow(&exasol_type, true)
+        TypeMapper::exasol_to_arrow(&exasol_type_of(data_type)?, true)
     }
 
     /// Convert a ResultData payload to RecordBatch, handling both JSON and Arrow variants.

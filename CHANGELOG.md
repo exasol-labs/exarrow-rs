@@ -1,12 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## 0.17.0
 
 - Breaking: `PreparedStatementHandle` gains a public field, `result_columns`, so struct-literal construction outside the crate no longer compiles. `new()` is unchanged.
 - Breaking: `NativeResponse` gains a variant, `PreparedStatement`, so external exhaustive `match` no longer compiles.
 - Breaking: `IS_VARCHAR` and `IS_UTF8` change value (`IS_VARCHAR`: `0x80` → `0x01`; `IS_UTF8`: `0x01` → `0x10`).
 - Fix: native-transport callers now see corrected Exasol type names. A `VARCHAR(n)` column now reports `VARCHAR(n)` where it previously reported `CHAR(n)`, because the varchar bit in the native vcFlag was wrong. Arrow types are unaffected — both map to `Utf8`.
 - Fix: both transports now decode and surface result-set column metadata from `createPreparedStatement` replies, instead of discarding it. Fixes #60.
+- Fix: `Connection::export_to_parquet` now writes the source's column names and Exasol types instead of positional `col0`, `col1`, ... `Utf8` fields, and no longer fails on values that contain the column separator, the column delimiter, or a line break. It reads the schema from the prepared SELECT statement of the export source, so the source must produce a result set, and a statement such as `DELETE` or `CREATE TABLE` now returns `ExportError::SqlExecutionError` without running. Fixes #58.
+- Fix: an empty `Connection::export_to_parquet` export now writes a Parquet file that carries the schema and no rows, instead of returning 0 without creating a file. A failed export leaves no output file behind.
+- Fix: the CSV-bytes Parquet entry points (`export_to_parquet`, `export_to_parquet_stream`, `csv_to_record_batches`) no longer trim fields, and accept line breaks inside quoted fields. A typed field with surrounding whitespace, such as ` 7` for an integer column, now fails with `ParquetExportError::CsvParse` instead of parsing. A `CsvParse` row is the 0-based data-row index in the whole input.
+- Fix: `CHAR(n)` values in a Parquet export now keep Exasol's space padding to length n, the same value a query returns.
+- Changed: a Parquet export writes INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, GEOMETRY, and HASHTYPE columns as `Utf8` text, where `exasol_types_to_arrow_schema` used to return an error for them. TIMESTAMP WITH LOCAL TIME ZONE columns are written as `Timestamp(Microsecond, None)`, holding the session-local value, instead of `Timestamp(Microsecond, "UTC")`.
+- Changed: `Connection::export_to_parquet` ignores `ParquetExportOptions::null_value`, because Exasol writes NULL as an empty field. The option applies only to the CSV-bytes entry points, where only a field equal to it is NULL.
 
 ## 0.16.0
 

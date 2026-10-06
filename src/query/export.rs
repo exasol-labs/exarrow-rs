@@ -96,6 +96,40 @@ pub enum ExportSource {
     },
 }
 
+fn qualified_name(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(schema) => format!("{schema}.{name}"),
+        None => name.to_string(),
+    }
+}
+
+impl ExportSource {
+    /// The SELECT statement whose result set this source exports.
+    ///
+    /// Preparing it describes the exported columns without running the export. It names the
+    /// table exactly as the EXPORT statement does, so both resolve the same object.
+    pub(crate) fn select_statement(&self) -> String {
+        match self {
+            ExportSource::Table {
+                schema,
+                name,
+                columns,
+            } => {
+                let select_list = if columns.is_empty() {
+                    "*".to_string()
+                } else {
+                    columns.join(", ")
+                };
+                format!(
+                    "SELECT {select_list} FROM {}",
+                    qualified_name(schema.as_deref(), name)
+                )
+            }
+            ExportSource::Query { sql } => sql.clone(),
+        }
+    }
+}
+
 /// Builder for constructing EXPORT SQL statements.
 ///
 /// Exasol EXPORT statements transfer data from tables or queries to external destinations
@@ -365,12 +399,7 @@ impl ExportQuery {
                 name,
                 columns,
             } => {
-                let mut clause = String::from("EXPORT ");
-                if let Some(s) = schema {
-                    clause.push_str(s);
-                    clause.push('.');
-                }
-                clause.push_str(name);
+                let mut clause = format!("EXPORT {}", qualified_name(schema.as_deref(), name));
                 if !columns.is_empty() {
                     clause.push_str(" (");
                     clause.push_str(&columns.join(", "));
@@ -415,6 +444,49 @@ impl ExportQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_select_statement_for_table_without_schema_selects_star() {
+        let source = ExportSource::Table {
+            schema: None,
+            name: "users".to_string(),
+            columns: vec![],
+        };
+        assert_eq!(source.select_statement(), "SELECT * FROM users");
+    }
+
+    #[test]
+    fn test_select_statement_for_table_with_schema_and_columns() {
+        let source = ExportSource::Table {
+            schema: Some("sales".to_string()),
+            name: "orders".to_string(),
+            columns: vec!["id".to_string(), "total".to_string()],
+        };
+        assert_eq!(
+            source.select_statement(),
+            "SELECT id, total FROM sales.orders"
+        );
+    }
+
+    #[test]
+    fn test_select_statement_for_query_is_the_query_text() {
+        let source = ExportSource::Query {
+            sql: "SELECT 1 AS X".to_string(),
+        };
+        assert_eq!(source.select_statement(), "SELECT 1 AS X");
+    }
+
+    #[test]
+    fn test_select_statement_and_export_clause_name_the_same_table() {
+        let source = ExportSource::Table {
+            schema: Some("s".to_string()),
+            name: "t".to_string(),
+            columns: vec![],
+        };
+        let export = ExportQuery::with_source(source.clone()).build();
+        assert!(export.starts_with("EXPORT s.t"));
+        assert!(source.select_statement().ends_with("FROM s.t"));
+    }
 
     // Test basic export statement generation from table
     #[test]

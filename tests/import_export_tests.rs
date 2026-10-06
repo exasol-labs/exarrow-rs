@@ -47,7 +47,7 @@
 
 mod common;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::{
@@ -2783,5 +2783,597 @@ async fn test_csv_export_runs_past_the_former_five_minute_limit() {
         ),
     }
 
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section: Parquet export from the transport (schema from the source's metadata)
+
+fn read_parquet_file(path: &std::path::Path) -> (Arc<Schema>, RecordBatch) {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path).expect("the export must have created the Parquet file");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("the export must have written a readable Parquet file");
+    let schema = builder.schema().clone();
+    let batches = builder
+        .build()
+        .expect("the Parquet reader must accept the written schema")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("every written row group must decode");
+    let batch = arrow::compute::concat_batches(&schema, &batches).expect("batches must concat");
+    (schema, batch)
+}
+
+fn typed_column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("the file must carry the field {name}"))
+        .as_any()
+        .downcast_ref::<T>()
+        .unwrap_or_else(|| panic!("the field {name} has an unexpected Arrow type"))
+}
+
+fn field_types(schema: &Schema) -> Vec<(String, DataType)> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().clone(), field.data_type().clone()))
+        .collect()
+}
+
+/// Maps each `ID` value of `batch` to its row index, so assertions do not depend on row order.
+fn row_of_id(batch: &RecordBatch) -> std::collections::HashMap<i128, usize> {
+    let ids = typed_column::<arrow::array::Decimal128Array>(batch, "ID");
+    (0..ids.len()).map(|row| (ids.value(row), row)).collect()
+}
+
+async fn create_table(conn: &mut Connection, schema_name: &str, table: &str, columns: &str) {
+    conn.execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {schema_name}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    conn.execute_update(&format!("CREATE TABLE {schema_name}.{table} ({columns})"))
+        .await
+        .expect("CREATE TABLE should succeed");
+}
+
+async fn count_of(conn: &mut Connection, sql: &str) -> i64 {
+    let batches = conn.query(sql).await.expect("the count query must succeed");
+    let text = arrow::compute::cast(batches[0].column(0), &DataType::Utf8)
+        .expect("a count must cast to text");
+    let text = text
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("the cast must yield Utf8");
+    text.value(0).parse().expect("a count must be an integer")
+}
+
+fn table_source(schema_name: &str, table: &str) -> ExportSource {
+    ExportSource::Table {
+        schema: Some(schema_name.to_string()),
+        name: table.to_string(),
+        columns: vec![],
+    }
+}
+
+/// Scenario: Export preserves schema
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_preserves_schema() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::{
+        BooleanArray, Date32Array, Decimal128Array, Float64Array, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::TimeUnit;
+    use chrono::{DateTime, NaiveDate, NaiveDateTime};
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    conn.execute_update("ALTER SESSION SET TIME_ZONE = 'EUROPE/BERLIN'")
+        .await
+        .expect("ALTER SESSION should succeed");
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), NAME VARCHAR(100), PRICE DECIMAL(10,2), ACTIVE BOOLEAN, \
+         CREATED DATE, UPDATED TIMESTAMP, RATIO DOUBLE, TS_LTZ TIMESTAMP WITH LOCAL TIME ZONE",
+    )
+    .await;
+    conn.execute_update(&format!(
+        "INSERT INTO {schema_name}.T VALUES \
+         (1, 'alpha', 0.50, TRUE, DATE '2024-02-29', TIMESTAMP '2024-02-29 13:45:10.123', 1.5, \
+          TIMESTAMP '2024-07-01 12:00:00.250'), \
+         (2, 'beta', -0.50, FALSE, DATE '1999-12-31', TIMESTAMP '2000-01-01 00:00:00.000', -2.25, \
+          TIMESTAMP '2024-01-15 08:30:00.000'), \
+         (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+    ))
+    .await
+    .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("t.parquet");
+    let rows_exported = conn
+        .export_to_parquet(
+            table_source(&schema_name, "T"),
+            &parquet_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .expect("Parquet export should succeed");
+    let csv_rows = conn
+        .export_csv_to_list(
+            ExportSource::Table {
+                schema: Some(schema_name.clone()),
+                name: "T".to_string(),
+                columns: vec!["ID".to_string(), "TS_LTZ".to_string()],
+            },
+            CsvExportOptions::default().use_tls(false),
+        )
+        .await
+        .expect("CSV export should succeed");
+
+    assert_eq!(rows_exported, 3);
+    let (schema, batch) = read_parquet_file(&parquet_path);
+    let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
+    assert_eq!(
+        field_types(&schema),
+        vec![
+            ("ID".to_string(), DataType::Decimal128(18, 0)),
+            ("NAME".to_string(), DataType::Utf8),
+            ("PRICE".to_string(), DataType::Decimal128(10, 2)),
+            ("ACTIVE".to_string(), DataType::Boolean),
+            ("CREATED".to_string(), DataType::Date32),
+            ("UPDATED".to_string(), micros.clone()),
+            ("RATIO".to_string(), DataType::Float64),
+            ("TS_LTZ".to_string(), micros),
+        ]
+    );
+
+    let rows = row_of_id(&batch);
+    let names = typed_column::<StringArray>(&batch, "NAME");
+    let prices = typed_column::<Decimal128Array>(&batch, "PRICE");
+    let active = typed_column::<BooleanArray>(&batch, "ACTIVE");
+    let created = typed_column::<Date32Array>(&batch, "CREATED");
+    let updated = typed_column::<TimestampMicrosecondArray>(&batch, "UPDATED");
+    let ratios = typed_column::<Float64Array>(&batch, "RATIO");
+    let local_times = typed_column::<TimestampMicrosecondArray>(&batch, "TS_LTZ");
+    let days_since_epoch = |year, month, day| {
+        NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+            .num_days() as i32
+    };
+    let micros_of = |text: &str| {
+        NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_utc()
+            .timestamp_micros()
+    };
+
+    let (r1, r2, r3) = (rows[&1], rows[&2], rows[&3]);
+    assert_eq!(names.value(r1), "alpha");
+    assert_eq!(names.value(r2), "beta");
+    assert_eq!((prices.value(r1), prices.value(r2)), (50, -50));
+    assert_eq!((active.value(r1), active.value(r2)), (true, false));
+    assert_eq!(created.value(r1), days_since_epoch(2024, 2, 29));
+    assert_eq!(created.value(r2), days_since_epoch(1999, 12, 31));
+    assert_eq!(updated.value(r1), micros_of("2024-02-29 13:45:10.123"));
+    assert_eq!(updated.value(r2), micros_of("2000-01-01 00:00:00.000"));
+    assert_eq!((ratios.value(r1), ratios.value(r2)), (1.5, -2.25));
+    for column in 1..batch.num_columns() {
+        assert!(batch.column(column).is_null(r3), "row 3 must be NULL");
+    }
+
+    assert_eq!(csv_rows.len(), 3);
+    for csv_row in csv_rows.iter().filter(|row| !row[1].is_empty()) {
+        let row = rows[&csv_row[0].parse::<i128>().unwrap()];
+        assert_eq!(
+            DateTime::from_timestamp_micros(local_times.value(row))
+                .unwrap()
+                .naive_utc(),
+            NaiveDateTime::parse_from_str(&csv_row[1], "%Y-%m-%d %H:%M:%S%.f").unwrap(),
+            "TS_LTZ of row {} must carry the wall-clock time Exasol writes",
+            csv_row[0]
+        );
+    }
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Query export names fields after the select list
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_names_fields_after_select_list() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), NAME VARCHAR(100)",
+    )
+    .await;
+    conn.execute_update(&format!("INSERT INTO {schema_name}.T VALUES (1, 'alpha')"))
+        .await
+        .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("query.parquet");
+    conn.export_to_parquet(
+        ExportSource::Query {
+            sql: format!("SELECT ID AS ITEM_ID, UPPER(NAME) FROM {schema_name}.T"),
+        },
+        &parquet_path,
+        ParquetExportOptions::default(),
+    )
+    .await
+    .expect("Parquet export should succeed");
+
+    let (schema, _) = read_parquet_file(&parquet_path);
+    assert_eq!(schema.fields().len(), 2);
+    assert_eq!(schema.field(0).name(), "ITEM_ID");
+    assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(18, 0));
+    let derived = schema.field(1).name();
+    assert!(
+        !derived.is_empty() && !derived.starts_with("col"),
+        "the derived column must carry Exasol's name, got {derived:?}"
+    );
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Values containing the separator, the delimiter, or a line break export intact
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_keeps_values_with_separators_and_line_breaks() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), NAME VARCHAR(100)",
+    )
+    .await;
+    conn.execute_update(&format!(
+        "INSERT INTO {schema_name}.T VALUES \
+         (1, 'Smith, John'), \
+         (2, 'say \"hi\"'), \
+         (3, 'A' || CHR(10) || 'B'), \
+         (4, 'A' || CHR(13) || CHR(10) || 'B'), \
+         (5, 'A' || CHR(13) || 'B'), \
+         (6, 'ENDS' || CHR(13))"
+    ))
+    .await
+    .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("values.parquet");
+    let rows_exported = conn
+        .export_to_parquet(
+            table_source(&schema_name, "T"),
+            &parquet_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .expect("Parquet export should succeed");
+
+    assert_eq!(rows_exported, 6);
+    let (_, batch) = read_parquet_file(&parquet_path);
+    assert_eq!(batch.num_rows(), 6);
+    let rows = row_of_id(&batch);
+    let names = typed_column::<StringArray>(&batch, "NAME");
+    let expected = [
+        (1, "Smith, John"),
+        (2, "say \"hi\""),
+        (3, "A\nB"),
+        (4, "A\r\nB"),
+        (5, "A\rB"),
+        (6, "ENDS\r"),
+    ];
+    for (id, name) in expected {
+        assert_eq!(names.value(rows[&id]), name, "NAME of row {id}");
+    }
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Exported text values keep their whitespace
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_keeps_text_whitespace() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), NAME VARCHAR(100)",
+    )
+    .await;
+    conn.execute_update(&format!(
+        "INSERT INTO {schema_name}.T VALUES \
+         (1, '  padded  '), (2, '   '), (3, 'NULL'), (4, NULL)"
+    ))
+    .await
+    .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("whitespace.parquet");
+    conn.export_to_parquet(
+        table_source(&schema_name, "T"),
+        &parquet_path,
+        ParquetExportOptions::default().with_null_value("NULL"),
+    )
+    .await
+    .expect("Parquet export should succeed");
+
+    let (_, batch) = read_parquet_file(&parquet_path);
+    let rows = row_of_id(&batch);
+    let names = typed_column::<StringArray>(&batch, "NAME");
+    assert_eq!(names.value(rows[&1]), "  padded  ");
+    assert_eq!(names.value(rows[&2]), "   ");
+    assert_eq!(names.value(rows[&3]), "NULL");
+    assert!(names.is_null(rows[&4]));
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Columns without a typed CSV conversion export as text
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_writes_untyped_columns_as_text() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "IYM INTERVAL YEAR TO MONTH, IDS INTERVAL DAY TO SECOND, G GEOMETRY, H HASHTYPE",
+    )
+    .await;
+    conn.execute_update(&format!(
+        "INSERT INTO {schema_name}.T VALUES \
+         ('3-2', '2 12:50:10.123', 'POINT(2 5)', '550e8400-e29b-11d4-a716-446655440000')"
+    ))
+    .await
+    .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("untyped.parquet");
+    conn.export_to_parquet(
+        table_source(&schema_name, "T"),
+        &parquet_path,
+        ParquetExportOptions::default(),
+    )
+    .await
+    .expect("Parquet export should succeed");
+    let csv_rows = conn
+        .export_csv_to_list(
+            table_source(&schema_name, "T"),
+            CsvExportOptions::default().use_tls(false),
+        )
+        .await
+        .expect("CSV export should succeed");
+
+    let (schema, batch) = read_parquet_file(&parquet_path);
+    assert_eq!(
+        field_types(&schema),
+        ["IYM", "IDS", "G", "H"]
+            .map(|name| (name.to_string(), DataType::Utf8))
+            .to_vec()
+    );
+    assert_eq!(csv_rows.len(), 1);
+    for (position, name) in ["IYM", "IDS", "G", "H"].iter().enumerate() {
+        assert_eq!(
+            typed_column::<StringArray>(&batch, name).value(0),
+            csv_rows[0][position],
+            "{name} must hold the text Exasol exports"
+        );
+    }
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Empty export writes a Parquet file that carries the schema
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_empty_result_writes_schema_only_file() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), NAME VARCHAR(100)",
+    )
+    .await;
+    conn.execute_update(&format!("INSERT INTO {schema_name}.T VALUES (1, 'alpha')"))
+        .await
+        .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("empty.parquet");
+    let rows_exported = conn
+        .export_to_parquet(
+            ExportSource::Query {
+                sql: format!("SELECT ID, NAME FROM {schema_name}.T WHERE FALSE"),
+            },
+            &parquet_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .expect("an empty export should succeed");
+
+    assert_eq!(rows_exported, 0);
+    let (schema, batch) = read_parquet_file(&parquet_path);
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(
+        field_types(&schema),
+        vec![
+            ("ID".to_string(), DataType::Decimal128(18, 0)),
+            ("NAME".to_string(), DataType::Utf8),
+        ]
+    );
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Export source that produces no result set is rejected before the export runs
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_rejects_source_without_result_set() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(&mut conn, &schema_name, "T", "ID DECIMAL(18,0)").await;
+    conn.execute_update(&format!("INSERT INTO {schema_name}.T VALUES (1), (2)"))
+        .await
+        .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let delete_path = temp_dir.path().join("delete.parquet");
+    let err = conn
+        .export_to_parquet(
+            ExportSource::Query {
+                sql: format!("DELETE FROM {schema_name}.T"),
+            },
+            &delete_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .expect_err("a DML source has no result set to export");
+
+    assert!(
+        matches!(&err, ExportError::SqlExecutionError { message } if message.contains("no result set")),
+        "got: {err:?}"
+    );
+    assert_eq!(
+        count_of(&mut conn, &format!("SELECT COUNT(*) FROM {schema_name}.T")).await,
+        2,
+        "the rejected DELETE must not run"
+    );
+    assert!(!delete_path.exists());
+
+    let ddl_path = temp_dir.path().join("ddl.parquet");
+    let err = conn
+        .export_to_parquet(
+            ExportSource::Query {
+                sql: format!("CREATE TABLE {schema_name}.T2 (X DECIMAL(1,0))"),
+            },
+            &ddl_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .expect_err("a DDL source has no result set to export");
+
+    assert!(
+        matches!(err, ExportError::SqlExecutionError { .. }),
+        "got: {err:?}"
+    );
+    assert_eq!(
+        count_of(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*) FROM EXA_ALL_TABLES \
+                 WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = 'T2'"
+            )
+        )
+        .await,
+        0,
+        "the rejected CREATE TABLE must not run"
+    );
+    assert!(!ddl_path.exists());
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: A value that does not match its column type fails the export
+#[tokio::test]
+#[ignore]
+async fn test_parquet_export_fails_on_value_outside_default_session_format() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), DAY_OF_RECORD DATE",
+    )
+    .await;
+    conn.execute_update(&format!(
+        "INSERT INTO {schema_name}.T VALUES (1, DATE '2024-03-05')"
+    ))
+    .await
+    .expect("INSERT should succeed");
+    conn.execute_update("ALTER SESSION SET NLS_DATE_FORMAT = 'DD.MM.YYYY'")
+        .await
+        .expect("ALTER SESSION should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("dates.parquet");
+    let err = conn
+        .export_to_parquet(
+            table_source(&schema_name, "T"),
+            &parquet_path,
+            ParquetExportOptions::default(),
+        )
+        .await
+        .expect_err("a date in a custom session format must fail the export");
+
+    assert!(
+        matches!(&err, ExportError::CsvParseError { message, .. }
+            if message.contains("column 1") && message.contains("05.03.2024")),
+        "got: {err:?}"
+    );
+    assert!(!parquet_path.exists());
+
+    cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
 }
