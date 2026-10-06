@@ -2859,7 +2859,10 @@ fn table_source(schema_name: &str, table: &str) -> ExportSource {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_preserves_schema() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     use arrow::array::{
         BooleanArray, Date32Array, Decimal128Array, Float64Array, TimestampMicrosecondArray,
@@ -2986,7 +2989,10 @@ async fn test_parquet_export_preserves_schema() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_names_fields_after_select_list() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();
@@ -3032,7 +3038,10 @@ async fn test_parquet_export_names_fields_after_select_list() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_keeps_values_with_separators_and_line_breaks() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();
@@ -3091,7 +3100,10 @@ async fn test_parquet_export_keeps_values_with_separators_and_line_breaks() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_keeps_text_whitespace() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();
@@ -3135,7 +3147,10 @@ async fn test_parquet_export_keeps_text_whitespace() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_writes_untyped_columns_as_text() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();
@@ -3194,7 +3209,10 @@ async fn test_parquet_export_writes_untyped_columns_as_text() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_empty_result_writes_schema_only_file() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();
@@ -3241,7 +3259,10 @@ async fn test_parquet_export_empty_result_writes_schema_only_file() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_rejects_source_without_result_set() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();
@@ -3312,7 +3333,10 @@ async fn test_parquet_export_rejects_source_without_result_set() {
 #[tokio::test]
 #[ignore]
 async fn test_parquet_export_fails_on_value_outside_default_session_format() {
-    skip_if_no_exasol!();
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
     let schema_name = generate_test_schema_name();

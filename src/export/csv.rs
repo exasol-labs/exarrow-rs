@@ -675,8 +675,10 @@ impl Iterator for CsvRows<'_> {
         let mut row = Vec::new();
         let mut field = String::new();
         let mut in_quotes = false;
+        let mut consumed_any = false;
 
         while let Some(c) = self.chars.next() {
+            consumed_any = true;
             if in_quotes {
                 if c != self.delimiter {
                     field.push(c);
@@ -708,7 +710,7 @@ impl Iterator for CsvRows<'_> {
                 message: "Unclosed quote at end of data".to_string(),
             }));
         }
-        if field.is_empty() && row.is_empty() {
+        if !consumed_any {
             return None;
         }
         Some(Ok(self.complete_row(row, field)))
@@ -773,6 +775,14 @@ mod tests {
         assert_eq!(rows.next().unwrap().unwrap(), vec!["2", "plain"]);
         assert_eq!(rows.next().unwrap().unwrap(), vec!["3", "last"]);
         assert!(rows.next().is_none());
+    }
+
+    #[test]
+    fn test_csv_rows_keeps_a_final_quoted_empty_field() {
+        let rows: Vec<_> = csv_rows("\"\"", ',', '"')
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![vec![String::new()]]);
     }
 
     #[test]
