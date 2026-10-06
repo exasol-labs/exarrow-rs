@@ -20,7 +20,7 @@ Arrow RecordBatch import converts RecordBatch data to CSV format for streaming t
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
-### Scenario: RecordBatch import converts pre-epoch timestamps of every time unit to the earlier instant
+### Scenario: RecordBatch import formats pre-epoch timestamps of every time unit as times before the epoch
 
 * *GIVEN* a RecordBatch with a Timestamp column whose value is -1
 * *WHEN* the import converts the value to CSV text for the time units `Second`, `Millisecond`, `Microsecond`, and `Nanosecond`

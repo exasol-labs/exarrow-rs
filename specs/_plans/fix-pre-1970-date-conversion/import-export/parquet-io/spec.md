@@ -25,7 +25,7 @@ The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builder
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
-### Scenario: CSV-path Parquet import converts pre-epoch timestamps of every time unit to the earlier instant
+### Scenario: CSV-path Parquet import formats pre-epoch timestamps of every time unit as times before the epoch
 
 * *GIVEN* a Parquet RecordBatch with a Timestamp column whose value is -1
 * *WHEN* the CSV path converts the value to CSV text for the time units `Second`, `Millisecond`, `Microsecond`, and `Nanosecond`
