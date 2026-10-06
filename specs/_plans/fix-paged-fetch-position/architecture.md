@@ -7,7 +7,7 @@
 - connection URI -> Driver -> Database -> Connection::from_params -> native transport (default) or websocket transport (`transport=websocket`) -> Exasol: TCP or WebSocket connect, TLS, RSA-encrypted login, session info
 - SQL text -> Connection::execute_statement -> TransportProtocol::execute_query -> Exasol -> ResultSet: the native transport returns one Arrow RecordBatch per fetch, and the websocket transport returns JSON rows that query converts to RecordBatches with TypeMapper
 - ResultSet -> fetch_results per batch -> caller: batches stream lazily through ResultSetIterator, and Connection::query collects all batches in memory
-- file, stream, or RecordBatch -> import -> http_transport handshake returns an internal address -> IMPORT SQL through the Connection transport -> Exasol pulls CSV chunks, or Parquet byte ranges on servers from 2025.1.11 other than 2025.2.0, through the tunnel; when the IMPORT SQL fails, import stops serving the tunnel and returns the error
+- file, stream, or RecordBatch -> import -> http_transport handshake returns an internal address -> IMPORT SQL through the Connection transport -> Exasol pulls CSV chunks, or Parquet byte ranges on servers from 2025.1.11, through the tunnel; when the IMPORT SQL fails, import stops serving the tunnel and returns the error
 - Parquet export source -> SELECT text -> TransportProtocol::create_prepared_statement -> result-set column metadata -> Arrow schema -> TransportProtocol::close_prepared_statement, all before the EXPORT SQL runs
 - EXPORT SQL through the Connection transport -> Exasol pushes CSV through the http_transport tunnel -> export -> file, stream, list, callback, Parquet, RecordBatches, or Arrow IPC
 - ADBC driver manager -> AdbcDriverExasolInit or ExarrowDriverInit -> adbc_ffi -> adbc Connection on the 2-worker runtime -> RecordBatchReader returned over the C ABI
@@ -22,7 +22,7 @@
 - Connection timeout defaults to 30 seconds and cannot exceed 300 seconds, and idle timeout defaults to 600 seconds
 - The native transport fetches up to the server's maximum data message size per batch, with a 64 MiB fallback
 - The FFI runtime is a multi-thread Tokio runtime with 2 workers so that import can run WebSocket and HTTP I/O at the same time inside `block_on`
-- Native Parquet import requires Exasol 2025.1.11 or later and is off on Exasol 2025.2.0, which rejects HTTP Parquet sources with ETL-2210, and every other server receives Parquet converted to CSV
+- Native Parquet import requires Exasol 2025.1.11 or later, and older servers receive Parquet converted to CSV
 - Password encryption uses RSA PKCS#1 v1.5 through num-bigint because Exasol servers can send 1024-bit keys, which aws-lc-rs rejects
 - Credentials are never logged or exposed, and Connection debug output omits the password
 - Results stream as Arrow RecordBatches, and conversion is Arrow-native and zero-copy where possible

@@ -152,7 +152,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
     - Recorded runs: plan 002 (`specs/_recorded/002-fix-thrift-cve-upgrade-arrow-58/verification-report.md`) reports 40 passed and 2 hung on 2025.2.0 at commit `95819035`. Plan 008 reports 51 of 51 passed without naming the image. `AGENTS.md` starts `exasol/docker-db:latest`, which is 2026.1.0 on the planning host.
     - Result: the hang depends on the server version, and entry [19] gives its cause. Neither a CI flag nor a driver change after commit `95819035` makes 2025.2.0 hang, because the same commit hangs on 2025.2.0 today.
 - **Consequences:**
-  - No native Parquet import test is ignored. Entries [19] and [20] fix the two causes of the hang, and entry [21] moves CI to `exasol/docker-db:2025.2.1`, on which every import/export test passes.
+  - No native Parquet import test is ignored. Entry [20] fixes the driver cause of the hang, entry [19] declares Exasol 2025.2.0 unsupported for native Parquet import, and entry [21] moves CI to `exasol/docker-db:2025.2.1`, on which every import/export test passes.
   - A test that hangs or fails in CI gets its cause fixed. A reasoned `#[ignore]` is for a test that cannot run in CI by design, such as the eight-minute opt-in check.
   - `test_csv_export_runs_past_the_former_five_minute_limit` gets `#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1"]` instead of losing its `#[ignore]`. It keeps its `EXARROW_LONG_EXPORT_CHECK` early return.
   - The `skip_if_no_exasol!` macro of `tests/driver_manager_tests.rs` panics under `REQUIRE_EXASOL=1`, as the macro in `tests/common/mod.rs` does, so that target also fails instead of skipping when Exasol is unavailable.
@@ -188,13 +188,15 @@ Headless run. No live interview took place. The orchestrator brief is the only i
   - `specs/mission.md` § Tech Stack names arrow 59, parquet 59, and adbc 0.24 (task 6.6).
 - **Promotes to ADR:** no
 
-### [19] Native Parquet import is off on Exasol 2025.2.0
+### [19] Exasol 2025.2.0 is not supported for native Parquet import, and nothing pins it
 
-- **Decision:** `supports_native_parquet_import` returns true for a version at or above `(2025, 1, 11)` other than `(2025, 2, 0)`. On Exasol 2025.2.0, Parquet import converts to CSV, as it does on servers below 2025.1.11.
-- **Alternatives:** (a) Keep 2025.2.0 on the native path and only fix the hang (entry [20]). Rejected: every Parquet import on 2025.2.0 would then fail with `ETL-2210` unless the caller forces the CSV path. (b) Raise the gate to `(2025, 2, 1)`. Rejected: it would also turn off native import on Exasol 2025.1.11 and later 2025.1.x releases, which the gate supports today. (c) Detect the rejection at run time and retry through CSV. Rejected: it costs one failed statement per import and depends on parsing an error message.
-- **Rationale:** Root-cause runs against local containers. Sent directly through `exapump` without the driver, `IMPORT INTO RC_PROBE.T FROM PARQUET AT 'http://127.0.0.1:9' FILE 'x.parquet'` fails on 2025.2.0 with `ETL-2210: AWS URL is invalid: Provided URL is not a valid AWS S3 URL (http://127.0.0.1:9/x.parquet)`. On 2025.2.1 the same statement fails only because nothing listens on the address (`ETL-2238: Remote File ... read failed. Couldn't connect to server`). On 2025.2.0 the same statement with `FROM CSV` also fails only on the connection (`ETL-5105`). A traced driver run of `test_parquet_import_from_file` on 2025.2.0 shows the IMPORT statement failing with `ETL-2210` after 0.2 seconds while the tunnel task waits. On 2025.2.1 the trace shows a `GET` with `Range: bytes=0-0`, a `HEAD`, five further range `GET`s, the server closing the tunnel, and the statement returning 3 rows. Exasol 2025.2.0 therefore accepts only S3 URLs as Parquet sources, and 2025.2.1 and 2026.1.0 accept HTTP sources. No local image exists for 2025.1.11, so the 2025.1.x part of the gate keeps the threshold it had.
-- **Consequences:** `connection-management/version-capability` owns the version rule, and `import-export/parquet-io` and `import-export/parallel-import` refer to `supports_native_parquet_import()` instead of naming 2025.1.11. An explicit `with_native_parquet(Some(true))` on 2025.2.0 returns `ETL-2210` (entry [20]). CI no longer runs a 2025.2.0 server, so plan.md § Manual Testing covers the 2025.2.0 fallback.
-- **Architecture:** § Data Flow, § Constraints
+- **Decision:** `supports_native_parquet_import` keeps its gate `>= (2025, 1, 11)` with no exception for any single version. Exasol 2025.2.0 is not supported for native Parquet import: Parquet import there returns Exasol's `ETL-2210` error (entry [20]), and users upgrade to 2025.2.1 or later or set `with_native_parquet(Some(false))`. Tests, scripts, CI, and specs no longer name 2025.2.0. `docs/import-export.md` § Native Parquet Import, `CHANGELOG.md`, and plan.md § Impact state the limitation.
+- **Alternatives:** (a) Exclude `(2025, 2, 0)` in the gate so that 2025.2.0 converts Parquet to CSV. Rejected by the user: the driver would keep code and tests for an outdated server version. (b) Raise the gate to `(2025, 2, 1)`. Rejected: it would also turn off native import on Exasol 2025.1.11 and later 2025.1.x releases.
+- **Rationale:** User decision. Root-cause runs against local containers show why 2025.2.0 fails. Sent directly through `exapump` without the driver, `IMPORT INTO RC_PROBE.T FROM PARQUET AT 'http://127.0.0.1:9' FILE 'x.parquet'` fails on 2025.2.0 with `ETL-2210: AWS URL is invalid: Provided URL is not a valid AWS S3 URL (http://127.0.0.1:9/x.parquet)`. On 2025.2.1 the same statement fails only because nothing listens on the address (`ETL-2238`). On 2025.2.0 the statement with `FROM CSV` also fails only on the connection (`ETL-5105`). A traced driver run on 2025.2.0 shows the IMPORT statement failing with `ETL-2210` after 0.2 seconds while the tunnel task waits. On 2025.2.1 the trace shows range `GET`s and a `HEAD`, the server closing the tunnel, and 3 imported rows. Exasol 2025.2.0 therefore accepts only S3 URLs as Parquet sources, and 2025.2.1 and 2026.1.0 accept HTTP sources. The repository states no minimum Exasol version overall. The only version requirement for a feature is the one for native Parquet import, in `docs/import-export.md` and `specs/architecture.md` § Constraints, so the 2025.2.0 limitation belongs in `docs/import-export.md`.
+- **Consequences:**
+  - The recorded scenario "Native Parquet import threshold" uses `(2025,2,1)` instead of `(2025,2,0)` as a boundary case. The gate and its other cases are unchanged.
+  - The three native Parquet import tests assert native Parquet support instead of skipping, because CI and the local runner use 2025.2.1.
+  - `scripts/run_all_tests.sh` drops 2025.2.0 from its default and its help example. `specs/architecture.md` names 2025.2.1 as the CI image. Every other Docker reference in the repository already uses `exasol/docker-db:latest`.
 - **Promotes to ADR:** no
 
 ### [20] A failed IMPORT statement stops the tunnel tasks and returns its error
@@ -208,10 +210,10 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 ### [21] CI runs on `exasol/docker-db:2025.2.1`
 
-- **Decision:** The `integration-tests` job and the `EXASOL_TAG` default of `scripts/run_all_tests.sh` use `exasol/docker-db:2025.2.1` instead of 2025.2.0.
-- **Alternatives:** (a) Keep 2025.2.0. Rejected: after entry [19], every Parquet import on 2025.2.0 takes the CSV path, so CI would never run the native path. (b) Move to 2026.1.0. Rejected: the planning runs on 2026.1.0 covered only two tests, and 2025.2.1 is the closest image to the current one.
+- **Decision:** The `integration-tests` job and the `EXASOL_TAG` default and help example of `scripts/run_all_tests.sh` use `exasol/docker-db:2025.2.1` instead of 2025.2.0.
+- **Alternatives:** (a) Keep 2025.2.0. Rejected: 2025.2.0 rejects HTTP Parquet sources, so every native Parquet import test would fail there (entry [19]). (b) Move to 2026.1.0. Rejected: the planning runs on 2026.1.0 covered only two tests, and 2025.2.1 is the closest image to the current one.
 - **Rationale:** On a local 2025.2.1 container, every integration target passes with the CI flags: `import_export_tests` 54 of 54 including the formerly ignored tests, `integration_tests` 69 passed and 4 ignored, `websocket_integration_tests` 44, `native_protocol_tests` 14, and `native_transport_smoke_test` 4. `driver_manager_tests` and the Python tests were not run on 2025.2.1 during planning.
-- **Consequences:** The CSV fallback for 2025.2.0 has no CI run. A unit test of the version gate and a manual run against 2025.2.0 cover it.
+- **Consequences:** No CI step or local script runs Exasol 2025.2.0 any longer.
 - **Architecture:** § Constraints
 - **Promotes to ADR:** no
 
@@ -286,4 +288,14 @@ Headless run. No live interview took place. The orchestrator brief is the only i
   - (4): root-cause runs found two causes. Exasol 2025.2.0 rejects HTTP Parquet sources with `ETL-2210` (entry [19]). The driver hangs whenever an IMPORT statement fails before Exasol requests data, on every server version (entry [20]). New group C (tasks 8.1 to 8.8) fixes both, adds the scenario "Failed IMPORT statement returns its error without waiting for the tunnel", excludes 2025.2.0 from native Parquet import, and moves CI to 2025.2.1 (entry [21]). Task 7.0 and the eleven `#[ignore]` reasons are removed. Only the eight-minute opt-in test keeps a reasoned `#[ignore]`.
   - (5): task 7.8 and entry [23].
   - Entry [10] states 0.18.0 as the release version. Review finding [1] above records the earlier ignore-based direction that this entry replaces.
+- **Promotes to ADR:** no
+
+### [9] [plan-review] User decision: drop Exasol 2025.2.0 support instead of excluding it in the gate
+
+- **Finding:** The user does not keep tests or code that pin outdated Exasol versions. Since 2025.2.1 works, support for 2025.2.0 is dropped entirely, the driver-side fix for the IMPORT hang stays, and the CI image move to 2025.2.1 stays.
+- **Direction change:**
+  - Entry [19] now keeps the gate `>= (2025, 1, 11)` and declares 2025.2.0 unsupported for native Parquet import, instead of excluding `(2025, 2, 0)`.
+  - The deltas for `import-export/parquet-io` and `import-export/parallel-import` are removed, together with the scenario "Exasol 2025.2.0 receives Parquet converted to CSV", the manual 2025.2.0 run, the two CSV-path multi-file tests that covered the changed parallel-import scenarios, and the 2025.2.0 lines of the architecture delta. A fifth missing-table test covers the CSV-converted multi-file Parquet path.
+  - The `connection-management/version-capability` delta now changes only the boundary case `(2025,2,0)` to `(2025,2,1)` in "Native Parquet import threshold".
+  - Tasks 8.6, 8.7, 8.9, and 8.10 move every remaining 2025.2.0 reference in tests, scripts, docs, and the gate's doc comment to 2025.2.1 or remove it. plan.md § Impact and task 8.8 state that users on 2025.2.0 get `ETL-2210` instead of a hang and upgrade to 2025.2.1 or force the CSV path.
 - **Promotes to ADR:** no
