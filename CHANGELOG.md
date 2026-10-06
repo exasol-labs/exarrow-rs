@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- Fix: `fetch_all()` and prepared-statement results return every row exactly once for WebSocket results larger than one fetch message and for results on both transports that are partly delivered with the execute response. Fixes #80.
+- Fix: `ResultSetIterator` ends after the last row on both transports.
+- Changed: `fetch_all()` and the iterator return `QueryError::ExecutionFailed` when a result set delivers fewer or more rows than its total row count.
+
 ## 0.17.0
 
 - Breaking: `PreparedStatementHandle` gains a public field, `result_columns`, so struct-literal construction outside the crate no longer compiles. `new()` is unchanged.

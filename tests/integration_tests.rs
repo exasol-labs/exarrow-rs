@@ -74,8 +74,10 @@ mod common;
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    disable_query_cache, generate_test_schema_name, get_host, get_port, get_test_connection,
-    get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
+    assert_every_key_once, disable_query_cache, drain_iterator, end_of_stream_query,
+    generate_test_schema_name, get_host, get_port, get_test_connection, get_test_connection_string,
+    get_user, is_exasol_available, long_running_count_query, multi_fetch_query,
+    partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
 #[cfg(feature = "native")]
 use common::{get_password, get_test_connection_with_transport};
@@ -292,6 +294,8 @@ async fn test_connection_health_check() {
 // Tests for SELECT queries, Arrow RecordBatch validation, and data retrieval.
 
 /// 3.1 Test SELECT from DUAL returns correct results
+///
+/// Scenario: Small result set retrieval
 #[tokio::test]
 async fn test_select_from_dual() {
     skip_if_no_exasol!();
@@ -3706,5 +3710,149 @@ async fn test_csv_export_timeout_during_callback_keeps_connection_usable() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
 
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section: Paged fetch (native transport)
+// Paged fetch position and end of stream.
+
+/// Scenario: Large result set (multi-fetch)
+/// Scenario: Large result set pagination
+#[tokio::test]
+async fn test_fetch_all_multi_fetch_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(multi_fetch_query())
+        .await
+        .expect("multi-fetch query should succeed");
+
+    let non_empty = batches.iter().filter(|b| b.num_rows() > 0).count();
+    assert!(
+        non_empty >= 2,
+        "expected at least two non-empty batches, got {non_empty}"
+    );
+    assert_every_key_once(&batches, MULTI_FETCH_ROWS);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Large result set (multi-fetch)
+/// Scenario: Result partly delivered with the execute response
+#[tokio::test]
+async fn test_fetch_all_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(partial_inline_query())
+        .await
+        .expect("partial-inline query should succeed");
+
+    let first = batches[0].num_rows();
+    assert!(
+        (1..PARTIAL_INLINE_ROWS).contains(&first),
+        "the execute response should deliver some but not all rows, got {first}"
+    );
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator ends after the last row
+#[test]
+fn test_iterator_ends_after_last_row() {
+    skip_if_no_exasol!();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (conn, mut iterator) = runtime.block_on(async {
+        let mut conn = get_test_connection().await.expect("Failed to connect");
+        let iterator = conn
+            .execute(end_of_stream_query())
+            .await
+            .expect("query should succeed")
+            .into_iterator()
+            .expect("a SELECT yields an iterator");
+        (conn, iterator)
+    });
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_every_key_once(&batches, END_OF_STREAM_ROWS);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: Result partly delivered with the execute response
+/// Scenario: Result set iterator ends after the last row
+#[test]
+fn test_iterator_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (conn, mut iterator) = runtime.block_on(async {
+        let mut conn = get_test_connection().await.expect("Failed to connect");
+        let iterator = conn
+            .execute(partial_inline_query())
+            .await
+            .expect("query should succeed")
+            .into_iterator()
+            .expect("a SELECT yields an iterator");
+        (conn, iterator)
+    });
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    let first = batches[0].num_rows();
+    assert!(
+        (1..PARTIAL_INLINE_ROWS).contains(&first),
+        "the execute response should deliver some but not all rows, got {first}"
+    );
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: Large result set (multi-fetch)
+/// Scenario: Prepared statement result is paged like a query result
+#[tokio::test]
+async fn test_prepared_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let prepared = conn
+        .prepare(partial_inline_query())
+        .await
+        .expect("Failed to prepare statement");
+    let batches = conn
+        .execute_prepared(&prepared)
+        .await
+        .expect("Failed to execute prepared statement")
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    let first = batches[0].num_rows();
+    assert!(
+        (1..PARTIAL_INLINE_ROWS).contains(&first),
+        "the execute response should deliver some but not all rows, got {first}"
+    );
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
     conn.close().await.expect("Failed to close connection");
 }

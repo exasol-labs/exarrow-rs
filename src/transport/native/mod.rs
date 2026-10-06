@@ -680,7 +680,11 @@ impl NativeTcpTransport {
         buf.extend_from_slice(&nanos.to_le_bytes());
     }
 
-    /// Convert a response to QueryResult, caching column metadata for result sets with handles.
+    /// Convert a response to QueryResult, caching column metadata and the fetch
+    /// start position for result sets with handles.
+    ///
+    /// The start position is the number of rows the execute response already
+    /// delivered, so the first `CMD_FETCH2` does not repeat them.
     fn convert_and_cache_result(
         &mut self,
         response: NativeResponse,
@@ -689,7 +693,7 @@ impl NativeTcpTransport {
             ref handle,
             ref columns,
             total_rows: _,
-            rows_received: _,
+            rows_received,
             ..
         } = response
         {
@@ -699,6 +703,7 @@ impl NativeTcpTransport {
             if *handle != SMALL_RESULTSET {
                 self.result_columns
                     .insert(*handle, Arc::new(columns.clone()));
+                self.fetch_positions.insert(*handle, rows_received);
             }
         }
         Self::native_result_to_query_result(response)
@@ -1609,6 +1614,29 @@ mod tests {
             }
             other => panic!("expected ResultSet, got {other:?}"),
         }
+    }
+
+    /// Scenario: Large result set (multi-fetch)
+    #[test]
+    fn inline_rows_seed_the_fetch_position_of_a_large_result_set() {
+        let mut transport = NativeTcpTransport::new();
+        let response = |handle, rows_received| NativeResponse::ResultSet {
+            handle,
+            columns: vec![column_meta("ID", T_DECIMAL)],
+            batch: None,
+            total_rows: 70,
+            rows_received,
+        };
+
+        transport
+            .convert_and_cache_result(response(42, 67))
+            .unwrap();
+        transport
+            .convert_and_cache_result(response(SMALL_RESULTSET, 70))
+            .unwrap();
+
+        assert_eq!(transport.fetch_positions.get(&42), Some(&67));
+        assert_eq!(transport.fetch_positions.get(&SMALL_RESULTSET), None);
     }
 
     #[test]

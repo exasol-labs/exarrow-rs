@@ -145,6 +145,22 @@ pub(crate) fn exasol_type_of(
     Ok(exasol_type)
 }
 
+/// Why `ResultSet::fetch_page_after` failed. The iterator ends after a row
+/// count mismatch, because the result set cannot be read further.
+enum PageFetchError {
+    Fetch(QueryError),
+    RowCountMismatch(String),
+}
+
+impl From<PageFetchError> for QueryError {
+    fn from(error: PageFetchError) -> Self {
+        match error {
+            PageFetchError::Fetch(error) => error,
+            PageFetchError::RowCountMismatch(message) => QueryError::ExecutionFailed(message),
+        }
+    }
+}
+
 impl ResultSet {
     /// Create a result set from a transport query result.
     pub(crate) fn from_transport_result(
@@ -256,66 +272,91 @@ impl ResultSet {
             ));
         };
 
-        if !*complete {
-            if let Some(handle_val) = *handle {
-                *batches = Self::paginate_remaining(
-                    &self.transport,
-                    handle_val,
-                    metadata,
-                    batches.clone(),
-                )
-                .await?;
-                *complete = true;
+        let pagination = match *handle {
+            Some(handle_val) if !*complete => {
+                Self::paginate_remaining(&self.transport, handle_val, metadata, batches.clone())
+                    .await
             }
-        }
-        let all_batches = batches.clone();
+            _ => Ok(batches.clone()),
+        };
 
         // Close the result set handle on the server to release resources
         if let Some(handle_val) = handle.take() {
             let mut transport = self.transport.lock().await;
-            // Ignore close errors - we've already fetched the data
+            // Ignore close errors - the pagination result is what the caller needs
             let _ = transport.close_result_set(handle_val).await;
         }
 
-        Ok(all_batches)
+        pagination
     }
 
     /// Fetch every remaining page of a result set, appending to `collected`.
     ///
-    /// Pagination ends either when the transport returns an empty page or when
-    /// the row count known from the query metadata has been reached. The
-    /// per-page `total_rows` reported by the transport is deliberately ignored:
-    /// it describes that page, so trusting it would end pagination early.
+    /// The per-page `total_rows` reported by the transport is deliberately
+    /// ignored: it describes that page, so trusting it would end pagination
+    /// early. The end rule lives in `fetch_page_after`.
     async fn paginate_remaining(
         transport: &Arc<Mutex<dyn TransportProtocol>>,
         handle: ResultSetHandle,
         metadata: &QueryMetadata,
         mut collected: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
-        let known_total = metadata.total_rows.unwrap_or(0);
-
-        loop {
-            // The guard deliberately spans the whole iteration, matching the
-            // locking window the transport has always been given.
-            let mut locked = transport.lock().await;
-            let result_data = locked
-                .fetch_results(handle)
+        while let Some(batch) =
+            Self::fetch_page_after(transport, handle, metadata, Self::row_count_of(&collected))
                 .await
-                .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-
-            if result_data.data.is_empty() {
-                return Ok(collected);
-            }
-
-            collected.push(
-                Self::payload_to_record_batch(&result_data, &metadata.schema)
-                    .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?,
-            );
-
-            if known_total > 0 && Self::row_count_of(&collected) >= known_total as usize {
-                return Ok(collected);
-            }
+                .map_err(QueryError::from)?
+        {
+            collected.push(batch);
         }
+        Ok(collected)
+    }
+
+    /// Fetch the page that follows `rows_received` rows, or `None` at the end.
+    ///
+    /// `fetch_all` and `ResultSetIterator` share this end-of-stream rule. When
+    /// the query metadata reports a total above zero, the stream ends exactly
+    /// when the rows received reach it, with no further fetch. A page that
+    /// ends the stream early or overshoots the total is an error, because
+    /// Exasol reports the exact total with every result set. A total of zero
+    /// means the count is unknown, so the first empty page ends the stream.
+    async fn fetch_page_after(
+        transport: &Arc<Mutex<dyn TransportProtocol>>,
+        handle: ResultSetHandle,
+        metadata: &QueryMetadata,
+        rows_received: usize,
+    ) -> Result<Option<RecordBatch>, PageFetchError> {
+        let total = metadata.total_rows.unwrap_or(0).max(0) as usize;
+        if total > 0 && rows_received >= total {
+            return Ok(None);
+        }
+
+        let result_data = transport
+            .lock()
+            .await
+            .fetch_results(handle)
+            .await
+            .map_err(|e| PageFetchError::Fetch(QueryError::ExecutionFailed(e.to_string())))?;
+
+        if result_data.data.is_empty() {
+            if total == 0 {
+                return Ok(None);
+            }
+            return Err(PageFetchError::RowCountMismatch(format!(
+                "Result set ended after {rows_received} rows, but its total row count is {total}"
+            )));
+        }
+
+        let batch = Self::payload_to_record_batch(&result_data, &metadata.schema)
+            .map_err(|e| PageFetchError::Fetch(QueryError::ExecutionFailed(e.to_string())))?;
+
+        let rows_after_page = rows_received + batch.num_rows();
+        if total > 0 && rows_after_page > total {
+            return Err(PageFetchError::RowCountMismatch(format!(
+                "Result set delivered {rows_after_page} rows, but its total row count is {total}"
+            )));
+        }
+
+        Ok(Some(batch))
     }
 
     fn row_count_of(batches: &[RecordBatch]) -> usize {
@@ -749,21 +790,21 @@ impl ResultSetIterator {
             }
         };
 
-        let mut transport = self.transport.lock().await;
-        let result_data = transport
-            .fetch_results(handle)
+        let rows_received = ResultSet::row_count_of(&self.batches);
+        match ResultSet::fetch_page_after(&self.transport, handle, &self.metadata, rows_received)
             .await
-            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-
-        if result_data.data.is_empty() {
-            self.complete = true;
-            return Ok(None);
+        {
+            Ok(None) => {
+                self.complete = true;
+                Ok(None)
+            }
+            Ok(batch) => Ok(batch),
+            Err(error @ PageFetchError::RowCountMismatch(_)) => {
+                self.complete = true;
+                Err(error.into())
+            }
+            Err(error) => Err(error.into()),
         }
-
-        let batch = ResultSet::payload_to_record_batch(&result_data, &self.metadata.schema)
-            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-
-        Ok(Some(batch))
     }
 
     /// Get the next batch synchronously (blocking).
@@ -2342,6 +2383,10 @@ mod tests {
                 "page fetch failed".to_string(),
             ))
         });
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let err = streaming_result_set(transport, &[1], 0, Some(ResultSetHandle::new(1)))
             .fetch_all()
@@ -2366,6 +2411,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(batches.len(), 1);
+    }
+
+    /// Scenario: Small result set retrieval
+    #[tokio::test]
+    async fn test_fetch_all_small_result_set_sends_no_fetch() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        transport.expect_close_result_set().times(0);
+
+        let batches = streaming_result_set(transport, &[1, 2], 2, None)
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(ResultSet::row_count_of(&batches), 2);
+    }
+
+    /// Scenario: Result set that ends before its total row count fails
+    #[tokio::test]
+    async fn test_fetch_all_fails_when_the_stream_ends_before_the_total() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[], 3)));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let err = streaming_result_set(transport, &[1], 3, Some(ResultSetHandle::new(1)))
+            .fetch_all()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains('1') && message.contains('3'), "{message}");
+    }
+
+    /// Scenario: Result set that exceeds its total row count fails
+    #[tokio::test]
+    async fn test_fetch_all_fails_when_a_page_exceeds_the_total() {
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[2, 3], 2)));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let err = streaming_result_set(transport, &[1], 2, Some(ResultSetHandle::new(1)))
+            .fetch_all()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains('3') && message.contains('2'), "{message}");
     }
 
     #[tokio::test]
@@ -2474,6 +2580,72 @@ mod tests {
 
         assert!(matches!(err, QueryError::ExecutionFailed(_)));
         assert!(err.to_string().contains("no page"));
+    }
+
+    /// Scenario: Result set iterator ends after the last row
+    #[test]
+    fn test_next_batch_stops_at_total_rows_without_another_fetch() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[2, 3], 3)));
+
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
+
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 2);
+        assert!(iterator.next_batch().is_none());
+        assert!(iterator.next_batch().is_none());
+    }
+
+    /// Scenario: Result set that ends before its total row count fails
+    #[test]
+    fn test_next_batch_fails_when_the_stream_ends_before_the_total() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[], 3)));
+
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+
+        let err = iterator.next_batch().unwrap().unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains('1') && message.contains('3'), "{message}");
+        assert!(iterator.next_batch().is_none());
+    }
+
+    /// Scenario: Result set that exceeds its total row count fails
+    #[test]
+    fn test_next_batch_fails_when_a_page_exceeds_the_total() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[2, 3], 2)));
+
+        let mut iterator = streaming_iterator(transport, &[1], 2, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+
+        let err = iterator.next_batch().unwrap().unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains('3') && message.contains('2'), "{message}");
+        assert!(iterator.next_batch().is_none());
     }
 
     #[tokio::test]
