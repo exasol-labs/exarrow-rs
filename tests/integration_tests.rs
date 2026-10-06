@@ -39,21 +39,22 @@
 //!
 //! # Running Tests
 //!
-//! Integration tests are marked with `#[ignore]` to prevent failures in
-//! CI environments without Exasol. Run them explicitly:
+//! CI runs every test in this file against an Exasol container with
+//! `REQUIRE_EXASOL=1`, so a missing database fails the run. Run them locally
+//! the same way:
 //!
 //! ```bash
 //! # Run all integration tests
-//! cargo test --test integration_tests -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --test integration_tests -- --test-threads=1
 //!
 //! # Run a specific test
-//! cargo test --test integration_tests test_connection_succeeds -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --test integration_tests test_connection_succeeds
 //!
 //! # Run with verbose output
-//! cargo test --test integration_tests -- --ignored --nocapture
+//! REQUIRE_EXASOL=1 cargo test --test integration_tests -- --nocapture
 //!
 //! # Run with custom Exasol instance
-//! EXASOL_HOST=192.168.1.100 cargo test --test integration_tests -- --ignored
+//! EXASOL_HOST=192.168.1.100 REQUIRE_EXASOL=1 cargo test --test integration_tests
 //! ```
 //!
 //! # Test Organization
@@ -468,9 +469,8 @@ async fn test_create_schema() {
 /// and the connection stays open with no active schema. Tools such as dbt rely
 /// on this so they can create their target schema after connecting.
 ///
-/// Documents the live behavior; run with `--ignored` against a real Exasol.
+/// Documents the live behavior against a real Exasol.
 #[tokio::test]
-#[ignore]
 async fn test_connect_with_nonexistent_uri_schema_succeeds() {
     skip_if_no_exasol!();
 
@@ -2461,7 +2461,6 @@ async fn test_connect_with_certificate_fingerprint() {
 /// Connecting with a URI that names a schema activates that schema server-side
 /// without the caller having to invoke `set_schema()` explicitly.
 #[tokio::test]
-#[ignore]
 async fn test_uri_schema_is_opened_on_connect() {
     skip_if_no_exasol!();
 
@@ -2540,7 +2539,6 @@ async fn test_uri_schema_is_opened_on_connect() {
 /// the ADBC URI path (the one dbt uses); the builder path is covered by
 /// `test_connect_with_nonexistent_uri_schema_succeeds`.
 #[tokio::test]
-#[ignore]
 async fn test_uri_schema_missing_is_best_effort_via_adbc() {
     skip_if_no_exasol!();
 

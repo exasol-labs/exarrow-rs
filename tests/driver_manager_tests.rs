@@ -28,10 +28,10 @@
 //! cargo build --release --features ffi
 //!
 //! # Then run the driver manager tests
-//! cargo test --test driver_manager_tests -- --ignored
+//! cargo test --test driver_manager_tests -- --include-ignored
 //!
 //! # Run with verbose output
-//! cargo test --test driver_manager_tests -- --ignored --nocapture
+//! cargo test --test driver_manager_tests -- --include-ignored --nocapture
 //! ```
 
 mod common;
@@ -88,6 +88,13 @@ fn get_test_uri() -> String {
 macro_rules! skip_if_no_exasol {
     () => {
         if !is_exasol_available() {
+            if std::env::var("REQUIRE_EXASOL").is_ok() {
+                panic!(
+                    "REQUIRE_EXASOL is set but Exasol is not available at {}:{}",
+                    get_host(),
+                    get_port()
+                );
+            }
             eprintln!(
                 "Skipping test: Exasol not available at {}:{}",
                 get_host(),
@@ -2630,9 +2637,9 @@ fn test_autocommit_toggle_with_dml() {
 ///
 /// Per CLAUDE.md: this test loads `target/release/libexarrow_rs.so` (or
 /// `.dylib`); run `cargo build --release --features ffi` before
-/// `cargo test --test driver_manager_tests -- --ignored`.
+/// `cargo test --test driver_manager_tests -- --include-ignored`.
 #[test]
-#[ignore]
+#[ignore = "loads the release cdylib, so it needs `cargo build --release --features ffi` first"]
 fn test_ffi_uri_schema_is_opened_on_connect() {
     skip_if_no_library!();
     skip_if_no_exasol!();

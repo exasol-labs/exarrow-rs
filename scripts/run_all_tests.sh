@@ -196,13 +196,16 @@ stage_integration() {
   cd "$PROJECT_DIR"
   export REQUIRE_EXASOL=1
   cargo test --features ffi --test integration_tests -- --test-threads=1
+  cargo test --features 'ffi websocket' --test websocket_integration_tests -- --test-threads=1
+  cargo test --features 'ffi websocket' --test native_protocol_tests -- --test-threads=1
+  cargo test --features ffi --test native_transport_smoke_test -- --test-threads=1
   cargo test --features ffi --test driver_manager_tests -- --include-ignored --test-threads=1
 }
 
 stage_import_export() {
   cd "$PROJECT_DIR"
   export REQUIRE_EXASOL=1
-  cargo test --test import_export_tests -- --ignored
+  cargo test --features ffi --test import_export_tests -- --test-threads=1
 }
 
 stage_python() {

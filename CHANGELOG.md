@@ -7,6 +7,7 @@
 - Fix: a CSV or Parquet import whose IMPORT statement fails before Exasol requests data, for example because the target table does not exist, returns the Exasol error instead of hanging. This affected multi-file CSV import and every Parquet import path.
 - Changed: `fetch_all()` and the iterator return `QueryError::ExecutionFailed` when a result set delivers fewer or more rows than its total row count.
 - Changed: Exasol 2025.2.0 is not supported for native Parquet import. It rejects HTTP Parquet sources, so a Parquet import there now returns `ETL-2210` instead of hanging. Upgrade to Exasol 2025.2.1 or later, or set `ParquetImportOptions::with_native_parquet(Some(false))` to use the CSV path.
+- Security: updated `xxhash-rust` to 0.8.19 (GHSA-6g2r-675j-hx59), `crossbeam-epoch` to 0.9.21 (RUSTSEC-2026-0204), and `indicatif` to 0.18, which removes the unmaintained `number_prefix` (RUSTSEC-2025-0119). All three are dependencies of the optional `benchmark` feature.
 
 ## 0.17.0
 

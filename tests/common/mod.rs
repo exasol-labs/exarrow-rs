@@ -286,14 +286,13 @@ pub fn is_exasol_available() -> bool {
 /// Skip a test if Exasol is not available.
 ///
 /// Use this at the beginning of integration tests to gracefully skip
-/// when no Exasol instance is running. Combined with `#[ignore]`, this
-/// provides a double layer of protection.
+/// when no Exasol instance is running. With `REQUIRE_EXASOL` set, a missing
+/// Exasol instance panics instead, which is how CI runs these tests.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[tokio::test]
-/// #[ignore]
 /// async fn test_query() {
 ///     skip_if_no_exasol!();
 ///     // Test code here...

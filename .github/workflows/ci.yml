@@ -80,6 +80,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Check CI covers every integration test target
+        run: python3 scripts/check_ci_test_targets.py
+
   licenses:
     name: License Check
     needs: [build]
@@ -94,7 +97,7 @@ jobs:
         run: cargo deny check licenses
 
       - name: Check advisories
-        run: cargo deny check advisories
+        run: cargo deny --all-features check advisories
 
   unit-tests:
     name: Unit Tests
@@ -132,6 +135,10 @@ jobs:
 
       - name: Run unit tests with coverage
         run: cargo llvm-cov --lib --lcov --output-path lcov-unit.info
+
+      # Outside the coverage run: AGENTS.md keeps the websocket feature out of it.
+      - name: Run websocket unit tests
+        run: cargo test --lib --features websocket
 
       # cargo llvm-cov instruments #[cfg(test)] modules too, so the raw report
       # counts the unit tests in their own denominator. Everything downstream
@@ -250,6 +257,22 @@ jobs:
         env:
           REQUIRE_EXASOL: "1"
         run: cargo test --features 'ffi websocket' --test websocket_integration_tests -- --test-threads=1
+
+      - name: Run import/export tests
+        timeout-minutes: 10
+        env:
+          REQUIRE_EXASOL: "1"
+        run: cargo test --features ffi --test import_export_tests -- --test-threads=1
+
+      - name: Run native protocol tests
+        env:
+          REQUIRE_EXASOL: "1"
+        run: cargo test --features 'ffi websocket' --test native_protocol_tests -- --test-threads=1
+
+      - name: Run native transport smoke test
+        env:
+          REQUIRE_EXASOL: "1"
+        run: cargo test --features ffi --test native_transport_smoke_test -- --test-threads=1
 
       - name: Check websocket-only test build
         run: cargo test --no-default-features --features websocket --tests --no-run
