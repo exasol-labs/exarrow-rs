@@ -17,9 +17,9 @@ mod common;
 use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    assert_every_key_once, drain_iterator, end_of_stream_query, generate_test_schema_name,
-    get_host, get_password, get_port, get_user, multi_fetch_query, partial_inline_query,
-    END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
+    assert_every_key_once, assert_partly_inline, drain_iterator, end_of_stream_query,
+    generate_test_schema_name, get_host, get_password, get_port, get_user, multi_fetch_query,
+    open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
 use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::transport::{ConnectionParams, Credentials, TransportProtocol, WebSocketTransport};
@@ -2036,11 +2036,7 @@ async fn test_ws_fetch_all_partial_inline_result_returns_every_row_once() {
         .await
         .expect("partial-inline query should succeed");
 
-    let first = batches[0].num_rows();
-    assert!(
-        (1..PARTIAL_INLINE_ROWS).contains(&first),
-        "the execute response should deliver some but not all rows, got {first}"
-    );
+    assert_partly_inline(&batches);
     assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
 
     conn.close().await.expect("Failed to close connection");
@@ -2051,20 +2047,7 @@ async fn test_ws_fetch_all_partial_inline_result_returns_every_row_once() {
 fn test_ws_iterator_ends_after_last_row() {
     skip_if_no_exasol!();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let (conn, mut iterator) = runtime.block_on(async {
-        let mut conn = get_ws_connection().await.expect("Failed to connect");
-        let iterator = conn
-            .execute(end_of_stream_query())
-            .await
-            .expect("query should succeed")
-            .into_iterator()
-            .expect("a SELECT yields an iterator");
-        (conn, iterator)
-    });
+    let (runtime, conn, mut iterator) = open_iterator(get_ws_connection(), end_of_stream_query());
 
     let batches = drain_iterator(&runtime, &mut iterator);
 
@@ -2080,28 +2063,11 @@ fn test_ws_iterator_ends_after_last_row() {
 fn test_ws_iterator_partial_inline_result_returns_every_row_once() {
     skip_if_no_exasol!();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let (conn, mut iterator) = runtime.block_on(async {
-        let mut conn = get_ws_connection().await.expect("Failed to connect");
-        let iterator = conn
-            .execute(partial_inline_query())
-            .await
-            .expect("query should succeed")
-            .into_iterator()
-            .expect("a SELECT yields an iterator");
-        (conn, iterator)
-    });
+    let (runtime, conn, mut iterator) = open_iterator(get_ws_connection(), partial_inline_query());
 
     let batches = drain_iterator(&runtime, &mut iterator);
 
-    let first = batches[0].num_rows();
-    assert!(
-        (1..PARTIAL_INLINE_ROWS).contains(&first),
-        "the execute response should deliver some but not all rows, got {first}"
-    );
+    assert_partly_inline(&batches);
     assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
     runtime
         .block_on(conn.close())
@@ -2128,11 +2094,7 @@ async fn test_ws_prepared_partial_inline_result_returns_every_row_once() {
         .await
         .expect("fetch_all should succeed");
 
-    let first = batches[0].num_rows();
-    assert!(
-        (1..PARTIAL_INLINE_ROWS).contains(&first),
-        "the execute response should deliver some but not all rows, got {first}"
-    );
+    assert_partly_inline(&batches);
     assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
 
     conn.close_prepared(prepared)

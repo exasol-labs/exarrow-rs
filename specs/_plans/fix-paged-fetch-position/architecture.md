@@ -26,7 +26,6 @@
 - Password encryption uses RSA PKCS#1 v1.5 through num-bigint because Exasol servers can send 1024-bit keys, which aws-lc-rs rejects
 - Credentials are never logged or exposed, and Connection debug output omits the password
 - Results stream as Arrow RecordBatches, and conversion is Arrow-native and zero-copy where possible
-- arrow and parquet stay on one major version that adbc_core accepts, because adbc_ffi passes the driver's Arrow arrays and schemas across the C ABI: arrow and parquet 59 with adbc_core and adbc_ffi 0.24, which accept Arrow 58 and 59
 - CI rejects clippy warnings, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
 - Integration tests require a running Exasol instance on port 8563, CI uses the image `exasol/docker-db:2025.2.1`, and the CI integration job runs every integration test target under `tests/`
 <!-- /DELTA:CHANGED -->

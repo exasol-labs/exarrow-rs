@@ -2667,6 +2667,7 @@ async fn test_parquet_import_forced_csv_path_fallback_works() {
 // Section: Failed IMPORT statement
 
 const MISSING_TABLE: &str = "MISSING_TABLE";
+const IMPORT_HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Creates a fresh schema without tables and returns the qualified name of a
 /// table that does not exist in it.
@@ -2680,14 +2681,17 @@ async fn missing_table_in_new_schema(conn: &mut Connection) -> (String, String) 
 }
 
 /// Awaits an import into a missing table and asserts that it returns Exasol's
-/// error, naming the table, within 60 seconds instead of waiting for the tunnel.
+/// error, naming the table, within `IMPORT_HANG_LIMIT` instead of waiting for
+/// the tunnel.
 async fn assert_import_reports_missing_table<F>(import: F, table: &str)
 where
     F: std::future::Future<Output = Result<u64, ImportError>>,
 {
-    let result = tokio::time::timeout(std::time::Duration::from_secs(60), import)
+    let result = tokio::time::timeout(IMPORT_HANG_LIMIT, import)
         .await
-        .expect("an import into a missing table must return within 60 seconds");
+        .unwrap_or_else(|_| {
+            panic!("an import into a missing table must return within {IMPORT_HANG_LIMIT:?}")
+        });
 
     let err = result.expect_err("an import into a missing table must fail");
     assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
@@ -2827,9 +2831,9 @@ async fn test_parallel_csv_import_into_missing_table_returns_error() {
 /// Kept `#[ignore]` and gated on `EXARROW_LONG_EXPORT_CHECK` because an
 /// eight-minute test has no place in a suite run by default: CI runs
 /// `import_export_tests`, and the reasoned `#[ignore]` keeps this test out of
-/// that run. Select it with `-- --ignored` when you want it.
+/// that run. Run it with `EXARROW_LONG_EXPORT_CHECK=1` and `-- --ignored`.
 #[tokio::test]
-#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1"]
+#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1 and -- --ignored"]
 async fn test_csv_export_runs_past_the_former_five_minute_limit() {
     if std::env::var("EXARROW_LONG_EXPORT_CHECK").is_err() {
         eprintln!(

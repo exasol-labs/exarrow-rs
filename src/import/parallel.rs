@@ -789,12 +789,18 @@ mod tests {
     #[tokio::test]
     async fn test_finish_import_returns_statement_error_over_a_tunnel_task_that_would_fail_later() {
         let (_release, released) = oneshot::channel::<()>();
+        let (started, has_started) = oneshot::channel::<()>();
         let tunnel = tokio::spawn(async move {
+            let _ = started.send(());
             let _ = released.await;
             Err(ImportError::HttpTransportError(
                 "late tunnel failure".to_string(),
             ))
         });
+        tokio::time::timeout(HANG_LIMIT, has_started)
+            .await
+            .expect("the tunnel task must start")
+            .expect("the tunnel task must signal its start");
 
         let err = tokio::time::timeout(HANG_LIMIT, finish_import(statement_error(), tunnel))
             .await

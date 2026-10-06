@@ -8,25 +8,6 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 
 ## Scenarios
 
-<!-- DELTA:REMOVED -->
-### Scenario: Arrow and Parquet dependencies resolve to version 58 or above with no duplicate sub-crate versions
-
-* *GIVEN* the resolved dependency tree in `Cargo.lock`
-* *WHEN* inspecting the `[[package]]` entries
-* *THEN* the `arrow` crate MUST resolve to a version `>= 58.0.0`
-* *AND* the `parquet` crate MUST resolve to a version `>= 58.0.0`
-* *AND* the `arrow-array` and `arrow-schema` sub-crates MUST NOT appear at both a 57.x and a 58.x version simultaneously (unified resolution required by `adbc_core 0.23.0`)
-<!-- /DELTA:REMOVED -->
-
-<!-- DELTA:NEW -->
-### Scenario: Arrow and Parquet dependencies resolve to version 59 or above with one version of each Arrow sub-crate
-
-* *GIVEN* the resolved dependency tree in `Cargo.lock`
-* *WHEN* inspecting the `[[package]]` entries
-* *THEN* the `arrow` and `parquet` crates MUST resolve to a version `>= 59.0.0`
-* *AND* each of the `arrow-array`, `arrow-buffer`, `arrow-data`, and `arrow-schema` crates MUST appear in exactly one `[[package]]` entry, so that `adbc_core` and `arrow` share one Arrow version
-<!-- /DELTA:NEW -->
-
 <!-- DELTA:NEW -->
 ### Scenario: Every integration test target runs in the CI integration job
 

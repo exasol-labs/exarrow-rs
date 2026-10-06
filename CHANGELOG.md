@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.17.1
 
 - Fix: `fetch_all()` and prepared-statement results return every row exactly once for WebSocket results larger than one fetch message and for results on both transports that are partly delivered with the execute response. Fixes #80.
 - Fix: `ResultSetIterator` ends after the last row on both transports.

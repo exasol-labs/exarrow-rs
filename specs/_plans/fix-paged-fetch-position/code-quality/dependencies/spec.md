@@ -59,35 +59,13 @@ Patch-level version bumps (`cargo update`) MAY be applied without a breaking-cha
 * *AND* the pull request MUST NOT be mergeable until the advisory is patched or suppressed with rationale
 <!-- /DELTA:CHANGED -->
 
-<!-- DELTA:REMOVED -->
+<!-- DELTA:CHANGED -->
 ### Scenario: GHSA-2f9f-gq7v-9h6m suppression for Apache Thrift
 
 * *GIVEN* `parquet 58.x` pulls in `thrift 0.17.0` as a transitive dependency
-* *AND* `thrift 0.23.0` (which fixes GHSA-2f9f-gq7v-9h6m) is not published on crates.io
-* *AND* the `parquet` semver constraint `^0.17` prevents a `[patch]` override to a non-existent version
-* *AND* `parquet 59.x` (which removes the `thrift` dependency entirely) is not yet released
-* *AND* `adbc_core 0.23` caps `arrow-schema` at `<59`, blocking an upgrade to `arrow/parquet 59.x`
-* *WHEN* `cargo deny check advisories` is run
+* *AND* the `parquet` semver constraint `^0.17` prevents an update to a `thrift` release that fixes GHSA-2f9f-gq7v-9h6m, and `parquet 59.x`, which drops `thrift`, needs `arrow 59` that the downstream users of exarrow-rs do not use yet
+* *WHEN* `cargo deny --all-features check advisories` is run
 * *THEN* the check MUST exit with code 0
 * *AND* the suppression MUST reference `GHSA-2f9f-gq7v-9h6m`
-* *AND* the suppression `reason` MUST state that `thrift 0.23.0` is not on crates.io, that `^0.17` blocks a patch override, and that re-evaluation is triggered when `parquet 59.x` is released or `adbc_core` supports `arrow-schema >=59`
-<!-- /DELTA:REMOVED -->
-
-<!-- DELTA:NEW -->
-### Scenario: Suppression is removed when its advisory no longer applies
-
-* *GIVEN* `deny.toml` ignores an advisory
-* *WHEN* a dependency change removes every affected crate version from the dependency tree of every Cargo feature
-* *THEN* the same change MUST remove the ignore entry from `deny.toml`
-* *AND* `cargo deny --all-features check advisories` MUST report no `advisory-not-detected` diagnostic for that advisory
-* *AND* `cargo deny --all-features check advisories` MUST exit with code 0
-<!-- /DELTA:NEW -->
-
-<!-- DELTA:NEW -->
-### Scenario: Apache Thrift is absent from the dependency tree
-
-* *GIVEN* `parquet` 59.0.0 and later do not depend on `thrift`, the crate affected by GHSA-2f9f-gq7v-9h6m (CVE-2026-43868)
-* *WHEN* `cargo tree --all-features -i thrift` is run
-* *THEN* it MUST report that no package matches `thrift`
-* *AND* `deny.toml` MUST NOT contain a suppression for `GHSA-2f9f-gq7v-9h6m`
-<!-- /DELTA:NEW -->
+* *AND* the suppression `reason` MUST state that `parquet 58.x` requires `thrift ^0.17`, that the fix is in `parquet 59.x`, and that re-evaluation is triggered when exarrow-rs and its downstream users move to `arrow 59`
+<!-- /DELTA:CHANGED -->

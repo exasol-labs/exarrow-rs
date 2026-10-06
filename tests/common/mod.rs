@@ -435,9 +435,52 @@ pub fn assert_every_key_once(batches: &[RecordBatch], expected_rows: usize) {
     }
 }
 
+/// Assert that the first batch of a `partial_inline_query` result holds some
+/// but not all of its `PARTIAL_INLINE_ROWS` rows, so the rest came by fetch.
+#[allow(dead_code)]
+pub fn assert_partly_inline(batches: &[RecordBatch]) {
+    let first = batches[0].num_rows();
+    assert!(
+        (1..PARTIAL_INLINE_ROWS).contains(&first),
+        "the execute response should deliver some but not all rows, got {first}"
+    );
+}
+
+/// Open a connection with `connect`, execute `sql`, and return its result as an
+/// iterator, together with the connection and the runtime that owns both.
+///
+/// The iterator blocks on that runtime while it fetches, so the caller keeps
+/// the runtime and passes it to `drain_iterator`.
+#[allow(dead_code)]
+pub fn open_iterator<F>(
+    connect: F,
+    sql: String,
+) -> (tokio::runtime::Runtime, Connection, ResultSetIterator)
+where
+    F: std::future::Future<Output = Result<Connection, exarrow_rs::error::ExasolError>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (conn, iterator) = runtime.block_on(async {
+        let mut conn = connect.await.expect("Failed to connect");
+        let iterator = conn
+            .execute(sql)
+            .await
+            .expect("query should succeed")
+            .into_iterator()
+            .expect("a SELECT yields an iterator");
+        (conn, iterator)
+    });
+    (runtime, conn, iterator)
+}
+
+const MAX_NEXT_BATCH_CALLS: usize = 100;
+
 /// Read `iterator` to its end and assert that it then reports no further batch
-/// on two consecutive calls. Fails after 100 calls, so a missing end of stream
-/// cannot hang the test.
+/// on two consecutive calls. Fails after `MAX_NEXT_BATCH_CALLS` calls, so a
+/// missing end of stream cannot hang the test.
 ///
 /// `next_batch` blocks on the runtime that owns the connection, so the caller
 /// passes that runtime and the helper enters it for the duration of the reads.
@@ -448,7 +491,7 @@ pub fn drain_iterator(
 ) -> Vec<RecordBatch> {
     let _guard = runtime.enter();
     let mut batches = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..MAX_NEXT_BATCH_CALLS {
         match iterator.next_batch() {
             Some(batch) => batches.push(batch.expect("next_batch should not fail")),
             None => {
@@ -460,7 +503,7 @@ pub fn drain_iterator(
             }
         }
     }
-    panic!("the iterator did not end within 100 next_batch calls");
+    panic!("the iterator did not end within {MAX_NEXT_BATCH_CALLS} next_batch calls");
 }
 
 #[cfg(test)]

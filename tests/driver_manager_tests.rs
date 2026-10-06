@@ -45,9 +45,7 @@ use arrow::array::{
     Array, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use common::{
-    generate_unique_test_name, get_host, get_password, get_port, get_user, is_exasol_available,
-};
+use common::{generate_unique_test_name, get_host, get_password, get_port, get_user};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -82,27 +80,6 @@ fn get_test_uri() -> String {
         get_host(),
         get_port()
     )
-}
-
-/// Skip test if Exasol is not available.
-macro_rules! skip_if_no_exasol {
-    () => {
-        if !is_exasol_available() {
-            if std::env::var("REQUIRE_EXASOL").is_ok() {
-                panic!(
-                    "REQUIRE_EXASOL is set but Exasol is not available at {}:{}",
-                    get_host(),
-                    get_port()
-                );
-            }
-            eprintln!(
-                "Skipping test: Exasol not available at {}:{}",
-                get_host(),
-                get_port()
-            );
-            return;
-        }
-    };
 }
 
 /// Skip test if the FFI library is not built.

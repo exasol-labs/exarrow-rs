@@ -259,6 +259,8 @@ impl ResultSet {
     ///
     /// # Errors
     /// Returns `QueryError` if fetching fails or if this is not a streaming result.
+    /// Returns `QueryError::ExecutionFailed` when the result set delivers fewer or
+    /// more rows than its total row count.
     pub async fn fetch_all(mut self) -> Result<Vec<RecordBatch>, QueryError> {
         let ResultSetInner::Stream {
             handle,
@@ -810,6 +812,11 @@ impl ResultSetIterator {
     /// Get the next batch synchronously (blocking).
     ///
     /// This is useful for implementing sync Iterator trait.
+    ///
+    /// # Errors
+    /// Returns `QueryError::ExecutionFailed` when the result set delivers fewer or
+    /// more rows than its total row count. After that error, every later call
+    /// returns `None`.
     pub fn next_batch(&mut self) -> Option<Result<RecordBatch, QueryError>> {
         // Return buffered batch if available
         if self.current_index < self.batches.len() {
@@ -2580,6 +2587,36 @@ mod tests {
 
         assert!(matches!(err, QueryError::ExecutionFailed(_)));
         assert!(err.to_string().contains("no page"));
+    }
+
+    #[test]
+    fn test_next_batch_fetches_again_after_a_transport_error() {
+        let runtime = entered_runtime();
+        let _guard = runtime.enter();
+
+        let mut transport = MockTransport::new();
+        let mut call = 0;
+        transport
+            .expect_fetch_results()
+            .times(2)
+            .returning(move |_| {
+                call += 1;
+                if call == 1 {
+                    Err(TransportError::ReceiveError("no page".to_string()))
+                } else {
+                    Ok(single_column_result_data(&[2], 2))
+                }
+            });
+
+        let mut iterator = streaming_iterator(transport, &[1], 2, Some(ResultSetHandle::new(1)));
+
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert!(matches!(
+            iterator.next_batch().unwrap().unwrap_err(),
+            QueryError::ExecutionFailed(_)
+        ));
+        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert!(iterator.next_batch().is_none());
     }
 
     /// Scenario: Result set iterator ends after the last row

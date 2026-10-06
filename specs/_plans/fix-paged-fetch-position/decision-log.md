@@ -97,37 +97,36 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 ### [10] Changelog entry under `[Unreleased]`
 
-- **Decision:** `CHANGELOG.md` gets a `## [Unreleased]` section above `## 0.17.0` with `Breaking:`, `Fix:`, `Security:`, and `Changed:` entries for this plan. The release that carries this change is a 0.x minor bump over the latest published version, never a patch bump. Tag `v0.17.0` exists, so the implement step sets `version = "0.18.0"` and folds `[Unreleased]` into `## 0.18.0` (plan.md § Parallelization › Commits, checkpoint 4).
-- **Alternatives:** (a) Let the implement step bump by Conventional Commit type. Rejected: a plan named `fix-...` gets a patch bump, and a patch release on arrow 59 after 0.17.0 on arrow 58 would reach every dependent on `exarrow-rs = "0.17"` through `cargo update` and break code that passes Arrow values between the crates.
-- **Rationale:** `AGENTS.md` requires the changelog update in the same PR as a user-facing change, and puts entries of a PR without a version bump under `## [Unreleased]`. Cargo treats versions with the same 0.x minor component as compatible, so the arrow 59 upgrade (entry [11]) needs a new 0.x minor version. `CONTRIBUTING.md` § Releasing requires a SemVer bump. This branch is based on `main`, and tag `v0.17.0` exists, so the release that carries this plan is 0.18.0.
+- **Decision:** `CHANGELOG.md` gets a `## [Unreleased]` section above `## 0.17.0` with `Fix:`, `Changed:`, and `Security:` entries for this plan. The release that carries this change is the patch release 0.17.1: the plan changes no public API and no dependency major version. The implement step sets `version = "0.17.1"` and folds `[Unreleased]` into `## 0.17.1` (plan.md § Parallelization › Commits, checkpoint 4).
+- **Alternatives:** (a) A 0.x minor bump (0.18.0). Rejected: it was needed only while the plan moved arrow to 59, which would have broken dependents on `exarrow-rs = "0.17"` through `cargo update`. Entry [11] drops that move.
+- **Rationale:** `AGENTS.md` requires the changelog update in the same PR as a user-facing change, and puts entries of a PR without a version bump under `## [Unreleased]`. `CONTRIBUTING.md` § Releasing requires a SemVer bump. The row-count mismatch error (entry [4]) and the end of Exasol 2025.2.0 support for native Parquet import (entry [19]) change behavior only where the old behavior was wrong data or a hang. This branch is based on `main`, and tag `v0.17.0` exists, so the next patch version is 0.17.1.
 - **Promotes to ADR:** no
 
-### [11] Remove the Apache Thrift advisory by upgrading parquet, not by suppressing it
+### [11] Keep the Apache Thrift suppression and stay on arrow and parquet 58
 
-- **Decision:** exarrow-rs removes the Apache Thrift advisory (GHSA-2f9f-gq7v-9h6m) by upgrading to the first parquet release line without a thrift dependency, together with the arrow and adbc releases that accept it, instead of suppressing the advisory. arrow and parquet stay on one major version that adbc_core accepts.
-- **Alternatives:** (a) Keep the suppression. Rejected: a fixed release line exists, and the advisory would stay open. (b) Move arrow past the range that adbc_core accepts. Rejected: adbc_ffi passes Arrow arrays across the C ABI, so both must share one Arrow version. (c) Patch thrift under the current parquet. Rejected: parquet's thrift requirement excludes the fixed release.
-- **Rationale:** `/speq:adr-rules` rule 2, criterion 3: a major dependency and security choice. Rule 5: the decision contradicts ADR-003, so it supersedes it. Search: `speq decision-log show` lists ADR-003 as the only ADR about dependencies. The re-evaluation trigger of ADR-003 has fired. Entry [18] holds the versions and the trial-build evidence.
+- **Decision:** exarrow-rs stays on arrow and parquet 58 and adbc 0.23. The suppression of the Apache Thrift advisory (GHSA-2f9f-gq7v-9h6m) in `deny.toml` stays under ADR-003, with an updated re-evaluation trigger: exarrow-rs and its downstream users move to arrow 59. Dependabot alert #19 stays open.
+- **Alternatives:** (a) Upgrade to parquet 59 with arrow 59 and adbc 0.24, which removes `thrift`. Rejected: exapump, language-container-rs, and lakehouse-engine-rs are on arrow 58, and a crate that exchanges Arrow values with exarrow-rs must share its arrow major version, so the upgrade would block them from taking the issue #80 fix. (b) Patch `thrift` under parquet 58. Rejected: parquet 58.4.0 still requires `thrift ^0.17`, which excludes the fixed release.
+- **Rationale:** The advisory fix is a dependency-tree change that needs a coordinated Arrow upgrade across the downstream crates, and the issue #80 fix does not depend on it. The user chose to stay on arrow 58 after the plan had proposed 59. The versions of the downstream crates come from their local `Cargo.toml` files, read on 2026-10-06. The plan did not build or test them.
 - **Consequences:**
-  - A downstream crate that exchanges Arrow values with exarrow-rs must move to the same Arrow major version.
-  - An Arrow major upgrade waits until adbc_core accepts it.
-- **Supersedes:** suppress-ghsa-2f9f-gq7v-9h6m-via-deny-toml
-- **Architecture:** § Constraints
-- **Promotes to ADR:** yes
+  - The Dependabot alert #19 stays open. cargo-deny does not know the GHSA ID, so only Dependabot reports it. A maintainer decides whether to dismiss it.
+  - An Arrow major upgrade is a separate plan that includes the downstream crates.
+  - ADR-003 stays Accepted. Only the re-evaluation trigger in the `deny.toml` reason changes.
+- **Promotes to ADR:** no
 
 ### [12] Advisories in optional-feature dependencies are fixed by updates, not suppressions
 
 - **Decision:** `Cargo.lock` moves `xxhash-rust` from 0.8.15 to 0.8.19 (GHSA-6g2r-675j-hx59, Dependabot alert #20) and `crossbeam-epoch` from 0.9.18 to 0.9.21 (RUSTSEC-2026-0204, invalid pointer dereference). `Cargo.toml` moves `indicatif` from 0.17 to 0.18, which replaces the unmaintained `number_prefix` (RUSTSEC-2025-0119) with `unit-prefix`.
 - **Alternatives:** (a) Suppress these advisories, because only the optional `benchmark` feature pulls them in. Rejected: patched versions exist, and Dependabot reports the lockfile regardless of features. (b) Upgrade polars. Rejected: polars-core 0.46 requires `xxhash-rust ^0.8.6`, and rayon accepts crossbeam-epoch 0.9.21, so lockfile updates suffice.
-- **Rationale:** `cargo deny --all-features check advisories` on the current tree fails on RUSTSEC-2026-0204 and RUSTSEC-2025-0119. The CI gate runs default features and passes, so CI did not report them. The trial build in entry [11] includes these three updates, and the `benchmark` binaries compile unchanged with indicatif 0.18.
+- **Rationale:** `cargo deny --all-features check advisories` on the current tree fails on RUSTSEC-2026-0204 and RUSTSEC-2025-0119. The CI gate runs default features and passes, so CI did not report them. A trial build on arrow 59 (entry [18]) included these three updates and the `benchmark` binaries compiled unchanged with indicatif 0.18. Task 6.1 repeats the check on arrow 58.
 - **Consequences:** The `xxhash-rust` and `crossbeam-epoch` changes are patch-level lockfile updates. The indicatif change is a minor bump of an optional dependency, so the PR description names it with its reason (scenario "Minor or major dep bump requires explicit evaluation").
 - **Promotes to ADR:** no
 
 ### [13] The CI advisory gate checks the dependencies of every Cargo feature
 
-- **Decision:** The `licenses` job runs `cargo deny --all-features check advisories` instead of `cargo deny check advisories`. `deny.toml` sets `unused-ignored-advisory = "deny"`, so an ignore entry that matches no crate fails the gate.
-- **Alternatives:** (a) Keep the default-feature check. Rejected: Dependabot alert #20 and RUSTSEC-2026-0204 live only in optional-feature dependencies, so the gate passed while both were open. (b) Set `all-features = true` under `[graph]` in `deny.toml`. Rejected: it also widens the licenses check, which this plan does not need to change.
+- **Decision:** The `licenses` job runs `cargo deny --all-features check advisories` instead of `cargo deny check advisories`. `deny.toml` does not set `unused-ignored-advisory`.
+- **Alternatives:** (a) Keep the default-feature check. Rejected: Dependabot alert #20 and RUSTSEC-2026-0204 live only in optional-feature dependencies, so the gate passed while both were open. (b) Set `all-features = true` under `[graph]` in `deny.toml`. Rejected: it also widens the licenses check, which this plan does not need to change. (c) Set `unused-ignored-advisory = "deny"`. Rejected: cargo-deny does not know the GHSA ID of the thrift ignore, so it reports `advisory-not-detected` for it, and the level would turn that warning into a failing gate (checked on 2026-10-06 with a copy of `deny.toml`).
 - **Rationale:** Dependabot scans `Cargo.lock`, which holds the dependencies of every feature. The gate now checks the same set.
-- **Consequences:** An advisory in a benchmark-only or FFI-only dependency blocks a merge. The `code-quality/dependencies` Background and the scenario "Advisory CI gate blocks merge on unacknowledged advisory" state the command. The `unused-ignored-advisory` level enforces the scenario "Suppression is removed when its advisory no longer applies". Today the stale GHSA-2f9f-gq7v-9h6m ignore produces only warnings.
+- **Consequences:** An advisory in a benchmark-only or FFI-only dependency blocks a merge. The `code-quality/dependencies` Background and the scenario "Advisory CI gate blocks merge on unacknowledged advisory" state the command. The gate still prints two warnings for the GHSA-2f9f-gq7v-9h6m ignore.
 - **Promotes to ADR:** no
 
 ### [14] The implementer re-checks advisories before the change is complete
@@ -135,7 +134,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Decision:** The dependency task ends with `cargo deny --all-features check advisories` and a listing of open Dependabot alerts (`ghbrk gh api "repos/exasol-labs/exarrow-rs/dependabot/alerts?state=open"`). An advisory that appears after this plan is fixed by an update, or suppressed per `code-quality/dependencies`, in the same change.
 - **Alternatives:** none
 - **Rationale:** The advisory databases change between planning and implementation. Planning found two advisories that the Dependabot list did not show (RUSTSEC-2026-0204, RUSTSEC-2025-0119).
-- **Consequences:** Dependabot closes alerts #19 and #20 only after the change reaches the default branch. Until then the alerts stay open.
+- **Consequences:** Dependabot closes alert #20 only after the change reaches the default branch. Alert #19 stays open (entry [11]).
 - **Promotes to ADR:** no
 
 ### [15] CI runs every integration test target, and only a reasoned `#[ignore]` excludes a test
@@ -178,14 +177,12 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Rationale:** The last successful run of the job (run 30378579965, 2026-07-28) took 6 minutes 34 seconds, of which the Exasol container start and readiness wait took 2 minutes 33 seconds. In the planning run on a 4-CPU host, the import/export tests that pass took about 30 seconds of test time, `native_protocol_tests` 1.7 seconds, `native_transport_smoke_test` 0.2 seconds, and the three URI-schema tests 0.9 seconds. Each new target also compiles once, which took 20 to 30 seconds per target on that host. The ten paged-fetch tests each move at most about 70 MB over the local connection. On `exasol/docker-db:2025.2.1`, the CI-flag runs took, including compilation on the planning host: `import_export_tests` 76 seconds for 54 tests, `integration_tests` 64 seconds, `websocket_integration_tests` 51 seconds, `native_protocol_tests` 16 seconds, and `native_transport_smoke_test` 21 seconds. Estimate, not measured on the CI runner: the job grows by 3 to 6 minutes and stays below 15 minutes.
 - **Promotes to ADR:** no
 
-### [18] Versions and lockfile steps of the parquet upgrade
+### [18] The Arrow stack stays at 58 and the lockfile updates are patch-level
 
-- **Decision:** `Cargo.toml` requires arrow 59, parquet 59.2 or later within 59.x, and adbc_core, adbc_ffi, and adbc_driver_manager 0.24 (plan.md tasks 6.1 and 6.6). `deny.toml` drops the ignores for GHSA-2f9f-gq7v-9h6m and RUSTSEC-2024-0436 (task 6.3).
-- **Alternatives:** (a) arrow and parquet 60. Rejected: adbc_core 0.24 accepts arrow-array and arrow-schema `>=58, <60`. (b) Keep the requirement `parquet = "59"`. Rejected: it admits 59.0.0 and 59.1.0, which still depend on `paste`, so the advisory gate would fail on RUSTSEC-2024-0436 if the lockfile resolved one of them.
-- **Rationale:** The crates.io index lists no `thrift` dependency for any parquet 59.x release (apache/arrow-rs#9962, released in 59.0.0 on 2026-06-09), and `paste ^1.0` for 59.0.0 and 59.1.0 but not for 59.2.0 and 59.3.0. adbc_core 0.24.0 (2026-07-28) is the first release that accepts Arrow 59. parquet 58.4.0 still requires `thrift ^0.17`. A trial build in a scratch copy with arrow and parquet 59.3.0, adbc 0.24.0, indicatif 0.18, and the updated lockfile compiled every target with every feature without source changes, passed clippy without warnings, passed 1,596 unit tests (1,624 with `websocket`), and passed `cargo deny --all-features check advisories` and `check licenses`.
-- **Consequences:**
-  - After the manifest change, Cargo keeps adbc_core on the locked arrow 58.3.0 although adbc_core accepts 59. Task 6.1 unifies the Arrow sub-crates explicitly.
-  - `specs/mission.md` § Tech Stack names arrow 59, parquet 59, and adbc 0.24 (task 6.6).
+- **Decision:** `Cargo.toml` keeps arrow and parquet 58 and adbc_core, adbc_ffi, and adbc_driver_manager 0.23. Only `indicatif` changes in `Cargo.toml` (plan.md task 6.1). `deny.toml` keeps both ignores and rewrites the reason of `GHSA-2f9f-gq7v-9h6m` (task 6.2).
+- **Alternatives:** (a) arrow and parquet 59 with adbc 0.24. Rejected: entry [11]. (b) adbc 0.24 on arrow 58. Rejected: adbc_core 0.24 accepts arrow 58, but nothing in this plan needs it.
+- **Rationale:** parquet 58.4.0 still requires `thrift ^0.17`. parquet 59.0.0 (apache/arrow-rs#9962, released 2026-06-09) dropped `thrift`, and adbc_core 0.24.0 (2026-07-28) is the first release that accepts Arrow 59. A trial build in a scratch copy with arrow and parquet 59.3.0, adbc 0.24.0, indicatif 0.18, and the updated lockfile compiled every target with every feature without source changes, passed clippy without warnings, passed 1,596 unit tests (1,624 with `websocket`), and passed `cargo deny --all-features check advisories` and `check licenses`. That build is the starting point of a later Arrow upgrade plan. It does not verify the 58 configuration.
+- **Consequences:** `specs/mission.md` § Tech Stack and the existing test `test_arrow_parquet_resolve_to_58_or_above_with_unified_sub_crates` stay unchanged.
 - **Promotes to ADR:** no
 
 ### [19] Exasol 2025.2.0 is not supported for native Parquet import, and nothing pins it
@@ -219,15 +216,14 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Architecture:** § Constraints
 - **Promotes to ADR:** no
 
-### [22] Group A lands as its own commit for a possible arrow 58 backport
+### [22] Each group lands as its own commit
 
-- **Decision:** The paged-fetch fix (group A) lands as the first commit of this plan. It holds only group A's source, tests, and `CHANGELOG.md` lines, so a maintainer can cherry-pick it onto an arrow 58 release. Group C follows as the second commit and group B as the third.
-- **Alternatives:** (a) Split the plan into two PRs. Rejected: the user keeps the arrow 59 upgrade in this plan.
-- **Rationale:** User decision. Group A has no arrow 59 dependency, and a dependent on arrow 58, such as exapump today, cannot take the issue #80 fix from a release on arrow 59.
+- **Decision:** The paged-fetch fix (group A) lands as the first commit of this plan, with only group A's source, tests, and `CHANGELOG.md` lines. Group C follows as the second commit and group B as the third.
+- **Alternatives:** (a) Split the plan into two PRs. Rejected: the groups are small, and one PR keeps one release.
+- **Rationale:** One commit per group lets a reviewer read the paged-fetch fix, the import error path, and the dependency and CI changes one at a time.
 - **Consequences:**
   - The `/speq:implement-pr` orchestrator, the only actor with git write authority, commits after group A, after group C, and at step A4 for group B. Implementer agents never commit. Code-review fixes go into a separate commit per group. plan.md § Parallelization › Commits lists the checkpoints.
-  - `main` squash-merges pull requests, which drops the group boundaries from `main`. The PR description lists the backport commits by SHA and states that a maintainer who wants a backport keeps the feature branch or merges without squashing.
-  - This plan ships no backport release. A human decides whether one is needed. Group C also has no arrow dependency, so its commits can join a backport as well.
+  - `main` squash-merges pull requests, which drops the group boundaries from `main`.
 - **Promotes to ADR:** no
 
 ### [23] Contributor docs name the new import/export test command
@@ -248,7 +244,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 ### [2] [plan-review] The release version of the breaking Arrow upgrade was left open
 
 - **Finding:** Round 2 `[NFR_IGNORED]`: a plan named `fix-...` gets a patch bump from `/speq:implement-pr`. A patch release on arrow 59 after 0.17.0 on arrow 58 would break dependents on `exarrow-rs = "0.17"` through `cargo update`.
-- **Direction change:** Entry [10] states the rule: a 0.x minor bump over the latest published version, never a patch bump, which is 0.18.0 because `v0.17.0` is tagged. plan.md § Impact repeats the rule, and § Context states that the branch is based on `main`.
+- **Direction change:** The plan stated a 0.x minor bump rule. Review finding [17] removes the arrow 59 upgrade, so the rule is gone and entry [10] states the patch release 0.17.1.
 - **Promotes to ADR:** no
 
 ### [3] [plan-review] The eight-minute opt-in export test lost its `#[ignore]`
@@ -277,22 +273,22 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 ### [7] [plan-review] Advisory findings applied with the round 2 revision
 
-- **Finding:** Round 1 raised five ADVISORY findings. Round 2 raised six, two of which corrected statements of this plan: parquet 59.0.0 and 59.1.0 still depend on `paste`, and a stale ignore under `unused-ignored-advisory = "deny"` is an error, not a warning.
+- **Finding:** Round 1 raised five ADVISORY findings. Round 2 raised six. Review finding [17] later removed the two that concerned the arrow 59 upgrade.
 - **Direction change:**
   - Round 1, all five: plan.md § Impact states how to decline the mismatch error. `fetch_all` closes the handle after a mismatch error (task 1.2, entry [4]). The overshoot message counts the offending batch (spec step, tasks 1.1 and 1.4). A new unit test `test_fetch_all_small_result_set_sends_no_fetch` replaces the misleading tag (task 4.3). Task 7.7 runs the WebSocket unit tests in CI (entry [5]).
-  - Round 2, two: plan.md § Context and entry [18] state that parquet 59.2.0 dropped `paste`, and task 6.1 requires `parquet` 59.2. The scenario "Suppression is removed when its advisory no longer applies" names an `advisory-not-detected` diagnostic.
-  - Round 2 ADVISORY findings not applied: the group A commit for an arrow 58 backport, and the import/export commands in `AGENTS.md`, `CONTRIBUTING.md`, `specs/mission.md`, and the `tests/common/mod.rs` doc example. Review finding [8] applies both and drops the follow-up issue task.
+  - Round 2, two: superseded by review finding [17].
+  - Round 2 ADVISORY findings not applied: the import/export commands in `AGENTS.md`, `CONTRIBUTING.md`, `specs/mission.md`, and the `tests/common/mod.rs` doc example. Review finding [8] applies both and drops the follow-up issue task.
 - **Promotes to ADR:** no
 
 ### [8] [plan-review] User decisions after review round 2
 
-- **Finding:** The user reviewed the plan after round 2. (1) Keep the row-count mismatch error of entry [4]. (2) Keep the arrow and parquet 59 and adbc 0.24 upgrade in this plan. (3) Land group A as its own commit for a possible arrow 58 backport. (4) Do not ignore the native Parquet import tests in CI; find the root cause of the hang on `exasol/docker-db:2025.2.0` and fix it, or keep the tests running in CI. (5) Update the import/export test command in the contributor docs. The branch is now based on `main`, and tag `v0.17.0` exists.
+- **Finding:** The user reviewed the plan after round 2. (1) Keep the row-count mismatch error of entry [4]. (2) Keep the arrow and parquet 59 and adbc 0.24 upgrade in this plan (reversed by review finding [17]). (3) Land group A as its own commit for a possible arrow 58 backport (reversed by review finding [17]). (4) Do not ignore the native Parquet import tests in CI; find the root cause of the hang on `exasol/docker-db:2025.2.0` and fix it, or keep the tests running in CI. (5) Update the import/export test command in the contributor docs. The branch is now based on `main`, and tag `v0.17.0` exists.
 - **Direction change:**
-  - (1) and (2): entries [4] and [11] stay unchanged.
+  - (1): entry [4] stays unchanged. (2): superseded by review finding [17].
   - (3): entry [22] and plan.md § Parallelization make group A the first, self-contained commit.
   - (4): root-cause runs found two causes. Exasol 2025.2.0 rejects HTTP Parquet sources with `ETL-2210` (entry [19]). The driver hangs whenever an IMPORT statement fails before Exasol requests data, on every server version (entry [20]). New group C (tasks 8.1 to 8.10) fixes the driver cause, adds the scenario "Failed IMPORT statement returns its error without waiting for the tunnel", drops Exasol 2025.2.0 (entry [19], superseded exclusion by review finding [9]), and moves CI to 2025.2.1 (entry [21]). Task 7.0 and the eleven `#[ignore]` reasons are removed. Only the eight-minute opt-in test keeps a reasoned `#[ignore]`.
   - (5): task 7.8 and entry [23].
-  - Entry [10] states 0.18.0 as the release version. Review finding [1] above records the earlier ignore-based direction that this entry replaces.
+  - Entry [10] states the release version. Review finding [1] above records the earlier ignore-based direction that this entry replaces.
 - **Promotes to ADR:** no
 
 ### [9] [plan-review] User decision: drop Exasol 2025.2.0 support instead of excluding it in the gate
@@ -305,10 +301,10 @@ Headless run. No live interview took place. The orchestrator brief is the only i
   - Tasks 8.6, 8.7, 8.9, and 8.10 move every remaining 2025.2.0 reference in tests, scripts, docs, and the gate's doc comment to 2025.2.1 or remove it. plan.md § Impact and task 8.8 state that users on 2025.2.0 get `ETL-2210` instead of a hang and upgrade to 2025.2.1 or force the CSV path.
 - **Promotes to ADR:** no
 
-### [10] [plan-review] No actor produced the commit order A, C, B or the 0.18.0 version
+### [10] [plan-review] No actor produced the commit order A, C, B or the release version
 
-- **Finding:** Round 3 `[HIDDEN_DEPENDENCY]`: `/speq:implement-pr` commits once at step A4, implementer agents are read-only, code review runs after all groups, `main` squash-merges, and step A3 bumps by Conventional Commits. User decision (3) and the 0.18.0 rule of entry [10] would fail without an error.
-- **Direction change:** plan.md § Parallelization has a `### Commits` subsection. It names the `/speq:implement-pr` orchestrator as the only committer, with commits after group A, after group C, and at step A4 for group B, separate review-fix commits per group, a review base before implementation, step A3 setting 0.18.0 per entry [10], and a PR description that lists the backport commits by SHA and states the squash-merge caveat. Entry [22] Consequences name the same actor and the caveat.
+- **Finding:** Round 3 `[HIDDEN_DEPENDENCY]`: `/speq:implement-pr` commits once at step A4, implementer agents are read-only, code review runs after all groups, `main` squash-merges, and step A3 bumps by Conventional Commits. The commit order and the version rule of entry [10] would fail without an error.
+- **Direction change:** plan.md § Parallelization has a `### Commits` subsection. It names the `/speq:implement-pr` orchestrator as the only committer, with commits after group A, after group C, and at step A4 for group B, separate review-fix commits per group, a review base before implementation, step A3 setting the version per entry [10], and a PR description that lists the commits by group. Entry [22] Consequences name the same actor and the squash-merge caveat.
 - **Promotes to ADR:** no
 
 ### [11] [plan-review] No test checked that per-connection tunnel tasks stop
@@ -345,4 +341,15 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 - **Finding:** Round 3 `[PROSE_BLOAT]` ADVISORY: entries [7] and [10] and review findings [2], [3], [7], and [8] described the 2025.2.0 CI image, the untagged `v0.17.0` branch, the stacked branch, 12 ignored tests, task 7.0, and the 2025.2.0 exclusion.
 - **Direction change:** Each statement now describes the current plan or names the review finding that supersedes it.
+- **Promotes to ADR:** no
+
+### [17] [plan-review] User decision: stay on arrow and parquet 58
+
+- **Finding:** The user asked whether the arrow and parquet 59 upgrade can be dropped. Downstream crates exapump, language-container-rs, and lakehouse-engine-rs are on arrow 58 (local `Cargo.toml` files, read on 2026-10-06), so a release on arrow 59 would block them from taking the issue #80 fix.
+- **Direction change:**
+  - The plan keeps arrow, parquet, and adbc unchanged. Entry [11] now keeps the thrift suppression, and entry [18] holds the evidence. Dependabot alert #19 stays open.
+  - The tasks for the arrow 59 upgrade, the `Breaking:` changelog line, the Tech Stack edit, and the Arrow version test are removed, and the dependency tasks are renumbered 6.1 to 6.5.
+  - `unused-ignored-advisory` is not set, because the thrift ignore would then fail the gate (entry [13]).
+  - The release version is the patch release 0.17.1 (entry [10]), and entry [22] drops the backport rationale.
+  - The two `code-quality` spec deltas about arrow 59 and an absent `thrift` are removed, the thrift scenario changes its reason, and the architecture delta drops the arrow constraint.
 - **Promotes to ADR:** no

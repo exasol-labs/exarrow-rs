@@ -815,6 +815,8 @@ impl TransportProtocol for WebSocketTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_support::FakeWebSocketServer;
+    use serde_json::{json, Value};
 
     #[test]
     fn test_websocket_transport_new() {
@@ -1467,11 +1469,6 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
         assert!(transport.session_info.is_none());
     }
 
-    // --- Fetch start position, against a scripted fake server ---
-
-    use crate::transport::test_support::FakeWebSocketServer;
-    use serde_json::{json, Value};
-
     fn decimal_column() -> Value {
         json!({"name": "ID", "dataType": {"type": "DECIMAL", "precision": 18, "scale": 0}})
     }
@@ -1580,12 +1577,12 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
         assert_eq!(fetch_start_positions(&server), vec![3]);
     }
 
-    /// Scenario: Fetch results command
     #[tokio::test]
     async fn test_close_result_set_forgets_the_fetch_position() {
         let server = FakeWebSocketServer::scripted(vec![
             execute_response(7, 5, &[1, 2]),
             json!({"status": "ok"}),
+            fetch_response(&[1]),
         ])
         .await;
         let mut transport = authenticated_transport(&server).await;
@@ -1595,7 +1592,11 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
             .close_result_set(ResultSetHandle::new(7))
             .await
             .unwrap();
+        transport
+            .fetch_results(ResultSetHandle::new(7))
+            .await
+            .unwrap();
 
-        assert!(transport.fetch_positions.is_empty());
+        assert_eq!(fetch_start_positions(&server), vec![0]);
     }
 }
