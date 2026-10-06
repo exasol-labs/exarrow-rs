@@ -76,7 +76,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 - **Decision:** The tests use `VALUES BETWEEN` queries, which need no table. The multi-fetch tests read 70,000 rows of about 1,000 bytes. The partial-inline tests read 70 rows of 1,000,000 bytes. The iterator end-of-stream tests read 5,000 short rows. Each multi-fetch test asserts at least two non-empty batches. Each partial-inline test asserts that the first batch holds between 1 and 69 rows. Each test asserts that the key column holds every value from 1 to N exactly once. The iterator tests are synchronous `#[test]` functions that build a multi-thread Tokio runtime, connect and execute inside `Runtime::block_on`, then call `next_batch()` while a `Runtime::enter()` guard is held. The loop stops after 100 calls and fails the test when it reaches that cap.
 - **Alternatives:** (a) Lower the fetch size to shrink the test data. Rejected: the fetch size comes from the session's maximum data message size, which no connection parameter sets. The execute response's inline size is chosen by the server. (b) Call `next_batch()` inside `#[tokio::test]`. Rejected: `next_batch()` calls `Handle::block_on`, which panics inside an async context. On a current-thread runtime, `Handle::block_on` also cannot drive socket I/O.
-- **Rationale:** The sizes are the smallest that cross the default 64 MiB data message size, which the CI image `exasol/docker-db:2025.2.0` uses. The batch-shape assertions make a test fail, not pass silently, if a server configuration stops exercising the paged path. Each partial-inline or multi-fetch test moves about 70 MB over the local connection.
+- **Rationale:** The sizes are the smallest that cross the default 64 MiB data message size, the server default. The batch-shape assertions make a test fail, not pass silently, if a server configuration stops exercising the paged path. Each partial-inline or multi-fetch test moves about 70 MB over the local connection.
 - **Consequences:** Ten new integration tests, five per transport. They follow each file's `skip_if_no_exasol!()` convention and run with `REQUIRE_EXASOL=1` in CI.
 - **Promotes to ADR:** no
 
@@ -97,7 +97,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 ### [10] Changelog entry under `[Unreleased]`
 
-- **Decision:** `CHANGELOG.md` gets a `## [Unreleased]` section above `## 0.17.0` with `Breaking:`, `Fix:`, `Security:`, and `Changed:` entries for this plan. The release that carries this change is a 0.x minor bump over the latest published version. If tag `v0.17.0` does not exist when this PR merges, the implement step keeps `version = "0.17.0"` and folds `[Unreleased]` into `## 0.17.0`. If `v0.17.0` exists, it sets `version = "0.18.0"` and folds `[Unreleased]` into `## 0.18.0`. It never bumps the patch component.
+- **Decision:** `CHANGELOG.md` gets a `## [Unreleased]` section above `## 0.17.0` with `Breaking:`, `Fix:`, `Security:`, and `Changed:` entries for this plan. The release that carries this change is a 0.x minor bump over the latest published version, never a patch bump. Tag `v0.17.0` exists, so the implement step sets `version = "0.18.0"` and folds `[Unreleased]` into `## 0.18.0` (plan.md § Parallelization › Commits, checkpoint 4).
 - **Alternatives:** (a) Let the implement step bump by Conventional Commit type. Rejected: a plan named `fix-...` gets a patch bump, and a patch release on arrow 59 after 0.17.0 on arrow 58 would reach every dependent on `exarrow-rs = "0.17"` through `cargo update` and break code that passes Arrow values between the crates.
 - **Rationale:** `AGENTS.md` requires the changelog update in the same PR as a user-facing change, and puts entries of a PR without a version bump under `## [Unreleased]`. Cargo treats versions with the same 0.x minor component as compatible, so the arrow 59 upgrade (entry [11]) needs a new 0.x minor version. `CONTRIBUTING.md` § Releasing requires a SemVer bump. This branch is based on `main`, and tag `v0.17.0` exists, so the release that carries this plan is 0.18.0.
 - **Promotes to ADR:** no
@@ -190,13 +190,15 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 ### [19] Exasol 2025.2.0 is not supported for native Parquet import, and nothing pins it
 
-- **Decision:** `supports_native_parquet_import` keeps its gate `>= (2025, 1, 11)` with no exception for any single version. Exasol 2025.2.0 is not supported for native Parquet import: Parquet import there returns Exasol's `ETL-2210` error (entry [20]), and users upgrade to 2025.2.1 or later or set `with_native_parquet(Some(false))`. Tests, scripts, CI, and specs no longer name 2025.2.0. `docs/import-export.md` § Native Parquet Import, `CHANGELOG.md`, and plan.md § Impact state the limitation.
+- **Decision:** `supports_native_parquet_import` keeps its gate `>= (2025, 1, 11)` with no exception for any single version. Exasol 2025.2.0 is not supported for native Parquet import: Parquet import there returns Exasol's `ETL-2210` error (entry [20]), and users upgrade to 2025.2.1 or later or set `with_native_parquet(Some(false))`. Tests, scripts, CI, and specs no longer name 2025.2.0. `docs/import-export.md` § Native Parquet Import, `CHANGELOG.md`, and plan.md § Impact state the limitation. Dropping 2025.2.0 support means that no code, test, script, CI step, or spec names 2025.2.0, and only `docs/import-export.md` and `CHANGELOG.md` state the native Parquet import limitation. The PR description repeats this sentence so the requester can confirm the interpretation.
 - **Alternatives:** (a) Exclude `(2025, 2, 0)` in the gate so that 2025.2.0 converts Parquet to CSV. Rejected by the user: the driver would keep code and tests for an outdated server version. (b) Raise the gate to `(2025, 2, 1)`. Rejected: it would also turn off native import on Exasol 2025.1.11 and later 2025.1.x releases.
 - **Rationale:** User decision. Root-cause runs against local containers show why 2025.2.0 fails. Sent directly through `exapump` without the driver, `IMPORT INTO RC_PROBE.T FROM PARQUET AT 'http://127.0.0.1:9' FILE 'x.parquet'` fails on 2025.2.0 with `ETL-2210: AWS URL is invalid: Provided URL is not a valid AWS S3 URL (http://127.0.0.1:9/x.parquet)`. On 2025.2.1 the same statement fails only because nothing listens on the address (`ETL-2238`). On 2025.2.0 the statement with `FROM CSV` also fails only on the connection (`ETL-5105`). A traced driver run on 2025.2.0 shows the IMPORT statement failing with `ETL-2210` after 0.2 seconds while the tunnel task waits. On 2025.2.1 the trace shows range `GET`s and a `HEAD`, the server closing the tunnel, and 3 imported rows. Exasol 2025.2.0 therefore accepts only S3 URLs as Parquet sources, and 2025.2.1 and 2026.1.0 accept HTTP sources. The repository states no minimum Exasol version overall. The only version requirement for a feature is the one for native Parquet import, in `docs/import-export.md` and `specs/architecture.md` § Constraints, so the 2025.2.0 limitation belongs in `docs/import-export.md`.
 - **Consequences:**
   - The recorded scenario "Native Parquet import threshold" uses `(2025,2,1)` instead of `(2025,2,0)` as a boundary case. The gate and its other cases are unchanged.
+  - The Backgrounds of `connection-management/version-capability` and `import-export/parquet-io` state that the driver selects native Parquet import from Exasol 2025.1.11 onward, instead of stating that the feature is available from that release.
   - The three native Parquet import tests assert native Parquet support instead of skipping, because CI and the local runner use 2025.2.1.
   - `scripts/run_all_tests.sh` drops 2025.2.0 from its default and its help example. `specs/architecture.md` names 2025.2.1 as the CI image. Every other Docker reference in the repository already uses `exasol/docker-db:latest`.
+- **Architecture:** no change: § Constraints states Exasol 2025.1.11 as a requirement for native Parquet import, which stays true, and the server-side limitation lives in `docs/import-export.md`
 - **Promotes to ADR:** no
 
 ### [20] A failed IMPORT statement stops the tunnel tasks and returns its error
@@ -204,7 +206,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Decision:** One crate-visible function in `src/import/parallel.rs` finishes an import from the IMPORT statement's result and its tunnel task. When the statement fails, the function aborts a tunnel task that has not finished and returns the statement's error, or the task's own error if the task failed first. Per-connection tasks stop together with their parent task. The five import paths that awaited the tunnel task after the statement use it. The single-file CSV path keeps its `tokio::select!`.
 - **Alternatives:** (a) Convert the five paths to the `tokio::select!` shape of the single-file CSV path. Rejected: the multi-file paths join a set of spawned per-connection tasks, so the change would rewrite each path instead of one shared ending. (b) Add a timeout to the tunnel task. Rejected: a fixed limit either cuts off a slow, healthy import or keeps a failed import waiting until it expires.
 - **Rationale:** Exasol never requests data after it rejects the statement, and it keeps the client's tunnel socket open, so a task that waits for the next HTTP request never finishes. Probes on 2025.2.0 and 2025.2.1 reproduce the hang for a missing target table: multi-file CSV import and native Parquet import never return within 30 seconds, while single-file CSV import returns `object NO_SUCH_SCHEMA_XYZ.NO_SUCH_TABLE not found`. The recorded scenario "Native Parquet import option overrides the server-version probe" already requires that the Exasol error reach the caller. One shared function gives the five paths one rule for ending an import, next to `resolve_stream_task`, which already collapses a tunnel task's outcome.
-- **Consequences:** An import that fails before Exasol requests data returns within the statement's own round trip. A tunnel task's protocol error still takes precedence over the statement's error, as before. `import-export/http-transport` states the behavior in a new scenario.
+- **Consequences:** An import that fails before Exasol requests data returns within the statement's own round trip. A tunnel task that failed before the statement returned still reports its own error. A tunnel task that is still running when the statement fails is aborted, and the statement's error is returned. Before this change, a tunnel error that arrived after the statement's error took precedence. Now the statement's error, which explains the failure, takes precedence. `import-export/http-transport` states the behavior in a new scenario.
 - **Architecture:** § Data Flow
 - **Promotes to ADR:** no
 
@@ -222,7 +224,10 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Decision:** The paged-fetch fix (group A) lands as the first commit of this plan. It holds only group A's source, tests, and `CHANGELOG.md` lines, so a maintainer can cherry-pick it onto an arrow 58 release. Group C follows as the second commit and group B as the third.
 - **Alternatives:** (a) Split the plan into two PRs. Rejected: the user keeps the arrow 59 upgrade in this plan.
 - **Rationale:** User decision. Group A has no arrow 59 dependency, and a dependent on arrow 58, such as exapump today, cannot take the issue #80 fix from a release on arrow 59.
-- **Consequences:** This plan ships no backport release. A human decides whether one is needed. Group C also has no arrow dependency, so its commit can join a backport as well.
+- **Consequences:**
+  - The `/speq:implement-pr` orchestrator, the only actor with git write authority, commits after group A, after group C, and at step A4 for group B. Implementer agents never commit. Code-review fixes go into a separate commit per group. plan.md § Parallelization › Commits lists the checkpoints.
+  - `main` squash-merges pull requests, which drops the group boundaries from `main`. The PR description lists the backport commits by SHA and states that a maintainer who wants a backport keeps the feature branch or merges without squashing.
+  - This plan ships no backport release. A human decides whether one is needed. Group C also has no arrow dependency, so its commits can join a backport as well.
 - **Promotes to ADR:** no
 
 ### [23] Contributor docs name the new import/export test command
@@ -243,13 +248,13 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 ### [2] [plan-review] The release version of the breaking Arrow upgrade was left open
 
 - **Finding:** Round 2 `[NFR_IGNORED]`: a plan named `fix-...` gets a patch bump from `/speq:implement-pr`. A patch release on arrow 59 after 0.17.0 on arrow 58 would break dependents on `exarrow-rs = "0.17"` through `cargo update`.
-- **Direction change:** Entry [10] states the rule: a 0.x minor bump over the latest published version, 0.17.0 if `v0.17.0` is not tagged at merge time, 0.18.0 if it is, never a patch bump. plan.md § Impact repeats the rule, and § Context states that this branch is stacked on the unmerged `feat/fix-export-parquet-transport-roundtrip`.
+- **Direction change:** Entry [10] states the rule: a 0.x minor bump over the latest published version, never a patch bump, which is 0.18.0 because `v0.17.0` is tagged. plan.md § Impact repeats the rule, and § Context states that the branch is based on `main`.
 - **Promotes to ADR:** no
 
 ### [3] [plan-review] The eight-minute opt-in export test lost its `#[ignore]`
 
 - **Finding:** Round 2 `[COMPLETENESS_GAP]`: task 7.2 removed the bare `#[ignore]` from `test_csv_export_runs_past_the_former_five_minute_limit`, so CI would run it, see no `EXARROW_LONG_EXPORT_CHECK`, and count the early return as a pass.
-- **Direction change:** Task 7.2 excludes the test from the removal, gives it `#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1"]`, and rewrites its doc-comment sentence about CI. Entry [15] names the test. The Checklist row expects 12 ignored tests, and the Manual Testing row names this test.
+- **Direction change:** Task 7.2 excludes the test from the removal, gives it `#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1"]`, and rewrites its doc-comment sentence about CI. Entry [15] names the test. The Checklist row expects 1 ignored test, and the Manual Testing row names this test.
 - **Promotes to ADR:** no
 
 ### [4] [plan-review] Three unchanged advisory scenarios named the default-feature command
@@ -276,7 +281,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Direction change:**
   - Round 1, all five: plan.md § Impact states how to decline the mismatch error. `fetch_all` closes the handle after a mismatch error (task 1.2, entry [4]). The overshoot message counts the offending batch (spec step, tasks 1.1 and 1.4). A new unit test `test_fetch_all_small_result_set_sends_no_fetch` replaces the misleading tag (task 4.3). Task 7.7 runs the WebSocket unit tests in CI (entry [5]).
   - Round 2, two: plan.md § Context and entry [18] state that parquet 59.2.0 dropped `paste`, and task 6.1 requires `parquet` 59.2. The scenario "Suppression is removed when its advisory no longer applies" names an `advisory-not-detected` diagnostic.
-  - Round 2 ADVISORY findings not applied: the group A commit for an arrow 58 backport, and the import/export commands in `AGENTS.md`, `CONTRIBUTING.md`, `specs/mission.md`, and the `tests/common/mod.rs` doc example. Task 7.0 covers the follow-up issue finding.
+  - Round 2 ADVISORY findings not applied: the group A commit for an arrow 58 backport, and the import/export commands in `AGENTS.md`, `CONTRIBUTING.md`, `specs/mission.md`, and the `tests/common/mod.rs` doc example. Review finding [8] applies both and drops the follow-up issue task.
 - **Promotes to ADR:** no
 
 ### [8] [plan-review] User decisions after review round 2
@@ -285,7 +290,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Direction change:**
   - (1) and (2): entries [4] and [11] stay unchanged.
   - (3): entry [22] and plan.md § Parallelization make group A the first, self-contained commit.
-  - (4): root-cause runs found two causes. Exasol 2025.2.0 rejects HTTP Parquet sources with `ETL-2210` (entry [19]). The driver hangs whenever an IMPORT statement fails before Exasol requests data, on every server version (entry [20]). New group C (tasks 8.1 to 8.8) fixes both, adds the scenario "Failed IMPORT statement returns its error without waiting for the tunnel", excludes 2025.2.0 from native Parquet import, and moves CI to 2025.2.1 (entry [21]). Task 7.0 and the eleven `#[ignore]` reasons are removed. Only the eight-minute opt-in test keeps a reasoned `#[ignore]`.
+  - (4): root-cause runs found two causes. Exasol 2025.2.0 rejects HTTP Parquet sources with `ETL-2210` (entry [19]). The driver hangs whenever an IMPORT statement fails before Exasol requests data, on every server version (entry [20]). New group C (tasks 8.1 to 8.10) fixes the driver cause, adds the scenario "Failed IMPORT statement returns its error without waiting for the tunnel", drops Exasol 2025.2.0 (entry [19], superseded exclusion by review finding [9]), and moves CI to 2025.2.1 (entry [21]). Task 7.0 and the eleven `#[ignore]` reasons are removed. Only the eight-minute opt-in test keeps a reasoned `#[ignore]`.
   - (5): task 7.8 and entry [23].
   - Entry [10] states 0.18.0 as the release version. Review finding [1] above records the earlier ignore-based direction that this entry replaces.
 - **Promotes to ADR:** no
@@ -298,4 +303,46 @@ Headless run. No live interview took place. The orchestrator brief is the only i
   - The deltas for `import-export/parquet-io` and `import-export/parallel-import` are removed, together with the scenario "Exasol 2025.2.0 receives Parquet converted to CSV", the manual 2025.2.0 run, the two CSV-path multi-file tests that covered the changed parallel-import scenarios, and the 2025.2.0 lines of the architecture delta. A fifth missing-table test covers the CSV-converted multi-file Parquet path.
   - The `connection-management/version-capability` delta now changes only the boundary case `(2025,2,0)` to `(2025,2,1)` in "Native Parquet import threshold".
   - Tasks 8.6, 8.7, 8.9, and 8.10 move every remaining 2025.2.0 reference in tests, scripts, docs, and the gate's doc comment to 2025.2.1 or remove it. plan.md § Impact and task 8.8 state that users on 2025.2.0 get `ETL-2210` instead of a hang and upgrade to 2025.2.1 or force the CSV path.
+- **Promotes to ADR:** no
+
+### [10] [plan-review] No actor produced the commit order A, C, B or the 0.18.0 version
+
+- **Finding:** Round 3 `[HIDDEN_DEPENDENCY]`: `/speq:implement-pr` commits once at step A4, implementer agents are read-only, code review runs after all groups, `main` squash-merges, and step A3 bumps by Conventional Commits. User decision (3) and the 0.18.0 rule of entry [10] would fail without an error.
+- **Direction change:** plan.md § Parallelization has a `### Commits` subsection. It names the `/speq:implement-pr` orchestrator as the only committer, with commits after group A, after group C, and at step A4 for group B, separate review-fix commits per group, a review base before implementation, step A3 setting 0.18.0 per entry [10], and a PR description that lists the backport commits by SHA and states the squash-merge caveat. Entry [22] Consequences name the same actor and the caveat.
+- **Promotes to ADR:** no
+
+### [11] [plan-review] No test checked that per-connection tunnel tasks stop
+
+- **Finding:** Round 3 `[TRACEABILITY_GAP]`: task 8.2 had no test, so a wrong or skipped task 8.2 would leave detached per-connection tasks holding tunnel sockets while every planned test passed. The `JoinSet` option broke the signature of the existing `join_stream_handles` tests, and task 8.2 placed `stream_parquet_files_parallel` in the wrong file.
+- **Direction change:** Task 8.2 puts an abort-on-drop guard inside `join_stream_handles`, which also stops the remaining tasks after the first failure, and drops the `JoinSet` option. Task 8.4 adds a unit test that aborts a parent of two never-finishing children and asserts that both `oneshot` receivers return `RecvError` within 5 seconds, and extends the `serve_parquet_bytes` test to assert end of stream on the fake server's connection through a new `FakeExasolServer` method. The Scenario Coverage rows and the group C Knowledge column name `src/import/parallel.rs` for `stream_parquet_files_parallel`.
+- **Promotes to ADR:** no
+
+### [12] [plan-review] Source code still named Exasol 2025.2.0
+
+- **Finding:** Round 3 `[INTENT_DRIFT]` ADVISORY: task 8.6 wrote 2025.2.0 into the doc comment of `supports_native_parquet_import`, and entry [19] did not define what dropping 2025.2.0 support means.
+- **Direction change:** Task 8.6 keeps the doc comment free of 2025.2.0 and points to `docs/import-export.md`. Entry [19] defines the term, and plan.md § Parallelization › Commits puts the definition into the PR description. This agrees with the user decision of review finding [9].
+- **Promotes to ADR:** no
+
+### [13] [plan-review] The changed error precedence was described as unchanged
+
+- **Finding:** Round 3 `[COMPLETENESS_GAP]` ADVISORY: the http-transport delta and entry [20] said the tunnel error wins "as before", but a tunnel task still running when the statement fails is now aborted and the statement's error wins.
+- **Direction change:** The delta step reads "when a tunnel task has failed before the IMPORT statement returns its error, the system SHALL return that task's error". Entry [20] Consequences state the new precedence. Task 8.4 adds a fourth case: a failed statement with a tunnel task that is still running returns `ImportError::SqlError`.
+- **Promotes to ADR:** no
+
+### [14] [plan-review] Two Backgrounds claimed native Parquet availability from 2025.1.11 without exception
+
+- **Finding:** Round 3 `[REQUIREMENT_CONFLICT]` ADVISORY: the recorded Backgrounds of `connection-management/version-capability` and `import-export/parquet-io` state availability from 2025.1.11 onward, which entry [19] disproves for 2025.2.0, and entry [19] had no `Architecture:` line.
+- **Direction change:** Both deltas change their Background to say that the driver selects native Parquet import from 2025.1.11 onward. The `import-export/parquet-io` delta returns for this Background change only. Entry [19] has an `Architecture: no change` line. Neither Background names 2025.2.0, which agrees with review finding [9].
+- **Promotes to ADR:** no
+
+### [15] [plan-review] Missing-table tests and test ordering did not pin the paths they cover
+
+- **Finding:** Round 3 `[TRACEABILITY_GAP]` ADVISORY: the two native-path missing-table tests relied on the server version to take the native path, the Manual Testing row expected four tests instead of five, the group C order put the reproducing tests after the fix, and task 8.9 updated one of three stale doc comments.
+- **Direction change:** Task 8.5 sets `with_native_parquet(Some(true))` on the two native-path tests. The Manual Testing row expects five tests. The group C order runs the tests of 8.5 and 8.4 first. Task 8.9 updates the doc comments of all three native-path tests.
+- **Promotes to ADR:** no
+
+### [16] [plan-review] Several log statements described superseded states
+
+- **Finding:** Round 3 `[PROSE_BLOAT]` ADVISORY: entries [7] and [10] and review findings [2], [3], [7], and [8] described the 2025.2.0 CI image, the untagged `v0.17.0` branch, the stacked branch, 12 ignored tests, task 7.0, and the 2025.2.0 exclusion.
+- **Direction change:** Each statement now describes the current plan or names the review finding that supersedes it.
 - **Promotes to ADR:** no

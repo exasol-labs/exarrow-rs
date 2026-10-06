@@ -16,5 +16,5 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *WHEN* the IMPORT statement returns its error
 * *THEN* the system SHALL stop serving the tunnel connections and SHALL return the Exasol error to the caller
 * *AND* the system MUST NOT wait for Exasol to close a tunnel connection
-* *AND* when a tunnel task has already failed, the system SHALL return that task's error, as it does today
+* *AND* when a tunnel task has failed before the IMPORT statement returns its error, the system SHALL return that task's error
 <!-- /DELTA:NEW -->
