@@ -12,8 +12,8 @@ The CSV-bytes entry points keep every field verbatim: an empty field is NULL whe
 
 ### Scenario: Export to Parquet stream
 
-* *GIVEN* an AsyncWrite implementation is available for Parquet output
-* *WHEN* user provides AsyncWrite for Parquet output
+* *GIVEN* a synchronous `std::io::Write + Send` implementation is available for Parquet output
+* *WHEN* user provides that `Write` implementation to `export_to_parquet_stream`
 * *THEN* system SHALL stream Parquet data to writer
 
 ### Scenario: CSV-bytes export keeps field whitespace
