@@ -535,6 +535,7 @@ mod tests {
         assert!(!SessionState::Closed.can_execute());
     }
 
+    /// Scenario: Native Parquet import threshold
     #[test]
     fn test_supports_native_parquet_import_is_pure_and_memoized() {
         let session_71 = Session::new(
@@ -551,12 +552,12 @@ mod tests {
         );
         assert!(session_2025_1_11.supports_native_parquet_import());
 
-        let session_2025_2_0 = Session::new(
+        let session_2025_2_1 = Session::new(
             "s3".to_string(),
-            mock_server_info_with_version("2025.2.0"),
+            mock_server_info_with_version("2025.2.1"),
             SessionConfig::default(),
         );
-        assert!(session_2025_2_0.supports_native_parquet_import());
+        assert!(session_2025_2_1.supports_native_parquet_import());
 
         let session_garbage = Session::new(
             "s4".to_string(),

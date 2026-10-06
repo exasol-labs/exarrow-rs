@@ -187,6 +187,8 @@ Type widening rules when fields differ across files:
 
 When connected to Exasol 2025.1.11 or newer, the driver automatically uses **native Parquet import**: raw Parquet bytes are served to the server over HTTP range requests, and the SQL uses `IMPORT INTO ... FROM PARQUET AT '...;MaxConcurrentReads=1' FILE 'NNN.parquet'` with no CSV format clauses. This eliminates client-side decoding and re-encoding cost and reduces wire-bytes by 5–30x for typed columnar data. On older Exasol versions (7.x, 8.x) the driver continues to convert Parquet to CSV transparently — no change in behavior for existing deployments.
 
+Exasol 2025.2.0 is not supported for native Parquet import. It accepts only S3 URLs as Parquet sources and rejects the driver's HTTP source with `ETL-2210: AWS URL is invalid`, so a Parquet import on 2025.2.0 returns that error. Users on 2025.2.0 upgrade to Exasol 2025.2.1 or later, or force the CSV conversion path with `with_native_parquet(Some(false))`.
+
 The server version is detected automatically at connection time. To override the auto-detected behavior, use `ParquetImportOptions::with_native_parquet`:
 
 ```rust
@@ -195,7 +197,7 @@ use exarrow_rs::import::ParquetImportOptions;
 // Force CSV conversion path (e.g. for testing or compatibility):
 let options = ParquetImportOptions::default().with_native_parquet(Some(false));
 
-// Force native mode (errors on pre-2025.1.11 servers):
+// Force native mode (errors on pre-2025.1.11 servers and on 2025.2.0):
 let options = ParquetImportOptions::default().with_native_parquet(Some(true));
 
 // Default: auto-detect from server version (recommended):

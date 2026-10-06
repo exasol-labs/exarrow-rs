@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::query::import::{Compression, ImportFileEntry, ImportQuery, RowSeparator, TrimMode};
 use crate::transport::HttpTransportClient;
 
-use super::parallel::{resolve_stream_task, stream_files_parallel, ParallelTransportPool};
+use super::parallel::{finish_import, stream_files_parallel, ParallelTransportPool};
 use super::source::IntoFileSources;
 use super::ImportError;
 
@@ -560,14 +560,7 @@ where
         stream_files_parallel(connections, file_data_vec, compression).await
     });
 
-    // Execute the IMPORT SQL in parallel
-    let sql_result = execute_sql(sql).await;
-
-    // Wait for streaming to complete; check it first as it holds protocol errors
-    resolve_stream_task(stream_handle.await)?;
-
-    // Return the row count from SQL execution
-    sql_result.map_err(ImportError::SqlError)
+    finish_import(execute_sql(sql).await, stream_handle).await
 }
 
 /// Build an ImportQuery for multi-file import.

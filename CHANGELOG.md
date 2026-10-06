@@ -4,7 +4,9 @@
 
 - Fix: `fetch_all()` and prepared-statement results return every row exactly once for WebSocket results larger than one fetch message and for results on both transports that are partly delivered with the execute response. Fixes #80.
 - Fix: `ResultSetIterator` ends after the last row on both transports.
+- Fix: a CSV or Parquet import whose IMPORT statement fails before Exasol requests data, for example because the target table does not exist, returns the Exasol error instead of hanging. This affected multi-file CSV import and every Parquet import path.
 - Changed: `fetch_all()` and the iterator return `QueryError::ExecutionFailed` when a result set delivers fewer or more rows than its total row count.
+- Changed: Exasol 2025.2.0 is not supported for native Parquet import. It rejects HTTP Parquet sources, so a Parquet import there now returns `ETL-2210` instead of hanging. Upgrade to Exasol 2025.2.1 or later, or set `ParquetImportOptions::with_native_parquet(Some(false))` to use the CSV path.
 
 ## 0.17.0
 

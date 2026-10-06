@@ -7,11 +7,11 @@
 #   ./scripts/run_all_tests.sh --stage integration   # Run deps + build + container + integration
 #   ./scripts/run_all_tests.sh --skip-cleanup        # Keep container running after tests
 #   ./scripts/run_all_tests.sh --no-fail-fast        # Don't stop on first failure
-#   ./scripts/run_all_tests.sh --exasol-tag 2025.2.0 # Use specific Exasol image tag
+#   ./scripts/run_all_tests.sh --exasol-tag 2025.2.1 # Use specific Exasol image tag
 set -euo pipefail
 
 # --- Defaults ---
-EXASOL_TAG="2025.2.0"
+EXASOL_TAG="2025.2.1"
 CONTAINER_NAME="exasol-test"
 SKIP_CLEANUP=false
 FAIL_FAST=true

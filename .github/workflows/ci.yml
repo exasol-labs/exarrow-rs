@@ -234,7 +234,7 @@ jobs:
             --shm-size=1g \
             -p 8563:8563 \
             -e COSLWD_ENABLED=1 \
-            exasol/docker-db:2025.2.0
+            exasol/docker-db:2025.2.1
 
       - name: Wait for Exasol to be ready
         run: ./scripts/wait_for_exasol.sh exasol-test 120

@@ -197,6 +197,14 @@ impl FakeExasolServer {
         });
         Self { host, port, peer }
     }
+
+    /// Waits for the peer task, which ends once the driver closes its end of
+    /// the tunnel connection.
+    pub(crate) async fn wait_for_disconnect(&mut self) {
+        (&mut self.peer)
+            .await
+            .expect("the fake peer must not panic");
+    }
 }
 
 impl Drop for FakeExasolServer {

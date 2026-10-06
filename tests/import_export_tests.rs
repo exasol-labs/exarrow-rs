@@ -60,6 +60,7 @@ use exarrow_rs::export::parquet::ParquetExportOptions;
 use exarrow_rs::import::arrow::ArrowImportOptions;
 use exarrow_rs::import::csv::CsvImportOptions;
 use exarrow_rs::import::parquet::ParquetImportOptions;
+use exarrow_rs::import::ImportError;
 use exarrow_rs::query::export::ExportSource;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2522,8 +2523,8 @@ async fn test_parquet_import_forced_csv_path_works() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test the native Parquet import path when the server supports it.
-/// Skips gracefully on older server versions.
+/// Test the native Parquet import path. Fails on a server without native
+/// Parquet import, because it needs Exasol 2025.2.1 or later.
 #[tokio::test]
 #[ignore]
 async fn test_parquet_import_native_path_when_supported() {
@@ -2531,11 +2532,10 @@ async fn test_parquet_import_native_path_when_supported() {
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
 
-    if !conn.supports_native_parquet_import() {
-        eprintln!("skip: server does not support native Parquet import (< 2025.1.11)");
-        conn.close().await.expect("Failed to close connection");
-        return;
-    }
+    assert!(
+        conn.supports_native_parquet_import(),
+        "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
+    );
 
     let schema_name = generate_test_schema_name();
     setup_id_name_table(&mut conn, &schema_name).await;
@@ -2570,8 +2570,8 @@ async fn test_parquet_import_native_path_when_supported() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test native Parquet import via the stream (reader) path.
-/// Skips gracefully on older server versions.
+/// Test native Parquet import via the stream (reader) path. Fails on a server
+/// without native Parquet import, because it needs Exasol 2025.2.1 or later.
 #[tokio::test]
 #[ignore]
 async fn test_parquet_stream_import_native_path() {
@@ -2579,11 +2579,10 @@ async fn test_parquet_stream_import_native_path() {
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
 
-    if !conn.supports_native_parquet_import() {
-        eprintln!("skip: server does not support native Parquet import (< 2025.1.11)");
-        conn.close().await.expect("Failed to close connection");
-        return;
-    }
+    assert!(
+        conn.supports_native_parquet_import(),
+        "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
+    );
 
     let schema_name = generate_test_schema_name();
     setup_id_name_table(&mut conn, &schema_name).await;
@@ -2620,8 +2619,8 @@ async fn test_parquet_stream_import_native_path() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test parallel native Parquet import from multiple files.
-/// Skips gracefully on older server versions.
+/// Test parallel native Parquet import from multiple files. Fails on a server
+/// without native Parquet import, because it needs Exasol 2025.2.1 or later.
 #[tokio::test]
 #[ignore]
 async fn test_parallel_parquet_import_native_path() {
@@ -2629,11 +2628,10 @@ async fn test_parallel_parquet_import_native_path() {
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
 
-    if !conn.supports_native_parquet_import() {
-        eprintln!("skip: server does not support native Parquet import (< 2025.1.11)");
-        conn.close().await.expect("Failed to close connection");
-        return;
-    }
+    assert!(
+        conn.supports_native_parquet_import(),
+        "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
+    );
 
     let schema_name = generate_test_schema_name();
     setup_id_name_table(&mut conn, &schema_name).await;
@@ -2702,6 +2700,149 @@ async fn test_parquet_import_forced_csv_path_fallback_works() {
         .expect("SELECT should succeed");
     assert!(!batches.is_empty());
     assert_eq!(batches[0].num_rows(), 3, "Data should round-trip correctly");
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section: Failed IMPORT statement
+
+const MISSING_TABLE: &str = "MISSING_TABLE";
+
+/// Creates a fresh schema without tables and returns the qualified name of a
+/// table that does not exist in it.
+async fn missing_table_in_new_schema(conn: &mut Connection) -> (String, String) {
+    let schema_name = generate_test_schema_name();
+    conn.execute_update(&format!("CREATE SCHEMA {schema_name}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    let table = format!("{schema_name}.{MISSING_TABLE}");
+    (schema_name, table)
+}
+
+/// Awaits an import into a missing table and asserts that it returns Exasol's
+/// error, naming the table, within 60 seconds instead of waiting for the tunnel.
+async fn assert_import_reports_missing_table<F>(import: F, table: &str)
+where
+    F: std::future::Future<Output = Result<u64, ImportError>>,
+{
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), import)
+        .await
+        .expect("an import into a missing table must return within 60 seconds");
+
+    let err = result.expect_err("an import into a missing table must fail");
+    assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
+    assert!(err.to_string().contains(table), "got: {err}");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parquet_import_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = write_small_parquet(temp_dir.path(), "test.parquet");
+    let options = ParquetImportOptions::default().with_native_parquet(Some(true));
+
+    assert_import_reports_missing_table(
+        conn.import_from_parquet(&table, &parquet_path, options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parquet_import_csv_path_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = write_small_parquet(temp_dir.path(), "test.parquet");
+    let options = ParquetImportOptions::default().with_native_parquet(Some(false));
+
+    assert_import_reports_missing_table(
+        conn.import_from_parquet(&table, &parquet_path, options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parallel_parquet_import_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path1 = write_small_parquet_offset(temp_dir.path(), "part1.parquet", 1);
+    let path2 = write_small_parquet_offset(temp_dir.path(), "part2.parquet", 10);
+    let options = ParquetImportOptions::default().with_native_parquet(Some(true));
+
+    assert_import_reports_missing_table(
+        conn.import_parquet_from_files(&table, vec![path1, path2], options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parallel_parquet_import_csv_path_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path1 = write_small_parquet_offset(temp_dir.path(), "part1.parquet", 1);
+    let path2 = write_small_parquet_offset(temp_dir.path(), "part2.parquet", 10);
+    let options = ParquetImportOptions::default().with_native_parquet(Some(false));
+
+    assert_import_reports_missing_table(
+        conn.import_parquet_from_files(&table, vec![path1, path2], options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parallel_csv_import_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path1 = temp_dir.path().join("data_part1.csv");
+    let csv_path2 = temp_dir.path().join("data_part2.csv");
+    std::fs::write(&csv_path1, "1,Alice,10.5\n").expect("Failed to write CSV file 1");
+    std::fs::write(&csv_path2, "2,Bob,20.5\n").expect("Failed to write CSV file 2");
+
+    assert_import_reports_missing_table(
+        conn.import_csv_from_files(
+            &table,
+            vec![csv_path1, csv_path2],
+            CsvImportOptions::default().use_tls(false),
+        ),
+        &table,
+    )
+    .await;
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
