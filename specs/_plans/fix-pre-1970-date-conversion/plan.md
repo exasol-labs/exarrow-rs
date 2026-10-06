@@ -1,0 +1,161 @@
+# Plan: fix-pre-1970-date-conversion
+
+## Summary
+
+DATE and TIMESTAMP values before 1970 convert to the correct day in query results on both transports, in typed exports, and in Arrow and Parquet imports. One day-count function with floor division serves every read path, the WebSocket path's private copy is deleted, and unit tests check the function against chrono over Exasol's full DATE range.
+
+## Context
+
+- Issue exasol-labs/exarrow-rs#84: `SELECT DATE '1968-01-01'` returns Date32 -730 (1968-01-02) instead of -731, and `TIMESTAMP '1950-06-15 00:00:00'` returns 1950-06-16. Both transports return the same wrong values.
+- Root cause: the days-from-year formula `(year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400` uses Rust's integer `/`, which truncates toward zero. For years before 1970 the three leap-year terms are negative and need floor division.
+- The formula exists twice. `ymd_to_days` in `src/types/conversion.rs` serves the native decoder (`read_packed_date_days` and `read_timestamp_micros` in `src/transport/native/result_parser.rs`), the public `ArrowConverter` (`src/arrow_conversion/builders.rs`), and the typed export conversions (`src/export/arrow.rs`, `src/export/parquet.rs`). A private copy, `ResultSet::parse_date_to_days` in `src/query/results.rs`, serves the WebSocket query results, together with private copies of the timestamp, time-of-day, and fraction parsers.
+- Over the 3,652,059 days from 0001-01-01 to 9999-12-31, the current formula returns a wrong day count for 487,680 days. With floor division it matches Python's proleptic Gregorian `datetime.date` on every day (`decision-log.md` entry [1]).
+- `format_timestamp_micros` in `src/import/arrow.rs` splits microseconds with `/`, `%`, and `unsigned_abs`. Importing 1969-12-31 12:00:00 stores 1970-01-01 12:00:00 (issue #84, confirmed against Docker). `import_from_record_batch`, `import_from_record_batches`, `import_from_arrow_ipc`, and ADBC bulk ingestion use it.
+- `format_timestamp` in `src/import/parquet.rs` splits seconds and microseconds with `/` and `%`, so -0.5 s becomes +0.5 s. Only the CSV path uses it: servers below 2025.1.11, or `with_native_parquet(Some(false))`. Native Parquet import sends the file bytes unchanged.
+- Both import formatters convert nanoseconds with `/ 1_000`, which moves a pre-epoch value with sub-microsecond digits toward the later instant.
+- Date32 import is already correct: `days_to_ymd` in `src/import/arrow.rs` uses floor arithmetic, and `src/import/parquet.rs` and the FFI parameter binding in `src/adbc_ffi.rs` use chrono. The FFI timestamp binding already uses `div_euclid` and `rem_euclid`.
+- Exasol labels dates before 1582-10-15 in the Julian calendar. On `exasol/docker-db` 2026.1.0, `ADD_DAYS(DATE '1582-10-04', 1)` is 1582-10-15, `1500-02-29` exists, and `DAYS_BETWEEN(DATE '0001-01-01', DATE '1970-01-01')` is -719164. chrono and pyarrow decode Date32 in the proleptic Gregorian calendar, where 0001-01-01 is day -719162 (`decision-log.md` entry [2]).
+- The existing unit tests check dates from 1969 onward only, which the current formula gets right. The existing integration tests use dates from 1999 onward.
+- Architecture: the calendar rule of `decision-log.md` entry [2] becomes a constraint on every read and write path. The architecture delta `architecture.md` in this plan directory adds it to § Constraints.
+
+## Features
+
+| Feature | Status | Spec |
+|---------|--------|------|
+| Exasol to Arrow | CHANGED | `type-mapping/exasol-to-arrow/spec.md` |
+| Boundaries and Validation | CHANGED | `type-mapping/boundaries-and-validation/spec.md` |
+| Parquet Export | CHANGED | `import-export/parquet-export/spec.md` |
+| Arrow RecordBatch Import/Export | CHANGED | `import-export/arrow-recordbatch/spec.md` |
+| Parquet I/O | CHANGED | `import-export/parquet-io/spec.md` |
+
+## Impact
+
+- Query results on both transports, `ArrowConverter`, `export_to_parquet`, `export_to_record_batches`, `export_to_arrow_ipc`, and the CSV-bytes Parquet export entry points return the correct Date32 and Timestamp values for DATE and TIMESTAMP values before 1970. Values from 1970 onward do not change.
+- `import_from_record_batch`, `import_from_record_batches`, `import_from_arrow_ipc`, ADBC bulk ingestion, and the CSV path of Parquet import store pre-1970 TIMESTAMP values at the correct instant. A pre-epoch value with sub-microsecond digits drops them toward the earlier instant.
+- Applications that read or stored pre-1970 values through the driver get different values for the same data: the correct ones. No public API changes.
+- A date before 1582-10-15 converts by its year, month, and day, so Arrow tools show the same date text as Exasol. A day difference across 1582-10-15 computed from Date32 values differs from Exasol's `DAYS_BETWEEN`, and February 29 of the twelve Julian-only leap years from 100 to 1500 converts to March 1. `docs/type-mapping.md` states both effects.
+- Breaking changes: none.
+
+## Dependencies
+
+None. The unit-test oracle uses chrono 0.4, which `Cargo.toml` already lists as a regular dependency.
+
+## Implementation Tasks
+
+1. Shared day count (`src/types/conversion.rs`)
+
+- [ ] 1.1 Add these unit tests to the test module of `src/types/conversion.rs`. Each carries the line `/// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar`.
+  - `test_ymd_to_days_matches_chrono_for_every_exasol_date`: iterate every `chrono::NaiveDate` from 0001-01-01 to 9999-12-31 and assert that `ymd_to_days(year, month, day)` equals the date's signed day difference from 1970-01-01. The assertion message names the date.
+  - `test_parse_timestamp_to_micros_matches_chrono_for_every_exasol_year`: for each year from 1 to 9999, parse `format!("{year:04}-03-01 12:34:56.789012")` and assert that the result equals chrono's microsecond timestamp of the same date and time in UTC.
+  - `test_parse_date_to_days_before_1970`: `1968-01-01` is -731, `1900-03-01` is -25508, `1600-03-01` is -135080, `0001-01-01` is -719162, and `9999-12-31` is 2932896.
+  - `test_parse_date_to_days_century_leap_years`: `1600-02-29` is -135081, `1900-02-28` is -25509, `1900-03-01` is -25508, `2000-02-29` is 11016, and `2000-03-01` is 11017.
+  - `test_parse_timestamp_to_micros_before_1970`: `1950-06-15 00:00:00` is -616896000000000, `1969-12-31 23:59:59.999999` is -1, `1969-12-31 12:00:00` is -43200000000, `0001-01-01 00:00:00` is -62135596800000000, and `9999-12-31 23:59:59.999999` is 253402300799999999.
+  - `test_ymd_hms_nanos_to_micros_before_epoch`: `(1969, 12, 31, 23, 59, 59, 999_999_000)` is -1, and `(1950, 6, 15, 0, 0, 0, 0)` is -616896000000000.
+  - `test_ymd_to_days_julian_only_leap_day_reads_as_march_first`: `ymd_to_days(1500, 2, 29)` and `ymd_to_days(1500, 3, 1)` both return -171605. This test also carries the line `/// Scenario: Lossless conversion validation`.
+  Run the tests. All seven fail on the current formula, because each one asserts at least one value from before 1970 that the current formula gets wrong.
+- [ ] 1.2 In `ymd_to_days`, replace `/` with `div_euclid` in the three leap-year terms. Rewrite its doc comment in at most two lines: it counts days in the proleptic Gregorian calendar for any year, and floor division keeps the leap-day count correct before 1970 (`decision-log.md` entries [1] and [2]). The tests of task 1.1 pass.
+
+2. WebSocket result path (`src/query/results.rs`)
+
+- [ ] 2.1 Add the unit test `test_column_major_to_record_batch_keeps_pre_1970_dates_and_timestamps`: a schema with a Date32 field and a `Timestamp(Microsecond, None)` field, and the JSON rows `["1968-01-01", "1950-06-15 00:00:00"]` and `["0001-01-01", "1969-12-31 23:59:59.999999"]`. `ResultSet::column_major_to_record_batch` returns the Date32 values -731 and -719162 and the timestamp values -616896000000000 and -1. The test carries the line `/// Scenario: Pre-1970 DATE and TIMESTAMP query results keep their calendar day`. It fails before task 2.2.
+- [ ] 2.2 In `json_column_to_array`, convert DATE strings with `crate::types::conversion::parse_date_to_days(s).ok()` and TIMESTAMP strings with `crate::types::conversion::parse_timestamp_to_micros(s).ok()`. Delete `ResultSet::parse_date_to_days`, `parse_timestamp_to_micros`, `parse_time_of_day_to_micros`, `parse_seconds_to_micros`, and `fractional_seconds_to_micros`, and the constants `SECONDS_PER_MINUTE`, `SECONDS_PER_HOUR`, `SECONDS_PER_DAY`, `MICROS_PER_SECOND`, and `MICROS_FRACTION_DIGITS`. The existing tests `test_column_major_to_record_batch_with_date32`, `test_column_major_to_record_batch_with_timestamp`, `test_column_major_to_record_batch_invalid_date_becomes_null`, and `test_column_major_to_record_batch_invalid_timestamp_becomes_null` pass unchanged, and task 2.1's test passes.
+- [ ] 2.3 Delete the unit tests in `src/query/results.rs` that call the removed functions: the sections for `ResultSet::parse_date_to_days` and `ResultSet::parse_timestamp_to_micros`. Move `test_parse_timestamp_to_micros_hours_and_minutes_only` to the test module of `src/types/conversion.rs` and make it call `parse_timestamp_to_micros`, because that module has no test for a time of day without seconds. Every other deleted case has a counterpart there.
+
+3. Native result decoder (`src/transport/native/result_parser.rs`)
+
+- [ ] 3.1 Add the unit test `single_pass_dates_and_timestamps_before_1970_keep_their_calendar_day`: wire data for a `T_DATE` column with the packed values (1968, 1, 1) and (1, 1, 1), and for a `T_TIMESTAMP` column with (1950, 6, 15, 0, 0, 0, 0) and (1969, 12, 31, 23, 59, 59, 999_999_000). `build_batch_from_wire` returns the Date32 values -731 and -719162 and the timestamp values -616896000000000 and -1. Build the wire bytes the way the existing date and timestamp tests in the file do. The test carries the line `/// Scenario: Pre-1970 DATE and TIMESTAMP query results keep their calendar day`.
+- [ ] 3.2 In the existing native date test that expects `crate::types::conversion::ymd_to_days(2024, 1, 2)`, replace that expected value with the literal 19724, so the test no longer derives its expectation from the code under test.
+
+4. Import formatters (`src/import/arrow.rs`, `src/import/parquet.rs`)
+
+- [ ] 4.1 In `src/import/arrow.rs`, add the unit tests `test_format_timestamp_micros_before_epoch` (-1 is `1969-12-31 23:59:59.999999`, -1000000 is `1969-12-31 23:59:59.000000`, -86400000000 is `1969-12-31 00:00:00.000000`, -43200000000 is `1969-12-31 12:00:00.000000`, -62135596800000000 is `0001-01-01 00:00:00.000000`) and `test_format_timestamp_before_epoch_in_every_unit` (the value -1 in a `TimestampSecondArray`, `TimestampMillisecondArray`, `TimestampMicrosecondArray`, and `TimestampNanosecondArray`, passed through `format_timestamp`, gives `1969-12-31 23:59:59.000000`, `1969-12-31 23:59:59.999000`, `1969-12-31 23:59:59.999999`, and `1969-12-31 23:59:59.999999`). Both carry the line `/// Scenario: RecordBatch import converts pre-epoch timestamps of every time unit to the earlier instant`.
+- [ ] 4.2 In `format_timestamp_micros`, compute the total seconds and the microsecond fraction with `div_euclid(1_000_000)` and `rem_euclid(1_000_000)`, and the day and the seconds of the day with `div_euclid(86_400)` and `rem_euclid(86_400)`. Remove the `unsigned_abs` calls. In `format_timestamp`, convert nanoseconds with `div_euclid(1_000)`. Delete `test_format_timestamp_micros_truncates_negative_day_offset` from `src/import/arrow.rs`. It asserts the truncating split that this task removes, and task 4.1 covers both of its inputs. The tests of task 4.1 and the remaining existing tests of the file pass.
+- [ ] 4.3 In `src/import/parquet.rs`, add the unit test `test_format_timestamp_before_epoch_in_every_unit`: the value -1 in each of the four timestamp array types gives the four strings of task 4.1, and -500000 in a `TimestampMicrosecondArray` gives `1969-12-31 23:59:59.500000`. The test carries the line `/// Scenario: CSV-path Parquet import converts pre-epoch timestamps of every time unit to the earlier instant`.
+- [ ] 4.4 In `format_timestamp` of `src/import/parquet.rs`, compute the seconds with `div_euclid(1_000_000)` and the microseconds with `rem_euclid(1_000_000)`, and convert nanoseconds with `div_euclid(1_000)`. The test of task 4.3 and the existing tests of the file, including `test_format_timestamp_nanosecond_unit_truncates_to_micros`, pass.
+
+5. Integration tests
+
+- [ ] 5.1 In `tests/integration_tests.rs`, add `test_pre_1970_dates_and_timestamps_keep_their_calendar_day`. It connects with `get_test_connection_with_transport("native").await.expect(...)` and does not call `skip_if_no_exasol!()` (`decision-log.md` entry [6]). It runs the query of the scenario with the column aliases `D1` to `D5` and `T1` to `T3`, downcasts the columns to `Date32Array` and `TimestampMicrosecondArray`, and asserts the eight values of the scenario. It carries the line `/// Scenario: Pre-1970 DATE and TIMESTAMP query results keep their calendar day`.
+- [ ] 5.2 In `tests/websocket_integration_tests.rs`, add `test_ws_pre_1970_dates_and_timestamps_keep_their_calendar_day` with the file's `get_ws_connection` helper and the same query, assertions, and scenario line as task 5.1.
+- [ ] 5.3 In `tests/import_export_tests.rs`, add `test_parquet_export_keeps_pre_1970_dates_and_timestamps` with `#[tokio::test]`, `#[ignore]`, and `assert!(common::is_exasol_available(), ...)` as its first statement (`decision-log.md` entry [6]). It creates table `T` and inserts the two rows of the scenario "Export keeps pre-1970 DATE and TIMESTAMP values", calls `export_to_parquet` for the table, reads the file with `read_parquet_file`, maps rows with `row_of_id`, and asserts the `D` and `TS` values of the scenario. It uses the file's helpers `create_table`, `table_source`, `typed_column`, and `cleanup_schema`. It carries that scenario's line.
+- [ ] 5.4 In `tests/import_export_tests.rs`, add `test_arrow_round_trip_keeps_pre_1970_dates_and_timestamps` with the attributes and first statement of task 5.3. It creates table `T` with `ID DECIMAL(18,0), D DATE, TS TIMESTAMP(6)`, imports the RecordBatch of the scenario "Pre-1970 DATE and TIMESTAMP values round-trip through RecordBatch import and export" with `import_from_record_batch`, and queries `SELECT ID, TO_CHAR(D, 'YYYY-MM-DD'), TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6') FROM T ORDER BY ID` through the connection. It asserts the six strings of the scenario. It then calls `export_to_record_batches` for `SELECT ID, D, TS FROM T ORDER BY ID` with `ArrowExportOptions::default().with_schema(...)` and the RecordBatch's schema, and asserts that the `D` and `TS` values equal the imported values. It carries that scenario's line.
+- [ ] 5.5 In `tests/import_export_tests.rs`, add `test_parquet_import_csv_path_keeps_pre_epoch_fractional_timestamps` with the attributes and first statement of task 5.3. It writes a Parquet file with the fields `ID` (Int64) and `TS` (`Timestamp(Microsecond, None)`) and the rows `(1, -500000)` and `(2, -1)` into a `TempDir` with `parquet::arrow::ArrowWriter`, as `write_small_parquet` does. It creates table `T` with `ID DECIMAL(18,0), TS TIMESTAMP(6)`, imports the file with `import_from_parquet` and `ParquetImportOptions::default().with_native_parquet(Some(false))`, and asserts the `TO_CHAR` strings of the scenario "CSV-path Parquet import keeps pre-epoch timestamps with fractional seconds". It carries that scenario's line.
+
+6. Documentation and changelog
+
+- [ ] 6.1 In `docs/type-mapping.md` § Precision and Scale, add a subsection `### DATE and TIMESTAMP before 1970` after § TIMESTAMP. It states that Date32 counts days and Timestamp counts microseconds from 1970-01-01 00:00:00, both in the proleptic Gregorian calendar, applied to the year, month, and day that Exasol reports, the same calendar Arrow tools use. It states that Exasol labels dates before 1582-10-15 in the Julian calendar, so such a date shows the same text in Arrow tools as in Exasol, a day difference across 1582-10-15 differs from Exasol's `DAYS_BETWEEN`, and February 29 of 100, 200, 300, 500, 600, 700, 900, 1000, 1100, 1300, 1400, and 1500 converts to March 1. It states that the driver's import and parameter binding convert Arrow values to Exasol text with the same calendar (`decision-log.md` entry [2]).
+- [ ] 6.2 In `CHANGELOG.md`, add a `## [Unreleased]` section above the newest release header (`decision-log.md` entry [7]) with two entries. A `Fix:` entry: DATE and TIMESTAMP values before 1970 now convert to the correct day in query results on both transports and in `export_to_parquet`, `export_to_record_batches`, and `export_to_arrow_ipc`. Many such values came back one day late, some years before 1902 one day early, and TIMESTAMP values shifted by 24 hours. Dates before 1582-10-15 convert by their year, month, and day, as `docs/type-mapping.md` describes. Fixes #84. A second `Fix:` entry: Arrow RecordBatch, Arrow IPC, and ADBC bulk-ingestion imports, and the CSV path of Parquet import, now store TIMESTAMP values before 1970 at the correct instant. 1969-12-31 12:00:00 was stored as 1970-01-01 12:00:00, and a fractional second before 1970 moved to the other side of the epoch.
+
+## Parallelization
+
+| Group | Tasks | Depends on | Knowledge |
+|-------|-------|------------|-----------|
+| A: Pre-1970 temporal conversion | 1.1-1.2, 2.1-2.3, 3.1-3.2, 4.1-4.4, 5.1-5.5, 6.1-6.2 | none | spec deltas `type-mapping/exasol-to-arrow`, `type-mapping/boundaries-and-validation`, `import-export/parquet-export`, `import-export/arrow-recordbatch`, `import-export/parquet-io`; `src/types/conversion.rs` (`ymd_to_days`, `parse_date_to_days`, `parse_timestamp_to_micros`, `ymd_hms_nanos_to_micros`), `src/query/results.rs` (`json_column_to_array` and the private parsers it replaces), `src/transport/native/result_parser.rs` (`read_packed_date_days`, `read_timestamp_micros`, tests), `src/import/arrow.rs` (`format_timestamp`, `format_timestamp_micros`), `src/import/parquet.rs` (`format_timestamp`), `tests/integration_tests.rs`, `tests/websocket_integration_tests.rs`, `tests/import_export_tests.rs`, `docs/type-mapping.md`, `CHANGELOG.md` |
+
+- One group: every task follows from one fact, how a calendar date maps to an Arrow day count and back. The read-path and write-path tests share `tests/import_export_tests.rs`, and the round-trip test of task 5.4 needs the read-path fix of task 1.2 and the write-path fix of task 4.2. Two groups would share files and this mental model.
+- Order: 1.1 and 1.2, then 2.1 to 2.3, 3.1 and 3.2, then 4.1 to 4.4, then 5.1 to 5.5 against a running Exasol, then 6.1 and 6.2.
+- No task carries `[expert]`. Planning settled the arithmetic and verified it on every day of the range, so the tasks are mechanical edits with literal expected values.
+
+### Release
+
+This instruction is for the `/speq:implement-pr` orchestrator (`decision-log.md` entry [7]). At step A3, do not apply the Conventional Commits patch default. Set `version` in `Cargo.toml` to X.(Y+1).0. X.Y is the highest of the `vX.Y.Z` tags and of the versions that open pull requests set in `Cargo.toml` or name in a `CHANGELOG.md` header (read each with `ghbrk gh pr diff <number>`). Run `cargo build`. Rename `## [Unreleased]` in `CHANGELOG.md` to `## X.(Y+1).0`, and merge in any `[Unreleased]` entries already on `main`.
+
+## Dead Code Removal
+
+| Type | Location | Reason |
+|------|----------|--------|
+| Function | `src/query/results.rs` `ResultSet::parse_date_to_days`, `parse_timestamp_to_micros`, `parse_time_of_day_to_micros`, `parse_seconds_to_micros`, `fractional_seconds_to_micros` | Duplicates of `types::conversion` parsers; the copy of the day-count formula carried the defect (task 2.2) |
+| Constant | `src/query/results.rs` `SECONDS_PER_MINUTE`, `SECONDS_PER_HOUR`, `SECONDS_PER_DAY`, `MICROS_PER_SECOND`, `MICROS_FRACTION_DIGITS` | Used only by the removed functions (task 2.2) |
+| Test | `src/query/results.rs` tests of `ResultSet::parse_date_to_days` and `ResultSet::parse_timestamp_to_micros` | Test removed functions; `src/types/conversion.rs` covers each case, and the one missing case moves there (task 2.3) |
+| Code | `src/import/arrow.rs` `format_timestamp_micros` and `src/import/parquet.rs` `format_timestamp`: the truncating `/`, `%`, and `unsigned_abs` splits | Replaced by Euclidean division (tasks 4.2, 4.4) |
+| Test | `src/import/arrow.rs` `test_format_timestamp_micros_truncates_negative_day_offset` | Asserts the truncating split that task 4.2 removes; task 4.1 covers both of its inputs (task 4.2) |
+
+## Verification
+
+### Scenario Coverage
+
+| Scenario | Test Type | Test Location | Test Name |
+|----------|-----------|---------------|-----------|
+| Pre-1970 DATE and TIMESTAMP query results keep their calendar day | Integration | `tests/integration_tests.rs` | `test_pre_1970_dates_and_timestamps_keep_their_calendar_day` |
+| Pre-1970 DATE and TIMESTAMP query results keep their calendar day | Integration | `tests/websocket_integration_tests.rs` | `test_ws_pre_1970_dates_and_timestamps_keep_their_calendar_day` |
+| Pre-1970 DATE and TIMESTAMP query results keep their calendar day | Unit | `src/query/results.rs` | `test_column_major_to_record_batch_keeps_pre_1970_dates_and_timestamps` |
+| Pre-1970 DATE and TIMESTAMP query results keep their calendar day | Unit | `src/transport/native/result_parser.rs` | `single_pass_dates_and_timestamps_before_1970_keep_their_calendar_day` |
+| DATE and TIMESTAMP values count days in the proleptic Gregorian calendar | Unit | `src/types/conversion.rs` | `test_ymd_to_days_matches_chrono_for_every_exasol_date`, `test_parse_timestamp_to_micros_matches_chrono_for_every_exasol_year`, `test_parse_date_to_days_before_1970`, `test_parse_date_to_days_century_leap_years`, `test_parse_timestamp_to_micros_before_1970`, `test_ymd_hms_nanos_to_micros_before_epoch`, `test_ymd_to_days_julian_only_leap_day_reads_as_march_first` |
+| Lossless conversion validation (new step: a loss that a `type-mapping` scenario specifies) | Unit | `src/types/conversion.rs` | `test_ymd_to_days_julian_only_leap_day_reads_as_march_first` |
+| Export keeps pre-1970 DATE and TIMESTAMP values | Integration | `tests/import_export_tests.rs` | `test_parquet_export_keeps_pre_1970_dates_and_timestamps` |
+| Pre-1970 DATE and TIMESTAMP values round-trip through RecordBatch import and export | Integration | `tests/import_export_tests.rs` | `test_arrow_round_trip_keeps_pre_1970_dates_and_timestamps` |
+| RecordBatch import converts pre-epoch timestamps of every time unit to the earlier instant | Unit | `src/import/arrow.rs` | `test_format_timestamp_micros_before_epoch`, `test_format_timestamp_before_epoch_in_every_unit` |
+| CSV-path Parquet import keeps pre-epoch timestamps with fractional seconds | Integration | `tests/import_export_tests.rs` | `test_parquet_import_csv_path_keeps_pre_epoch_fractional_timestamps` |
+| CSV-path Parquet import converts pre-epoch timestamps of every time unit to the earlier instant | Unit | `src/import/parquet.rs` | `test_format_timestamp_before_epoch_in_every_unit` |
+
+- "DATE and TIMESTAMP values count days in the proleptic Gregorian calendar" and the two time-unit scenarios use unit tests only. They describe pure conversions with no I/O, and the full date range cannot be exercised through a database query in reasonable time. The integration tests check the same rule at the issue's examples and the range boundaries.
+- The query-result scenario also has unit tests on each transport's decoding path, so a regression on one transport fails without Docker.
+- "Lossless conversion validation" keeps its first two steps unchanged. This plan adds only the step that names a loss a `type-mapping` scenario specifies, and the Julian-leap-day unit test covers that step.
+
+### Manual Testing
+
+| Feature | Command | Expected Output |
+|---------|---------|-----------------|
+| type-mapping/exasol-to-arrow | `cargo build --release --features 'ffi websocket'`, then in a scratch virtual environment with `pip install adbc-driver-manager pyarrow` (the packages CI installs): `python -c "import adbc_driver_manager.dbapi as d; c=d.connect(driver='target/release/libexarrow_rs.so', entrypoint='AdbcDriverExasolInit', db_kwargs={'uri':'exasol://sys:exasol@localhost:8563?tls=true&validateservercertificate=0'}); cur=c.cursor(); cur.execute(\"SELECT DATE '1968-01-01' D, DATE '0001-01-01' E, TIMESTAMP '1950-06-15 00:00:00' T FROM DUAL\"); print(cur.fetch_arrow_table().to_pylist())"`, then the same with `&transport=websocket` appended to the URI | Both runs print `[{'D': datetime.date(1968, 1, 1), 'E': datetime.date(1, 1, 1), 'T': datetime.datetime(1950, 6, 15, 0, 0)}]` |
+| import-export/arrow-recordbatch | In the same environment and connection (native URI): run `CREATE SCHEMA PRE1970_CHECK`, `OPEN SCHEMA PRE1970_CHECK`, and `CREATE TABLE T (TS TIMESTAMP(6))`, ingest `pyarrow.table({'TS': pyarrow.array([-43200000000], pyarrow.timestamp('us'))})` with `cur.adbc_ingest('T', table, mode='append')`, run `SELECT TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6') FROM T`, then `DROP SCHEMA PRE1970_CHECK CASCADE` | The SELECT returns `1969-12-31 12:00:00.000000` |
+| import-export/parquet-export | `cargo test --test import_export_tests test_parquet_export_keeps_pre_1970_dates_and_timestamps -- --ignored --nocapture` | The Parquet file holds Date32 -731 and -719162 and timestamps -616896000000000 and -1, and the test passes |
+| import-export/parquet-io | `cargo test --test import_export_tests test_parquet_import_csv_path_keeps_pre_epoch_fractional_timestamps -- --ignored --nocapture` | Exasol returns `1969-12-31 23:59:59.500000` and `1969-12-31 23:59:59.999999`, and the test passes |
+
+Exasol runs in Docker per `AGENTS.md` § Testing: `docker run -d --name exasol-test -p 8563:8563 --privileged exasol/docker-db:latest`, ready when `exapump sql 'select 1'` returns `1`.
+
+### Checklist
+
+| Step | Command | Expected |
+|------|---------|----------|
+| Build | `cargo build` | Exit 0 |
+| Build (WebSocket only) | `cargo test --no-default-features --features websocket --tests --no-run` | Exit 0 |
+| Build (FFI) | `cargo build --release --features ffi` | Exit 0 |
+| Unit test | `cargo test --lib` | 0 failures |
+| Unit test (WebSocket) | `cargo test --lib --features websocket` | 0 failures |
+| Integration test (native) | `REQUIRE_EXASOL=1 cargo test --features ffi --test integration_tests -- --test-threads=1` | 0 failures |
+| Integration test (WebSocket) | `REQUIRE_EXASOL=1 cargo test --features 'ffi websocket' --test websocket_integration_tests -- --test-threads=1` | 0 failures |
+| Import/export test | `cargo test --test import_export_tests -- --ignored --test-threads=1` | 0 failures |
+| Driver manager test | `REQUIRE_EXASOL=1 cargo test --features ffi --test driver_manager_tests -- --include-ignored --test-threads=1` | 0 failures, run after the FFI build |
+| Lint | `cargo clippy --all-targets --all-features -- -W clippy::all` | 0 warnings |
+| Format | `cargo fmt --all -- --check` | No changes |
+| Coverage | `cargo llvm-cov --lib --lcov --output-path lcov-unit.info && python3 scripts/strip_test_coverage.py strip --input lcov-unit.info --output lcov-unit-production.info --summary coverage-summary.json && python3 scripts/strip_test_coverage.py check --summary coverage-summary.json` | Check passes: total production coverage at least 80%, every file at least 50% |
