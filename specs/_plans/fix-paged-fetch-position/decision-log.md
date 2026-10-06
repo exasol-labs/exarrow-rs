@@ -99,7 +99,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 - **Decision:** `CHANGELOG.md` gets a `## [Unreleased]` section above `## 0.17.0` with `Breaking:`, `Fix:`, `Security:`, and `Changed:` entries for this plan. The release that carries this change is a 0.x minor bump over the latest published version. If tag `v0.17.0` does not exist when this PR merges, the implement step keeps `version = "0.17.0"` and folds `[Unreleased]` into `## 0.17.0`. If `v0.17.0` exists, it sets `version = "0.18.0"` and folds `[Unreleased]` into `## 0.18.0`. It never bumps the patch component.
 - **Alternatives:** (a) Let the implement step bump by Conventional Commit type. Rejected: a plan named `fix-...` gets a patch bump, and a patch release on arrow 59 after 0.17.0 on arrow 58 would reach every dependent on `exarrow-rs = "0.17"` through `cargo update` and break code that passes Arrow values between the crates.
-- **Rationale:** `AGENTS.md` requires the changelog update in the same PR as a user-facing change, and puts entries of a PR without a version bump under `## [Unreleased]`. Cargo treats versions with the same 0.x minor component as compatible, so the arrow 59 upgrade (entry [11]) needs a new 0.x minor version. `CONTRIBUTING.md` § Releasing requires a SemVer bump. Version 0.17.0 is in `Cargo.toml` and `CHANGELOG.md` but has no tag yet (latest tag `v0.16.0`), because it comes from the unmerged branch `feat/fix-export-parquet-transport-roundtrip`, on which this branch is stacked.
+- **Rationale:** `AGENTS.md` requires the changelog update in the same PR as a user-facing change, and puts entries of a PR without a version bump under `## [Unreleased]`. Cargo treats versions with the same 0.x minor component as compatible, so the arrow 59 upgrade (entry [11]) needs a new 0.x minor version. `CONTRIBUTING.md` § Releasing requires a SemVer bump. This branch is based on `main`, and tag `v0.17.0` exists, so the release that carries this plan is 0.18.0.
 - **Promotes to ADR:** no
 
 ### [11] Remove the Apache Thrift advisory by upgrading parquet, not by suppressing it
@@ -150,10 +150,10 @@ Headless run. No live interview took place. The orchestrator brief is the only i
     - CI flags on `exasol/docker-db:2026.1.0`: both pass, in 3 and 2 seconds.
     - Commit `95819035` (built from `git archive`) with plan 002's command `cargo test --test import_export_tests -- --ignored` on 2025.2.0: both hang.
     - Recorded runs: plan 002 (`specs/_recorded/002-fix-thrift-cve-upgrade-arrow-58/verification-report.md`) reports 40 passed and 2 hung on 2025.2.0 at commit `95819035`. Plan 008 reports 51 of 51 passed without naming the image. `AGENTS.md` starts `exasol/docker-db:latest`, which is 2026.1.0 on the planning host.
-    - Result: the hang depends on the server version. Neither a CI flag nor a driver change after commit `95819035` causes it, because the same commit hangs on 2025.2.0 today. The planning runs do not explain plan 002's 40 passes on 2025.2.0.
+    - Result: the hang depends on the server version, and entry [19] gives its cause. Neither a CI flag nor a driver change after commit `95819035` makes 2025.2.0 hang, because the same commit hangs on 2025.2.0 today.
 - **Consequences:**
-  - The eleven hanging tests get `#[ignore = "native Parquet import hangs against Exasol 2025.2.0 (the CI image) and passes on 2025.2.1 and 2026.1.0, see #<issue>"]`. CI does not run them while it uses 2025.2.0. The orchestrator files the follow-up issue (plan.md task 7.0). Fixing the hang, or moving the CI image to a version on which the tests pass, belongs to that issue.
-  - A user on Exasol 2025.2.0 who imports Parquet without forcing the CSV path waits without an error, because `supports_native_parquet_import` sends that version to the native path. plan.md § Impact states it.
+  - No native Parquet import test is ignored. Entries [19] and [20] fix the two causes of the hang, and entry [21] moves CI to `exasol/docker-db:2025.2.1`, on which every import/export test passes.
+  - A test that hangs or fails in CI gets its cause fixed. A reasoned `#[ignore]` is for a test that cannot run in CI by design, such as the eight-minute opt-in check.
   - `test_csv_export_runs_past_the_former_five_minute_limit` gets `#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1"]` instead of losing its `#[ignore]`. It keeps its `EXARROW_LONG_EXPORT_CHECK` early return.
   - The `skip_if_no_exasol!` macro of `tests/driver_manager_tests.rs` panics under `REQUIRE_EXASOL=1`, as the macro in `tests/common/mod.rs` does, so that target also fails instead of skipping when Exasol is unavailable.
   - The import/export CI step gets `timeout-minutes: 10`, so a future hang fails that step instead of the whole 30-minute job.
@@ -175,7 +175,7 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 
 - **Decision:** The `integration-tests` job keeps `timeout-minutes: 30`, and every new step runs with `--test-threads=1`. The import/export step has its own `timeout-minutes: 10` (entry [15]). The paged-fetch tests run in `integration_tests` and `websocket_integration_tests`, which the job already runs with `--test-threads=1`.
 - **Alternatives:** (a) Raise the timeout. Rejected: the measured total stays well below 30 minutes.
-- **Rationale:** The last successful run of the job (run 30378579965, 2026-07-28) took 6 minutes 34 seconds, of which the Exasol container start and readiness wait took 2 minutes 33 seconds. In the planning run on a 4-CPU host, the import/export tests that pass took about 30 seconds of test time, `native_protocol_tests` 1.7 seconds, `native_transport_smoke_test` 0.2 seconds, and the three URI-schema tests 0.9 seconds. Each new target also compiles once, which took 20 to 30 seconds per target on that host. The ten paged-fetch tests each move at most about 70 MB over the local connection. Estimate, not measured on the CI runner: the job grows by 3 to 6 minutes and stays below 15 minutes.
+- **Rationale:** The last successful run of the job (run 30378579965, 2026-07-28) took 6 minutes 34 seconds, of which the Exasol container start and readiness wait took 2 minutes 33 seconds. In the planning run on a 4-CPU host, the import/export tests that pass took about 30 seconds of test time, `native_protocol_tests` 1.7 seconds, `native_transport_smoke_test` 0.2 seconds, and the three URI-schema tests 0.9 seconds. Each new target also compiles once, which took 20 to 30 seconds per target on that host. The ten paged-fetch tests each move at most about 70 MB over the local connection. On `exasol/docker-db:2025.2.1`, the CI-flag runs took, including compilation on the planning host: `import_export_tests` 76 seconds for 54 tests, `integration_tests` 64 seconds, `websocket_integration_tests` 51 seconds, `native_protocol_tests` 16 seconds, and `native_transport_smoke_test` 21 seconds. Estimate, not measured on the CI runner: the job grows by 3 to 6 minutes and stays below 15 minutes.
 - **Promotes to ADR:** no
 
 ### [18] Versions and lockfile steps of the parquet upgrade
@@ -186,6 +186,48 @@ Headless run. No live interview took place. The orchestrator brief is the only i
 - **Consequences:**
   - After the manifest change, Cargo keeps adbc_core on the locked arrow 58.3.0 although adbc_core accepts 59. Task 6.1 unifies the Arrow sub-crates explicitly.
   - `specs/mission.md` § Tech Stack names arrow 59, parquet 59, and adbc 0.24 (task 6.6).
+- **Promotes to ADR:** no
+
+### [19] Native Parquet import is off on Exasol 2025.2.0
+
+- **Decision:** `supports_native_parquet_import` returns true for a version at or above `(2025, 1, 11)` other than `(2025, 2, 0)`. On Exasol 2025.2.0, Parquet import converts to CSV, as it does on servers below 2025.1.11.
+- **Alternatives:** (a) Keep 2025.2.0 on the native path and only fix the hang (entry [20]). Rejected: every Parquet import on 2025.2.0 would then fail with `ETL-2210` unless the caller forces the CSV path. (b) Raise the gate to `(2025, 2, 1)`. Rejected: it would also turn off native import on Exasol 2025.1.11 and later 2025.1.x releases, which the gate supports today. (c) Detect the rejection at run time and retry through CSV. Rejected: it costs one failed statement per import and depends on parsing an error message.
+- **Rationale:** Root-cause runs against local containers. Sent directly through `exapump` without the driver, `IMPORT INTO RC_PROBE.T FROM PARQUET AT 'http://127.0.0.1:9' FILE 'x.parquet'` fails on 2025.2.0 with `ETL-2210: AWS URL is invalid: Provided URL is not a valid AWS S3 URL (http://127.0.0.1:9/x.parquet)`. On 2025.2.1 the same statement fails only because nothing listens on the address (`ETL-2238: Remote File ... read failed. Couldn't connect to server`). On 2025.2.0 the same statement with `FROM CSV` also fails only on the connection (`ETL-5105`). A traced driver run of `test_parquet_import_from_file` on 2025.2.0 shows the IMPORT statement failing with `ETL-2210` after 0.2 seconds while the tunnel task waits. On 2025.2.1 the trace shows a `GET` with `Range: bytes=0-0`, a `HEAD`, five further range `GET`s, the server closing the tunnel, and the statement returning 3 rows. Exasol 2025.2.0 therefore accepts only S3 URLs as Parquet sources, and 2025.2.1 and 2026.1.0 accept HTTP sources. No local image exists for 2025.1.11, so the 2025.1.x part of the gate keeps the threshold it had.
+- **Consequences:** `connection-management/version-capability` owns the version rule, and `import-export/parquet-io` and `import-export/parallel-import` refer to `supports_native_parquet_import()` instead of naming 2025.1.11. An explicit `with_native_parquet(Some(true))` on 2025.2.0 returns `ETL-2210` (entry [20]). CI no longer runs a 2025.2.0 server, so plan.md § Manual Testing covers the 2025.2.0 fallback.
+- **Architecture:** § Data Flow, § Constraints
+- **Promotes to ADR:** no
+
+### [20] A failed IMPORT statement stops the tunnel tasks and returns its error
+
+- **Decision:** One crate-visible function in `src/import/parallel.rs` finishes an import from the IMPORT statement's result and its tunnel task. When the statement fails, the function aborts a tunnel task that has not finished and returns the statement's error, or the task's own error if the task failed first. Per-connection tasks stop together with their parent task. The five import paths that awaited the tunnel task after the statement use it. The single-file CSV path keeps its `tokio::select!`.
+- **Alternatives:** (a) Convert the five paths to the `tokio::select!` shape of the single-file CSV path. Rejected: the multi-file paths join a set of spawned per-connection tasks, so the change would rewrite each path instead of one shared ending. (b) Add a timeout to the tunnel task. Rejected: a fixed limit either cuts off a slow, healthy import or keeps a failed import waiting until it expires.
+- **Rationale:** Exasol never requests data after it rejects the statement, and it keeps the client's tunnel socket open, so a task that waits for the next HTTP request never finishes. Probes on 2025.2.0 and 2025.2.1 reproduce the hang for a missing target table: multi-file CSV import and native Parquet import never return within 30 seconds, while single-file CSV import returns `object NO_SUCH_SCHEMA_XYZ.NO_SUCH_TABLE not found`. The recorded scenario "Native Parquet import option overrides the server-version probe" already requires that the Exasol error reach the caller. One shared function gives the five paths one rule for ending an import, next to `resolve_stream_task`, which already collapses a tunnel task's outcome.
+- **Consequences:** An import that fails before Exasol requests data returns within the statement's own round trip. A tunnel task's protocol error still takes precedence over the statement's error, as before. `import-export/http-transport` states the behavior in a new scenario.
+- **Architecture:** § Data Flow
+- **Promotes to ADR:** no
+
+### [21] CI runs on `exasol/docker-db:2025.2.1`
+
+- **Decision:** The `integration-tests` job and the `EXASOL_TAG` default of `scripts/run_all_tests.sh` use `exasol/docker-db:2025.2.1` instead of 2025.2.0.
+- **Alternatives:** (a) Keep 2025.2.0. Rejected: after entry [19], every Parquet import on 2025.2.0 takes the CSV path, so CI would never run the native path. (b) Move to 2026.1.0. Rejected: the planning runs on 2026.1.0 covered only two tests, and 2025.2.1 is the closest image to the current one.
+- **Rationale:** On a local 2025.2.1 container, every integration target passes with the CI flags: `import_export_tests` 54 of 54 including the formerly ignored tests, `integration_tests` 69 passed and 4 ignored, `websocket_integration_tests` 44, `native_protocol_tests` 14, and `native_transport_smoke_test` 4. `driver_manager_tests` and the Python tests were not run on 2025.2.1 during planning.
+- **Consequences:** The CSV fallback for 2025.2.0 has no CI run. A unit test of the version gate and a manual run against 2025.2.0 cover it.
+- **Architecture:** § Constraints
+- **Promotes to ADR:** no
+
+### [22] Group A lands as its own commit for a possible arrow 58 backport
+
+- **Decision:** The paged-fetch fix (group A) lands as the first commit of this plan. It holds only group A's source, tests, and `CHANGELOG.md` lines, so a maintainer can cherry-pick it onto an arrow 58 release. Group C follows as the second commit and group B as the third.
+- **Alternatives:** (a) Split the plan into two PRs. Rejected: the user keeps the arrow 59 upgrade in this plan.
+- **Rationale:** User decision. Group A has no arrow 59 dependency, and a dependent on arrow 58, such as exapump today, cannot take the issue #80 fix from a release on arrow 59.
+- **Consequences:** This plan ships no backport release. A human decides whether one is needed. Group C also has no arrow dependency, so its commit can join a backport as well.
+- **Promotes to ADR:** no
+
+### [23] Contributor docs name the new import/export test command
+
+- **Decision:** `AGENTS.md`, `CONTRIBUTING.md`, and `specs/mission.md` § Commands name `REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1`. The `tests/common/mod.rs` doc example drops `#[ignore]`, and the `tests/driver_manager_tests.rs` module doc names `--include-ignored`.
+- **Alternatives:** none
+- **Rationale:** After task 7.2, `-- --ignored` selects only the eight-minute opt-in test of `import_export_tests`, and the lint check of task 7.3 rejects a bare `#[ignore]`, so the old instructions would mislead contributors and agents.
 - **Promotes to ADR:** no
 
 ## Review Findings
@@ -233,4 +275,15 @@ Headless run. No live interview took place. The orchestrator brief is the only i
   - Round 1, all five: plan.md § Impact states how to decline the mismatch error. `fetch_all` closes the handle after a mismatch error (task 1.2, entry [4]). The overshoot message counts the offending batch (spec step, tasks 1.1 and 1.4). A new unit test `test_fetch_all_small_result_set_sends_no_fetch` replaces the misleading tag (task 4.3). Task 7.7 runs the WebSocket unit tests in CI (entry [5]).
   - Round 2, two: plan.md § Context and entry [18] state that parquet 59.2.0 dropped `paste`, and task 6.1 requires `parquet` 59.2. The scenario "Suppression is removed when its advisory no longer applies" names an `advisory-not-detected` diagnostic.
   - Round 2 ADVISORY findings not applied: the group A commit for an arrow 58 backport, and the import/export commands in `AGENTS.md`, `CONTRIBUTING.md`, `specs/mission.md`, and the `tests/common/mod.rs` doc example. Task 7.0 covers the follow-up issue finding.
+- **Promotes to ADR:** no
+
+### [8] [plan-review] User decisions after review round 2
+
+- **Finding:** The user reviewed the plan after round 2. (1) Keep the row-count mismatch error of entry [4]. (2) Keep the arrow and parquet 59 and adbc 0.24 upgrade in this plan. (3) Land group A as its own commit for a possible arrow 58 backport. (4) Do not ignore the native Parquet import tests in CI; find the root cause of the hang on `exasol/docker-db:2025.2.0` and fix it, or keep the tests running in CI. (5) Update the import/export test command in the contributor docs. The branch is now based on `main`, and tag `v0.17.0` exists.
+- **Direction change:**
+  - (1) and (2): entries [4] and [11] stay unchanged.
+  - (3): entry [22] and plan.md § Parallelization make group A the first, self-contained commit.
+  - (4): root-cause runs found two causes. Exasol 2025.2.0 rejects HTTP Parquet sources with `ETL-2210` (entry [19]). The driver hangs whenever an IMPORT statement fails before Exasol requests data, on every server version (entry [20]). New group C (tasks 8.1 to 8.8) fixes both, adds the scenario "Failed IMPORT statement returns its error without waiting for the tunnel", excludes 2025.2.0 from native Parquet import, and moves CI to 2025.2.1 (entry [21]). Task 7.0 and the eleven `#[ignore]` reasons are removed. Only the eight-minute opt-in test keeps a reasoned `#[ignore]`.
+  - (5): task 7.8 and entry [23].
+  - Entry [10] states 0.18.0 as the release version. Review finding [1] above records the earlier ignore-based direction that this entry replaces.
 - **Promotes to ADR:** no
