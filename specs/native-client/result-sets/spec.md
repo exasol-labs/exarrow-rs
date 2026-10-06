@@ -44,10 +44,10 @@ Native protocol result sets contain: a result type marker (1 byte), result set h
 
 ### Scenario: Large result set (multi-fetch)
 
-* *GIVEN* a query returns a result set with a positive handle
-* *AND* the initial message contains fewer rows than total_rows
+* *GIVEN* a query or a prepared statement returns a result set with a positive handle whose initial message contains fewer rows than total_rows
 * *WHEN* retrieving the full result
 * *THEN* the system SHALL issue `CMD_FETCH2` commands to retrieve remaining rows
+* *AND* each `CMD_FETCH2` for the handle SHALL start at the rows received in the initial message plus the rows received by every earlier `CMD_FETCH2` for that handle
 * *AND* each fetch response SHALL be converted to an Arrow RecordBatch
 * *AND* the system SHALL close the result set handle after all rows are fetched
 

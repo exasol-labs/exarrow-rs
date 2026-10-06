@@ -83,15 +83,6 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *THEN* Exasol SHALL respond with 24-byte packet containing internal address
 * *AND* internal address SHALL be parsed as: bytes 4-7 = port (i32 LE), bytes 8-23 = IP (null-padded string)
 
-### Scenario: TLS encryption with ad-hoc certificates
-
-* *GIVEN* TLS encryption is configured for the connection
-* *WHEN* TLS encryption is enabled
-* *THEN* client SHALL generate ad-hoc RSA certificate
-* *AND* client SHALL wrap connection with TLS after magic packet exchange
-* *AND* client SHALL compute SHA-256 fingerprint of DER-encoded public key
-* *AND* fingerprint SHALL be formatted as `sha256//<base64>` for SQL PUBLIC KEY clause
-
 ### Scenario: Internal address used in SQL statements
 
 * *GIVEN* the EXA tunneling handshake has completed successfully
@@ -123,24 +114,11 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *AND* client SHALL receive PUT request with chunked transfer encoding
 * *AND* client SHALL read data chunks until zero-length terminator
 
-### Scenario: WebSocket TLS and HTTP transport TLS are independent
+### Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
 
-* *GIVEN* a connection has been established to Exasol with the main control channel (WebSocket or native TCP) using its own TLS configuration
-* *WHEN* the application initiates an import or export operation that uses the HTTP transport tunnel
-* *THEN* the HTTP-transport TLS setting (`use_tls(bool)` on the import/export options) SHALL be evaluated independently of the main control channel's TLS state
-* *AND* the driver MUST NOT infer the HTTP-transport TLS setting from the control channel's TLS configuration
-* *AND* the documented default for the HTTP-transport `use_tls` SHALL remain `false` because Exasol generates ad-hoc certificates for the tunnel that fail standard certificate validation in many client environments
-
-### Scenario: HTTP transport TLS against Exasol Docker (self-signed certificate)
-
-* *GIVEN* the application connects to a local `exasol/docker-db` instance with a control-channel connection string of the form `exasol://sys:exasol@localhost:8563/?validateservercertificate=0`
-* *WHEN* the application performs an import or export through the HTTP transport tunnel
-* *THEN* the application SHOULD set `use_tls(false)` on the import/export options
-* *AND* the driver SHALL use a plain HTTP tunnel (no rustls wrap) so that the Exasol-side SQLProcess can connect back without certificate-validation failures from the ad-hoc cert
-
-### Scenario: HTTP transport TLS against Exasol SaaS / production
-
-* *GIVEN* the application connects to a managed or production Exasol cluster with TLS termination on the control channel and a trusted certificate chain
-* *WHEN* the application performs an import or export through the HTTP transport tunnel
-* *THEN* the application SHOULD set `use_tls(true)` on the import/export options
-* *AND* the driver SHALL generate an ad-hoc RSA certificate, wrap the tunnel with rustls, and pass the SHA-256 fingerprint as `PUBLIC KEY 'sha256//<base64>'` in the IMPORT/EXPORT SQL `AT` clause
+* *GIVEN* a single-file or multi-file CSV or Parquet import has opened its HTTP tunnel connections and sent its IMPORT statement
+* *AND* Exasol rejects the IMPORT statement before it requests data through a tunnel, for example because the target table does not exist
+* *WHEN* the IMPORT statement returns its error
+* *THEN* the system SHALL stop serving the tunnel connections and SHALL return the Exasol error to the caller
+* *AND* the system MUST NOT wait for Exasol to close a tunnel connection
+* *AND* when a tunnel task has failed before the IMPORT statement returns its error, the system SHALL return that task's error

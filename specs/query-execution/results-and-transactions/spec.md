@@ -1,36 +1,12 @@
 # Feature: Results and Transactions
 
-Specifies result set retrieval, transaction management, and query metadata for SQL query execution.
+Specifies transaction management and query metadata for SQL query execution.
 
 ## Background
 
-Query results are retrieved efficiently with support for both small single-fetch result sets and large paginated result sets. All result data is converted to Arrow RecordBatch format with full schema metadata. Transaction management supports explicit begin/commit/rollback operations as well as auto-commit mode (enabled by default). Query execution metadata including timing, row counts, and warnings is available after each query completes.
+Transaction management supports explicit begin/commit/rollback operations as well as auto-commit mode (enabled by default). Query execution metadata including timing, row counts, and warnings is available after each query completes.
 
 ## Scenarios
-
-### Scenario: Small result set retrieval
-
-* *GIVEN* a query has been executed
-* *WHEN* a query returns a small result set (< 1000 rows)
-* *THEN* it SHALL fetch all rows in a single request
-* *AND* it SHALL convert data to Arrow RecordBatch
-
-### Scenario: Large result set pagination
-
-* *GIVEN* a query has been executed
-* *WHEN* a query returns a large result set
-* *THEN* it SHALL support fetching results in batches
-* *AND* it SHALL provide mechanisms to retrieve subsequent batches
-* *AND* it SHALL maintain result set handle for pagination
-
-### Scenario: Result set metadata
-
-* *GIVEN* a query has been executed
-* *WHEN* retrieving result metadata
-* *THEN* it SHALL provide column names and types
-* *AND* it SHALL provide row count (if available)
-* *AND* it SHALL provide Arrow schema
-* *AND* the Arrow schema SHALL be available regardless of how many rows the result set contains, including zero rows
 
 ### Scenario: Explicit transaction begin
 
@@ -94,12 +70,3 @@ Query results are retrieved efficiently with support for both small single-fetch
 * *WHEN* EXPLAIN is used
 * *THEN* it SHALL return query execution plan information
 * *AND* it SHALL format plan data appropriately for display
-
-### Scenario: Zero-row result set preserves schema
-
-* *GIVEN* a query has been executed
-* *WHEN* the query returns a result set with zero rows
-* *THEN* it SHALL yield exactly one Arrow RecordBatch
-* *AND* that RecordBatch SHALL have a row count of zero
-* *AND* that RecordBatch SHALL carry the full column schema (column names and Arrow data types) derived from the result set's column metadata
-* *AND* it SHALL NOT return an empty batch list that drops the schema

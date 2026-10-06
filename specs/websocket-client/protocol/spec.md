@@ -26,9 +26,11 @@ The system implements the Exasol WebSocket API protocol as defined in https://gi
 ### Scenario: Fetch results command
 
 * *GIVEN* an authenticated WebSocket session exists
+* *AND* an `execute` or `executePreparedStatement` response has returned a result set handle
 * *WHEN* retrieving query results
 * *THEN* it SHALL send fetch commands for result data
 * *AND* it SHALL handle pagination for large result sets
+* *AND* each fetch command for the handle SHALL set `startPosition` to the number of rows that the execute response and every earlier fetch response for that handle delivered
 
 ### Scenario: Disconnect command
 
