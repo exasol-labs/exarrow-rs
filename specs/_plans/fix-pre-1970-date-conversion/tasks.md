@@ -4,7 +4,7 @@
 - [x] resolved
 - [x] implemented
 - [x] version-bumped
-- [ ] tested-green
+- [x] tested-green
 - [ ] recorded
 - [ ] pr-ready
 
