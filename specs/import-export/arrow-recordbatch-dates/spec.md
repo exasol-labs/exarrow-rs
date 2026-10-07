@@ -1,14 +1,13 @@
-# Feature: Arrow RecordBatch Import/Export
+# Feature: Arrow RecordBatch DATE and TIMESTAMP Conversion
 
-Specifies Arrow RecordBatch import and export capabilities, enabling direct transfer of Arrow-formatted data between applications and Exasol tables.
+Specifies how RecordBatch import and export convert DATE and TIMESTAMP values, including values before 1970 and values outside Exasol's range.
 
 ## Background
 
-Arrow RecordBatch import converts RecordBatch data to CSV format for streaming through the HTTP tunnel. Export converts CSV received from Exasol into Arrow RecordBatches with schemas reflecting Exasol column types. Both single RecordBatches and streams of RecordBatches are supported, along with Arrow IPC file format for persistent storage. Streaming export supports configurable batch sizes. The HTTP-transport TLS knob is exposed as a single fluent method `use_tls(bool)` on both option builders, replacing the earlier flag-style `with_encryption()` (import) and `use_encryption(bool)` (export) names.
+RecordBatch import converts Date32 and Timestamp values to CSV text by their year, month, and day in the proleptic Gregorian calendar, and export converts the CSV text that Exasol sends back to the same values. Exasol accepts DATE and TIMESTAMP values from 0001-01-01 to 9999-12-31. The general RecordBatch import and export behavior is specified in `import-export/arrow-recordbatch`.
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: Pre-1970 DATE and TIMESTAMP values round-trip through RecordBatch import and export
 
 * *GIVEN* a table `T` with columns `ID DECIMAL(18,0)`, `D DATE`, and `TS TIMESTAMP(6)`
@@ -17,9 +16,7 @@ Arrow RecordBatch import converts RecordBatch data to CSV format for streaming t
 * *THEN* `TO_CHAR(D, 'YYYY-MM-DD')` SHALL return `1968-01-01`, `0001-01-01`, and `1900-03-01` for `ID` 1, 2, and 3
 * *AND* `TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6')` SHALL return `1969-12-31 23:59:59.999999`, `1969-12-31 12:00:00.000000`, and `1950-06-15 00:00:00.500000` for `ID` 1, 2, and 3
 * *AND* the exported RecordBatches SHALL hold the same `D` and `TS` values as the imported RecordBatch
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:NEW -->
 ### Scenario: RecordBatch import formats pre-epoch timestamps of every time unit as times before the epoch
 
 * *GIVEN* a RecordBatch with a Timestamp column whose value is -1
@@ -27,12 +24,9 @@ Arrow RecordBatch import converts RecordBatch data to CSV format for streaming t
 * *THEN* the text SHALL be `1969-12-31 23:59:59.000000`, `1969-12-31 23:59:59.999000`, `1969-12-31 23:59:59.999999`, and `1969-12-31 23:59:59.999999`, in that order
 * *AND* the `Microsecond` value -43200000000 SHALL convert to `1969-12-31 12:00:00.000000`
 * *AND* the `Microsecond` value -62135596800000000 SHALL convert to `0001-01-01 00:00:00.000000`
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:NEW -->
 ### Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
 
 * *GIVEN* a RecordBatch with a Date32 value 2932897 (10000-01-01), a Date32 value -719163 (0000-12-31), a `Timestamp(Second, None)` value 9223372036854775807, or a `Timestamp(Microsecond, None)` value 253402300800000000 (10000-01-01 00:00:00)
 * *WHEN* the import converts the value to CSV text
 * *THEN* the conversion SHALL return `ImportError::ConversionError` that names the value, and the import SHALL fail
-<!-- /DELTA:NEW -->

@@ -44,3 +44,11 @@ The system defines mappings from Arrow types to Exasol types for parameter bindi
 * *WHEN* a value exceeds Arrow type capacity
 * *THEN* it SHALL return a type conversion error
 * *AND* it SHALL specify which column and value caused the overflow
+
+### Scenario: Parameter binding formats pre-epoch DATE and TIMESTAMP values and rejects values outside Exasol's range
+
+* *GIVEN* a Date32 parameter value -731 and a `Timestamp(Microsecond, None)` parameter value -1
+* *WHEN* the driver binds the values as prepared-statement parameters
+* *THEN* the bound text SHALL be `1968-01-01` and `1969-12-31 23:59:59.999999`
+* *AND* a Date32 value outside 0001-01-01 to 9999-12-31, such as 2932897, SHALL fail with `AdbcStatus::InvalidArguments`
+* *AND* a Timestamp value outside 0001-01-01 00:00:00 to 9999-12-31 23:59:59.999999, or one that overflows when converted to microseconds, SHALL fail with `AdbcStatus::InvalidArguments`
