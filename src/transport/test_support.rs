@@ -8,7 +8,8 @@
 //! keeps every line here out of the production coverage denominator.
 //!
 //! Doubles here: `MockTransport` and `StalledQueryTransport` for the
-//! `TransportProtocol` trait, `FakeExasolServer` for the HTTP-tunnel wire
+//! `TransportProtocol` trait with `transport_session_info` as the session a
+//! mocked login reports, `FakeExasolServer` for the HTTP-tunnel wire
 //! format, and `FakeWebSocketServer` (`websocket` feature) for scripted
 //! WebSocket API exchanges.
 
@@ -45,6 +46,19 @@ mock! {
         fn is_connected(&self) -> bool;
         async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError>;
         async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError>;
+    }
+}
+
+/// The session a mocked `authenticate` reports: a plain Exasol 8 login.
+pub(crate) fn transport_session_info() -> SessionInfo {
+    SessionInfo {
+        session_id: "1739284756".to_string(),
+        protocol_version: 3,
+        release_version: "8.32.0".to_string(),
+        database_name: "exadb".to_string(),
+        product_name: "EXASolution".to_string(),
+        max_data_message_size: 64 * 1024,
+        time_zone: Some("Europe/Berlin".to_string()),
     }
 }
 

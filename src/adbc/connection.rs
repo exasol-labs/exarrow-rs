@@ -174,7 +174,7 @@ impl Connection {
     }
 
     /// Connect using the given transport implementation.
-    async fn connect_with_transport<T: TransportProtocol + 'static>(
+    pub(crate) async fn connect_with_transport<T: TransportProtocol + 'static>(
         params: ConnectionParams,
         mut transport: T,
     ) -> Result<Self, ConnectionError> {
@@ -2421,7 +2421,7 @@ mod tests {
     // ========================================================================
 
     use crate::transport::messages::SessionInfo as TransportSessionInfo;
-    use crate::transport::test_support::MockTransport;
+    use crate::transport::test_support::{transport_session_info, MockTransport};
     use std::sync::Mutex as SyncMutex;
 
     /// Every SQL string the mocked transport was asked to execute, in order.
@@ -2448,18 +2448,6 @@ mod tests {
             statements
         );
         statements.into_iter().next().unwrap()
-    }
-
-    fn transport_session_info() -> TransportSessionInfo {
-        TransportSessionInfo {
-            session_id: "1739284756".to_string(),
-            protocol_version: 3,
-            release_version: "8.32.0".to_string(),
-            database_name: "exadb".to_string(),
-            product_name: "EXASolution".to_string(),
-            max_data_message_size: 64 * 1024,
-            time_zone: Some("Europe/Berlin".to_string()),
-        }
     }
 
     fn test_params() -> ConnectionParams {

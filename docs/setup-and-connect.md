@@ -13,11 +13,25 @@ exasol://[user[:password]@]host[:port][/schema][?params]
 ### Examples
 
 ```
-exasol://localhost:8563
+exasol://user@localhost:8563
 exasol://user:password@localhost:8563
 exasol://user:password@exasol.example.com:8563/my_schema
 exasol://user:password@host:8563/schema?connection_timeout=60
 ```
+
+### Credentials
+
+A username is required. The driver has no default user, so a connection without a username fails with `Username is required`.
+
+The username comes from one of three sources:
+
+- the userinfo part of the URI, as in `exasol://user@host`
+- the `user` or `username` query parameter
+- the ADBC `username` database option (see [Driver Manager](driver-manager.md#credentials-as-database-options))
+
+The password comes from the matching sources: the userinfo part, as in `exasol://user:password@host`, the `password` or `pass` query parameter, or the ADBC `password` database option. A connection with no password from any source uses an empty password.
+
+Each field resolves on its own, in this order: the ADBC option, then the userinfo, then the query parameter (`user` before `username`, `password` before `pass`). URI values are percent-decoded. ADBC option values are used verbatim and need no encoding.
 
 ## Docker Quickstart
 
@@ -75,8 +89,8 @@ All parameters are set via URL query string (`?key=value&key2=value2`).
 | `idle_timeout` | — | `600` | Idle connection timeout in seconds |
 | `client_name` | — | `exarrow-rs` | Client application name sent to server |
 | `client_version` | — | crate version | Client version string sent to server |
-| `user` / `username` | — | — | Alternative to `user:password@` in the URL |
-| `password` / `pass` | — | — | Alternative to `:password@` in the URL |
+| `user` / `username` | — | — | Username, used when the URI userinfo omits it (see [Credentials](#credentials)) |
+| `password` / `pass` | — | — | Password, used when the URI userinfo omits it (see [Credentials](#credentials)) |
 
 ### Boolean Parameter Values
 

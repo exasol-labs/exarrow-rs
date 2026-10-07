@@ -69,6 +69,85 @@ impl ConnectionParams {
     pub fn builder() -> ConnectionBuilder {
         ConnectionBuilder::new()
     }
+
+    /// Parse a connection URI and merge credentials given outside it, such as
+    /// the ADBC `username` and `password` database options.
+    ///
+    /// Each credential resolves on its own: the given value when it is `Some`,
+    /// even when empty, else the URI userinfo, else the `user` then `username`
+    /// query key (`password` then `pass` for the password). The password falls
+    /// back to empty; a missing username fails with `Username is required`, so
+    /// no connection logs in as a user the caller did not name. Given values
+    /// are used verbatim and never percent-decoded, because they are not part
+    /// of the URI. The credential query keys are always consumed, so none of
+    /// them is kept as a connection attribute.
+    pub(crate) fn parse_with_credentials(
+        uri: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Self, ConnectionError> {
+        let url = uri.trim().strip_prefix("exasol://").ok_or_else(|| {
+            ConnectionError::ParseError("Connection string must start with 'exasol://'".to_string())
+        })?;
+
+        let (main_part, query_string) = match url.split_once('?') {
+            Some((main, query)) => (main, Some(query)),
+            None => (url, None),
+        };
+
+        let mut params = parse_query_params(query_string)?;
+
+        let (auth_part, host_part) = match main_part.rfind('@') {
+            Some(pos) => (Some(&main_part[..pos]), &main_part[pos + 1..]),
+            None => (None, main_part),
+        };
+
+        let (userinfo_username, userinfo_password) = match auth_part {
+            Some(auth) => {
+                let (user, pass) = parse_auth(auth)?;
+                (Some(user), pass)
+            }
+            None => (None, None),
+        };
+        let query_user = params.remove("user");
+        let query_username = params.remove("username");
+        let query_password = params.remove("password");
+        let query_pass = params.remove("pass");
+
+        let username = username
+            .map(str::to_string)
+            .or(userinfo_username)
+            .or(query_user)
+            .or(query_username)
+            .ok_or_else(|| ConnectionError::ParseError("Username is required".to_string()))?;
+        let password = password
+            .map(str::to_string)
+            .or(userinfo_password)
+            .or(query_password)
+            .or(query_pass)
+            .unwrap_or_default();
+
+        let (host_port, schema) = match host_part.split_once('/') {
+            Some((host, schema)) => (host, Some(schema).filter(|s| !s.is_empty())),
+            None => (host_part, None),
+        };
+
+        let (host, port) = parse_host_port(host_port)?;
+
+        let mut builder = ConnectionBuilder::new()
+            .host(&host)
+            .port(port)
+            .username(&username)
+            .password(&password);
+
+        if let Some(schema) = schema {
+            builder = builder.schema(schema);
+        }
+
+        builder = apply_query_params(builder, params)?;
+
+        builder.build()
+    }
 }
 
 impl FromStr for ConnectionParams {
@@ -77,87 +156,10 @@ impl FromStr for ConnectionParams {
     /// Parse a connection string in the format:
     /// `exasol://username[:password]@host[:port][/schema][?param=value&...]`
     ///
-    /// # Examples
-    ///
+    /// The username and password can also come from the `user`/`username` and
+    /// `password`/`pass` query keys when the userinfo omits them.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Parse the connection string
-        let url = s.trim();
-
-        // Check for exasol:// prefix
-        if !url.starts_with("exasol://") {
-            return Err(ConnectionError::ParseError(
-                "Connection string must start with 'exasol://'".to_string(),
-            ));
-        }
-
-        let url = &url[9..]; // Skip "exasol://"
-
-        // Split into main part and query string
-        let (main_part, query_string) = match url.split_once('?') {
-            Some((main, query)) => (main, Some(query)),
-            None => (url, None),
-        };
-
-        // Parse query parameters
-        let mut params = parse_query_params(query_string)?;
-
-        // Split main part into auth@host/schema
-        let (auth_part, host_part) = match main_part.rfind('@') {
-            Some(pos) => {
-                let auth = &main_part[..pos];
-                let host = &main_part[pos + 1..];
-                (Some(auth), host)
-            }
-            None => (None, main_part),
-        };
-
-        // Parse authentication
-        let (username, password) = if let Some(auth) = auth_part {
-            parse_auth(auth)?
-        } else {
-            // Check query params for username/password
-            let username = params
-                .remove("user")
-                .or_else(|| params.remove("username"))
-                .ok_or_else(|| ConnectionError::ParseError("Username is required".to_string()))?;
-            let password = params
-                .remove("password")
-                .or_else(|| params.remove("pass"))
-                .unwrap_or_default();
-            (username, password)
-        };
-
-        // Parse host and schema
-        let (host_port, schema) = match host_part.split_once('/') {
-            Some((host, schema)) => {
-                let schema = if schema.is_empty() {
-                    None
-                } else {
-                    Some(schema.to_string())
-                };
-                (host, schema)
-            }
-            None => (host_part, None),
-        };
-
-        // Parse host and port
-        let (host, port) = parse_host_port(host_port)?;
-
-        // Build connection params
-        let mut builder = ConnectionBuilder::new()
-            .host(&host)
-            .port(port)
-            .username(&username)
-            .password(&password);
-
-        if let Some(schema) = schema {
-            builder = builder.schema(&schema);
-        }
-
-        // Apply query parameters
-        builder = apply_query_params(builder, params)?;
-
-        builder.build()
+        Self::parse_with_credentials(s, None, None)
     }
 }
 
@@ -198,7 +200,7 @@ impl fmt::Display for ConnectionParams {
 }
 
 /// Builder for constructing ConnectionParams with validation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectionBuilder {
     host: Option<String>,
     port: Option<u16>,
@@ -410,25 +412,49 @@ impl Default for ConnectionBuilder {
     }
 }
 
+// Prevent password from being displayed in debug output
+impl fmt::Debug for ConnectionBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionBuilder")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("schema", &self.schema)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("query_timeout", &self.query_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("use_tls", &self.use_tls)
+            .field(
+                "validate_server_certificate",
+                &self.validate_server_certificate,
+            )
+            .field("certificate_fingerprint", &self.certificate_fingerprint)
+            .field("client_name", &self.client_name)
+            .field("client_version", &self.client_version)
+            .field("transport", &self.transport)
+            .field("attributes", &self.attributes)
+            .finish()
+    }
+}
+
 /// Parse query parameters from URL query string.
 fn parse_query_params(query: Option<&str>) -> Result<HashMap<String, String>, ConnectionError> {
     let mut params = HashMap::new();
 
     if let Some(query) = query {
-        for pair in query.split('&') {
+        for (index, pair) in query.split('&').enumerate() {
             if pair.is_empty() {
                 continue;
             }
 
-            let (key, value) = match pair.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => {
-                    return Err(ConnectionError::ParseError(format!(
-                        "Invalid query parameter format: {}",
-                        pair
-                    )));
-                }
-            };
+            // An unencoded password can shift into the query, so the error names the position only.
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                ConnectionError::ParseError(format!(
+                    "Invalid query parameter format at position {}: expected key=value",
+                    index + 1
+                ))
+            })?;
 
             // URL decode the values
             let key = urlencoding::decode(key)
@@ -445,35 +471,34 @@ fn parse_query_params(query: Option<&str>) -> Result<HashMap<String, String>, Co
     Ok(params)
 }
 
-/// Parse authentication part (username:password).
-fn parse_auth(auth: &str) -> Result<(String, String), ConnectionError> {
-    match auth.split_once(':') {
-        Some((user, pass)) => {
-            let user = urlencoding::decode(user)
-                .map_err(|e| {
-                    ConnectionError::ParseError(format!("Failed to decode username: {}", e))
-                })?
-                .into_owned();
-            let pass = urlencoding::decode(pass)
+/// Parse authentication part (username[:password]). The password is `Some`
+/// only when the part contains `:`, so `alice:` gives an empty password.
+fn parse_auth(auth: &str) -> Result<(String, Option<String>), ConnectionError> {
+    let (user, pass) = match auth.split_once(':') {
+        Some((user, pass)) => (user, Some(pass)),
+        None => (auth, None),
+    };
+    let user = urlencoding::decode(user)
+        .map_err(|e| ConnectionError::ParseError(format!("Failed to decode username: {}", e)))?
+        .into_owned();
+    let pass = pass
+        .map(|pass| {
+            urlencoding::decode(pass)
+                .map(|decoded| decoded.into_owned())
                 .map_err(|e| {
                     ConnectionError::ParseError(format!("Failed to decode password: {}", e))
-                })?
-                .into_owned();
-            Ok((user, pass))
-        }
-        None => {
-            let user = urlencoding::decode(auth)
-                .map_err(|e| {
-                    ConnectionError::ParseError(format!("Failed to decode username: {}", e))
-                })?
-                .into_owned();
-            Ok((user, String::new()))
-        }
-    }
+                })
+        })
+        .transpose()?;
+    Ok((user, pass))
 }
 
 /// Parse host and port.
 fn parse_host_port(host_port: &str) -> Result<(String, u16), ConnectionError> {
+    // The port text is never echoed: an unencoded '?' in a password leaves the password there.
+    let invalid_port =
+        || ConnectionError::ParseError("Invalid port: expected a number from 1 to 65535".into());
+
     // Check for IPv6 address format [host]:port
     if host_port.starts_with('[') {
         if let Some(close_bracket) = host_port.find(']') {
@@ -481,9 +506,7 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), ConnectionError> {
             let port_part = &host_port[close_bracket + 1..];
 
             let port = if let Some(stripped) = port_part.strip_prefix(':') {
-                stripped.parse().map_err(|_| {
-                    ConnectionError::ParseError(format!("Invalid port: {}", port_part))
-                })?
+                stripped.parse().map_err(|_| invalid_port())?
             } else {
                 8563
             };
@@ -495,9 +518,7 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), ConnectionError> {
     // Regular host:port or just host
     match host_port.rsplit_once(':') {
         Some((host, port_str)) => {
-            let port = port_str
-                .parse()
-                .map_err(|_| ConnectionError::ParseError(format!("Invalid port: {}", port_str)))?;
+            let port = port_str.parse().map_err(|_| invalid_port())?;
             Ok((host.to_string(), port))
         }
         None => Ok((host_port.to_string(), 8563)),
@@ -505,6 +526,9 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), ConnectionError> {
 }
 
 /// Apply query parameters to builder.
+///
+/// Errors name the query key and never repeat its value, because an unencoded
+/// password can shift into the query string.
 fn apply_query_params(
     mut builder: ConnectionBuilder,
     params: HashMap<String, String>,
@@ -512,38 +536,20 @@ fn apply_query_params(
     for (key, value) in params {
         match key.as_str() {
             "timeout" | "connection_timeout" => {
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| ConnectionError::InvalidParameter {
-                        parameter: key.clone(),
-                        message: format!("Invalid timeout value: {}", value),
-                    })?;
-                builder = builder.connection_timeout(Duration::from_secs(secs));
+                builder = builder.connection_timeout(parse_timeout(&key, &value)?);
             }
             "query_timeout" => {
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| ConnectionError::InvalidParameter {
-                        parameter: key.clone(),
-                        message: format!("Invalid timeout value: {}", value),
-                    })?;
-                builder = builder.query_timeout(Duration::from_secs(secs));
+                builder = builder.query_timeout(parse_timeout(&key, &value)?);
             }
             "idle_timeout" => {
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| ConnectionError::InvalidParameter {
-                        parameter: key.clone(),
-                        message: format!("Invalid timeout value: {}", value),
-                    })?;
-                builder = builder.idle_timeout(Duration::from_secs(secs));
+                builder = builder.idle_timeout(parse_timeout(&key, &value)?);
             }
             "tls" | "use_tls" | "ssl" => {
-                let use_tls = parse_bool(&value)?;
+                let use_tls = parse_bool(&key, &value)?;
                 builder = builder.use_tls(use_tls);
             }
             "validate_certificate" | "verify_certificate" | "validateservercertificate" => {
-                let validate = parse_bool(&value)?;
+                let validate = parse_bool(&key, &value)?;
                 builder = builder.validate_server_certificate(validate);
             }
             "client_name" => {
@@ -564,10 +570,8 @@ fn apply_query_params(
                     _ => {
                         return Err(ConnectionError::InvalidParameter {
                             parameter: "transport".to_string(),
-                            message: format!(
-                                "Invalid transport value: {}. Must be 'native' or 'websocket'",
-                                value
-                            ),
+                            message: "Invalid transport value. Must be 'native' or 'websocket'"
+                                .to_string(),
                         });
                     }
                 }
@@ -582,14 +586,26 @@ fn apply_query_params(
     Ok(builder)
 }
 
-/// Parse boolean value from string.
-fn parse_bool(s: &str) -> Result<bool, ConnectionError> {
-    match s.to_lowercase().as_str() {
+/// Parse a timeout given in whole seconds.
+fn parse_timeout(key: &str, value: &str) -> Result<Duration, ConnectionError> {
+    value
+        .parse()
+        .map(Duration::from_secs)
+        .map_err(|_| ConnectionError::InvalidParameter {
+            parameter: key.to_string(),
+            message: "Invalid timeout value: expected a whole number of seconds".to_string(),
+        })
+}
+
+/// Parse the boolean value of query key `key`.
+fn parse_bool(key: &str, value: &str) -> Result<bool, ConnectionError> {
+    match value.to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
         "false" | "0" | "no" | "off" => Ok(false),
         _ => Err(ConnectionError::InvalidParameter {
-            parameter: "boolean".to_string(),
-            message: format!("Invalid boolean value: {}", s),
+            parameter: key.to_string(),
+            message: "Invalid boolean value: expected true, false, 1, 0, yes, no, on, or off"
+                .to_string(),
         }),
     }
 }
@@ -1084,7 +1100,7 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             ConnectionError::InvalidParameter { parameter, message }
-                if parameter == "boolean" && message.contains("Invalid boolean value")
+                if parameter == "tls" && message.contains("Invalid boolean value")
         ));
     }
 
@@ -1266,5 +1282,279 @@ mod tests {
             .parse::<ConnectionParams>()
             .unwrap();
         assert_eq!(params.certificate_fingerprint.as_deref(), Some("ddeeff"));
+    }
+
+    // ============================================================
+    // Credential sources
+    // ============================================================
+
+    /// Scenario: Option credentials take precedence over URI credentials
+    #[test]
+    fn test_parse_with_credentials_options_override_userinfo() {
+        let params = ConnectionParams::parse_with_credentials(
+            "exasol://nobody:Wrong1@db.example.com:8563",
+            Some("alice"),
+            Some("Secret1"),
+        )
+        .unwrap();
+
+        assert_eq!(params.username, "alice");
+        assert_eq!(params.password(), "Secret1");
+    }
+
+    /// Scenario: A single credential option replaces only its own field
+    #[test]
+    fn test_parse_with_credentials_password_option_keeps_userinfo_username() {
+        let params = ConnectionParams::parse_with_credentials(
+            "exasol://alice:Wrong1@db.example.com:8563",
+            None,
+            Some("Secret1"),
+        )
+        .unwrap();
+
+        assert_eq!(params.username, "alice");
+        assert_eq!(params.password(), "Secret1");
+    }
+
+    /// Scenario: Option password reaches the server verbatim
+    #[test]
+    fn test_parse_with_credentials_keeps_option_password_verbatim() {
+        for password in ["Ab?cd1234", "Ab%41cd1234", "Ab@:/#cd1234"] {
+            let params = ConnectionParams::parse_with_credentials(
+                "exasol://db.example.com:8563",
+                Some("alice"),
+                Some(password),
+            )
+            .unwrap();
+
+            assert_eq!(params.password(), password);
+            assert_eq!(params.host, "db.example.com");
+        }
+    }
+
+    /// Scenario: An at sign in a query parameter value does not change the host
+    #[test]
+    fn test_parse_with_credentials_at_sign_in_query_value_keeps_host() {
+        let params = ConnectionParams::parse_with_credentials(
+            "exasol://db.example.com:8563?client_name=dbt@ci",
+            Some("alice"),
+            Some("Secret1"),
+        )
+        .unwrap();
+
+        assert_eq!(params.host, "db.example.com");
+        assert_eq!(params.port, 8563);
+        assert_eq!(params.client_name, "dbt@ci");
+    }
+
+    /// Scenario: Missing username is rejected
+    #[test]
+    fn test_parse_with_credentials_requires_username() {
+        let message = ConnectionParams::parse_with_credentials(
+            "exasol://db.example.com:8563",
+            None,
+            Some("Secret1"),
+        )
+        .expect_err("a URI without any username source must be refused")
+        .to_string();
+
+        assert!(message.contains("Username is required"), "got: {message}");
+        assert!(!message.contains("Secret1"), "got: {message}");
+    }
+
+    #[test]
+    fn test_parse_with_credentials_empty_username_option_is_rejected() {
+        let message = ConnectionParams::parse_with_credentials(
+            "exasol://alice:Pw1@db.example.com:8563",
+            Some(""),
+            None,
+        )
+        .expect_err("an empty username option must not fall back to the URI user")
+        .to_string();
+
+        assert!(
+            message.contains("Username cannot be empty"),
+            "got: {message}"
+        );
+    }
+
+    /// Scenario: URI credentials apply when no credential option is set
+    #[test]
+    fn test_parse_with_credentials_decodes_userinfo_without_options() {
+        let params = ConnectionParams::parse_with_credentials(
+            "exasol://alice:Ab%3Fcd1234@db.example.com:8563",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(params.username, "alice");
+        assert_eq!(params.password(), "Ab?cd1234");
+    }
+
+    /// Scenario: Query credentials fill only what the userinfo omits
+    #[test]
+    fn test_parse_query_credentials_fill_only_what_userinfo_omits() {
+        let params = ConnectionParams::from_str(
+            "exasol://alice@db.example.com:8563?user=bob&username=carol&password=Secret1&pass=Other1",
+        )
+        .unwrap();
+
+        assert_eq!(params.username, "alice");
+        assert_eq!(params.password(), "Secret1");
+        for key in ["user", "username", "password", "pass"] {
+            assert!(
+                !params.attributes.contains_key(key),
+                "credential key {key} must not be kept as an attribute"
+            );
+        }
+    }
+
+    /// Scenario: Query user applies when only the password option is set
+    #[test]
+    fn test_parse_with_credentials_query_user_with_password_option() {
+        let params = ConnectionParams::parse_with_credentials(
+            "exasol://db.example.com:8563?user=bob&username=carol",
+            None,
+            Some("Secret1"),
+        )
+        .unwrap();
+
+        assert_eq!(params.username, "bob");
+        assert_eq!(params.password(), "Secret1");
+    }
+
+    /// Scenario: Password stays out of Debug output
+    #[test]
+    fn test_debug_redacts_password_from_every_source() {
+        let from_option = ConnectionParams::parse_with_credentials(
+            "exasol://db.example.com:8563",
+            Some("alice"),
+            Some("Secret1"),
+        )
+        .unwrap();
+        let from_userinfo =
+            ConnectionParams::from_str("exasol://alice:Secret1@db.example.com:8563").unwrap();
+        let from_query =
+            ConnectionParams::from_str("exasol://alice@db.example.com:8563?password=Secret1")
+                .unwrap();
+        for params in [&from_option, &from_userinfo, &from_query] {
+            assert_eq!(params.password(), "Secret1");
+        }
+        let builder = ConnectionBuilder::new()
+            .host("localhost")
+            .password("Secret1");
+
+        for debug in [
+            format!("{from_option:?}"),
+            format!("{from_userinfo:?}"),
+            format!("{from_query:?}"),
+            format!("{builder:?}"),
+        ] {
+            assert!(!debug.contains("Secret1"), "got: {debug}");
+        }
+    }
+
+    // ============================================================
+    // Parse errors
+    // ============================================================
+
+    /// Scenario: URI parse errors do not repeat URI values
+    #[test]
+    fn test_parse_errors_do_not_repeat_uri_values() {
+        // (URI, field named without the username option, field named with it)
+        let cases = [
+            (
+                "exasol://alice:Qx7?Kp9@db.example.com:8563",
+                "position 1",
+                "position 1",
+            ),
+            (
+                "exasol://alice:Qx7?k=1@db.example.com:8563",
+                "Username is required",
+                "Invalid port",
+            ),
+            (
+                "exasol://alice@db.example.com:Qx7",
+                "Invalid port",
+                "Invalid port",
+            ),
+            ("exasol://alice@[::1]:Qx7", "Invalid port", "Invalid port"),
+            (
+                "exasol://alice@db.example.com:8563?timeout=Qx7",
+                "'timeout'",
+                "'timeout'",
+            ),
+            (
+                "exasol://alice@db.example.com:8563?tls=Qx7",
+                "'tls'",
+                "'tls'",
+            ),
+            (
+                "exasol://alice@db.example.com:8563?transport=Qx7",
+                "'transport'",
+                "'transport'",
+            ),
+        ];
+
+        for (uri, without_option, with_option) in cases {
+            let outcomes = [
+                (ConnectionParams::from_str(uri), without_option),
+                (
+                    ConnectionParams::parse_with_credentials(uri, Some("alice"), None),
+                    with_option,
+                ),
+            ];
+            for (result, field) in outcomes {
+                let message = result
+                    .expect_err("an invalid URI must be refused")
+                    .to_string();
+                assert!(message.contains(field), "{uri}: got {message}");
+                for value in ["Qx7", "Kp9", "db.example.com"] {
+                    assert!(!message.contains(value), "{uri}: {message} repeats {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_query_param_error_counts_every_ampersand_separated_part() {
+        let cases = [
+            (
+                "exasol://alice@db.example.com:8563?tls=true&Kp9",
+                "position 2",
+            ),
+            (
+                "exasol://alice@db.example.com:8563?tls=true&&Kp9",
+                "position 3",
+            ),
+        ];
+
+        for (uri, position) in cases {
+            let message = ConnectionParams::from_str(uri)
+                .expect_err("a query part without '=' must be refused")
+                .to_string();
+
+            assert!(message.contains(position), "{uri}: got {message}");
+            assert!(!message.contains("Kp9"), "{uri}: got {message}");
+        }
+    }
+
+    /// Scenario: URI parse errors do not repeat URI values
+    #[test]
+    fn test_parse_error_for_unencoded_password_omits_password() {
+        let message = ConnectionParams::from_str("exasol://u:pa?ss@host")
+            .expect_err("an unencoded '?' in the password must fail to parse")
+            .to_string();
+        let other_password = ConnectionParams::from_str("exasol://u:xy?zw@host")
+            .expect_err("an unencoded '?' in the password must fail to parse")
+            .to_string();
+
+        assert_eq!(
+            message, other_password,
+            "the error text must not depend on the password"
+        );
+        assert!(!message.contains("ss"), "got: {message}");
+        assert!(!message.contains("pa?ss"), "got: {message}");
     }
 }

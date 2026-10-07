@@ -36,11 +36,12 @@
 
 mod common;
 
+use adbc_core::error::Status;
 use adbc_core::options::{
     AdbcVersion, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
 };
 use adbc_core::{Connection as AdbcConnection, Database, Driver, Optionable, Statement};
-use adbc_driver_manager::ManagedDriver;
+use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use arrow::array::{
     Array, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
 };
@@ -2728,4 +2729,245 @@ fn test_ffi_uri_schema_is_opened_on_connect() {
     stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
         .unwrap();
     let _ = stmt.execute_update();
+}
+
+// Credential Option Tests
+
+/// Passwords whose characters break a URI that is rebuilt by string pasting.
+const VERBATIM_PASSWORDS: [&str; 3] = ["Ab?cd1234", "Ab%41cd1234", "Ab@:/#cd1234"];
+
+fn load_driver() -> ManagedDriver {
+    ManagedDriver::load_dynamic_from_filename(
+        get_library_path(),
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver")
+}
+
+/// The test URI with no credentials, for tests that pass them as options.
+fn get_test_uri_without_credentials() -> String {
+    format!(
+        "exasol://{}:{}?tls=true&validateservercertificate=0",
+        get_host(),
+        get_port()
+    )
+}
+
+/// Open a database on `uri`, passing each given credential as a database option.
+fn open_database(uri: &str, username: Option<&str>, password: Option<&str>) -> ManagedDatabase {
+    let mut driver = load_driver();
+    let mut opts = vec![(OptionDatabase::Uri, OptionValue::String(uri.to_string()))];
+    if let Some(username) = username {
+        opts.push((
+            OptionDatabase::Username,
+            OptionValue::String(username.to_string()),
+        ));
+    }
+    if let Some(password) = password {
+        opts.push((
+            OptionDatabase::Password,
+            OptionValue::String(password.to_string()),
+        ));
+    }
+    driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database")
+}
+
+/// The user the server reports for the session of `conn`.
+fn current_user<C: AdbcConnection>(conn: &mut C) -> String {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT CURRENT_USER")
+        .expect("Failed to set query");
+    let users: Vec<String> = stmt
+        .execute()
+        .expect("SELECT CURRENT_USER should succeed")
+        .flat_map(|batch| strings_in(batch.expect("batch read should succeed").column(0)))
+        .collect();
+    assert_eq!(users.len(), 1, "expected one user, got {:?}", users);
+    users.into_iter().next().unwrap()
+}
+
+/// Log in through the driver manager with credential options only, and report
+/// the user the server sees.
+fn login_with_options(username: &str, password: &str) -> String {
+    let db = open_database(
+        &get_test_uri_without_credentials(),
+        Some(username),
+        Some(password),
+    );
+    let mut conn = db.new_connection().expect("Failed to create connection");
+    current_user(&mut conn)
+}
+
+/// Create a database user that can log in with `password`, and return its name.
+fn create_temporary_user<C: AdbcConnection>(admin_conn: &mut C, password: &str) -> String {
+    let name = generate_unique_test_name("EXARROW_CRED");
+    execute_ddl(
+        admin_conn,
+        format!("CREATE USER {} IDENTIFIED BY \"{}\"", name, password),
+    );
+    execute_ddl(admin_conn, format!("GRANT CREATE SESSION TO {}", name));
+    name
+}
+
+/// Drop a temporary user.
+///
+/// Failure is deliberately ignored so a cleanup problem never masks the
+/// assertion failure that actually matters.
+fn drop_temporary_user<C: AdbcConnection>(admin_conn: &mut C, name: &str) {
+    let mut stmt = admin_conn
+        .new_statement()
+        .expect("Failed to create statement");
+    stmt.set_sql_query(format!("DROP USER {} CASCADE", name))
+        .unwrap();
+    let _ = stmt.execute_update();
+}
+
+/// Scenario: Option credentials take precedence over URI credentials
+#[test]
+fn test_driver_manager_option_credentials_override_uri_credentials() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let uri = format!(
+        "exasol://NO_SUCH_USER:Wrong1@{}:{}?tls=true&validateservercertificate=0",
+        get_host(),
+        get_port()
+    );
+    let db = open_database(&uri, Some(&get_user()), Some(&get_password()));
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    assert_eq!(current_user(&mut conn), get_user().to_uppercase());
+}
+
+/// Scenario: A single credential option replaces only its own field
+#[test]
+fn test_driver_manager_password_option_keeps_uri_username() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let uri = format!(
+        "exasol://{}:Wrong1@{}:{}?tls=true&validateservercertificate=0",
+        get_user(),
+        get_host(),
+        get_port()
+    );
+    let db = open_database(&uri, None, Some(&get_password()));
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    assert_eq!(current_user(&mut conn), get_user().to_uppercase());
+}
+
+/// Scenario: Option password reaches the server verbatim
+#[test]
+fn test_driver_manager_option_password_reaches_server_verbatim() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let admin_db = open_database(&get_test_uri(), None, None);
+    let mut admin_conn = admin_db
+        .new_connection()
+        .expect("Failed to create admin connection");
+    let name = create_temporary_user(&mut admin_conn, "Initial1");
+
+    let mut logins = Vec::new();
+    for password in VERBATIM_PASSWORDS {
+        execute_ddl(
+            &mut admin_conn,
+            format!("ALTER USER {} IDENTIFIED BY \"{}\"", name, password),
+        );
+        logins.push((password, login_with_options(&name, password)));
+    }
+    drop_temporary_user(&mut admin_conn, &name);
+
+    for (password, user) in logins {
+        assert_eq!(user, name, "login with password {:?}", password);
+    }
+}
+
+/// Scenario: An at sign in a query parameter value does not change the host
+#[test]
+fn test_driver_manager_at_sign_in_query_value_keeps_host() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let uri = format!("{}&client_name=dbt@ci", get_test_uri_without_credentials());
+    let db = open_database(&uri, Some(&get_user()), Some(&get_password()));
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    assert_eq!(current_user(&mut conn), get_user().to_uppercase());
+}
+
+/// Scenario: Missing username is rejected
+#[test]
+fn test_driver_manager_missing_username_is_rejected() {
+    skip_if_no_library!();
+
+    let db = open_database(&get_test_uri_without_credentials(), None, Some("Secret1"));
+
+    let error = db
+        .new_connection()
+        .err()
+        .expect("a connection without a username must be refused");
+
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("Username is required"),
+        "got: {}",
+        error.message
+    );
+    assert!(!error.message.contains("Secret1"), "got: {}", error.message);
+}
+
+/// Scenario: URI credentials apply when no credential option is set
+#[test]
+fn test_driver_manager_uri_credentials_apply_without_options() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let admin_db = open_database(&get_test_uri(), None, None);
+    let mut admin_conn = admin_db
+        .new_connection()
+        .expect("Failed to create admin connection");
+    let name = create_temporary_user(&mut admin_conn, "Ab?cd1234");
+
+    let uri = format!(
+        "exasol://{}:Ab%3Fcd1234@{}:{}?tls=true&validateservercertificate=0",
+        name,
+        get_host(),
+        get_port()
+    );
+    let user = {
+        let db = open_database(&uri, None, None);
+        let mut conn = db.new_connection().expect("Failed to create connection");
+        current_user(&mut conn)
+    };
+    drop_temporary_user(&mut admin_conn, &name);
+
+    assert_eq!(user, name);
+}
+
+/// Scenario: URI parse errors do not repeat URI values
+#[test]
+fn test_driver_manager_uri_parse_error_omits_uri_values() {
+    skip_if_no_library!();
+
+    let uri = format!("exasol://alice:Qx7?Kp9@{}:{}", get_host(), get_port());
+    let db = open_database(&uri, Some("alice"), Some("Secret1"));
+
+    let error = db
+        .new_connection()
+        .err()
+        .expect("a URI with an unencoded '?' in the password must be refused");
+
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("position 1"),
+        "got: {}",
+        error.message
+    );
+    assert!(!error.message.contains("Qx7"), "got: {}", error.message);
+    assert!(!error.message.contains("Kp9"), "got: {}", error.message);
 }

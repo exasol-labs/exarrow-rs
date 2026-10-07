@@ -74,7 +74,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
 use crate::adbc::Connection as ExaConnection;
-use crate::error::{ExasolError, QueryError};
+use crate::connection::ConnectionParams;
+use crate::error::QueryError;
 use crate::query::prepared::PreparedStatement;
 use crate::query::Parameter;
 use crate::transport::messages::DataType as TransportDataType;
@@ -1016,19 +1017,15 @@ impl adbc_core::Driver for FfiDriver {
 ///
 /// This stores connection options and creates connections on demand.
 /// The primary option is `OptionDatabase::Uri` which should contain
-/// the Exasol connection string.
-///
-/// # Connection URI Format
-///
-///
-/// # Example
-///
+/// the Exasol connection string. A set `username` or `password` option
+/// replaces the matching URI credential verbatim, so a driver manager can pass
+/// credentials that would need percent-encoding inside the URI.
 pub struct FfiDatabase {
     /// URI for the connection (exasol://user:pass@host:port/schema)
     uri: Option<String>,
-    /// Username override
+    /// Username option; when set, replaces the URI username verbatim
     username: Option<String>,
-    /// Password override
+    /// Password option; when set, replaces the URI password verbatim
     password: Option<String>,
     /// Custom options
     options: std::collections::HashMap<String, OptionValue>,
@@ -1044,58 +1041,29 @@ impl FfiDatabase {
         }
     }
 
-    /// Build connection parameters from stored options.
-    /// This rebuilds the URI with any override credentials.
-    fn build_connection_uri(&self) -> AdbcResult<String> {
-        let uri = self.uri.as_ref().ok_or_else(|| {
+    /// Parse the `uri` option into connection parameters, with a set
+    /// `username` or `password` option replacing the URI value verbatim.
+    ///
+    /// The connection module owns the URI grammar, so this layer passes the
+    /// option values through and never reads or rewrites the URI string. A
+    /// parse error or a missing username reports `InvalidArguments` when the
+    /// connection is created, not at its first statement.
+    fn build_connection_params(&self) -> AdbcResult<ConnectionParams> {
+        let uri = self.uri.as_deref().ok_or_else(|| {
             AdbcError::with_message_and_status(
-                "Database URI not set. Set adbc.exasol.uri option.",
+                "Database URI not set. Set the uri database option.",
                 AdbcStatus::InvalidState,
             )
         })?;
 
-        // If no overrides, use URI as-is
-        if self.username.is_none() && self.password.is_none() {
-            return Ok(uri.clone());
-        }
-
-        // Parse the URI and rebuild with overrides
-        // URI format: exasol://[user[:pass]@]host[:port][/schema][?params]
-        let uri_str = uri.as_str();
-        if !uri_str.starts_with("exasol://") {
-            return Err(AdbcError::with_message_and_status(
-                "URI must start with exasol://",
-                AdbcStatus::InvalidArguments,
-            ));
-        }
-
-        let after_scheme = &uri_str[9..]; // Skip "exasol://"
-
-        // Find @, /, ? positions
-        let at_pos = after_scheme.rfind('@');
-        let (host_part, orig_user, orig_pass) = if let Some(at) = at_pos {
-            let auth_part = &after_scheme[..at];
-            let host_part = &after_scheme[at + 1..];
-            let (user, pass) = if let Some(colon) = auth_part.find(':') {
-                (&auth_part[..colon], Some(&auth_part[colon + 1..]))
-            } else {
-                (auth_part, None)
-            };
-            (host_part, Some(user), pass)
-        } else {
-            (after_scheme, None, None)
-        };
-
-        // Use overrides or originals
-        let user = self.username.as_deref().or(orig_user).unwrap_or("sys");
-        let pass = self.password.as_deref().or(orig_pass).unwrap_or("");
-
-        // Rebuild URI
-        if pass.is_empty() {
-            Ok(format!("exasol://{}@{}", user, host_part))
-        } else {
-            Ok(format!("exasol://{}:{}@{}", user, pass, host_part))
-        }
+        ConnectionParams::parse_with_credentials(
+            uri,
+            self.username.as_deref(),
+            self.password.as_deref(),
+        )
+        .map_err(|err| {
+            AdbcError::with_message_and_status(err.to_string(), AdbcStatus::InvalidArguments)
+        })
     }
 }
 
@@ -1218,16 +1186,14 @@ impl adbc_core::Database for FfiDatabase {
     type ConnectionType = FfiConnection;
 
     fn new_connection(&self) -> AdbcResult<Self::ConnectionType> {
-        let uri = self.build_connection_uri()?;
-        Ok(FfiConnection::new(uri))
+        Ok(FfiConnection::new(self.build_connection_params()?))
     }
 
     fn new_connection_with_opts(
         &self,
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> AdbcResult<Self::ConnectionType> {
-        let uri = self.build_connection_uri()?;
-        let mut conn = FfiConnection::new(uri);
+        let mut conn = FfiConnection::new(self.build_connection_params()?);
         for (key, value) in opts {
             conn.set_option(key, value)?;
         }
@@ -1245,8 +1211,8 @@ impl adbc_core::Database for FfiDatabase {
 /// is lazily established on first use (when creating a statement or
 /// performing a transaction operation).
 pub struct FfiConnection {
-    /// Connection URI
-    uri: String,
+    /// Connection parameters, parsed and checked when the connection is created
+    params: ConnectionParams,
     /// The actual connection (lazily initialized), shared with statements
     inner: Option<Arc<Mutex<ExaConnection>>>,
     /// Pre-init options
@@ -1258,9 +1224,9 @@ pub struct FfiConnection {
 }
 
 impl FfiConnection {
-    fn new(uri: String) -> Self {
+    fn new(params: ConnectionParams) -> Self {
         Self {
-            uri,
+            params,
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
@@ -1329,12 +1295,8 @@ impl FfiConnection {
     /// Ensure the connection is established.
     fn ensure_connected(&mut self) -> AdbcResult<Arc<Mutex<ExaConnection>>> {
         if self.inner.is_none() {
-            let uri = self.uri.clone();
             let conn = get_runtime()
-                .block_on(async {
-                    let params: crate::connection::ConnectionParams = uri.parse()?;
-                    ExaConnection::from_params(params).await
-                })
+                .block_on(ExaConnection::from_params(self.params.clone()))
                 .map_err(to_adbc_error)?;
             self.inner = Some(Arc::new(Mutex::new(conn)));
         }
@@ -1494,7 +1456,7 @@ impl adbc_core::Connection for FfiConnection {
 
     fn new_statement(&mut self) -> AdbcResult<Self::StatementType> {
         let conn = self.ensure_connected()?;
-        let mut stmt = FfiStatement::with_connection(Some(conn), self.uri.clone());
+        let mut stmt = FfiStatement::with_connection(conn);
         stmt.auto_commit = self.auto_commit;
         Ok(stmt)
     }
@@ -1873,15 +1835,13 @@ fn arrow_value_to_parameter(array: &dyn Array, row: usize) -> AdbcResult<Paramet
 
 /// FFI-compatible ADBC Statement wrapper.
 ///
-/// Used to execute SQL queries and retrieve results as Arrow RecordBatches.
-///
-/// # Example
-///
+/// Executes SQL on the connection of the `FfiConnection` that created it and
+/// returns results as Arrow RecordBatches. It never opens a connection of its
+/// own, so it holds no credentials.
 pub struct FfiStatement {
-    /// Shared connection handle from the parent FfiConnection
+    /// Shared connection handle from the parent FfiConnection; `None` only for
+    /// a standalone test statement
     conn: Option<Arc<Mutex<ExaConnection>>>,
-    /// Connection URI (fallback for ephemeral connections)
-    uri: String,
     /// SQL query
     sql: Option<String>,
     /// Bound parameters as RecordBatch
@@ -1896,10 +1856,9 @@ pub struct FfiStatement {
 
 impl FfiStatement {
     #[cfg(test)]
-    fn new(uri: String) -> Self {
+    fn new() -> Self {
         Self {
             conn: None,
-            uri,
             sql: None,
             bound_data: None,
             options: std::collections::HashMap::new(),
@@ -1908,10 +1867,9 @@ impl FfiStatement {
         }
     }
 
-    fn with_connection(conn: Option<Arc<Mutex<ExaConnection>>>, uri: String) -> Self {
+    fn with_connection(conn: Arc<Mutex<ExaConnection>>) -> Self {
         Self {
-            conn,
-            uri,
+            conn: Some(conn),
             sql: None,
             bound_data: None,
             options: std::collections::HashMap::new(),
@@ -1999,65 +1957,30 @@ impl FfiStatement {
         Ok(total_count)
     }
 
-    /// Run `sql` as a query and collect its batches.
+    /// Run `sql` as a query on the parent connection and collect its batches.
     ///
-    /// A statement handed out by a connection shares that connection; a
-    /// standalone one opens and closes its own for this call. A statement that
-    /// produces no result set yields no batches rather than an error.
+    /// A statement that produces no result set yields no batches rather than
+    /// an error.
     fn query_sql(&self, sql: &str) -> AdbcResult<Vec<RecordBatch>> {
-        if let Some(conn_arc) = self.conn.as_ref() {
-            let conn_arc = Arc::clone(conn_arc);
-            return match get_runtime().block_on(async {
-                let mut conn = conn_arc.lock().await;
-                conn.query(sql).await
-            }) {
-                Ok(batches) => Ok(batches),
-                Err(QueryError::NoResultSet(_)) => Ok(vec![]),
-                Err(e) => Err(to_adbc_error(e)),
-            };
+        let conn_arc = self.require_connection()?;
+        match get_runtime().block_on(async {
+            let mut conn = conn_arc.lock().await;
+            conn.query(sql).await
+        }) {
+            Ok(batches) => Ok(batches),
+            Err(QueryError::NoResultSet(_)) => Ok(vec![]),
+            Err(e) => Err(to_adbc_error(e)),
         }
-
-        let uri = self.uri.clone();
-        let sql = sql.to_string();
-        get_runtime()
-            .block_on(async {
-                let params: crate::connection::ConnectionParams = uri.parse()?;
-                let mut conn = ExaConnection::from_params(params).await?;
-                let result = conn.query(&sql).await;
-                conn.close().await?;
-                match result {
-                    Ok(batches) => Ok(batches),
-                    Err(QueryError::NoResultSet(_)) => Ok(vec![]),
-                    Err(e) => Err(ExasolError::from(e)),
-                }
-            })
-            .map_err(to_adbc_error)
     }
 
-    /// Run `sql` as a non-query statement and report the affected-row count.
-    ///
-    /// Shares the parent connection when there is one, otherwise opens and
-    /// closes its own for this call.
+    /// Run `sql` as a non-query statement on the parent connection and report
+    /// the affected-row count.
     fn update_sql(&self, sql: &str) -> AdbcResult<i64> {
-        if let Some(conn_arc) = self.conn.as_ref() {
-            let conn_arc = Arc::clone(conn_arc);
-            return get_runtime()
-                .block_on(async {
-                    let mut conn = conn_arc.lock().await;
-                    conn.execute_update(sql).await
-                })
-                .map_err(to_adbc_error);
-        }
-
-        let uri = self.uri.clone();
-        let sql = sql.to_string();
+        let conn_arc = self.require_connection()?;
         get_runtime()
             .block_on(async {
-                let params: crate::connection::ConnectionParams = uri.parse()?;
-                let mut conn = ExaConnection::from_params(params).await?;
-                let count = conn.execute_update(&sql).await?;
-                conn.close().await?;
-                Ok::<_, ExasolError>(count)
+                let mut conn = conn_arc.lock().await;
+                conn.execute_update(sql).await
             })
             .map_err(to_adbc_error)
     }
@@ -2444,8 +2367,16 @@ pub unsafe extern "C" fn ExarrowDriverInit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adbc_core::{Driver, Statement};
+    use crate::transport::test_support::{transport_session_info, MockTransport};
+    use adbc_core::{Database, Driver, Statement};
     use arrow::datatypes::{DataType, Field};
+    use mockall::predicate::eq;
+
+    fn test_params() -> ConnectionParams {
+        "exasol://user@localhost:8563"
+            .parse()
+            .expect("the test URI must parse")
+    }
 
     #[test]
     fn test_ffi_driver_creation() {
@@ -2477,46 +2408,25 @@ mod tests {
     }
 
     #[test]
-    fn test_ffi_database_build_uri_with_overrides() {
-        let mut db = FfiDatabase::new();
+    fn test_ffi_database_build_params_with_overrides() {
+        let db = database_with(
+            "exasol://user:pass@localhost:8563/schema",
+            Some("admin"),
+            Some("secret"),
+        );
 
-        // Set base URI
-        db.set_option(
-            OptionDatabase::Uri,
-            "exasol://user:pass@localhost:8563/schema".into(),
-        )
-        .unwrap();
+        let params = db.build_connection_params().unwrap();
 
-        // Override username
-        db.set_option(OptionDatabase::Username, "admin".into())
-            .unwrap();
-
-        // Override password
-        db.set_option(OptionDatabase::Password, "secret".into())
-            .unwrap();
-
-        let uri = db.build_connection_uri().unwrap();
-        assert!(uri.contains("admin"));
-        assert!(uri.contains("secret"));
-        assert!(uri.contains("localhost:8563/schema"));
-    }
-
-    #[test]
-    fn test_ffi_connection_options() {
-        let mut conn = FfiConnection::new("exasol://user@localhost:8563".to_string());
-
-        // Set auto-commit
-        conn.set_option(OptionConnection::AutoCommit, "false".into())
-            .unwrap();
-        let auto_commit = conn
-            .get_option_string(OptionConnection::AutoCommit)
-            .unwrap();
-        assert_eq!(auto_commit, "false");
+        assert_eq!(params.username, "admin");
+        assert_eq!(params.password(), "secret");
+        assert_eq!(params.host, "localhost");
+        assert_eq!(params.port, 8563);
+        assert_eq!(params.schema.as_deref(), Some("schema"));
     }
 
     #[test]
     fn test_ffi_statement_sql() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
 
         stmt.set_sql_query("SELECT 1").unwrap();
         assert_eq!(stmt.sql, Some("SELECT 1".to_string()));
@@ -2680,7 +2590,7 @@ mod tests {
 
     #[test]
     fn test_get_parameter_schema_not_prepared() {
-        let stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let stmt = FfiStatement::new();
         let result = stmt.get_parameter_schema();
         assert!(result.is_err());
     }
@@ -2688,7 +2598,7 @@ mod tests {
     #[test]
     fn test_get_objects_invalid_catalog() {
         let conn = FfiConnection {
-            uri: "exasol://user@localhost:8563".to_string(),
+            params: test_params(),
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
@@ -2711,7 +2621,7 @@ mod tests {
     #[test]
     fn test_get_objects_no_connection() {
         let conn = FfiConnection {
-            uri: "exasol://user@localhost:8563".to_string(),
+            params: test_params(),
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
@@ -2734,7 +2644,7 @@ mod tests {
     #[test]
     fn test_get_table_schema_no_connection() {
         let conn = FfiConnection {
-            uri: "exasol://user@localhost:8563".to_string(),
+            params: test_params(),
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
@@ -2755,7 +2665,7 @@ mod tests {
 
     #[test]
     fn test_bulk_ingest_temporary_not_supported() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         stmt.set_option(
             OptionStatement::Other("adbc.ingest.target_table".to_string()),
             OptionValue::String("test_table".to_string()),
@@ -2783,7 +2693,7 @@ mod tests {
 
     #[test]
     fn test_bulk_ingest_no_bound_data() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         stmt.set_option(
             OptionStatement::Other("adbc.ingest.target_table".to_string()),
             OptionValue::String("test_table".to_string()),
@@ -2798,7 +2708,7 @@ mod tests {
 
     #[test]
     fn test_bulk_ingest_no_connection() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         stmt.set_option(
             OptionStatement::Other("adbc.ingest.target_table".to_string()),
             OptionValue::String("test_table".to_string()),
@@ -2820,7 +2730,7 @@ mod tests {
 
     #[test]
     fn test_bulk_ingest_unknown_mode() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         stmt.set_option(
             OptionStatement::Other("adbc.ingest.target_table".to_string()),
             OptionValue::String("test_table".to_string()),
@@ -2847,7 +2757,7 @@ mod tests {
 
     #[test]
     fn test_bulk_ingest_detection_in_execute() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         stmt.set_option(
             OptionStatement::Other("adbc.ingest.target_table".to_string()),
             OptionValue::String("test_table".to_string()),
@@ -2868,21 +2778,13 @@ mod tests {
 
     #[test]
     fn test_autocommit_default_true() {
-        let conn = FfiConnection::new("exasol://user@localhost:8563".to_string());
+        let conn = FfiConnection::new(test_params());
         assert!(conn.auto_commit);
     }
 
     #[test]
-    fn test_autocommit_set_false() {
-        let mut conn = FfiConnection::new("exasol://user@localhost:8563".to_string());
-        conn.set_option(OptionConnection::AutoCommit, "false".into())
-            .unwrap();
-        assert!(!conn.auto_commit);
-    }
-
-    #[test]
     fn test_statement_inherits_autocommit() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         assert!(stmt.auto_commit);
         stmt.auto_commit = false;
         assert!(!stmt.auto_commit);
@@ -3780,15 +3682,199 @@ mod tests {
     }
 
     // ========================================================================
+    // Credential sources
+    // ========================================================================
+
+    fn database_with(uri: &str, username: Option<&str>, password: Option<&str>) -> FfiDatabase {
+        let mut db = FfiDatabase::new();
+        db.set_option(OptionDatabase::Uri, uri.into())
+            .expect("set uri");
+        if let Some(username) = username {
+            db.set_option(OptionDatabase::Username, username.into())
+                .expect("set username");
+        }
+        if let Some(password) = password {
+            db.set_option(OptionDatabase::Password, password.into())
+                .expect("set password");
+        }
+        db
+    }
+
+    #[test]
+    fn test_ffi_database_without_uri_rejects_connection() {
+        let mut db = FfiDatabase::new();
+        db.set_option(OptionDatabase::Password, "Secret1".into())
+            .expect("set password");
+
+        let error = db
+            .new_connection()
+            .err()
+            .expect("a connection without a URI must be refused");
+
+        assert_eq!(error.status, AdbcStatus::InvalidState);
+        assert!(
+            error.message.contains("uri database option"),
+            "got: {}",
+            error.message
+        );
+        assert!(!error.message.contains("Secret1"), "got: {}", error.message);
+    }
+
+    /// Scenario: Missing username is rejected
+    #[test]
+    fn test_ffi_database_without_username_rejects_connection() {
+        let db = database_with("exasol://localhost:8563", None, Some("Secret1"));
+
+        let error = db
+            .new_connection()
+            .err()
+            .expect("a connection without a username must be refused");
+
+        assert_eq!(error.status, AdbcStatus::InvalidArguments);
+        assert!(
+            error.message.contains("Username is required"),
+            "got: {}",
+            error.message
+        );
+        assert!(!error.message.contains("Secret1"), "got: {}", error.message);
+    }
+
+    /// Scenario: Option password reaches the server verbatim
+    #[test]
+    fn test_ffi_database_option_password_is_verbatim() {
+        for password in ["Ab?cd1234", "Ab%41cd1234", "Ab@:/#cd1234"] {
+            let db = database_with("exasol://localhost:8563", Some("alice"), Some(password));
+
+            let params = db.build_connection_params().expect("params must build");
+
+            assert_eq!(params.password(), password);
+        }
+    }
+
+    /// Scenario: An at sign in a query parameter value does not change the host
+    #[test]
+    fn test_ffi_database_at_sign_in_query_value_keeps_host() {
+        let db = database_with(
+            "exasol://localhost:8563?client_name=dbt@ci",
+            Some("alice"),
+            Some("Secret1"),
+        );
+
+        let params = db.build_connection_params().expect("params must build");
+
+        assert_eq!(params.host, "localhost");
+        assert_eq!(params.client_name, "dbt@ci");
+    }
+
+    /// Scenario: Query user applies when only the password option is set
+    #[test]
+    fn test_ffi_database_query_user_with_password_option() {
+        let db = database_with(
+            "exasol://localhost:8563?user=bob&username=carol",
+            None,
+            Some("Secret1"),
+        );
+
+        let params = db.build_connection_params().expect("params must build");
+
+        assert_eq!(params.username, "bob");
+        assert_eq!(params.password(), "Secret1");
+    }
+
+    /// Scenario: URI parse errors do not repeat URI values
+    #[test]
+    fn test_ffi_database_parse_error_omits_uri_values() {
+        let db = database_with(
+            "exasol://alice:Qx7?Kp9@localhost:8563",
+            Some("alice"),
+            Some("Secret1"),
+        );
+
+        let error = db
+            .new_connection()
+            .err()
+            .expect("a URI with an unencoded '?' in the password must be refused");
+
+        assert_eq!(error.status, AdbcStatus::InvalidArguments);
+        assert!(
+            error.message.contains("position 1"),
+            "got: {}",
+            error.message
+        );
+        assert!(!error.message.contains("Qx7"), "got: {}", error.message);
+        assert!(!error.message.contains("Kp9"), "got: {}", error.message);
+    }
+
+    #[test]
+    fn test_ffi_statement_without_connection_does_not_dial() {
+        let mut stmt = FfiStatement::new();
+        stmt.set_sql_query("SELECT 1").expect("set query");
+
+        let query_error = stmt
+            .execute()
+            .err()
+            .expect("a standalone statement must not run a query");
+        let update_error = stmt
+            .execute_update()
+            .expect_err("a standalone statement must not run an update");
+
+        for error in [query_error, update_error] {
+            assert_eq!(error.status, AdbcStatus::InvalidState);
+            assert!(
+                error.message.contains("No connection available"),
+                "got: {}",
+                error.message
+            );
+        }
+    }
+
+    // ========================================================================
     // Connection options
     //
-    // Every case here is reachable without a server: an option that would need
-    // one (an autocommit change that opens or closes a transaction) is covered
-    // by the driver-manager suite instead.
+    // No case here needs a server: an autocommit change that opens a
+    // transaction runs over a mock transport.
     // ========================================================================
 
     fn unconnected_connection() -> FfiConnection {
-        FfiConnection::new("exasol://user@localhost:8563".to_string())
+        FfiConnection::new(test_params())
+    }
+
+    fn connected_connection(transport: MockTransport) -> FfiConnection {
+        let params = test_params();
+        let conn = get_runtime()
+            .block_on(ExaConnection::connect_with_transport(
+                params.clone(),
+                transport,
+            ))
+            .expect("mock transport must connect");
+        let mut ffi_conn = FfiConnection::new(params);
+        ffi_conn.inner = Some(Arc::new(Mutex::new(conn)));
+        ffi_conn
+    }
+
+    #[test]
+    fn set_option_auto_commit_false_opens_a_transaction_and_reports_false() {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_set_autocommit()
+            .with(eq(false))
+            .times(1)
+            .returning(|_| Ok(()));
+        transport.expect_close().returning(|| Ok(()));
+        let mut conn = connected_connection(transport);
+
+        conn.set_option(OptionConnection::AutoCommit, "false".into())
+            .unwrap();
+
+        assert_eq!(
+            conn.get_option_string(OptionConnection::AutoCommit)
+                .unwrap(),
+            "false"
+        );
     }
 
     #[test]
@@ -4162,7 +4248,7 @@ mod tests {
 
     #[test]
     fn statement_is_bulk_ingest_only_when_a_target_table_is_configured() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         assert!(!stmt.is_bulk_ingest());
 
         stmt.options
@@ -4172,7 +4258,7 @@ mod tests {
 
     #[test]
     fn statement_require_sql_reports_an_unset_query() {
-        let stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let stmt = FfiStatement::new();
 
         let error = stmt
             .require_sql()
@@ -4187,7 +4273,7 @@ mod tests {
 
     #[test]
     fn statement_require_sql_returns_the_configured_query() {
-        let mut stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let mut stmt = FfiStatement::new();
         stmt.set_sql_query("SELECT 1").expect("set query");
 
         assert_eq!(stmt.require_sql().expect("get query"), "SELECT 1");
@@ -4195,7 +4281,7 @@ mod tests {
 
     #[test]
     fn statement_require_connection_reports_a_standalone_statement() {
-        let stmt = FfiStatement::new("exasol://user@localhost:8563".to_string());
+        let stmt = FfiStatement::new();
 
         let error = stmt
             .require_connection()
