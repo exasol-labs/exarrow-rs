@@ -1,6 +1,6 @@
 # Feature: Credential Sources
 
-The driver takes the database username and password from the ADBC `username` and `password` database options, from the userinfo part of the connection URI, or from the URI query parameters. It resolves them into one set of connection parameters, so the credentials reach the server exactly as the caller gave them and a connection never logs in as a user the caller did not name.
+The driver takes the database username and password from the ADBC `username` and `password` database options, from the userinfo part of the connection URI, or from the URI query parameters. It resolves them into one set of connection parameters, so the credentials reach the server exactly as the caller gave them and a connection never logs in as a user the caller did not name. A password that is not percent-encoded can shift into the host, port, or query part of the URI, so an error from parsing the URI names the field at fault and never repeats a value from the URI.
 
 ## Background
 
@@ -78,3 +78,12 @@ The driver takes the database username and password from the ADBC `username` and
 * *AND* a connection builder with a password set
 * *WHEN* the connection parameters or the connection builder are formatted with `Debug`
 * *THEN* the output MUST NOT contain the password
+
+### Scenario: URI parse errors do not repeat URI values
+
+* *GIVEN* the connection URI `exasol://alice:Qx7?Kp9@db.example.com:8563`, whose password is not percent-encoded, so the text after `?` becomes a query parameter without `=`
+* *AND* the connection URI `exasol://alice:Qx7?k=1@db.example.com:8563`, whose unencoded `?` leaves `Qx7` in the port position
+* *AND* the connection URIs `exasol://alice@db.example.com:Qx7`, `exasol://alice@db.example.com:8563?timeout=Qx7`, `exasol://alice@db.example.com:8563?tls=Qx7`, and `exasol://alice@db.example.com:8563?transport=Qx7`
+* *WHEN* each URI is parsed into connection parameters, once without credential options and once with the ADBC `username` option `alice`
+* *THEN* parsing SHALL fail with an error message that names the field at fault, or the position of the query parameter without `=`
+* *AND* the error message MUST NOT contain `Qx7`, `Kp9`, or `db.example.com`
