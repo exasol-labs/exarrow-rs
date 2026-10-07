@@ -22,8 +22,8 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 <!-- DELTA:NEW -->
 ### Scenario: Tunnel setup is bounded by 30 seconds by default
 
-* *GIVEN* an import or export that opens its HTTP tunnel through `HttpTransportClient::connect`, as every import and export path in the driver does
-* *AND* the peer accepts the TCP connection and never sends the EXA handshake response
+* *GIVEN* an import or an export that opens its HTTP tunnel
+* *AND* the tunnel peer accepts the TCP connection and never sends the EXA handshake response
 * *WHEN* 30 seconds pass after the tunnel setup started
 * *THEN* the import or export SHALL fail with an error message that contains `HTTP tunnel setup timeout after 30000ms (EXA handshake)`
 * *AND* the driver MUST NOT send the IMPORT or EXPORT statement
