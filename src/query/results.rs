@@ -279,7 +279,7 @@ impl ResultSet {
                 Self::paginate_remaining(&self.transport, handle_val, metadata, batches.clone())
                     .await
             }
-            _ => Ok(batches.clone()),
+            _ => Self::check_buffered_rows(metadata, batches).map(|()| batches.clone()),
         };
 
         // Close the result set handle on the server to release resources
@@ -359,6 +359,21 @@ impl ResultSet {
         }
 
         Ok(Some(batch))
+    }
+
+    /// Verify that buffered rows match a known total, for results that need no fetch.
+    fn check_buffered_rows(
+        metadata: &QueryMetadata,
+        batches: &[RecordBatch],
+    ) -> Result<(), QueryError> {
+        let total = metadata.total_rows.unwrap_or(0).max(0) as usize;
+        let rows = Self::row_count_of(batches);
+        if total > 0 && rows != total {
+            return Err(QueryError::ExecutionFailed(format!(
+                "Result set delivered {rows} rows, but its total row count is {total}"
+            )));
+        }
+        Ok(())
     }
 
     fn row_count_of(batches: &[RecordBatch]) -> usize {
@@ -2373,13 +2388,47 @@ mod tests {
         transport.expect_fetch_results().times(0);
         transport.expect_close_result_set().times(0);
 
-        let batches = streaming_result_set(transport, &[1], 5, None)
+        let batches = streaming_result_set(transport, &[1, 2, 3], 3, None)
             .fetch_all()
             .await
             .unwrap();
 
         assert_eq!(batches.len(), 1);
-        assert_eq!(ResultSet::row_count_of(&batches), 1);
+        assert_eq!(ResultSet::row_count_of(&batches), 3);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_without_handle_fails_when_buffered_rows_miss_total() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        transport.expect_close_result_set().times(0);
+
+        let err = streaming_result_set(transport, &[1], 5, None)
+            .fetch_all()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains("delivered 1 rows"), "{message}");
+        assert!(message.contains("total row count is 5"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_without_handle_fails_when_buffered_rows_exceed_total() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().times(0);
+        transport.expect_close_result_set().times(0);
+
+        let err = streaming_result_set(transport, &[1, 2, 3], 2, None)
+            .fetch_all()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains("delivered 3 rows"), "{message}");
+        assert!(message.contains("total row count is 2"), "{message}");
     }
 
     #[tokio::test]

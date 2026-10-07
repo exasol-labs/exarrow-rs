@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::query::import::Compression;
 use crate::transport::HttpTransportClient;
@@ -305,18 +305,28 @@ pub async fn stream_files_parallel(
 
 /// Await every streaming task with fail-fast semantics.
 ///
-/// Reports the index of the failing task so a multi-file import points at the
-/// file that broke. Dropping a `JoinHandle` detaches its task, so a guard holds
-/// the handles from the call on and aborts the tasks not yet joined after the
-/// first failure or when the returned future is dropped.
+/// Tasks are polled concurrently, so a failure in any stream is reported
+/// without waiting for earlier streams. The error carries the index of the
+/// failing task so a multi-file import points at the file that broke. Dropping
+/// a `JoinHandle` detaches its task, so a guard holds the abort handles from
+/// the call on and aborts the unfinished tasks after the first failure or when
+/// the returned future is dropped.
 fn join_stream_handles(
     handles: Vec<JoinHandle<Result<(), ImportError>>>,
 ) -> impl Future<Output = Result<(), ImportError>> {
-    let mut unjoined = AbortOnDrop(handles);
+    let guard = AbortOnDrop(handles.iter().map(JoinHandle::abort_handle).collect());
     async move {
-        for (idx, handle) in unjoined.0.iter_mut().enumerate() {
-            handle
-                .await
+        let _guard = guard;
+        let mut joins = JoinSet::new();
+        for (idx, handle) in handles.into_iter().enumerate() {
+            joins.spawn(async move { (idx, handle.await) });
+        }
+
+        while let Some(joined) = joins.join_next().await {
+            let (idx, outcome) = joined.map_err(|e| {
+                ImportError::ParallelImportError(format!("Stream join task failed: {e}"))
+            })?;
+            outcome
                 .map_err(|e| {
                     ImportError::ParallelImportError(format!("Stream task {} panicked: {e}", idx))
                 })?
@@ -329,11 +339,11 @@ fn join_stream_handles(
     }
 }
 
-struct AbortOnDrop(Vec<JoinHandle<Result<(), ImportError>>>);
+struct AbortOnDrop(Vec<AbortHandle>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.iter().for_each(JoinHandle::abort);
+        self.0.iter().for_each(AbortHandle::abort);
     }
 }
 
@@ -856,6 +866,30 @@ mod tests {
             .await
             .expect("the remaining task must stop within 5 seconds");
         assert!(outcome.is_err(), "the remaining task must drop its sender");
+    }
+
+    /// Scenario: Fail-fast on streaming error
+    #[tokio::test]
+    async fn test_join_stream_handles_reports_a_later_failure_while_an_earlier_stream_is_pending() {
+        let (sender, receiver) = oneshot::channel::<()>();
+        let handles = vec![
+            tokio::spawn(async move {
+                let _held = sender;
+                std::future::pending::<Result<(), ImportError>>().await
+            }),
+            tokio::spawn(async { Err(ImportError::InvalidConfig("bad file".to_string())) }),
+        ];
+
+        let err = tokio::time::timeout(HANG_LIMIT, join_stream_handles(handles))
+            .await
+            .expect("a later failure must not wait for an earlier pending stream")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Stream 1 failed"), "got: {err}");
+        let outcome = tokio::time::timeout(HANG_LIMIT, receiver)
+            .await
+            .expect("the pending task must stop within 5 seconds");
+        assert!(outcome.is_err(), "the pending task must drop its sender");
     }
 
     #[tokio::test]
