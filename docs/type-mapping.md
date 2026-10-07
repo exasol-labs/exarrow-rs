@@ -40,6 +40,18 @@ Arrow `Decimal128` preserves the exact precision and scale.
 
 Exasol timestamps support 0–9 fractional digits. Arrow stores timestamps at microsecond precision, which covers most use cases.
 
+### DATE and TIMESTAMP before 1970
+
+`Date32` counts days and `Timestamp` counts microseconds from 1970-01-01 00:00:00. Values before that point are negative. Both use the proleptic Gregorian calendar and apply it to the year, month, and day that Exasol reports. This is the same calendar that Arrow tools use.
+
+Exasol labels dates before 1582-10-15 in the Julian calendar. The driver converts the year, month, and day as Exasol shows them, so such a date has the same text in Arrow tools as in Exasol. This has three consequences:
+
+- A day difference across 1582-10-15 is not the same as Exasol's `DAYS_BETWEEN`.
+- February 29 of the years 100, 200, 300, 500, 600, 700, 900, 1000, 1100, 1300, 1400, and 1500 converts to March 1, because Arrow's calendar has no such day.
+- On import, a `Date32` value for 1582-10-05 to 1582-10-14 becomes Exasol text that Exasol stores as 1582-10-15.
+
+Import and parameter binding convert Arrow values to Exasol text with the same calendar. Values outside 0001-01-01 to 9999-12-31 are rejected.
+
 ### INTERVAL
 
 Both interval types are returned as `Utf8` strings preserving the Exasol string representation:

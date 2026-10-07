@@ -487,11 +487,15 @@ pub async fn convert_parquet_files_to_csv(
                     ))
                 })?;
 
-                let csv_rows = record_batch_to_csv(&batch, &options).map_err(|e| {
-                    ImportError::ParallelImportError(format!(
+                // Keep ConversionError so callers see the same variant as a single-file import.
+                let csv_rows = record_batch_to_csv(&batch, &options).map_err(|e| match e {
+                    ImportError::ConversionError(msg) => {
+                        ImportError::ConversionError(format!("{}: {msg}", path.display()))
+                    }
+                    e => ImportError::ParallelImportError(format!(
                         "Failed to convert batch to CSV from {}: {e}",
                         path.display()
-                    ))
+                    )),
                 })?;
 
                 for row in csv_rows {
@@ -524,8 +528,9 @@ pub async fn convert_parquet_files_to_csv(
             .map_err(|e| {
                 ImportError::ParallelImportError(format!("Conversion task {} panicked: {e}", idx))
             })?
-            .map_err(|e| {
-                ImportError::ParallelImportError(format!("Conversion {} failed: {e}", idx))
+            .map_err(|e| match e {
+                e @ ImportError::ConversionError(_) => e,
+                e => ImportError::ParallelImportError(format!("Conversion {} failed: {e}", idx)),
             })?;
         results.push(csv_data);
     }
@@ -968,5 +973,40 @@ mod tests {
         assert_eq!(csv_data.len(), 2);
         assert_eq!(String::from_utf8(csv_data[0].clone()).unwrap(), "0,a\n");
         assert_eq!(String::from_utf8(csv_data[1].clone()).unwrap(), "1,b\n");
+    }
+
+    #[tokio::test]
+    async fn test_convert_parquet_files_to_csv_keeps_conversion_error_for_out_of_range_date() {
+        use arrow::array::Date32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut paths = Vec::new();
+        for (name, days) in [("ok", 0), ("bad", 3_000_000)] {
+            let path = dir.path().join(format!("{name}.parquet"));
+            let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Date32Array::from(vec![days]))],
+            )
+            .expect("batch");
+            let file = std::fs::File::create(&path).expect("create file");
+            let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+            writer.write(&batch).expect("write");
+            writer.close().expect("close");
+            paths.push(path);
+        }
+
+        let err = convert_parquet_files_to_csv(paths, 1024, String::new(), ',', '"')
+            .await
+            .expect_err("out-of-range date must fail");
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(msg) if msg.contains("bad.parquet")),
+            "got {err:?}"
+        );
     }
 }

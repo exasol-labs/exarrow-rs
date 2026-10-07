@@ -425,8 +425,7 @@ where
     // Check if file is already compressed before moving into async closure
     let file_is_compressed = is_compressed_file(file_path);
 
-    // Read the file synchronously
-    let data = std::fs::read(file_path)?;
+    let data = tokio::fs::read(file_path).await?;
 
     import_csv_internal(
         execute_sql,
@@ -531,7 +530,7 @@ where
         let file_is_compressed = is_compressed_file(path);
 
         // Read file
-        let data = std::fs::read(path)?;
+        let data = tokio::fs::read(path).await?;
 
         // Apply compression if needed
         let compressed_data = if file_is_compressed {

@@ -31,15 +31,6 @@ The system defines a complete mapping from Exasol data types to Apache Arrow dat
 * *AND* CHAR(n) SHALL map to Arrow Utf8 with padding handling
 * *AND* CLOB SHALL map to Arrow LargeUtf8
 
-### Scenario: Date and time types mapping
-
-* *GIVEN* an Exasol schema is provided with column type information
-* *WHEN* mapping Exasol temporal types
-* *THEN* DATE SHALL map to Arrow Date32
-* *AND* TIMESTAMP with fractional precision 0-9 SHALL map to Arrow Timestamp with appropriate TimeUnit
-* *AND* parameterized TIMESTAMP variants like `TIMESTAMP(3)` SHALL be parsed correctly, ignoring the precision parameter for Arrow mapping
-* *AND* INTERVAL types SHALL map to Arrow Duration or Interval types in the conversions that produce Arrow interval values, `TypeMapper::exasol_to_arrow` and the `arrow_conversion` converters, and SHALL map to Utf8 holding Exasol's text form of the value in the native transport's result sets (`native-client/type-conversion`) and in the CSV-based Parquet export (`import-export/parquet-io`)
-
 ### Scenario: Boolean type mapping
 
 * *GIVEN* an Exasol schema is provided with column type information

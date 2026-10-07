@@ -378,9 +378,9 @@ fn format_value(
         }
         DataType::Date32 => {
             let val = array.as_primitive::<Date32Type>().value(row_idx);
-            Ok(format_date32(val))
+            crate::types::conversion::format_date32(val).map_err(ImportError::ConversionError)
         }
-        DataType::Timestamp(unit, _tz) => Ok(format_timestamp(array, row_idx, unit)),
+        DataType::Timestamp(unit, _tz) => format_timestamp(array, row_idx, unit),
         DataType::Decimal128(_precision, scale) => format_decimal_value(array, row_idx, *scale),
         DataType::Binary => {
             let arr = array.as_binary::<i32>();
@@ -397,37 +397,28 @@ fn format_value(
     }
 }
 
-/// Format a timestamp value, normalizing every Arrow time unit to microseconds.
+/// Format a timestamp value of any Arrow time unit.
 fn format_timestamp(
     array: &dyn Array,
     row_idx: usize,
     unit: &arrow::datatypes::TimeUnit,
-) -> String {
+) -> Result<String, ImportError> {
     use arrow::datatypes::TimeUnit;
 
-    let micros = match unit {
-        TimeUnit::Second => {
-            let val = array.as_primitive::<TimestampSecondType>().value(row_idx);
-            val * 1_000_000
-        }
-        TimeUnit::Millisecond => {
-            let val = array
-                .as_primitive::<TimestampMillisecondType>()
-                .value(row_idx);
-            val * 1_000
-        }
+    let value = match unit {
+        TimeUnit::Second => array.as_primitive::<TimestampSecondType>().value(row_idx),
+        TimeUnit::Millisecond => array
+            .as_primitive::<TimestampMillisecondType>()
+            .value(row_idx),
         TimeUnit::Microsecond => array
             .as_primitive::<TimestampMicrosecondType>()
             .value(row_idx),
-        TimeUnit::Nanosecond => {
-            let val = array
-                .as_primitive::<TimestampNanosecondType>()
-                .value(row_idx);
-            val / 1_000
-        }
+        TimeUnit::Nanosecond => array
+            .as_primitive::<TimestampNanosecondType>()
+            .value(row_idx),
     };
 
-    format_timestamp_micros(micros)
+    crate::types::conversion::format_timestamp(unit, value).map_err(ImportError::ConversionError)
 }
 
 /// Format a Decimal128 array element using the column's declared scale.
@@ -485,52 +476,6 @@ fn format_float(val: f64) -> String {
         // Use default Rust formatting which handles precision well
         val.to_string()
     }
-}
-
-/// Format a Date32 value (days since epoch) to YYYY-MM-DD.
-fn format_date32(days: i32) -> String {
-    // Days since Unix epoch (1970-01-01)
-    let (year, month, day) = days_to_ymd(days);
-    format!("{:04}-{:02}-{:02}", year, month, day)
-}
-
-/// Convert days since epoch to year, month, day.
-fn days_to_ymd(days: i32) -> (i32, u32, u32) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = if z >= 0 {
-        z / 146097
-    } else {
-        (z - 146096) / 146097
-    };
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i32 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
-}
-
-/// Format a timestamp in microseconds since epoch to YYYY-MM-DD HH:MM:SS.ffffff.
-fn format_timestamp_micros(micros: i64) -> String {
-    let total_seconds = micros / 1_000_000;
-    let frac_micros = (micros % 1_000_000).unsigned_abs();
-
-    let days = (total_seconds / 86400) as i32;
-    let day_seconds = (total_seconds % 86400).unsigned_abs() as u32;
-
-    let (year, month, day) = days_to_ymd(days);
-    let hours = day_seconds / 3600;
-    let minutes = (day_seconds % 3600) / 60;
-    let seconds = day_seconds % 60;
-
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
-        year, month, day, hours, minutes, seconds, frac_micros
-    )
 }
 
 /// Format a Decimal128 value to a string with proper scale.
@@ -935,31 +880,6 @@ mod tests {
         assert_eq!(format_float(f64::NAN), "NaN");
         assert_eq!(format_float(f64::INFINITY), "Infinity");
         assert_eq!(format_float(f64::NEG_INFINITY), "-Infinity");
-    }
-
-    #[test]
-    fn test_format_date32() {
-        assert_eq!(format_date32(0), "1970-01-01");
-        assert_eq!(format_date32(1), "1970-01-02");
-        assert_eq!(format_date32(365), "1971-01-01");
-        assert_eq!(format_date32(-1), "1969-12-31");
-    }
-
-    #[test]
-    fn test_format_timestamp_micros() {
-        assert_eq!(format_timestamp_micros(0), "1970-01-01 00:00:00.000000");
-        assert_eq!(
-            format_timestamp_micros(1_000_000),
-            "1970-01-01 00:00:01.000000"
-        );
-        assert_eq!(
-            format_timestamp_micros(86_400_000_000),
-            "1970-01-02 00:00:00.000000"
-        );
-        assert_eq!(
-            format_timestamp_micros(123456),
-            "1970-01-01 00:00:00.123456"
-        );
     }
 
     #[test]
@@ -1627,57 +1547,72 @@ mod tests {
         assert!(!csv_str.contains("\"clean simple text\""));
     }
 
+    /// Scenario: RecordBatch import formats pre-epoch timestamps of every time unit as times before the epoch
     #[test]
-    fn test_days_to_ymd_edge_cases() {
-        // Test boundary dates
-        let (y, m, d) = days_to_ymd(0);
-        assert_eq!((y, m, d), (1970, 1, 1));
+    fn test_format_timestamp_before_epoch_in_every_unit() {
+        use arrow::array::{
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        };
 
-        // Leap year date - 2000-02-29 is day 11016 from epoch
-        let (y, m, d) = days_to_ymd(11016);
-        assert_eq!((y, m, d), (2000, 2, 29));
+        let options = CsvWriterOptions::default();
+        let arrays: [(ArrayRef, &str); 4] = [
+            (
+                Arc::new(TimestampSecondArray::from(vec![-1])),
+                "1969-12-31 23:59:59.000000",
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![-1])),
+                "1969-12-31 23:59:59.999000",
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![-1])),
+                "1969-12-31 23:59:59.999999",
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![-1])),
+                "1969-12-31 23:59:59.999999",
+            ),
+        ];
 
-        // 2000-03-01 is day 11017 from epoch
-        let (y, m, d) = days_to_ymd(11017);
-        assert_eq!((y, m, d), (2000, 3, 1));
-
-        // End of 1999 - December 31, 1999 is day 10956 from epoch
-        let (y, m, d) = days_to_ymd(10956);
-        assert_eq!((y, m, d), (1999, 12, 31));
+        for (array, expected) in arrays {
+            assert_eq!(
+                format_value(&options, array.as_ref(), 0).unwrap(),
+                expected,
+                "{:?}",
+                array.data_type()
+            );
+        }
     }
 
+    /// Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
     #[test]
-    fn test_days_to_ymd_before_epoch() {
-        assert_eq!(days_to_ymd(-1), (1969, 12, 31));
-        assert_eq!(days_to_ymd(-365), (1969, 1, 1));
-        // 1900-01-01 is 25567 days before the epoch; 1900 is not a leap year.
-        assert_eq!(days_to_ymd(-25567), (1900, 1, 1));
-        // Crosses the negative-era branch of the Hinnant algorithm.
-        assert_eq!(days_to_ymd(-719_468), (0, 3, 1));
-        assert_eq!(days_to_ymd(-719_469), (0, 2, 29));
-        // Before the year-zero era boundary, where the era divisor turns negative.
-        assert_eq!(days_to_ymd(-800_000), (-221, 9, 4));
-    }
+    fn test_format_value_rejects_dates_and_timestamps_outside_exasol_range() {
+        use arrow::array::TimestampSecondArray;
 
-    #[test]
-    fn test_format_date32_before_epoch() {
-        assert_eq!(format_date32(-1), "1969-12-31");
-        assert_eq!(format_date32(-25567), "1900-01-01");
-    }
+        let options = CsvWriterOptions::default();
+        let cases: [(ArrayRef, &str); 4] = [
+            (Arc::new(Date32Array::from(vec![2_932_897])), "2932897"),
+            (Arc::new(Date32Array::from(vec![-719_163])), "-719163"),
+            (
+                Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
+                "9223372036854775807",
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    253_402_300_800_000_000,
+                ])),
+                "253402300800000000",
+            ),
+        ];
 
-    #[test]
-    fn test_format_timestamp_micros_truncates_negative_day_offset() {
-        // Characterization: integer division truncates toward zero, so a
-        // pre-epoch timestamp keeps the epoch date and an absolute time of day.
-        // The parquet import path (chrono-based) renders these differently.
-        assert_eq!(
-            format_timestamp_micros(-1_000_000),
-            "1970-01-01 00:00:01.000000"
-        );
-        assert_eq!(
-            format_timestamp_micros(-86_400_000_000),
-            "1969-12-31 00:00:00.000000"
-        );
+        for (array, value) in cases {
+            let err = format_value(&options, array.as_ref(), 0).unwrap_err();
+            assert!(
+                matches!(&err, ImportError::ConversionError(message) if message.contains(value)),
+                "{:?} {value}: {err}",
+                array.data_type()
+            );
+        }
     }
 
     #[test]

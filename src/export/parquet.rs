@@ -269,7 +269,7 @@ pub async fn export_to_parquet(
     file_path: &Path,
     options: ParquetExportOptions,
 ) -> Result<u64, ParquetExportError> {
-    let file = std::fs::File::create(file_path)?;
+    let file = tokio::fs::File::create(file_path).await?.into_std().await;
     export_to_parquet_stream(csv_data, schema, file, options).await
 }
 

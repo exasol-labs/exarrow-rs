@@ -72,3 +72,23 @@ The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builder
 * *AND* the option builders MUST NOT expose `with_encryption(bool)` or `use_encryption(bool)` aliases
 * *AND* the underlying option struct field SHALL be named `use_tls` (renamed from `use_encryption`) so that public field access uses the same vocabulary as the builder
 * *AND* the default value of `use_tls` SHALL remain `false` to preserve current Docker/self-signed-cert behavior
+
+### Scenario: CSV-path Parquet import keeps pre-epoch timestamps with fractional seconds
+
+* *GIVEN* a table `T` with columns `ID DECIMAL(18,0)` and `TS TIMESTAMP(6)`
+* *AND* a Parquet file with the fields `ID` (Int64) and `TS` (`Timestamp(Microsecond, None)`), holding the rows `(1, -500000)` and `(2, -1)`
+* *WHEN* the application imports the file into `T` with `import_from_parquet` and `ParquetImportOptions::with_native_parquet(Some(false))`
+* *THEN* `TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6')` SHALL return `1969-12-31 23:59:59.500000` for `ID` 1 and `1969-12-31 23:59:59.999999` for `ID` 2
+
+### Scenario: CSV-path Parquet import formats pre-epoch timestamps of every time unit as times before the epoch
+
+* *GIVEN* a Parquet RecordBatch with a Timestamp column whose value is -1
+* *WHEN* the CSV path converts the value to CSV text for the time units `Second`, `Millisecond`, `Microsecond`, and `Nanosecond`
+* *THEN* the text SHALL be `1969-12-31 23:59:59.000000`, `1969-12-31 23:59:59.999000`, `1969-12-31 23:59:59.999999`, and `1969-12-31 23:59:59.999999`, in that order
+* *AND* the `Microsecond` value -500000 SHALL convert to `1969-12-31 23:59:59.500000`
+
+### Scenario: CSV-path Parquet import rejects DATE and TIMESTAMP values outside Exasol's range
+
+* *GIVEN* a Parquet RecordBatch with a Date32 value 2932897 (10000-01-01), a Date32 value -719163 (0000-12-31), a `Timestamp(Second, None)` value 9223372036854775807, or a `Timestamp(Microsecond, None)` value 253402300800000000 (10000-01-01 00:00:00)
+* *WHEN* the CSV path converts the value to CSV text
+* *THEN* the conversion SHALL return `ImportError::ConversionError` that names the value, and the import SHALL fail

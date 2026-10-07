@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.0
+
+- Fix: DATE and TIMESTAMP values before 1970 now convert to the correct day in query results on both transports and in `export_to_parquet`, `export_to_record_batches`, and `export_to_arrow_ipc`. Many such values came back one day late, some before 1902 one day early, and TIMESTAMP values were shifted by 24 hours. Dates before 1582-10-15 convert by their year, month, and day, as `docs/type-mapping.md` describes. Fixes #84.
+- Fix: Arrow RecordBatch, Arrow IPC, and ADBC bulk-ingestion imports, and the CSV path of Parquet import, now store TIMESTAMP values before 1970 at the correct instant. 1969-12-31 12:00:00 was stored as 1970-01-01 12:00:00, and a fractional second before 1970 moved to the other side of the epoch.
+- Fix: ADBC parameter binding stores TIMESTAMP values before 1677-09-21 and after 2262-04-11 at the correct instant.
+- Fix: async import and export no longer block the runtime on file reads and writes.
+- Changed: a Date32 or Timestamp value outside 0001-01-01 to 9999-12-31 now fails with `ImportError::ConversionError` on both import paths and with `InvalidArguments` in parameter binding. The Arrow import used to format an out-of-range year, and the date binding could panic.
+
 ## 0.17.1
 
 - Fix: `fetch_all()` and prepared-statement results return every row exactly once for WebSocket results larger than one fetch message and for results on both transports that are partly delivered with the execute response. Fixes #80.

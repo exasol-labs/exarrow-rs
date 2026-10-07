@@ -3472,3 +3472,250 @@ async fn test_parquet_export_fails_on_value_outside_default_session_format() {
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
 }
+
+/// Scenario: Export keeps pre-1970 DATE and TIMESTAMP values
+#[tokio::test]
+async fn test_parquet_export_keeps_pre_1970_dates_and_timestamps() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::{Date32Array, TimestampMicrosecondArray};
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), D DATE, TS TIMESTAMP(6)",
+    )
+    .await;
+    conn.execute_update(&format!(
+        "INSERT INTO {schema_name}.T VALUES \
+         (1, DATE '1968-01-01', TIMESTAMP '1950-06-15 00:00:00'), \
+         (2, DATE '0001-01-01', TIMESTAMP '1969-12-31 23:59:59.999999')"
+    ))
+    .await
+    .expect("INSERT should succeed");
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("t.parquet");
+    conn.export_to_parquet(
+        table_source(&schema_name, "T"),
+        &parquet_path,
+        ParquetExportOptions::default(),
+    )
+    .await
+    .expect("Parquet export should succeed");
+
+    let (_schema, batch) = read_parquet_file(&parquet_path);
+    let rows = row_of_id(&batch);
+    let dates = typed_column::<Date32Array>(&batch, "D");
+    let timestamps = typed_column::<TimestampMicrosecondArray>(&batch, "TS");
+
+    assert_eq!(dates.value(rows[&1]), -731);
+    assert_eq!(dates.value(rows[&2]), -719_162);
+    assert_eq!(timestamps.value(rows[&1]), -616_896_000_000_000);
+    assert_eq!(timestamps.value(rows[&2]), -1);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+async fn text_rows(conn: &mut Connection, sql: &str) -> Vec<Vec<String>> {
+    let batches = conn.query(sql).await.expect("the query must succeed");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let columns: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                arrow::compute::cast(column, &DataType::Utf8).expect("a column must cast to text")
+            })
+            .collect();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                columns
+                    .iter()
+                    .map(|column| {
+                        column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .expect("the cast must yield Utf8")
+                            .value(row)
+                            .to_string()
+                    })
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+/// Scenario: Pre-1970 DATE and TIMESTAMP values round-trip through RecordBatch import and export
+#[tokio::test]
+async fn test_arrow_round_trip_keeps_pre_1970_dates_and_timestamps() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::{Date32Array, TimestampMicrosecondArray};
+    use arrow::datatypes::TimeUnit;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), D DATE, TS TIMESTAMP(6)",
+    )
+    .await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("D", DataType::Date32, false),
+        Field::new(
+            "TS",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Date32Array::from(vec![-731, -719_162, -25_508])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                -1,
+                -43_200_000_000,
+                -616_895_999_500_000,
+            ])),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    conn.import_from_record_batch(
+        &format!("{schema_name}.T"),
+        &batch,
+        ArrowImportOptions::default(),
+    )
+    .await
+    .expect("Arrow import should succeed");
+
+    let rows = text_rows(
+        &mut conn,
+        &format!(
+            "SELECT ID, TO_CHAR(D, 'YYYY-MM-DD'), TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6') \
+             FROM {schema_name}.T ORDER BY ID"
+        ),
+    )
+    .await;
+    let expected = [
+        ("1968-01-01", "1969-12-31 23:59:59.999999"),
+        ("0001-01-01", "1969-12-31 12:00:00.000000"),
+        ("1900-03-01", "1950-06-15 00:00:00.500000"),
+    ];
+    let stored: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|row| (row[1].as_str(), row[2].as_str()))
+        .collect();
+    assert_eq!(stored, expected);
+
+    let exported = conn
+        .export_to_record_batches(
+            ExportSource::Query {
+                sql: format!("SELECT ID, D, TS FROM {schema_name}.T ORDER BY ID"),
+            },
+            ArrowExportOptions::default().with_schema(schema),
+        )
+        .await
+        .expect("Arrow export should succeed");
+    let exported = arrow::compute::concat_batches(&batch.schema(), &exported)
+        .expect("the exported batches must share the schema");
+    assert_eq!(
+        typed_column::<Date32Array>(&exported, "D"),
+        typed_column::<Date32Array>(&batch, "D")
+    );
+    assert_eq!(
+        typed_column::<TimestampMicrosecondArray>(&exported, "TS"),
+        typed_column::<TimestampMicrosecondArray>(&batch, "TS")
+    );
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: CSV-path Parquet import keeps pre-epoch timestamps with fractional seconds
+#[tokio::test]
+async fn test_parquet_import_csv_path_keeps_pre_epoch_fractional_timestamps() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::TimestampMicrosecondArray;
+    use arrow::datatypes::TimeUnit;
+    use parquet::arrow::ArrowWriter;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), TS TIMESTAMP(6)",
+    )
+    .await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new(
+            "TS",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(TimestampMicrosecondArray::from(vec![-500_000, -1])),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("pre_epoch.parquet");
+    let file = std::fs::File::create(&parquet_path).expect("Failed to create parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, schema, None).expect("Failed to create ArrowWriter");
+    writer.write(&batch).expect("Failed to write batch");
+    writer.close().expect("Failed to close ArrowWriter");
+
+    conn.import_from_parquet(
+        &format!("{schema_name}.T"),
+        &parquet_path,
+        ParquetImportOptions::default().with_native_parquet(Some(false)),
+    )
+    .await
+    .expect("Parquet import should succeed");
+
+    let rows = text_rows(
+        &mut conn,
+        &format!(
+            "SELECT ID, TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6') FROM {schema_name}.T ORDER BY ID"
+        ),
+    )
+    .await;
+    let stored: Vec<&str> = rows.iter().map(|row| row[1].as_str()).collect();
+    assert_eq!(
+        stored,
+        ["1969-12-31 23:59:59.500000", "1969-12-31 23:59:59.999999"]
+    );
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}

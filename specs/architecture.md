@@ -42,7 +42,7 @@
 - tls (src/transport/tls.rs): shared rustls certificate verifiers that accept any certificate or match a SHA-256 fingerprint | owns: none | depends on: none
 - import (src/import/): imports CSV, Parquet, Arrow RecordBatches, and Arrow IPC into tables, converts non-CSV input to CSV while streaming or serves Parquet files natively, and runs parallel multi-file imports | owns: ParallelTransportPool of tunnel connections | depends on: http_transport, query, types, error
 - export (src/export/): exports tables or queries to CSV files, streams, lists, callbacks, Parquet, Arrow RecordBatches, and Arrow IPC by parsing the CSV stream that Exasol sends, and takes a Parquet export's column names and types from the prepared-statement result-set metadata of the export source | owns: none | depends on: http_transport, transport core, query, types, error
-- types (src/types/): maps Exasol types to Arrow types, infers table schemas from CSV and Parquet files, and quotes identifiers | owns: ExasolType and TypeMapper definitions | depends on: import, error
+- types (src/types/): maps Exasol types to Arrow types, infers table schemas from CSV and Parquet files, quotes identifiers, and converts DATE and TIMESTAMP values between Exasol text and Arrow day and microsecond counts in both directions | owns: ExasolType and TypeMapper definitions | depends on: import, error
 - arrow_conversion (src/arrow_conversion/): public utility that converts Exasol JSON column data into Arrow arrays, with no caller inside the crate | owns: none | depends on: transport core, types, error
 - error (src/error.rs): crate error types for connection, query, conversion, and transport failures | owns: none | depends on: none
 
@@ -80,6 +80,7 @@
 - Results stream as Arrow RecordBatches, and conversion is Arrow-native and zero-copy where possible
 - CI rejects clippy warnings, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
 - Integration tests require a running Exasol instance on port 8563, CI uses the image `exasol/docker-db:2025.2.1`, and the CI integration job runs every integration test target under `tests/`
+- DATE and TIMESTAMP values convert between Exasol and Arrow by the year, month, and day that Exasol reports, counted in the proleptic Gregorian calendar, on every read and write path
 
 ## External Dependencies
 
