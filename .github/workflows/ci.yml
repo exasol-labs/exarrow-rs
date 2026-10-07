@@ -374,8 +374,8 @@ jobs:
           # Use the sparse index, not the API: it is built for automated
           # clients. (The API also 403s curl's default User-Agent.)
           # Fail on an unknown status; never guess.
-          STATUS=$(curl -s -o index.json -w '%{http_code}' "https://index.crates.io/ex/ar/exarrow-rs")
-          if [ "$STATUS" = "200" ] && grep -q "\"vers\":\"$VERSION\"" index.json; then
+          STATUS=$(curl -s -o "$RUNNER_TEMP/index.json" -w '%{http_code}' "https://index.crates.io/ex/ar/exarrow-rs")
+          if [ "$STATUS" = "200" ] && grep -q "\"vers\":\"$VERSION\"" "$RUNNER_TEMP/index.json"; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           elif [ "$STATUS" = "200" ] || [ "$STATUS" = "404" ]; then
             # 404 = crate never published.
