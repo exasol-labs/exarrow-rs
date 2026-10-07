@@ -56,6 +56,7 @@ This plan ran in headless mode. No live interview took place. The orchestrator p
   - Behavior change beyond the defect: `import::arrow` no longer formats a Date32 or Timestamp value outside 0001-01-01 to 9999-12-31 with an out-of-range year, it returns `ImportError::ConversionError`. The FFI date binding returns `InvalidArguments` where it could panic on `Duration::days` overflow. A seconds or milliseconds value that overflows `i64` when converted to microseconds returns an error where it wrapped in a release build or panicked in a debug build. The changelog and `type-mapping/arrow-to-exasol`, `import-export/arrow-recordbatch`, and `import-export/parquet-io` scenarios state this.
   - The text form of dates and timestamps stays `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS.ffffff`, with the fraction truncated to six digits.
   - A later change to the Exasol date or timestamp text form edits one place.
+  - The new FFI unit tests run in CI through a step added in task 4.5, outside the coverage run.
 - **Promotes to ADR:** no
 
 ### [4] chrono and literal values are the test oracles
