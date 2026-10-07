@@ -5,6 +5,7 @@
 //! to allow callers to wrap errors into their specific error types.
 
 use arrow::datatypes::{DataType, TimeUnit};
+use chrono::Datelike;
 
 use crate::types::ExasolType;
 
@@ -49,14 +50,12 @@ pub fn parse_date_to_days(date_str: &str) -> Result<i32, String> {
     Ok(ymd_to_days(year, month, day))
 }
 
-/// Converts a year/month/day triple directly to days since Unix epoch (1970-01-01).
-///
-/// Uses the same arithmetic as `parse_date_to_days` but skips string parsing
-/// and validation; callers that have already decoded the components should
-/// prefer this function on hot paths.
+/// Converts a year/month/day triple to days since 1970-01-01 in the proleptic Gregorian calendar, for any year.
+/// Floor division keeps the leap-day count correct before 1970; the function does no validation.
 pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
-    let days_from_year =
-        (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+    let days_from_year = (year - 1970) * 365 + (year - 1969).div_euclid(4)
+        - (year - 1901).div_euclid(100)
+        + (year - 1601).div_euclid(400);
 
     let days_from_month = match month {
         1 => 0,
@@ -98,6 +97,62 @@ pub fn ymd_hms_nanos_to_micros(
     micros += second as i64 * 1_000_000;
     micros += nanos as i64 / 1_000;
     micros
+}
+
+const EXASOL_YEARS: std::ops::RangeInclusive<i32> = 1..=9999;
+const DAYS_FROM_CE_TO_EPOCH: i32 = 719_163;
+
+/// Formats Date32 days since 1970-01-01 as `YYYY-MM-DD` in the proleptic Gregorian calendar.
+///
+/// Fails for a date outside the years 1 to 9999.
+pub fn format_date32(days: i32) -> Result<String, String> {
+    let date = days
+        .checked_add(DAYS_FROM_CE_TO_EPOCH)
+        .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
+        .filter(|date| EXASOL_YEARS.contains(&date.year()))
+        .ok_or_else(|| {
+            format!(
+                "Date32 value {days} is outside 0001-01-01 to 9999-12-31, the range Exasol accepts"
+            )
+        })?;
+    Ok(date.format("%Y-%m-%d").to_string())
+}
+
+/// Formats microseconds since the epoch as `YYYY-MM-DD HH:MM:SS.ffffff`.
+///
+/// Fails for an instant outside the years 1 to 9999.
+pub fn format_timestamp_micros(micros: i64) -> Result<String, String> {
+    let instant = chrono::DateTime::from_timestamp_micros(micros)
+        .filter(|instant| EXASOL_YEARS.contains(&instant.year()))
+        .ok_or_else(|| {
+            format!(
+                "Timestamp value {micros} microseconds is outside 0001-01-01 00:00:00 to 9999-12-31 23:59:59.999999, the range Exasol accepts"
+            )
+        })?;
+    Ok(instant.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+}
+
+/// Converts the value to whole microseconds, flooring a nanosecond value toward the earlier instant.
+/// Fails when the conversion overflows `i64` or the instant is outside the years 1 to 9999.
+pub fn format_timestamp(unit: &TimeUnit, value: i64) -> Result<String, String> {
+    format_timestamp_micros(timestamp_unit_to_micros(unit, value)?).map_err(|_| {
+        format!(
+            "Timestamp value {value} in unit {unit:?} is outside 0001-01-01 00:00:00 to 9999-12-31 23:59:59.999999, the range Exasol accepts"
+        )
+    })
+}
+
+fn timestamp_unit_to_micros(unit: &TimeUnit, value: i64) -> Result<i64, String> {
+    let micros = match unit {
+        TimeUnit::Second => value.checked_mul(1_000_000),
+        TimeUnit::Millisecond => value.checked_mul(1_000),
+        TimeUnit::Microsecond => Some(value),
+        // Rounds a pre-epoch value down to the microsecond, as a positive one already is.
+        TimeUnit::Nanosecond => Some(value.div_euclid(1_000)),
+    };
+    micros.ok_or_else(|| {
+        format!("Timestamp value {value} in unit {unit:?} overflows when converted to microseconds")
+    })
 }
 
 /// Parses a timestamp string to microseconds since Unix epoch.
@@ -293,6 +348,118 @@ pub fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, String
 mod tests {
     use super::*;
 
+    // Tests for pre-1970 day counts
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[test]
+    fn test_ymd_to_days_matches_chrono_for_every_exasol_date() {
+        use chrono::{Datelike, NaiveDate};
+
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let last = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap();
+        let mut date = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+        loop {
+            let expected = (date - epoch).num_days() as i32;
+            assert_eq!(
+                ymd_to_days(date.year(), date.month(), date.day()),
+                expected,
+                "day count of {date}"
+            );
+            if date == last {
+                break;
+            }
+            date = date.succ_opt().unwrap();
+        }
+    }
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[test]
+    fn test_parse_timestamp_to_micros_matches_chrono_for_every_exasol_year() {
+        use chrono::NaiveDate;
+
+        for year in 1..=9999 {
+            let text = format!("{year:04}-03-01 12:34:56.789012");
+            let expected = NaiveDate::from_ymd_opt(year, 3, 1)
+                .unwrap()
+                .and_hms_micro_opt(12, 34, 56, 789_012)
+                .unwrap()
+                .and_utc()
+                .timestamp_micros();
+            assert_eq!(
+                parse_timestamp_to_micros(&text).unwrap(),
+                expected,
+                "microseconds of {text}"
+            );
+        }
+    }
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[test]
+    fn test_parse_date_to_days_before_1970() {
+        assert_eq!(parse_date_to_days("1968-01-01").unwrap(), -731);
+        assert_eq!(parse_date_to_days("1900-03-01").unwrap(), -25508);
+        assert_eq!(parse_date_to_days("1600-03-01").unwrap(), -135080);
+        assert_eq!(parse_date_to_days("0001-01-01").unwrap(), -719162);
+        assert_eq!(parse_date_to_days("9999-12-31").unwrap(), 2932896);
+    }
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[test]
+    fn test_parse_date_to_days_century_leap_years() {
+        assert_eq!(parse_date_to_days("1600-02-29").unwrap(), -135081);
+        assert_eq!(parse_date_to_days("1900-02-28").unwrap(), -25509);
+        assert_eq!(parse_date_to_days("1900-03-01").unwrap(), -25508);
+        assert_eq!(parse_date_to_days("2000-02-29").unwrap(), 11016);
+        assert_eq!(parse_date_to_days("2000-03-01").unwrap(), 11017);
+    }
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[test]
+    fn test_parse_timestamp_to_micros_before_1970() {
+        assert_eq!(
+            parse_timestamp_to_micros("1950-06-15 00:00:00").unwrap(),
+            -616_896_000_000_000
+        );
+        assert_eq!(
+            parse_timestamp_to_micros("1969-12-31 23:59:59.999999").unwrap(),
+            -1
+        );
+        assert_eq!(
+            parse_timestamp_to_micros("1969-12-31 12:00:00").unwrap(),
+            -43_200_000_000
+        );
+        assert_eq!(
+            parse_timestamp_to_micros("0001-01-01 00:00:00").unwrap(),
+            -62_135_596_800_000_000
+        );
+        assert_eq!(
+            parse_timestamp_to_micros("9999-12-31 23:59:59.999999").unwrap(),
+            253_402_300_799_999_999
+        );
+    }
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[test]
+    fn test_ymd_hms_nanos_to_micros_before_epoch() {
+        assert_eq!(
+            ymd_hms_nanos_to_micros(1969, 12, 31, 23, 59, 59, 999_999_000),
+            -1
+        );
+        assert_eq!(
+            ymd_hms_nanos_to_micros(1950, 6, 15, 0, 0, 0, 0),
+            -616_896_000_000_000
+        );
+    }
+
+    /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    /// Scenario: Lossless conversion validation
+    #[test]
+    fn test_ymd_to_days_julian_only_leap_day_reads_as_march_first() {
+        assert_eq!(ymd_to_days(1500, 2, 29), -171_605);
+        assert_eq!(ymd_to_days(1500, 3, 1), -171_605);
+        assert_eq!(parse_date_to_days("1500-02-29"), Ok(-171_605));
+    }
+
     // Tests for parse_date_to_days
 
     #[test]
@@ -366,6 +533,12 @@ mod tests {
         // .123 should be interpreted as 123000 microseconds
         let micros = parse_timestamp_to_micros("1970-01-01 00:00:00.123").unwrap();
         assert_eq!(micros, 123000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_to_micros_hours_and_minutes_only() {
+        let result = parse_timestamp_to_micros("1970-01-01 01:30").unwrap();
+        assert_eq!(result, 5400 * 1_000_000);
     }
 
     #[test]
@@ -605,6 +778,136 @@ mod tests {
     #[test]
     fn test_fractional_seconds_to_nanos_unparsable_is_zero() {
         assert_eq!(fractional_seconds_to_nanos("abc"), 0);
+    }
+
+    // Tests for the Arrow-to-Exasol date and timestamp formatters
+
+    #[test]
+    fn test_format_date32_round_trips_every_month_boundary() {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        for year in 1..=9999 {
+            for month in 1..=12 {
+                let first = (chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap() - epoch)
+                    .num_days() as i32;
+                for day in [first - 1, first] {
+                    if day == -719_163 {
+                        continue;
+                    }
+                    assert_eq!(
+                        parse_date_to_days(&format_date32(day).unwrap()),
+                        Ok(day),
+                        "day {day}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_format_date32_literals() {
+        let cases = [
+            (0, "1970-01-01"),
+            (1, "1970-01-02"),
+            (365, "1971-01-01"),
+            (-1, "1969-12-31"),
+            (-731, "1968-01-01"),
+            (-25567, "1900-01-01"),
+            (10956, "1999-12-31"),
+            (11016, "2000-02-29"),
+            (11017, "2000-03-01"),
+            (19737, "2024-01-15"),
+            (-719_162, "0001-01-01"),
+            (2_932_896, "9999-12-31"),
+        ];
+        for (days, expected) in cases {
+            assert_eq!(format_date32(days).as_deref(), Ok(expected), "day {days}");
+        }
+    }
+
+    /// Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
+    #[test]
+    fn test_format_date32_rejects_days_outside_exasol_range() {
+        for days in [-719_163, 2_932_897, i32::MIN, i32::MAX] {
+            assert!(format_date32(days).is_err(), "day {days}");
+        }
+    }
+
+    /// Scenario: RecordBatch import formats pre-epoch timestamps of every time unit as times before the epoch
+    #[test]
+    fn test_format_timestamp_micros_literals() {
+        let cases = [
+            (0, "1970-01-01 00:00:00.000000"),
+            (1_000_000, "1970-01-01 00:00:01.000000"),
+            (86_400_000_000, "1970-01-02 00:00:00.000000"),
+            (123_456, "1970-01-01 00:00:00.123456"),
+            (-1, "1969-12-31 23:59:59.999999"),
+            (-1_000_000, "1969-12-31 23:59:59.000000"),
+            (-86_400_000_000, "1969-12-31 00:00:00.000000"),
+            (-43_200_000_000, "1969-12-31 12:00:00.000000"),
+            (-62_135_596_800_000_000, "0001-01-01 00:00:00.000000"),
+            (253_402_300_799_999_999, "9999-12-31 23:59:59.999999"),
+        ];
+        for (micros, expected) in cases {
+            assert_eq!(
+                format_timestamp_micros(micros).as_deref(),
+                Ok(expected),
+                "micros {micros}"
+            );
+        }
+    }
+
+    /// Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
+    #[test]
+    fn test_format_timestamp_micros_rejects_micros_outside_exasol_range() {
+        for micros in [
+            253_402_300_800_000_000,
+            -62_135_596_800_000_001,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            assert!(format_timestamp_micros(micros).is_err(), "micros {micros}");
+        }
+    }
+
+    /// Scenario: RecordBatch import formats pre-epoch timestamps of every time unit as times before the epoch
+    #[test]
+    fn test_format_timestamp_floors_every_unit() {
+        let cases = [
+            (TimeUnit::Second, -1, "1969-12-31 23:59:59.000000"),
+            (TimeUnit::Millisecond, -1, "1969-12-31 23:59:59.999000"),
+            (TimeUnit::Microsecond, -1, "1969-12-31 23:59:59.999999"),
+            (TimeUnit::Nanosecond, -1, "1969-12-31 23:59:59.999999"),
+            (TimeUnit::Nanosecond, -1000, "1969-12-31 23:59:59.999999"),
+            (TimeUnit::Nanosecond, -1001, "1969-12-31 23:59:59.999998"),
+            (TimeUnit::Nanosecond, 1999, "1970-01-01 00:00:00.000001"),
+        ];
+        for (unit, value, expected) in cases {
+            assert_eq!(
+                format_timestamp(&unit, value).as_deref(),
+                Ok(expected),
+                "{unit:?} {value}"
+            );
+        }
+    }
+
+    /// Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
+    #[test]
+    fn test_format_timestamp_rejects_overflow_and_out_of_range() {
+        let cases = [
+            (TimeUnit::Second, i64::MAX),
+            (TimeUnit::Millisecond, i64::MIN),
+            (TimeUnit::Microsecond, 253_402_300_800_000_000),
+        ];
+        for (unit, value) in cases {
+            assert!(format_timestamp(&unit, value).is_err(), "{unit:?} {value}");
+        }
+    }
+
+    #[test]
+    fn test_format_timestamp_names_the_value_in_its_own_unit() {
+        let error = format_timestamp(&TimeUnit::Second, 253_402_300_800).unwrap_err();
+        assert!(error.contains("253402300800 in unit Second"), "{error}");
+        assert!(!error.contains("microseconds"), "{error}");
     }
 
     // Tests for parse_decimal_to_i128

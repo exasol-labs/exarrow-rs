@@ -1706,6 +1706,10 @@ impl adbc_core::Connection for FfiConnection {
 // Arrow-to-Parameter Conversion
 // -----------------------------------------------------------------------------
 
+fn invalid_argument(message: String) -> AdbcError {
+    AdbcError::with_message_and_status(message, AdbcStatus::InvalidArguments)
+}
+
 /// Extract a value from an Arrow array at a given row index and convert it to
 /// a `Parameter` enum suitable for Exasol prepared statement binding.
 ///
@@ -1798,59 +1802,40 @@ fn arrow_value_to_parameter(array: &dyn Array, row: usize) -> AdbcResult<Paramet
             Ok(Parameter::Binary(arr.value(row).to_vec()))
         }
         DataType::Date32 => {
-            // Date32 stores days since Unix epoch. Convert to "YYYY-MM-DD" string.
             let arr = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .expect("date32 downcast");
-            let days = arr.value(row);
-            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let date = epoch + chrono::Duration::days(days as i64);
-            Ok(Parameter::String(date.format("%Y-%m-%d").to_string()))
+            crate::types::conversion::format_date32(arr.value(row))
+                .map(Parameter::String)
+                .map_err(invalid_argument)
         }
         DataType::Timestamp(unit, _tz) => {
-            // Convert timestamp to ISO 8601 string for Exasol
-            let nanos = match unit {
-                arrow::datatypes::TimeUnit::Second => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .expect("timestamp_s downcast");
-                    arr.value(row) * 1_000_000_000
-                }
-                arrow::datatypes::TimeUnit::Millisecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .expect("timestamp_ms downcast");
-                    arr.value(row) * 1_000_000
-                }
-                arrow::datatypes::TimeUnit::Microsecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .expect("timestamp_us downcast");
-                    arr.value(row) * 1_000
-                }
-                arrow::datatypes::TimeUnit::Nanosecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .expect("timestamp_ns downcast");
-                    arr.value(row)
-                }
+            let value = match unit {
+                arrow::datatypes::TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .expect("timestamp_s downcast")
+                    .value(row),
+                arrow::datatypes::TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .expect("timestamp_ms downcast")
+                    .value(row),
+                arrow::datatypes::TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .expect("timestamp_us downcast")
+                    .value(row),
+                arrow::datatypes::TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("timestamp_ns downcast")
+                    .value(row),
             };
-            let secs = nanos.div_euclid(1_000_000_000);
-            let subsec_nanos = nanos.rem_euclid(1_000_000_000) as u32;
-            let dt = chrono::DateTime::from_timestamp(secs, subsec_nanos).ok_or_else(|| {
-                AdbcError::with_message_and_status(
-                    format!("Invalid timestamp value: {nanos} nanos"),
-                    AdbcStatus::InvalidArguments,
-                )
-            })?;
-            Ok(Parameter::String(
-                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-            ))
+            crate::types::conversion::format_timestamp(unit, value)
+                .map(Parameter::String)
+                .map_err(invalid_argument)
         }
         DataType::Decimal128(_precision, scale) => {
             let arr = array
@@ -4221,5 +4206,49 @@ mod tests {
             "got: {}",
             error.message
         );
+    }
+
+    /// Scenario: Parameter binding formats pre-epoch DATE and TIMESTAMP values and rejects values outside Exasol's range
+    #[test]
+    fn test_arrow_value_to_parameter_formats_pre_epoch_values() {
+        use arrow::array::{Date32Array, TimestampMicrosecondArray};
+
+        let date = arrow_value_to_parameter(&Date32Array::from(vec![-731]), 0).unwrap();
+        assert!(
+            matches!(&date, Parameter::String(s) if s == "1968-01-01"),
+            "got: {date:?}"
+        );
+
+        let timestamp =
+            arrow_value_to_parameter(&TimestampMicrosecondArray::from(vec![-1]), 0).unwrap();
+        assert!(
+            matches!(&timestamp, Parameter::String(s) if s == "1969-12-31 23:59:59.999999"),
+            "got: {timestamp:?}"
+        );
+    }
+
+    /// Scenario: Parameter binding formats pre-epoch DATE and TIMESTAMP values and rejects values outside Exasol's range
+    #[test]
+    fn test_arrow_value_to_parameter_rejects_values_outside_exasol_range() {
+        use arrow::array::{Array, Date32Array, TimestampMicrosecondArray, TimestampSecondArray};
+
+        let arrays: [Arc<dyn Array>; 3] = [
+            Arc::new(Date32Array::from(vec![2_932_897])),
+            Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                253_402_300_800_000_000,
+            ])),
+        ];
+
+        for array in arrays {
+            let error = arrow_value_to_parameter(array.as_ref(), 0)
+                .expect_err("a value outside Exasol's range must be refused");
+            assert_eq!(
+                error.status,
+                AdbcStatus::InvalidArguments,
+                "{:?}",
+                array.data_type()
+            );
+        }
     }
 }

@@ -888,7 +888,8 @@ fn format_arrow_value(
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| ImportError::ConversionError("Invalid Date32 array".to_string()))?;
-            Ok(format_date32(arr.value(row_idx)))
+            crate::types::conversion::format_date32(arr.value(row_idx))
+                .map_err(ImportError::ConversionError)
         }
 
         DataType::Timestamp(unit, _) => format_timestamp(array, row_idx, unit),
@@ -956,21 +957,13 @@ fn escape_csv_string(value: &str, delimiter: char) -> String {
     }
 }
 
-/// Formats a Date32 value (days since epoch) as YYYY-MM-DD.
-fn format_date32(days: i32) -> String {
-    // Days since Unix epoch (1970-01-01)
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-    let date = epoch + chrono::Duration::days(i64::from(days));
-    date.format("%Y-%m-%d").to_string()
-}
-
 /// Formats a timestamp value as YYYY-MM-DD HH:MM:SS.ffffff.
 fn format_timestamp(
     array: &dyn Array,
     row_idx: usize,
     unit: &TimeUnit,
 ) -> Result<String, ImportError> {
-    let timestamp_micros = match unit {
+    let value = match unit {
         TimeUnit::Second => {
             let arr = array
                 .as_any()
@@ -978,7 +971,7 @@ fn format_timestamp(
                 .ok_or_else(|| {
                     ImportError::ConversionError("Invalid TimestampSecond array".to_string())
                 })?;
-            arr.value(row_idx) * 1_000_000
+            arr.value(row_idx)
         }
         TimeUnit::Millisecond => {
             let arr = array
@@ -987,7 +980,7 @@ fn format_timestamp(
                 .ok_or_else(|| {
                     ImportError::ConversionError("Invalid TimestampMillisecond array".to_string())
                 })?;
-            arr.value(row_idx) * 1_000
+            arr.value(row_idx)
         }
         TimeUnit::Microsecond => {
             let arr = array
@@ -1005,17 +998,11 @@ fn format_timestamp(
                 .ok_or_else(|| {
                     ImportError::ConversionError("Invalid TimestampNanosecond array".to_string())
                 })?;
-            arr.value(row_idx) / 1_000
+            arr.value(row_idx)
         }
     };
 
-    let secs = timestamp_micros / 1_000_000;
-    let micros = (timestamp_micros % 1_000_000).unsigned_abs() as u32;
-
-    let datetime = chrono::DateTime::from_timestamp(secs, micros * 1_000)
-        .ok_or_else(|| ImportError::ConversionError("Invalid timestamp value".to_string()))?;
-
-    Ok(datetime.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+    crate::types::conversion::format_timestamp(unit, value).map_err(ImportError::ConversionError)
 }
 
 /// Formats a Decimal128 value with the given scale.
@@ -1139,18 +1126,6 @@ mod tests {
         assert_eq!(format_float(f64::NAN), "NaN");
         assert_eq!(format_float(f64::INFINITY), "Infinity");
         assert_eq!(format_float(f64::NEG_INFINITY), "-Infinity");
-    }
-
-    #[test]
-    fn test_format_date32() {
-        // 2024-01-15 is day 19737 since epoch
-        let days = chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
-            .unwrap()
-            .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-            .num_days() as i32;
-
-        let result = format_date32(days);
-        assert_eq!(result, "2024-01-15");
     }
 
     #[test]
@@ -1749,6 +1724,64 @@ mod tests {
         let array = LargeBinaryArray::from(vec![Some(&[0xDEu8, 0xADu8][..])]);
 
         assert_eq!(format_arrow_value(&array, 0, '"', "").unwrap(), "dead");
+    }
+
+    /// Scenario: CSV-path Parquet import formats pre-epoch timestamps of every time unit as times before the epoch
+    #[test]
+    fn test_format_timestamp_before_epoch_in_every_unit() {
+        let second = TimestampSecondArray::from(vec![-1]);
+        let millisecond = TimestampMillisecondArray::from(vec![-1]);
+        let microsecond = TimestampMicrosecondArray::from(vec![-1, -500_000]);
+        let nanosecond = TimestampNanosecondArray::from(vec![-1]);
+
+        assert_eq!(
+            format_timestamp(&second, 0, &TimeUnit::Second).unwrap(),
+            "1969-12-31 23:59:59.000000"
+        );
+        assert_eq!(
+            format_timestamp(&millisecond, 0, &TimeUnit::Millisecond).unwrap(),
+            "1969-12-31 23:59:59.999000"
+        );
+        assert_eq!(
+            format_timestamp(&microsecond, 0, &TimeUnit::Microsecond).unwrap(),
+            "1969-12-31 23:59:59.999999"
+        );
+        assert_eq!(
+            format_timestamp(&nanosecond, 0, &TimeUnit::Nanosecond).unwrap(),
+            "1969-12-31 23:59:59.999999"
+        );
+        assert_eq!(
+            format_timestamp(&microsecond, 1, &TimeUnit::Microsecond).unwrap(),
+            "1969-12-31 23:59:59.500000"
+        );
+    }
+
+    /// Scenario: CSV-path Parquet import rejects DATE and TIMESTAMP values outside Exasol's range
+    #[test]
+    fn test_format_arrow_value_rejects_dates_and_timestamps_outside_exasol_range() {
+        let cases: [(ArrayRef, &str); 4] = [
+            (Arc::new(Date32Array::from(vec![2_932_897])), "2932897"),
+            (Arc::new(Date32Array::from(vec![-719_163])), "-719163"),
+            (
+                Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
+                "9223372036854775807",
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    253_402_300_800_000_000,
+                ])),
+                "253402300800000000",
+            ),
+        ];
+
+        for (array, value) in cases {
+            let err = format_arrow_value(array.as_ref(), 0, '"', "").unwrap_err();
+            assert!(
+                matches!(&err, ImportError::ConversionError(message) if message.contains(value)),
+                "{:?} {value}: {err}",
+                array.data_type()
+            );
+        }
     }
 
     #[test]

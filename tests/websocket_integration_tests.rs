@@ -2102,3 +2102,56 @@ async fn test_ws_prepared_partial_inline_result_returns_every_row_once() {
         .expect("Failed to close prepared statement");
     conn.close().await.expect("Failed to close connection");
 }
+
+/// Scenario: Pre-1970 DATE and TIMESTAMP query results keep their calendar day
+#[tokio::test]
+async fn test_ws_pre_1970_dates_and_timestamps_keep_their_calendar_day() {
+    use arrow::array::{Date32Array, TimestampMicrosecondArray};
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(
+            "SELECT DATE '1968-01-01' AS D1, DATE '1900-03-01' AS D2, DATE '1600-03-01' AS D3, \
+             DATE '0001-01-01' AS D4, DATE '9999-12-31' AS D5, \
+             TIMESTAMP '1950-06-15 00:00:00' AS T1, \
+             CAST(TIMESTAMP '1969-12-31 23:59:59.999999' AS TIMESTAMP(6)) AS T2, \
+             TIMESTAMP '0001-01-01 00:00:00' AS T3 FROM DUAL",
+        )
+        .await
+        .expect("Query should succeed");
+    let batch = &batches[0];
+
+    let dates: Vec<i32> = ["D1", "D2", "D3", "D4", "D5"]
+        .iter()
+        .map(|name| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("missing column {name}"))
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap_or_else(|| panic!("{name} should be Date32"))
+                .value(0)
+        })
+        .collect();
+    assert_eq!(dates, vec![-731, -25508, -135080, -719162, 2932896]);
+
+    let timestamps: Vec<i64> = ["T1", "T2", "T3"]
+        .iter()
+        .map(|name| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("missing column {name}"))
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap_or_else(|| panic!("{name} should be Timestamp(Microsecond)"))
+                .value(0)
+        })
+        .collect();
+    assert_eq!(
+        timestamps,
+        vec![-616_896_000_000_000, -1, -62_135_596_800_000_000]
+    );
+
+    conn.close().await.expect("Failed to close connection");
+}

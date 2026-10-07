@@ -20,12 +20,6 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SECONDS_PER_MINUTE: i64 = 60;
-const SECONDS_PER_HOUR: i64 = 3600;
-const SECONDS_PER_DAY: i64 = 86400;
-const MICROS_PER_SECOND: i64 = 1_000_000;
-const MICROS_FRACTION_DIGITS: usize = 6;
-
 /// Metadata about a query execution.
 #[derive(Debug, Clone)]
 pub struct QueryMetadata {
@@ -500,15 +494,15 @@ impl ResultSet {
                 |value| {
                     value
                         .as_str()
-                        .and_then(|s| Self::parse_date_to_days(s).ok())
+                        .and_then(|s| crate::types::conversion::parse_date_to_days(s).ok())
                 },
             )),
             DataType::Timestamp(_, timezone) => {
                 let array =
                     Self::json_to_primitive_array::<TimestampMicrosecondType, _>(values, |value| {
-                        value
-                            .as_str()
-                            .and_then(|s| Self::parse_timestamp_to_micros(s).ok())
+                        value.as_str().and_then(|s| {
+                            crate::types::conversion::parse_timestamp_to_micros(s).ok()
+                        })
                     });
                 match timezone {
                     Some(_) => Arc::new(array.with_timezone("UTC")),
@@ -601,113 +595,6 @@ impl ResultSet {
             return Ok(Some((float * 10f64.powi(scale as i32)) as i128));
         }
         Ok(None)
-    }
-
-    /// Parse a date string "YYYY-MM-DD" to days since Unix epoch (1970-01-01).
-    fn parse_date_to_days(date_str: &str) -> Result<i32, ()> {
-        let parts: Vec<&str> = date_str.split('-').collect();
-        if parts.len() != 3 {
-            return Err(());
-        }
-
-        let year: i32 = parts[0].parse().map_err(|_| ())?;
-        let month: u32 = parts[1].parse().map_err(|_| ())?;
-        let day: u32 = parts[2].parse().map_err(|_| ())?;
-
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-            return Err(());
-        }
-
-        // Calculate days since Unix epoch
-        let days_from_year =
-            (year - 1970) * 365 + (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-        let days_from_month = match month {
-            1 => 0,
-            2 => 31,
-            3 => 59,
-            4 => 90,
-            5 => 120,
-            6 => 151,
-            7 => 181,
-            8 => 212,
-            9 => 243,
-            10 => 273,
-            11 => 304,
-            12 => 334,
-            _ => return Err(()),
-        };
-
-        // Add leap day if after February and leap year
-        let is_leap_year = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-        let leap_adjustment = if month > 2 && is_leap_year { 1 } else { 0 };
-
-        Ok(days_from_year + days_from_month + day as i32 - 1 + leap_adjustment)
-    }
-
-    /// Parse a timestamp string to microseconds since Unix epoch.
-    ///
-    /// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY-MM-DD HH:MM:SS` and
-    /// `YYYY-MM-DD HH:MM:SS.ffffff`. Anything after the time component is
-    /// ignored; a time component that is not `HH:MM`-shaped contributes nothing.
-    fn parse_timestamp_to_micros(timestamp_str: &str) -> Result<i64, ()> {
-        // `str::split` always yields at least one element, so the date part is
-        // never absent and needs no emptiness guard.
-        let parts: Vec<&str> = timestamp_str.split(' ').collect();
-
-        let days = Self::parse_date_to_days(parts[0])?;
-        let mut micros = days as i64 * SECONDS_PER_DAY * MICROS_PER_SECOND;
-
-        if let Some(time_str) = parts.get(1) {
-            micros += Self::parse_time_of_day_to_micros(time_str)?;
-        }
-
-        Ok(micros)
-    }
-
-    /// Parse the `HH:MM[:SS[.ffffff]]` part of a timestamp into microseconds.
-    fn parse_time_of_day_to_micros(time_str: &str) -> Result<i64, ()> {
-        let time_parts: Vec<&str> = time_str.split(':').collect();
-        let (Some(hours_str), Some(minutes_str)) = (time_parts.first(), time_parts.get(1)) else {
-            return Ok(0);
-        };
-
-        let hours: i64 = hours_str.parse().map_err(|_| ())?;
-        let minutes: i64 = minutes_str.parse().map_err(|_| ())?;
-        let mut micros = hours * SECONDS_PER_HOUR * MICROS_PER_SECOND
-            + minutes * SECONDS_PER_MINUTE * MICROS_PER_SECOND;
-
-        if let Some(seconds_str) = time_parts.get(2) {
-            micros += Self::parse_seconds_to_micros(seconds_str)?;
-        }
-
-        Ok(micros)
-    }
-
-    /// Parse the `SS[.ffffff]` part of a timestamp into microseconds.
-    fn parse_seconds_to_micros(seconds_str: &str) -> Result<i64, ()> {
-        let seconds_parts: Vec<&str> = seconds_str.split('.').collect();
-        let seconds: i64 = seconds_parts[0].parse().map_err(|_| ())?;
-        let fraction = seconds_parts
-            .get(1)
-            .map_or(0, |frac| Self::fractional_seconds_to_micros(frac));
-
-        Ok(seconds * MICROS_PER_SECOND + fraction)
-    }
-
-    /// Interpret the digits after the decimal point as a microsecond fraction.
-    ///
-    /// Shorter fractions are right-padded, longer ones truncated to microsecond
-    /// resolution; anything unparsable contributes nothing.
-    fn fractional_seconds_to_micros(fraction: &str) -> i64 {
-        if fraction.len() <= MICROS_FRACTION_DIGITS {
-            let padding = MICROS_FRACTION_DIGITS - fraction.len();
-            let padded = format!("{}{}", fraction, "0".repeat(padding));
-            padded.parse::<i64>().unwrap_or(0)
-        } else {
-            fraction[..MICROS_FRACTION_DIGITS]
-                .parse::<i64>()
-                .unwrap_or(0)
-        }
     }
 
     /// Parse a decimal string to i128 scaled value.
@@ -1274,184 +1161,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for ResultSet::parse_date_to_days
-    // =========================================================================
-
-    #[test]
-    fn test_parse_date_to_days_unix_epoch() {
-        let result = ResultSet::parse_date_to_days("1970-01-01").unwrap();
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_parse_date_to_days_after_epoch() {
-        let result = ResultSet::parse_date_to_days("1970-01-02").unwrap();
-        assert_eq!(result, 1);
-    }
-
-    #[test]
-    fn test_parse_date_to_days_year_2000() {
-        // 2000-01-01 is 10957 days after Unix epoch
-        let result = ResultSet::parse_date_to_days("2000-01-01").unwrap();
-        assert_eq!(result, 10957);
-    }
-
-    #[test]
-    fn test_parse_date_to_days_leap_year() {
-        // 2000-03-01 should include Feb 29 (leap year)
-        let result = ResultSet::parse_date_to_days("2000-03-01").unwrap();
-        // 2000-01-01 = 10957, Jan has 31 days, Feb has 29 days (leap year)
-        // 10957 + 31 + 29 = 11017
-        assert_eq!(result, 11017);
-    }
-
-    #[test]
-    fn test_parse_date_to_days_non_leap_year() {
-        // 2001-03-01 should NOT include Feb 29 (non-leap year)
-        let result = ResultSet::parse_date_to_days("2001-03-01").unwrap();
-        // 2001-01-01 = 11323, Jan has 31 days, Feb has 28 days
-        // 11323 + 31 + 28 = 11382
-        assert_eq!(result, 11382);
-    }
-
-    #[test]
-    fn test_parse_date_to_days_before_epoch() {
-        // 1969-12-31 is -1 day before Unix epoch
-        let result = ResultSet::parse_date_to_days("1969-12-31").unwrap();
-        assert_eq!(result, -1);
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_format_wrong_separator() {
-        let result = ResultSet::parse_date_to_days("2000/01/01");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_format_missing_parts() {
-        let result = ResultSet::parse_date_to_days("2000-01");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_month_zero() {
-        let result = ResultSet::parse_date_to_days("2000-00-01");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_month_thirteen() {
-        let result = ResultSet::parse_date_to_days("2000-13-01");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_day_zero() {
-        let result = ResultSet::parse_date_to_days("2000-01-00");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_day_thirty_two() {
-        let result = ResultSet::parse_date_to_days("2000-01-32");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_date_to_days_invalid_non_numeric() {
-        let result = ResultSet::parse_date_to_days("YYYY-MM-DD");
-        assert!(result.is_err());
-    }
-
-    // =========================================================================
-    // Tests for ResultSet::parse_timestamp_to_micros
-    // =========================================================================
-
-    #[test]
-    fn test_parse_timestamp_to_micros_date_only() {
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01").unwrap();
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_time() {
-        // 1970-01-01 01:00:00 = 1 hour = 3600 * 1_000_000 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 01:00:00").unwrap();
-        assert_eq!(result, 3600 * 1_000_000);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_minutes() {
-        // 1970-01-01 00:30:00 = 30 minutes = 30 * 60 * 1_000_000 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 00:30:00").unwrap();
-        assert_eq!(result, 30 * 60 * 1_000_000);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_seconds() {
-        // 1970-01-01 00:00:45 = 45 seconds = 45 * 1_000_000 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:45").unwrap();
-        assert_eq!(result, 45 * 1_000_000);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_fractional_seconds_3_digits() {
-        // 1970-01-01 00:00:00.123 = 123000 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:00.123").unwrap();
-        assert_eq!(result, 123000);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_fractional_seconds_6_digits() {
-        // 1970-01-01 00:00:00.123456 = 123456 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:00.123456").unwrap();
-        assert_eq!(result, 123456);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_fractional_seconds_more_than_6_digits() {
-        // 1970-01-01 00:00:00.1234567 should truncate to 123456 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:00.1234567").unwrap();
-        assert_eq!(result, 123456);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_with_fractional_seconds_1_digit() {
-        // 1970-01-01 00:00:00.1 = 100000 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:00.1").unwrap();
-        assert_eq!(result, 100000);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_complex_timestamp() {
-        // 2000-06-15 12:30:45.500
-        // days = 11124 (from previous calculation for 2000-06-15)
-        // time = 12*3600 + 30*60 + 45 seconds = 45045 seconds
-        // micros from time = 45045 * 1_000_000 + 500000
-        let result = ResultSet::parse_timestamp_to_micros("2000-06-15 12:30:45.500").unwrap();
-
-        // Calculate expected value
-        let days_micros: i64 =
-            ResultSet::parse_date_to_days("2000-06-15").unwrap() as i64 * 86400 * 1_000_000;
-        let time_micros: i64 = (12 * 3600 + 30 * 60 + 45) * 1_000_000 + 500000;
-        assert_eq!(result, days_micros + time_micros);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_empty_string() {
-        let result = ResultSet::parse_timestamp_to_micros("");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_hours_and_minutes_only() {
-        // 1970-01-01 01:30 (without seconds)
-        // hours + minutes = 1*3600 + 30*60 = 5400 seconds = 5400 * 1_000_000 microseconds
-        let result = ResultSet::parse_timestamp_to_micros("1970-01-01 01:30").unwrap();
-        assert_eq!(result, 5400 * 1_000_000);
-    }
-
-    // =========================================================================
     // Tests for ResultSet::parse_string_to_decimal
     // =========================================================================
 
@@ -1885,6 +1594,54 @@ mod tests {
         assert_eq!(array.value(0), 0); // Unix epoch
         assert_eq!(array.value(1), 10957); // 2000-01-01
         assert!(array.is_null(2));
+    }
+
+    /// Scenario: Pre-1970 DATE and TIMESTAMP query results keep their calendar day
+    #[tokio::test]
+    async fn test_column_major_to_record_batch_keeps_pre_1970_dates_and_timestamps() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("date", arrow::datatypes::DataType::Date32, true),
+            Field::new(
+                "timestamp",
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    None,
+                ),
+                true,
+            ),
+        ]));
+
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Json(vec![
+                vec![
+                    serde_json::json!("1968-01-01"),
+                    serde_json::json!("1950-06-15 00:00:00"),
+                ],
+                vec![
+                    serde_json::json!("0001-01-01"),
+                    serde_json::json!("1969-12-31 23:59:59.999999"),
+                ],
+            ]),
+            total_rows: 2,
+        };
+
+        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+
+        let dates = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+        assert_eq!(dates.value(0), -731);
+        assert_eq!(dates.value(1), -719162);
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), -616_896_000_000_000);
+        assert_eq!(timestamps.value(1), -1);
     }
 
     #[tokio::test]
@@ -2906,71 +2663,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for the parse_date_to_days month table
-    // =========================================================================
-
-    #[test]
-    fn test_parse_date_to_days_covers_every_month_of_a_common_year() {
-        // 1970 is a common year, so the first of each month lands exactly on
-        // the cumulative day offsets of the month table.
-        let first_of_month_offsets = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-
-        for (index, expected) in first_of_month_offsets.iter().enumerate() {
-            let date = format!("1970-{:02}-01", index + 1);
-            assert_eq!(
-                ResultSet::parse_date_to_days(&date),
-                Ok(*expected),
-                "unexpected day offset for {}",
-                date
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_date_to_days_adds_the_leap_day_only_after_february() {
-        // 1972 is a leap year: February has 29 days, so March 1st sits 29 days
-        // after February 1st (28 in a common year).
-        let february = ResultSet::parse_date_to_days("1972-02-01").unwrap();
-        let march = ResultSet::parse_date_to_days("1972-03-01").unwrap();
-
-        assert_eq!(march - february, 29);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_always_has_a_date_part_to_parse() {
-        // `str::split` always yields at least one element, so the date part is
-        // never absent: an empty timestamp reaches (and fails) date parsing.
-        assert_eq!("".split(' ').count(), 1);
-        assert!(ResultSet::parse_date_to_days("").is_err());
-        assert!(ResultSet::parse_timestamp_to_micros("").is_err());
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_ignores_a_trailing_third_space_part() {
-        // Only the first two space-separated parts are interpreted; anything
-        // after the time is discarded.
-        assert_eq!(
-            ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:01 UTC"),
-            Ok(1_000_000)
-        );
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_empty_fractional_part_contributes_nothing() {
-        assert_eq!(
-            ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:01."),
-            Ok(1_000_000)
-        );
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_rejects_non_numeric_time_parts() {
-        assert!(ResultSet::parse_timestamp_to_micros("1970-01-01 aa:00").is_err());
-        assert!(ResultSet::parse_timestamp_to_micros("1970-01-01 00:bb").is_err());
-        assert!(ResultSet::parse_timestamp_to_micros("1970-01-01 00:00:cc").is_err());
-    }
-
-    // =========================================================================
     // Remaining type-mapping and parsing branches
     // =========================================================================
 
@@ -3043,14 +2735,6 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.column(0).null_count(), 3);
-    }
-
-    #[test]
-    fn test_parse_timestamp_to_micros_time_part_without_a_colon_adds_nothing() {
-        assert_eq!(
-            ResultSet::parse_timestamp_to_micros("1970-01-02 12"),
-            Ok(SECONDS_PER_DAY * MICROS_PER_SECOND)
-        );
     }
 
     #[test]

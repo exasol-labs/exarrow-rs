@@ -1538,9 +1538,51 @@ mod tests {
             .downcast_ref::<Date32Array>()
             .unwrap();
         assert!(arr.is_null(1));
-        let expected = crate::types::conversion::ymd_to_days(2024, 1, 2);
-        assert_eq!(arr.value(0), expected);
+        assert_eq!(arr.value(0), 19724);
         assert_eq!(offset, data.len());
+    }
+
+    /// Scenario: Pre-1970 DATE and TIMESTAMP query results keep their calendar day
+    #[test]
+    fn single_pass_dates_and_timestamps_before_1970_keep_their_calendar_day() {
+        use arrow::array::{Date32Array, TimestampMicrosecondArray};
+
+        let date_columns = vec![meta("d", T_DATE, None, None)];
+        let mut date_data = Vec::new();
+        for (year, month, day) in [(1968i32, 1i32, 1i32), (1, 1, 1)] {
+            date_data.push(1u8);
+            date_data.extend_from_slice(&((year << 16) | (month << 8) | day).to_le_bytes());
+        }
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&date_data, &mut offset, &date_columns, 2).unwrap();
+        let dates = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(dates.value(0), -731);
+        assert_eq!(dates.value(1), -719162);
+
+        let ts_columns = vec![meta("ts", T_TIMESTAMP, None, None)];
+        let mut ts_data = Vec::new();
+        for (year, month, day, hour, minute, second, nanos) in [
+            (1950i16, 6u8, 15u8, 0u8, 0u8, 0u8, 0i32),
+            (1969, 12, 31, 23, 59, 59, 999_999_000),
+        ] {
+            ts_data.push(1u8);
+            ts_data.extend_from_slice(&year.to_le_bytes());
+            ts_data.extend_from_slice(&[month, day, hour, minute, second]);
+            ts_data.extend_from_slice(&nanos.to_le_bytes());
+        }
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&ts_data, &mut offset, &ts_columns, 2).unwrap();
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), -616_896_000_000_000);
+        assert_eq!(timestamps.value(1), -1);
     }
 
     #[test]
