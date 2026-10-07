@@ -46,7 +46,10 @@ pub fn supports_at_least(parsed: (u32, u32, u32), major: u32, minor: u32) -> boo
 ///
 /// Comparison is lexicographic across all three components, matching Rust's
 /// default tuple ordering. So `(2025, 1, 10)` is rejected, while
-/// `(2025, 1, 11)`, `(2025, 2, 0)`, and `(2026, 0, 0)` are accepted.
+/// `(2025, 1, 11)`, `(2025, 2, 1)`, and `(2026, 0, 0)` are accepted.
+///
+/// `docs/import-export.md` § Native Parquet Import names the server releases
+/// that pass this gate but reject HTTP Parquet sources.
 pub fn supports_native_parquet_import(v: (u32, u32, u32)) -> bool {
     v >= (2025, 1, 11)
 }
@@ -75,11 +78,12 @@ mod tests {
         assert_eq!(parse_release_version("8.31.0+build"), Some((8, 31, 0)));
     }
 
+    /// Scenario: Native Parquet import threshold
     #[test]
     fn test_supports_native_parquet_import_threshold_boundaries() {
         assert!(!supports_native_parquet_import((2025, 1, 10)));
         assert!(supports_native_parquet_import((2025, 1, 11)));
-        assert!(supports_native_parquet_import((2025, 2, 0)));
+        assert!(supports_native_parquet_import((2025, 2, 1)));
         assert!(supports_native_parquet_import((2026, 0, 0)));
         assert!(!supports_native_parquet_import((7, 1, 0)));
         assert!(!supports_native_parquet_import((8, 31, 0)));

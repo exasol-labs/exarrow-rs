@@ -34,7 +34,7 @@ cargo clippy --all-targets --all-features -- -W clippy::all  # Lint (zero warnin
 cargo test --lib                         # Unit tests only
 cargo test --test integration_tests      # Integration tests (requires Exasol)
 cargo test --test driver_manager_tests   # Driver manager tests
-cargo test --test import_export_tests -- --ignored  # Import/export tests (requires Exasol)
+REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1  # Import/export tests (requires Exasol)
 
 # Run a single test
 cargo test test_name                     # By name
@@ -82,7 +82,7 @@ tests/             # Integration test suites (integration_tests, driver_manager_
 
 ```bash
 cargo test --test integration_tests
-cargo test --test import_export_tests -- --ignored
+REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1
 ```
 
 ## Driver Manager Tests & FFI

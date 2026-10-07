@@ -4,9 +4,10 @@
 //! connections for parallel file imports, and utilities for streaming multiple files
 //! concurrently.
 
+use std::future::Future;
 use std::path::PathBuf;
 
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::query::import::Compression;
 use crate::transport::HttpTransportClient;
@@ -20,7 +21,7 @@ pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
 ///
 /// A panicked task and a failed stream are indistinguishable to callers, so
 /// both collapse into `ImportError` here rather than at every call site.
-pub(crate) fn resolve_stream_task(
+fn resolve_stream_task(
     joined: Result<Result<(), ImportError>, tokio::task::JoinError>,
 ) -> Result<(), ImportError> {
     match joined {
@@ -30,6 +31,29 @@ pub(crate) fn resolve_stream_task(
             "Stream task panicked: {e}"
         ))),
     }
+}
+
+/// Finish an import from its IMPORT statement's result and its tunnel task.
+///
+/// After a successful statement it waits for the tunnel task. After a failed
+/// one it aborts the tunnel task: Exasol never requests data after it rejects
+/// the statement and keeps the tunnel socket open, so the task would wait
+/// forever. The task's own error wins if the task failed first.
+pub(crate) async fn finish_import(
+    statement: Result<u64, String>,
+    tunnel: JoinHandle<Result<(), ImportError>>,
+) -> Result<u64, ImportError> {
+    let statement_error = match statement {
+        Ok(row_count) => return resolve_stream_task(tunnel.await).map(|()| row_count),
+        Err(message) => message,
+    };
+
+    tunnel.abort();
+    let tunnel_error = match tunnel.await {
+        Err(join_error) if join_error.is_cancelled() => None,
+        joined => resolve_stream_task(joined).err(),
+    };
+    Err(tunnel_error.unwrap_or(ImportError::SqlError(statement_error)))
 }
 
 /// Entry describing a file for parallel import.
@@ -281,21 +305,46 @@ pub async fn stream_files_parallel(
 
 /// Await every streaming task with fail-fast semantics.
 ///
-/// Reports the index of the failing task so a multi-file import points at the
-/// file that broke.
-async fn join_stream_handles(
+/// Tasks are polled concurrently, so a failure in any stream is reported
+/// without waiting for earlier streams. The error carries the index of the
+/// failing task so a multi-file import points at the file that broke. Dropping
+/// a `JoinHandle` detaches its task, so a guard holds the abort handles from
+/// the call on and aborts the unfinished tasks after the first failure or when
+/// the returned future is dropped.
+fn join_stream_handles(
     handles: Vec<JoinHandle<Result<(), ImportError>>>,
-) -> Result<(), ImportError> {
-    for (idx, handle) in handles.into_iter().enumerate() {
-        handle
-            .await
-            .map_err(|e| {
-                ImportError::ParallelImportError(format!("Stream task {} panicked: {e}", idx))
-            })?
-            .map_err(|e| ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx)))?;
-    }
+) -> impl Future<Output = Result<(), ImportError>> {
+    let guard = AbortOnDrop(handles.iter().map(JoinHandle::abort_handle).collect());
+    async move {
+        let _guard = guard;
+        let mut joins = JoinSet::new();
+        for (idx, handle) in handles.into_iter().enumerate() {
+            joins.spawn(async move { (idx, handle.await) });
+        }
 
-    Ok(())
+        while let Some(joined) = joins.join_next().await {
+            let (idx, outcome) = joined.map_err(|e| {
+                ImportError::ParallelImportError(format!("Stream join task failed: {e}"))
+            })?;
+            outcome
+                .map_err(|e| {
+                    ImportError::ParallelImportError(format!("Stream task {} panicked: {e}", idx))
+                })?
+                .map_err(|e| {
+                    ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx))
+                })?;
+        }
+
+        Ok(())
+    }
+}
+
+struct AbortOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.iter().for_each(AbortHandle::abort);
+    }
 }
 
 /// Streams multiple Parquet files through HTTP connections in parallel using
@@ -487,6 +536,8 @@ pub async fn convert_parquet_files_to_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
 
     #[test]
     fn test_import_file_entry_new() {
@@ -692,6 +743,153 @@ mod tests {
         ];
 
         assert!(join_stream_handles(handles).await.is_ok());
+    }
+
+    const HANG_LIMIT: Duration = Duration::from_secs(5);
+
+    fn statement_error() -> Result<u64, String> {
+        Err("object T not found".to_string())
+    }
+
+    /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+    #[tokio::test]
+    async fn test_finish_import_returns_statement_error_without_waiting_for_a_silent_tunnel() {
+        let tunnel = tokio::spawn(std::future::pending::<Result<(), ImportError>>());
+
+        let err = tokio::time::timeout(HANG_LIMIT, finish_import(statement_error(), tunnel))
+            .await
+            .expect("a failed statement must not wait for a tunnel task that never finishes")
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::SqlError(m) if m == "object T not found"),
+            "got: {err}"
+        );
+    }
+
+    /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+    #[tokio::test]
+    async fn test_finish_import_returns_the_error_of_a_tunnel_task_that_already_failed() {
+        let tunnel = tokio::spawn(async {
+            Err(ImportError::HttpTransportError("tunnel broke".to_string()))
+        });
+        while !tunnel.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let err = finish_import(statement_error(), tunnel).await.unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::HttpTransportError(m) if m == "tunnel broke"),
+            "got: {err}"
+        );
+    }
+
+    /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+    #[tokio::test]
+    async fn test_finish_import_returns_the_row_count_when_statement_and_tunnel_succeed() {
+        let tunnel = tokio::spawn(async { Ok(()) });
+
+        let rows = finish_import(Ok(3), tunnel).await.expect("import succeeds");
+
+        assert_eq!(rows, 3);
+    }
+
+    /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+    #[tokio::test]
+    async fn test_finish_import_returns_statement_error_over_a_tunnel_task_that_would_fail_later() {
+        let (_release, released) = oneshot::channel::<()>();
+        let (started, has_started) = oneshot::channel::<()>();
+        let tunnel = tokio::spawn(async move {
+            let _ = started.send(());
+            let _ = released.await;
+            Err(ImportError::HttpTransportError(
+                "late tunnel failure".to_string(),
+            ))
+        });
+        tokio::time::timeout(HANG_LIMIT, has_started)
+            .await
+            .expect("the tunnel task must start")
+            .expect("the tunnel task must signal its start");
+
+        let err = tokio::time::timeout(HANG_LIMIT, finish_import(statement_error(), tunnel))
+            .await
+            .expect("a failed statement must not wait for a running tunnel task")
+            .unwrap_err();
+
+        assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
+    }
+
+    /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+    #[tokio::test]
+    async fn test_join_stream_handles_stops_its_tasks_when_the_parent_task_is_aborted() {
+        let (first_sender, first_receiver) = oneshot::channel::<()>();
+        let (second_sender, second_receiver) = oneshot::channel::<()>();
+        let children = vec![
+            tokio::spawn(async move {
+                let _held = first_sender;
+                std::future::pending::<Result<(), ImportError>>().await
+            }),
+            tokio::spawn(async move {
+                let _held = second_sender;
+                std::future::pending::<Result<(), ImportError>>().await
+            }),
+        ];
+        let parent = tokio::spawn(join_stream_handles(children));
+
+        parent.abort();
+
+        for receiver in [first_receiver, second_receiver] {
+            let outcome = tokio::time::timeout(HANG_LIMIT, receiver)
+                .await
+                .expect("an aborted parent must stop its child tasks within 5 seconds");
+            assert!(outcome.is_err(), "the child task must drop its sender");
+        }
+    }
+
+    /// Scenario: Fail-fast on streaming error
+    #[tokio::test]
+    async fn test_join_stream_handles_stops_the_remaining_tasks_after_the_first_failure() {
+        let (sender, receiver) = oneshot::channel::<()>();
+        let handles = vec![
+            tokio::spawn(async { Err(ImportError::InvalidConfig("bad file".to_string())) }),
+            tokio::spawn(async move {
+                let _held = sender;
+                std::future::pending::<Result<(), ImportError>>().await
+            }),
+        ];
+
+        let err = join_stream_handles(handles).await.unwrap_err();
+
+        assert!(err.to_string().contains("Stream 0 failed"), "got: {err}");
+        let outcome = tokio::time::timeout(HANG_LIMIT, receiver)
+            .await
+            .expect("the remaining task must stop within 5 seconds");
+        assert!(outcome.is_err(), "the remaining task must drop its sender");
+    }
+
+    /// Scenario: Fail-fast on streaming error
+    #[tokio::test]
+    async fn test_join_stream_handles_reports_a_later_failure_while_an_earlier_stream_is_pending() {
+        let (sender, receiver) = oneshot::channel::<()>();
+        let handles = vec![
+            tokio::spawn(async move {
+                let _held = sender;
+                std::future::pending::<Result<(), ImportError>>().await
+            }),
+            tokio::spawn(async { Err(ImportError::InvalidConfig("bad file".to_string())) }),
+        ];
+
+        let err = tokio::time::timeout(HANG_LIMIT, join_stream_handles(handles))
+            .await
+            .expect("a later failure must not wait for an earlier pending stream")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Stream 1 failed"), "got: {err}");
+        let outcome = tokio::time::timeout(HANG_LIMIT, receiver)
+            .await
+            .expect("the pending task must stop within 5 seconds");
+        assert!(outcome.is_err(), "the pending task must drop its sender");
     }
 
     #[tokio::test]

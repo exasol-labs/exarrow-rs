@@ -3,6 +3,7 @@
 //! This module provides a WebSocket-based transport for communicating with
 //! Exasol databases using the Exasol WebSocket protocol.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -43,6 +44,8 @@ pub struct WebSocketTransport {
     session_info: Option<SessionInfo>,
     /// Connection state
     state: ConnectionState,
+    /// Next fetch start position per open result set handle
+    fetch_positions: HashMap<i32, i64>,
 }
 
 /// Connection state tracking.
@@ -65,6 +68,7 @@ impl WebSocketTransport {
             ws_stream: None,
             session_info: None,
             state: ConnectionState::Disconnected,
+            fetch_positions: HashMap::new(),
         }
     }
 
@@ -152,9 +156,10 @@ impl WebSocketTransport {
     ///
     /// Both statement paths receive the same `ExecuteResponse` shape and owe
     /// callers the same `QueryResult`, so the status check, the first-result
-    /// selection, and the result-type dispatch live here once.
+    /// selection, and the result-type dispatch live here once. A result set
+    /// handle starts its fetch position after the rows this response delivered.
     fn query_result_from_response(
-        &self,
+        &mut self,
         response: ExecuteResponse,
     ) -> Result<QueryResult, TransportError> {
         self.check_status(&response.status, &response.exception)?;
@@ -197,6 +202,10 @@ impl WebSocketTransport {
 
                 // Handle may be None when all data fits in one response
                 let handle = result_set.result_set_handle.map(ResultSetHandle::new);
+                if let Some(handle) = handle {
+                    self.fetch_positions
+                        .insert(handle.as_i32(), data.data.num_rows() as i64);
+                }
 
                 Ok(QueryResult::result_set(handle, data))
             }
@@ -553,7 +562,12 @@ impl TransportProtocol for WebSocketTransport {
             .unwrap_or(1024 * 1024); // 1MB default
 
         // Send fetch request
-        let request = FetchRequest::new(handle.as_i32(), 0, max_bytes);
+        let start_position = self
+            .fetch_positions
+            .get(&handle.as_i32())
+            .copied()
+            .unwrap_or(0);
+        let request = FetchRequest::new(handle.as_i32(), start_position, max_bytes);
         let response: FetchResponse = self.send_receive(&request).await?;
 
         // Check response status
@@ -563,6 +577,11 @@ impl TransportProtocol for WebSocketTransport {
         let fetch_data = response
             .response_data
             .ok_or_else(|| TransportError::InvalidResponse("Missing response data".to_string()))?;
+
+        self.fetch_positions.insert(
+            handle.as_i32(),
+            start_position + fetch_data.data.len() as i64,
+        );
 
         // Note: columns are not included in fetch response,
         // they should be cached from the initial execute response
@@ -580,6 +599,8 @@ impl TransportProtocol for WebSocketTransport {
                 "Must authenticate before closing result sets".to_string(),
             ));
         }
+
+        self.fetch_positions.remove(&handle.as_i32());
 
         // Send close result set request
         let request = CloseResultSetRequest::new(vec![handle.as_i32()]);
@@ -794,6 +815,8 @@ impl TransportProtocol for WebSocketTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_support::FakeWebSocketServer;
+    use serde_json::{json, Value};
 
     #[test]
     fn test_websocket_transport_new() {
@@ -1444,5 +1467,136 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
 
         assert!(result.is_ok());
         assert!(transport.session_info.is_none());
+    }
+
+    fn decimal_column() -> Value {
+        json!({"name": "ID", "dataType": {"type": "DECIMAL", "precision": 18, "scale": 0}})
+    }
+
+    fn execute_response(handle: i32, total_rows: i64, inline: &[i64]) -> Value {
+        json!({
+            "status": "ok",
+            "responseData": {
+                "numResults": 1,
+                "results": [{
+                    "resultType": "resultSet",
+                    "resultSet": {
+                        "resultSetHandle": handle,
+                        "numColumns": 1,
+                        "numRows": total_rows,
+                        "numRowsInMessage": inline.len(),
+                        "columns": [decimal_column()],
+                        "data": [inline],
+                    }
+                }]
+            }
+        })
+    }
+
+    fn fetch_response(rows: &[i64]) -> Value {
+        json!({"status": "ok", "responseData": {"numRows": rows.len(), "data": [rows]}})
+    }
+
+    fn fetch_start_positions(server: &FakeWebSocketServer) -> Vec<i64> {
+        server
+            .requests()
+            .iter()
+            .filter(|request| request["command"] == "fetch")
+            .map(|request| request["startPosition"].as_i64().expect("startPosition"))
+            .collect()
+    }
+
+    async fn authenticated_transport(server: &FakeWebSocketServer) -> WebSocketTransport {
+        let mut transport = WebSocketTransport::new();
+        let params = ConnectionParams::new("127.0.0.1".to_string(), server.port).with_tls(false);
+        transport.connect(&params).await.expect("connect");
+        transport.state = ConnectionState::Authenticated;
+        transport.session_info = Some(SessionInfo {
+            session_id: "1".to_string(),
+            protocol_version: 3,
+            release_version: "2026.1.0".to_string(),
+            database_name: "exa".to_string(),
+            product_name: "Exasol".to_string(),
+            max_data_message_size: 1024 * 1024,
+            time_zone: None,
+        });
+        transport
+    }
+
+    /// Scenario: Fetch results command
+    #[tokio::test]
+    async fn test_fetch_results_starts_after_the_inline_rows_and_advances_per_page() {
+        let server = FakeWebSocketServer::scripted(vec![
+            execute_response(7, 5, &[1, 2]),
+            execute_response(8, 5, &[]),
+            fetch_response(&[3, 4]),
+            fetch_response(&[1, 2]),
+            fetch_response(&[5, 6]),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+
+        transport.execute_query("SELECT 7").await.unwrap();
+        transport.execute_query("SELECT 8").await.unwrap();
+        transport
+            .fetch_results(ResultSetHandle::new(7))
+            .await
+            .unwrap();
+        transport
+            .fetch_results(ResultSetHandle::new(8))
+            .await
+            .unwrap();
+        transport
+            .fetch_results(ResultSetHandle::new(7))
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_start_positions(&server), vec![2, 0, 4]);
+    }
+
+    /// Scenario: Fetch results command
+    #[tokio::test]
+    async fn test_prepared_statement_fetch_starts_after_the_inline_rows() {
+        let server = FakeWebSocketServer::scripted(vec![
+            execute_response(9, 10, &[1, 2, 3]),
+            fetch_response(&[4, 5]),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+        let statement = PreparedStatementHandle::new(1, 0, vec![], vec![]);
+
+        transport
+            .execute_prepared_statement(&statement, None)
+            .await
+            .unwrap();
+        transport
+            .fetch_results(ResultSetHandle::new(9))
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_start_positions(&server), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn test_close_result_set_forgets_the_fetch_position() {
+        let server = FakeWebSocketServer::scripted(vec![
+            execute_response(7, 5, &[1, 2]),
+            json!({"status": "ok"}),
+            fetch_response(&[1]),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+
+        transport.execute_query("SELECT 7").await.unwrap();
+        transport
+            .close_result_set(ResultSetHandle::new(7))
+            .await
+            .unwrap();
+        transport
+            .fetch_results(ResultSetHandle::new(7))
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_start_positions(&server), vec![0]);
     }
 }

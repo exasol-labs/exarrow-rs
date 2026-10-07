@@ -16,7 +16,11 @@ mod common;
 
 use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
-use common::{generate_test_schema_name, get_host, get_password, get_port, get_user};
+use common::{
+    assert_every_key_once, assert_partly_inline, drain_iterator, end_of_stream_query,
+    generate_test_schema_name, get_host, get_password, get_port, get_user, multi_fetch_query,
+    open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
+};
 use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::transport::{ConnectionParams, Credentials, TransportProtocol, WebSocketTransport};
 
@@ -238,6 +242,8 @@ async fn test_terminate_marks_websocket_transport_disconnected() {
 // ── Section 3: Basic Queries ──────────────────────────────────────────────────
 
 /// 3.1 SELECT from DUAL over WebSocket.
+///
+/// Scenario: Small result set retrieval
 #[tokio::test]
 async fn test_ws_select_from_dual() {
     skip_if_no_exasol!();
@@ -1989,4 +1995,110 @@ async fn test_prepared_result_columns_websocket_matches_native() {
         .await;
 
     transport.close().await.expect("close failed");
+}
+
+// Section: Paged fetch (WebSocket transport)
+// Paged fetch position and end of stream.
+
+/// Scenario: Fetch results command
+/// Scenario: Large result set pagination
+#[tokio::test]
+async fn test_ws_fetch_all_multi_fetch_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(multi_fetch_query())
+        .await
+        .expect("multi-fetch query should succeed");
+
+    let non_empty = batches.iter().filter(|b| b.num_rows() > 0).count();
+    assert!(
+        non_empty >= 2,
+        "expected at least two non-empty batches, got {non_empty}"
+    );
+    assert_every_key_once(&batches, MULTI_FETCH_ROWS);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Fetch results command
+/// Scenario: Result partly delivered with the execute response
+#[tokio::test]
+async fn test_ws_fetch_all_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(partial_inline_query())
+        .await
+        .expect("partial-inline query should succeed");
+
+    assert_partly_inline(&batches);
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator ends after the last row
+#[test]
+fn test_ws_iterator_ends_after_last_row() {
+    skip_if_no_exasol!();
+
+    let (runtime, conn, mut iterator) = open_iterator(get_ws_connection(), end_of_stream_query());
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_every_key_once(&batches, END_OF_STREAM_ROWS);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: Result partly delivered with the execute response
+/// Scenario: Result set iterator ends after the last row
+#[test]
+fn test_ws_iterator_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let (runtime, conn, mut iterator) = open_iterator(get_ws_connection(), partial_inline_query());
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_partly_inline(&batches);
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: Fetch results command
+/// Scenario: Prepared statement result is paged like a query result
+#[tokio::test]
+async fn test_ws_prepared_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let prepared = conn
+        .prepare(partial_inline_query())
+        .await
+        .expect("Failed to prepare statement");
+    let batches = conn
+        .execute_prepared(&prepared)
+        .await
+        .expect("Failed to execute prepared statement")
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    assert_partly_inline(&batches);
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
+    conn.close().await.expect("Failed to close connection");
 }

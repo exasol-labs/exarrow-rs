@@ -28,21 +28,22 @@
 //!
 //! # Running Tests
 //!
-//! Integration tests are marked with `#[ignore]` to prevent failures in
-//! CI environments without Exasol. Run them explicitly:
+//! CI runs every test in this file against an Exasol container with
+//! `REQUIRE_EXASOL=1`, so a missing database fails the run. Run them locally
+//! the same way:
 //!
 //! ```bash
 //! # Run all import/export tests
-//! cargo test --test import_export_tests -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1
 //!
 //! # Run CSV tests only
-//! cargo test --test import_export_tests csv -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests csv -- --test-threads=1
 //!
 //! # Run Parquet tests only
-//! cargo test --test import_export_tests parquet -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests parquet -- --test-threads=1
 //!
 //! # Run Arrow tests only
-//! cargo test --test import_export_tests arrow -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests arrow -- --test-threads=1
 //! ```
 
 mod common;
@@ -60,6 +61,7 @@ use exarrow_rs::export::parquet::ParquetExportOptions;
 use exarrow_rs::import::arrow::ArrowImportOptions;
 use exarrow_rs::import::csv::CsvImportOptions;
 use exarrow_rs::import::parquet::ParquetImportOptions;
+use exarrow_rs::import::ImportError;
 use exarrow_rs::query::export::ExportSource;
 use std::sync::Arc;
 use std::time::Instant;
@@ -102,7 +104,6 @@ async fn cleanup_schema(conn: &mut Connection, schema_name: &str) {
 
 /// 11.1.1 Test import CSV into new table
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_into_table() {
     skip_if_no_exasol!();
 
@@ -152,7 +153,6 @@ async fn test_csv_import_into_table() {
 
 /// 11.1.2 Test import with column mapping
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_with_column_mapping() {
     skip_if_no_exasol!();
 
@@ -218,7 +218,6 @@ async fn test_csv_import_with_column_mapping() {
 
 /// 11.1.3 Test import with error handling
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_error_handling() {
     skip_if_no_exasol!();
 
@@ -255,7 +254,6 @@ async fn test_csv_import_error_handling() {
 
 /// 11.1.4 Test import compressed CSV (gzip)
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_compressed_gzip() {
     skip_if_no_exasol!();
 
@@ -312,7 +310,6 @@ async fn test_csv_import_compressed_gzip() {
 
 /// 11.1.5 Test import CSV from async stream
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_from_stream() {
     skip_if_no_exasol!();
 
@@ -362,7 +359,6 @@ async fn test_csv_import_from_stream() {
 
 /// 11.2.1 Test export table to CSV file
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_table_to_file() {
     skip_if_no_exasol!();
 
@@ -409,7 +405,6 @@ async fn test_csv_export_table_to_file() {
 
 /// 11.2.2 Test export query result to CSV
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_query_to_file() {
     skip_if_no_exasol!();
 
@@ -454,7 +449,6 @@ async fn test_csv_export_query_to_file() {
 
 /// 11.2.3 Test export with column headers
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_with_headers() {
     skip_if_no_exasol!();
 
@@ -518,7 +512,6 @@ async fn test_csv_export_with_headers() {
 /// The resulting file is NOT gzip compressed - it contains plain CSV data.
 /// This test verifies that gzip transfer encoding works correctly for data transfer.
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_with_gzip_transfer() {
     skip_if_no_exasol!();
 
@@ -568,7 +561,6 @@ async fn test_csv_export_with_gzip_transfer() {
 
 /// 11.2.5 Test export to in-memory list (callback-style)
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_to_list() {
     skip_if_no_exasol!();
 
@@ -608,7 +600,6 @@ async fn test_csv_export_to_list() {
 
 /// 11.2.6 Test export to async stream
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_to_stream() {
     skip_if_no_exasol!();
 
@@ -649,7 +640,6 @@ async fn test_csv_export_to_stream() {
 
 /// 11.3.1 Test import Parquet file
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_from_file() {
     skip_if_no_exasol!();
 
@@ -727,7 +717,6 @@ async fn test_parquet_import_from_file() {
 
 /// 11.3.2 Test export to Parquet file
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_to_file() {
     skip_if_no_exasol!();
 
@@ -781,7 +770,6 @@ async fn test_parquet_export_to_file() {
 
 /// 11.3.3 Test Parquet round-trip (import -> export -> verify)
 #[tokio::test]
-#[ignore]
 async fn test_parquet_round_trip() {
     skip_if_no_exasol!();
 
@@ -877,7 +865,6 @@ async fn test_parquet_round_trip() {
 
 /// 11.4.1 Test import from RecordBatch
 #[tokio::test]
-#[ignore]
 async fn test_arrow_import_from_record_batch() {
     skip_if_no_exasol!();
 
@@ -939,7 +926,6 @@ async fn test_arrow_import_from_record_batch() {
 
 /// 11.4.2 Test export to RecordBatch stream
 #[tokio::test]
-#[ignore]
 async fn test_arrow_export_to_record_batches() {
     skip_if_no_exasol!();
 
@@ -987,7 +973,6 @@ async fn test_arrow_export_to_record_batches() {
 
 /// 11.4.3 Test import from Arrow IPC file
 #[tokio::test]
-#[ignore]
 async fn test_arrow_import_from_ipc_file() {
     skip_if_no_exasol!();
 
@@ -1064,7 +1049,6 @@ async fn test_arrow_import_from_ipc_file() {
 
 /// 11.4.4 Test export to Arrow IPC file
 #[tokio::test]
-#[ignore]
 async fn test_arrow_export_to_ipc_file() {
     skip_if_no_exasol!();
 
@@ -1123,7 +1107,6 @@ async fn test_arrow_export_to_ipc_file() {
 
 /// 11.4.5 Test Arrow round-trip (RecordBatch -> Exasol -> RecordBatch)
 #[tokio::test]
-#[ignore]
 async fn test_arrow_round_trip() {
     skip_if_no_exasol!();
 
@@ -1206,7 +1189,6 @@ async fn test_arrow_round_trip() {
 
 /// Test CSV import with empty file
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_empty_file() {
     skip_if_no_exasol!();
 
@@ -1241,7 +1223,6 @@ async fn test_csv_import_empty_file() {
 
 /// Test CSV export from empty table
 #[tokio::test]
-#[ignore]
 async fn test_csv_export_empty_table() {
     skip_if_no_exasol!();
 
@@ -1279,7 +1260,6 @@ async fn test_csv_export_empty_table() {
 
 /// Test CSV import with special characters
 #[tokio::test]
-#[ignore]
 async fn test_csv_import_special_characters() {
     skip_if_no_exasol!();
 
@@ -1330,7 +1310,6 @@ async fn test_csv_import_special_characters() {
 
 /// Test large dataset import/export
 #[tokio::test]
-#[ignore]
 async fn test_large_dataset_import_export() {
     skip_if_no_exasol!();
 
@@ -1400,7 +1379,6 @@ async fn test_large_dataset_import_export() {
 /// This test verifies that import operations work correctly when the main
 /// WebSocket connection uses TLS (which is the default for our test connection).
 #[tokio::test]
-#[ignore]
 async fn test_tls_connection_csv_import() {
     skip_if_no_exasol!();
 
@@ -1453,7 +1431,6 @@ async fn test_tls_connection_csv_import() {
 /// This test verifies that export operations work correctly when the main
 /// WebSocket connection uses TLS.
 #[tokio::test]
-#[ignore]
 async fn test_tls_connection_csv_export() {
     skip_if_no_exasol!();
 
@@ -1505,7 +1482,6 @@ async fn test_tls_connection_csv_export() {
 /// 2. Export data (WebSocket uses TLS)
 /// 3. Verify data integrity
 #[tokio::test]
-#[ignore]
 async fn test_tls_connection_round_trip() {
     skip_if_no_exasol!();
 
@@ -1583,7 +1559,6 @@ async fn test_tls_connection_round_trip() {
 /// Verifies that two CSV files can be imported in parallel into the same table,
 /// with the total rows being the sum of both files.
 #[tokio::test]
-#[ignore]
 async fn test_parallel_csv_import_two_files() {
     skip_if_no_exasol!();
 
@@ -1635,7 +1610,6 @@ async fn test_parallel_csv_import_two_files() {
 ///
 /// Verifies that five CSV files can be imported in parallel into the same table.
 #[tokio::test]
-#[ignore]
 async fn test_parallel_csv_import_five_files() {
     skip_if_no_exasol!();
 
@@ -1699,7 +1673,6 @@ async fn test_parallel_csv_import_five_files() {
 /// Verifies that when a single file is provided as a Vec, it delegates
 /// to the existing single-file import implementation.
 #[tokio::test]
-#[ignore]
 async fn test_parallel_csv_import_single_file_fallback() {
     skip_if_no_exasol!();
 
@@ -1750,7 +1723,6 @@ async fn test_parallel_csv_import_single_file_fallback() {
 /// Verifies that two Parquet files can be imported in parallel into the same table,
 /// with each file being converted to CSV on-the-fly.
 #[tokio::test]
-#[ignore]
 async fn test_parallel_parquet_import_two_files() {
     skip_if_no_exasol!();
 
@@ -1851,7 +1823,6 @@ async fn test_parallel_parquet_import_two_files() {
 ///
 /// Verifies that Parquet files with different row counts can be imported in parallel.
 #[tokio::test]
-#[ignore]
 async fn test_parallel_parquet_import_mixed_batch_sizes() {
     skip_if_no_exasol!();
 
@@ -1950,7 +1921,6 @@ async fn test_parallel_parquet_import_mixed_batch_sizes() {
 /// Verifies backward compatibility - the existing import_csv_from_file
 /// method should continue to work with a single PathBuf.
 #[tokio::test]
-#[ignore]
 async fn test_single_path_still_works() {
     skip_if_no_exasol!();
 
@@ -1999,7 +1969,6 @@ async fn test_single_path_still_works() {
 
 /// Test importing Parquet file with auto table creation (single file)
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_auto_create_table() {
     skip_if_no_exasol!();
 
@@ -2084,7 +2053,6 @@ async fn test_parquet_import_auto_create_table() {
 
 /// Test importing Parquet file with auto table creation using sanitized column names
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_auto_create_sanitized_names() {
     skip_if_no_exasol!();
 
@@ -2166,7 +2134,6 @@ async fn test_parquet_import_auto_create_sanitized_names() {
 
 /// Test importing multiple Parquet files with auto table creation (union schema)
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_auto_create_multi_file() {
     skip_if_no_exasol!();
 
@@ -2265,7 +2232,6 @@ async fn test_parquet_import_auto_create_multi_file() {
 
 /// Test importing Parquet when table already exists (auto-create should be no-op)
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_auto_create_existing_table() {
     skip_if_no_exasol!();
 
@@ -2339,7 +2305,6 @@ async fn test_parquet_import_auto_create_existing_table() {
 
 /// Test that parquet import with auto-create targeting nonexistent schema returns error
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_auto_create_nonexistent_schema_returns_error() {
     skip_if_no_exasol!();
 
@@ -2484,7 +2449,6 @@ async fn setup_id_name_table(conn: &mut Connection, schema_name: &str) {
 /// Test that forcing the CSV path via `with_native_parquet(Some(false))` succeeds
 /// regardless of the server version.
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_forced_csv_path_works() {
     skip_if_no_exasol!();
 
@@ -2522,20 +2486,18 @@ async fn test_parquet_import_forced_csv_path_works() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test the native Parquet import path when the server supports it.
-/// Skips gracefully on older server versions.
+/// Test the native Parquet import path. Fails on a server without native
+/// Parquet import, because it needs Exasol 2025.2.1 or later.
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_native_path_when_supported() {
     skip_if_no_exasol!();
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
 
-    if !conn.supports_native_parquet_import() {
-        eprintln!("skip: server does not support native Parquet import (< 2025.1.11)");
-        conn.close().await.expect("Failed to close connection");
-        return;
-    }
+    assert!(
+        conn.supports_native_parquet_import(),
+        "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
+    );
 
     let schema_name = generate_test_schema_name();
     setup_id_name_table(&mut conn, &schema_name).await;
@@ -2570,20 +2532,18 @@ async fn test_parquet_import_native_path_when_supported() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test native Parquet import via the stream (reader) path.
-/// Skips gracefully on older server versions.
+/// Test native Parquet import via the stream (reader) path. Fails on a server
+/// without native Parquet import, because it needs Exasol 2025.2.1 or later.
 #[tokio::test]
-#[ignore]
 async fn test_parquet_stream_import_native_path() {
     skip_if_no_exasol!();
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
 
-    if !conn.supports_native_parquet_import() {
-        eprintln!("skip: server does not support native Parquet import (< 2025.1.11)");
-        conn.close().await.expect("Failed to close connection");
-        return;
-    }
+    assert!(
+        conn.supports_native_parquet_import(),
+        "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
+    );
 
     let schema_name = generate_test_schema_name();
     setup_id_name_table(&mut conn, &schema_name).await;
@@ -2620,20 +2580,18 @@ async fn test_parquet_stream_import_native_path() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test parallel native Parquet import from multiple files.
-/// Skips gracefully on older server versions.
+/// Test parallel native Parquet import from multiple files. Fails on a server
+/// without native Parquet import, because it needs Exasol 2025.2.1 or later.
 #[tokio::test]
-#[ignore]
 async fn test_parallel_parquet_import_native_path() {
     skip_if_no_exasol!();
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
 
-    if !conn.supports_native_parquet_import() {
-        eprintln!("skip: server does not support native Parquet import (< 2025.1.11)");
-        conn.close().await.expect("Failed to close connection");
-        return;
-    }
+    assert!(
+        conn.supports_native_parquet_import(),
+        "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
+    );
 
     let schema_name = generate_test_schema_name();
     setup_id_name_table(&mut conn, &schema_name).await;
@@ -2668,7 +2626,6 @@ async fn test_parallel_parquet_import_native_path() {
 /// Test that forcing CSV path via `with_native_parquet(Some(false))` works even
 /// on a modern server that would otherwise auto-select the native path.
 #[tokio::test]
-#[ignore]
 async fn test_parquet_import_forced_csv_path_fallback_works() {
     skip_if_no_exasol!();
 
@@ -2707,6 +2664,153 @@ async fn test_parquet_import_forced_csv_path_fallback_works() {
     conn.close().await.expect("Failed to close connection");
 }
 
+// Section: Failed IMPORT statement
+
+const MISSING_TABLE: &str = "MISSING_TABLE";
+const IMPORT_HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Creates a fresh schema without tables and returns the qualified name of a
+/// table that does not exist in it.
+async fn missing_table_in_new_schema(conn: &mut Connection) -> (String, String) {
+    let schema_name = generate_test_schema_name();
+    conn.execute_update(&format!("CREATE SCHEMA {schema_name}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    let table = format!("{schema_name}.{MISSING_TABLE}");
+    (schema_name, table)
+}
+
+/// Awaits an import into a missing table and asserts that it returns Exasol's
+/// error, naming the table, within `IMPORT_HANG_LIMIT` instead of waiting for
+/// the tunnel.
+async fn assert_import_reports_missing_table<F>(import: F, table: &str)
+where
+    F: std::future::Future<Output = Result<u64, ImportError>>,
+{
+    let result = tokio::time::timeout(IMPORT_HANG_LIMIT, import)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("an import into a missing table must return within {IMPORT_HANG_LIMIT:?}")
+        });
+
+    let err = result.expect_err("an import into a missing table must fail");
+    assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
+    assert!(err.to_string().contains(table), "got: {err}");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parquet_import_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = write_small_parquet(temp_dir.path(), "test.parquet");
+    let options = ParquetImportOptions::default().with_native_parquet(Some(true));
+
+    assert_import_reports_missing_table(
+        conn.import_from_parquet(&table, &parquet_path, options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parquet_import_csv_path_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = write_small_parquet(temp_dir.path(), "test.parquet");
+    let options = ParquetImportOptions::default().with_native_parquet(Some(false));
+
+    assert_import_reports_missing_table(
+        conn.import_from_parquet(&table, &parquet_path, options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parallel_parquet_import_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path1 = write_small_parquet_offset(temp_dir.path(), "part1.parquet", 1);
+    let path2 = write_small_parquet_offset(temp_dir.path(), "part2.parquet", 10);
+    let options = ParquetImportOptions::default().with_native_parquet(Some(true));
+
+    assert_import_reports_missing_table(
+        conn.import_parquet_from_files(&table, vec![path1, path2], options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parallel_parquet_import_csv_path_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path1 = write_small_parquet_offset(temp_dir.path(), "part1.parquet", 1);
+    let path2 = write_small_parquet_offset(temp_dir.path(), "part2.parquet", 10);
+    let options = ParquetImportOptions::default().with_native_parquet(Some(false));
+
+    assert_import_reports_missing_table(
+        conn.import_parquet_from_files(&table, vec![path1, path2], options),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+#[tokio::test]
+async fn test_parallel_csv_import_into_missing_table_returns_error() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path1 = temp_dir.path().join("data_part1.csv");
+    let csv_path2 = temp_dir.path().join("data_part2.csv");
+    std::fs::write(&csv_path1, "1,Alice,10.5\n").expect("Failed to write CSV file 1");
+    std::fs::write(&csv_path2, "2,Bob,20.5\n").expect("Failed to write CSV file 2");
+
+    assert_import_reports_missing_table(
+        conn.import_csv_from_files(
+            &table,
+            vec![csv_path1, csv_path2],
+            CsvImportOptions::default().use_tls(false),
+        ),
+        &table,
+    )
+    .await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
 /// Opt-in long-running proof that the default `CsvExportOptions` arms no
 /// client-side export timer. Before the fix, `timeout_ms` defaulted to
 /// `300_000` and any export running longer than five minutes failed with
@@ -2725,12 +2829,11 @@ async fn test_parquet_import_forced_csv_path_fallback_works() {
 /// where 8 minutes runs far short or long.
 ///
 /// Kept `#[ignore]` and gated on `EXARROW_LONG_EXPORT_CHECK` because an
-/// eight-minute test has no place in a suite run by default: it never runs
-/// in CI today (`import_export_tests` is not part of the CI job), and even a
-/// local `cargo test --test import_export_tests -- --ignored` should not
-/// eat eight minutes without being asked for it by name.
+/// eight-minute test has no place in a suite run by default: CI runs
+/// `import_export_tests`, and the reasoned `#[ignore]` keeps this test out of
+/// that run. Run it with `EXARROW_LONG_EXPORT_CHECK=1` and `-- --ignored`.
 #[tokio::test]
-#[ignore]
+#[ignore = "eight-minute opt-in check, run with EXARROW_LONG_EXPORT_CHECK=1 and -- --ignored"]
 async fn test_csv_export_runs_past_the_former_five_minute_limit() {
     if std::env::var("EXARROW_LONG_EXPORT_CHECK").is_err() {
         eprintln!(
@@ -2857,7 +2960,6 @@ fn table_source(schema_name: &str, table: &str) -> ExportSource {
 
 /// Scenario: Export preserves schema
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_preserves_schema() {
     assert!(
         common::is_exasol_available(),
@@ -2987,7 +3089,6 @@ async fn test_parquet_export_preserves_schema() {
 
 /// Scenario: Query export names fields after the select list
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_names_fields_after_select_list() {
     assert!(
         common::is_exasol_available(),
@@ -3036,7 +3137,6 @@ async fn test_parquet_export_names_fields_after_select_list() {
 
 /// Scenario: Values containing the separator, the delimiter, or a line break export intact
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_keeps_values_with_separators_and_line_breaks() {
     assert!(
         common::is_exasol_available(),
@@ -3098,7 +3198,6 @@ async fn test_parquet_export_keeps_values_with_separators_and_line_breaks() {
 
 /// Scenario: Exported text values keep their whitespace
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_keeps_text_whitespace() {
     assert!(
         common::is_exasol_available(),
@@ -3145,7 +3244,6 @@ async fn test_parquet_export_keeps_text_whitespace() {
 
 /// Scenario: Columns without a typed CSV conversion export as text
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_writes_untyped_columns_as_text() {
     assert!(
         common::is_exasol_available(),
@@ -3207,7 +3305,6 @@ async fn test_parquet_export_writes_untyped_columns_as_text() {
 
 /// Scenario: Empty export writes a Parquet file that carries the schema
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_empty_result_writes_schema_only_file() {
     assert!(
         common::is_exasol_available(),
@@ -3257,7 +3354,6 @@ async fn test_parquet_export_empty_result_writes_schema_only_file() {
 
 /// Scenario: Export source that produces no result set is rejected before the export runs
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_rejects_source_without_result_set() {
     assert!(
         common::is_exasol_available(),
@@ -3331,7 +3427,6 @@ async fn test_parquet_export_rejects_source_without_result_set() {
 
 /// Scenario: A value that does not match its column type fails the export
 #[tokio::test]
-#[ignore]
 async fn test_parquet_export_fails_on_value_outside_default_session_format() {
     assert!(
         common::is_exasol_available(),

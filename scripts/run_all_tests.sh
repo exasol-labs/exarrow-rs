@@ -7,11 +7,11 @@
 #   ./scripts/run_all_tests.sh --stage integration   # Run deps + build + container + integration
 #   ./scripts/run_all_tests.sh --skip-cleanup        # Keep container running after tests
 #   ./scripts/run_all_tests.sh --no-fail-fast        # Don't stop on first failure
-#   ./scripts/run_all_tests.sh --exasol-tag 2025.2.0 # Use specific Exasol image tag
+#   ./scripts/run_all_tests.sh --exasol-tag 2025.2.1 # Use specific Exasol image tag
 set -euo pipefail
 
 # --- Defaults ---
-EXASOL_TAG="2025.2.0"
+EXASOL_TAG="2025.2.1"
 CONTAINER_NAME="exasol-test"
 SKIP_CLEANUP=false
 FAIL_FAST=true
@@ -196,13 +196,16 @@ stage_integration() {
   cd "$PROJECT_DIR"
   export REQUIRE_EXASOL=1
   cargo test --features ffi --test integration_tests -- --test-threads=1
+  cargo test --features 'ffi websocket' --test websocket_integration_tests -- --test-threads=1
+  cargo test --features 'ffi websocket' --test native_protocol_tests -- --test-threads=1
+  cargo test --features ffi --test native_transport_smoke_test -- --test-threads=1
   cargo test --features ffi --test driver_manager_tests -- --include-ignored --test-threads=1
 }
 
 stage_import_export() {
   cd "$PROJECT_DIR"
   export REQUIRE_EXASOL=1
-  cargo test --test import_export_tests -- --ignored
+  cargo test --features ffi --test import_export_tests -- --test-threads=1
 }
 
 stage_python() {

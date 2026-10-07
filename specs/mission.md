@@ -81,7 +81,7 @@ cargo test --lib                         # Unit tests
 cargo test --test integration_tests      # Integration tests (requires Exasol)
 cargo test --test native_protocol_tests  # Native protocol tests (requires Exasol)
 cargo test --test driver_manager_tests   # Driver manager tests
-cargo test --test import_export_tests -- --ignored  # Import/export tests (requires Exasol)
+REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1  # Import/export tests (requires Exasol)
 
 # Lint & Format
 cargo fmt --all                          # Format code

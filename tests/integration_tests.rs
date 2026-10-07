@@ -39,21 +39,22 @@
 //!
 //! # Running Tests
 //!
-//! Integration tests are marked with `#[ignore]` to prevent failures in
-//! CI environments without Exasol. Run them explicitly:
+//! CI runs every test in this file against an Exasol container with
+//! `REQUIRE_EXASOL=1`, so a missing database fails the run. Run them locally
+//! the same way:
 //!
 //! ```bash
 //! # Run all integration tests
-//! cargo test --test integration_tests -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --test integration_tests -- --test-threads=1
 //!
 //! # Run a specific test
-//! cargo test --test integration_tests test_connection_succeeds -- --ignored
+//! REQUIRE_EXASOL=1 cargo test --test integration_tests test_connection_succeeds
 //!
 //! # Run with verbose output
-//! cargo test --test integration_tests -- --ignored --nocapture
+//! REQUIRE_EXASOL=1 cargo test --test integration_tests -- --nocapture
 //!
 //! # Run with custom Exasol instance
-//! EXASOL_HOST=192.168.1.100 cargo test --test integration_tests -- --ignored
+//! EXASOL_HOST=192.168.1.100 REQUIRE_EXASOL=1 cargo test --test integration_tests
 //! ```
 //!
 //! # Test Organization
@@ -74,8 +75,11 @@ mod common;
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    disable_query_cache, generate_test_schema_name, get_host, get_port, get_test_connection,
+    assert_every_key_once, assert_partly_inline, disable_query_cache, drain_iterator,
+    end_of_stream_query, generate_test_schema_name, get_host, get_port, get_test_connection,
     get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
+    multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
+    PARTIAL_INLINE_ROWS,
 };
 #[cfg(feature = "native")]
 use common::{get_password, get_test_connection_with_transport};
@@ -292,6 +296,8 @@ async fn test_connection_health_check() {
 // Tests for SELECT queries, Arrow RecordBatch validation, and data retrieval.
 
 /// 3.1 Test SELECT from DUAL returns correct results
+///
+/// Scenario: Small result set retrieval
 #[tokio::test]
 async fn test_select_from_dual() {
     skip_if_no_exasol!();
@@ -464,9 +470,8 @@ async fn test_create_schema() {
 /// and the connection stays open with no active schema. Tools such as dbt rely
 /// on this so they can create their target schema after connecting.
 ///
-/// Documents the live behavior; run with `--ignored` against a real Exasol.
+/// Documents the live behavior against a real Exasol.
 #[tokio::test]
-#[ignore]
 async fn test_connect_with_nonexistent_uri_schema_succeeds() {
     skip_if_no_exasol!();
 
@@ -2457,7 +2462,6 @@ async fn test_connect_with_certificate_fingerprint() {
 /// Connecting with a URI that names a schema activates that schema server-side
 /// without the caller having to invoke `set_schema()` explicitly.
 #[tokio::test]
-#[ignore]
 async fn test_uri_schema_is_opened_on_connect() {
     skip_if_no_exasol!();
 
@@ -2536,7 +2540,6 @@ async fn test_uri_schema_is_opened_on_connect() {
 /// the ADBC URI path (the one dbt uses); the builder path is covered by
 /// `test_connect_with_nonexistent_uri_schema_succeeds`.
 #[tokio::test]
-#[ignore]
 async fn test_uri_schema_missing_is_best_effort_via_adbc() {
     skip_if_no_exasol!();
 
@@ -3706,5 +3709,112 @@ async fn test_csv_export_timeout_during_callback_keeps_connection_usable() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
 
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section: Paged fetch (native transport)
+// Paged fetch position and end of stream.
+
+/// Scenario: Large result set (multi-fetch)
+/// Scenario: Large result set pagination
+#[tokio::test]
+async fn test_fetch_all_multi_fetch_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(multi_fetch_query())
+        .await
+        .expect("multi-fetch query should succeed");
+
+    let non_empty = batches.iter().filter(|b| b.num_rows() > 0).count();
+    assert!(
+        non_empty >= 2,
+        "expected at least two non-empty batches, got {non_empty}"
+    );
+    assert_every_key_once(&batches, MULTI_FETCH_ROWS);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Large result set (multi-fetch)
+/// Scenario: Result partly delivered with the execute response
+#[tokio::test]
+async fn test_fetch_all_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batches = conn
+        .query(partial_inline_query())
+        .await
+        .expect("partial-inline query should succeed");
+
+    assert_partly_inline(&batches);
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator ends after the last row
+#[test]
+fn test_iterator_ends_after_last_row() {
+    skip_if_no_exasol!();
+
+    let (runtime, conn, mut iterator) = open_iterator(get_test_connection(), end_of_stream_query());
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_every_key_once(&batches, END_OF_STREAM_ROWS);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: Result partly delivered with the execute response
+/// Scenario: Result set iterator ends after the last row
+#[test]
+fn test_iterator_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let (runtime, conn, mut iterator) =
+        open_iterator(get_test_connection(), partial_inline_query());
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_partly_inline(&batches);
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: Large result set (multi-fetch)
+/// Scenario: Prepared statement result is paged like a query result
+#[tokio::test]
+async fn test_prepared_partial_inline_result_returns_every_row_once() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let prepared = conn
+        .prepare(partial_inline_query())
+        .await
+        .expect("Failed to prepare statement");
+    let batches = conn
+        .execute_prepared(&prepared)
+        .await
+        .expect("Failed to execute prepared statement")
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    assert_partly_inline(&batches);
+    assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
+
+    conn.close_prepared(prepared)
+        .await
+        .expect("Failed to close prepared statement");
     conn.close().await.expect("Failed to close connection");
 }

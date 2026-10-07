@@ -6,6 +6,11 @@
 //! thing (and with each other) is a back-door duplication this module exists
 //! to eliminate. It is declared out of line from `transport::mod`, which also
 //! keeps every line here out of the production coverage denominator.
+//!
+//! Doubles here: `MockTransport` and `StalledQueryTransport` for the
+//! `TransportProtocol` trait, `FakeExasolServer` for the HTTP-tunnel wire
+//! format, and `FakeWebSocketServer` (`websocket` feature) for scripted
+//! WebSocket API exchanges.
 
 use crate::error::TransportError;
 use crate::transport::http_transport::{
@@ -192,6 +197,14 @@ impl FakeExasolServer {
         });
         Self { host, port, peer }
     }
+
+    /// Waits for the peer task, which ends once the driver closes its end of
+    /// the tunnel connection.
+    pub(crate) async fn wait_for_disconnect(&mut self) {
+        (&mut self.peer)
+            .await
+            .expect("the fake peer must not panic");
+    }
 }
 
 impl Drop for FakeExasolServer {
@@ -231,4 +244,67 @@ async fn accept_and_handshake(listener: &TcpListener) -> TcpStream {
         .expect("write the response packet");
     stream.flush().await.expect("flush the response packet");
     stream
+}
+
+/// A loopback WebSocket peer that answers each request with the next scripted
+/// JSON response and records every request it receives.
+///
+/// It lets a unit test run the real `WebSocketTransport` request and response
+/// handling, which a mocked `TransportProtocol` would bypass.
+#[cfg(feature = "websocket")]
+pub(crate) struct FakeWebSocketServer {
+    pub(crate) port: u16,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    peer: JoinHandle<()>,
+}
+
+#[cfg(feature = "websocket")]
+impl FakeWebSocketServer {
+    /// Accepts one plain `ws://` connection and replies to the n-th text frame
+    /// with `responses[n]`.
+    pub(crate) async fn scripted(responses: Vec<serde_json::Value>) -> Self {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (listener, _, port) = bind_loopback().await;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&requests);
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept the connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("complete the WebSocket handshake");
+            for response in responses {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    return;
+                };
+                recorded
+                    .lock()
+                    .expect("request log")
+                    .push(serde_json::from_str(&text).expect("requests are JSON"));
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .expect("send the scripted response");
+            }
+            let _ = socket.next().await;
+        });
+        Self {
+            port,
+            requests,
+            peer,
+        }
+    }
+
+    /// The requests received so far, in arrival order.
+    pub(crate) fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().expect("request log").clone()
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl Drop for FakeWebSocketServer {
+    fn drop(&mut self) {
+        self.peer.abort();
+    }
 }

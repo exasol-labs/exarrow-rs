@@ -52,7 +52,12 @@
 //! or tables. Use unique identifiers (e.g., timestamps) in schema names to
 //! avoid conflicts when tests run in parallel.
 
+use arrow::array::{Array, Int64Array};
+use arrow::compute::cast;
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use exarrow_rs::adbc::{Connection, Driver};
+use exarrow_rs::ResultSetIterator;
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -281,14 +286,13 @@ pub fn is_exasol_available() -> bool {
 /// Skip a test if Exasol is not available.
 ///
 /// Use this at the beginning of integration tests to gracefully skip
-/// when no Exasol instance is running. Combined with `#[ignore]`, this
-/// provides a double layer of protection.
+/// when no Exasol instance is running. With `REQUIRE_EXASOL` set, a missing
+/// Exasol instance panics instead, which is how CI runs these tests.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[tokio::test]
-/// #[ignore]
 /// async fn test_query() {
 ///     skip_if_no_exasol!();
 ///     // Test code here...
@@ -366,6 +370,140 @@ pub async fn disable_query_cache(conn: &mut Connection) {
     conn.execute_update("ALTER SESSION SET QUERY_CACHE='OFF'")
         .await
         .expect("Failed to disable QUERY_CACHE for the test session");
+}
+
+/// Row count of `multi_fetch_query`: about 70 MB, more than one fetch message.
+pub const MULTI_FETCH_ROWS: usize = 70_000;
+
+/// Row count of `partial_inline_query`: each row is about 1 MB, so the execute
+/// response carries only the first rows and the rest arrive by fetch.
+pub const PARTIAL_INLINE_ROWS: usize = 70;
+
+/// Row count of `end_of_stream_query`.
+pub const END_OF_STREAM_ROWS: usize = 5_000;
+
+/// A result set of `MULTI_FETCH_ROWS` rows of about 1,000 bytes, keyed by `V`.
+#[allow(dead_code)]
+pub fn multi_fetch_query() -> String {
+    format!(
+        "SELECT t.v AS v, RPAD(TO_CHAR(t.v), 1000, 'x') AS s FROM VALUES BETWEEN 1 AND {} AS t(v)",
+        MULTI_FETCH_ROWS
+    )
+}
+
+/// A result set of `PARTIAL_INLINE_ROWS` rows of 1,000,000 bytes, keyed by `V`.
+#[allow(dead_code)]
+pub fn partial_inline_query() -> String {
+    format!(
+        "SELECT t.v AS v, RPAD(TO_CHAR(t.v), 1000000, 'x') AS s FROM VALUES BETWEEN 1 AND {} AS t(v)",
+        PARTIAL_INLINE_ROWS
+    )
+}
+
+/// A result set of `END_OF_STREAM_ROWS` short rows, keyed by `V`.
+#[allow(dead_code)]
+pub fn end_of_stream_query() -> String {
+    format!(
+        "SELECT t.v AS v FROM VALUES BETWEEN 1 AND {} AS t(v)",
+        END_OF_STREAM_ROWS
+    )
+}
+
+/// Assert that the `V` column of `batches` holds every value from 1 to
+/// `expected_rows` exactly once.
+#[allow(dead_code)]
+pub fn assert_every_key_once(batches: &[RecordBatch], expected_rows: usize) {
+    let mut seen = vec![0u32; expected_rows + 1];
+    for batch in batches {
+        let keys = cast(
+            batch.column_by_name("V").expect("column V"),
+            &DataType::Int64,
+        )
+        .expect("V casts to Int64");
+        let keys = keys.as_any().downcast_ref::<Int64Array>().expect("Int64");
+        for key in keys.iter().flatten() {
+            let key = key as usize;
+            assert!(
+                (1..=expected_rows).contains(&key),
+                "key {key} is outside 1..={expected_rows}"
+            );
+            seen[key] += 1;
+        }
+    }
+    for (key, count) in seen.iter().enumerate().skip(1) {
+        assert_eq!(*count, 1, "key {key} occurs {count} times, expected once");
+    }
+}
+
+/// Assert that the first batch of a `partial_inline_query` result holds some
+/// but not all of its `PARTIAL_INLINE_ROWS` rows, so the rest came by fetch.
+#[allow(dead_code)]
+pub fn assert_partly_inline(batches: &[RecordBatch]) {
+    let first = batches[0].num_rows();
+    assert!(
+        (1..PARTIAL_INLINE_ROWS).contains(&first),
+        "the execute response should deliver some but not all rows, got {first}"
+    );
+}
+
+/// Open a connection with `connect`, execute `sql`, and return its result as an
+/// iterator, together with the connection and the runtime that owns both.
+///
+/// The iterator blocks on that runtime while it fetches, so the caller keeps
+/// the runtime and passes it to `drain_iterator`.
+#[allow(dead_code)]
+pub fn open_iterator<F>(
+    connect: F,
+    sql: String,
+) -> (tokio::runtime::Runtime, Connection, ResultSetIterator)
+where
+    F: std::future::Future<Output = Result<Connection, exarrow_rs::error::ExasolError>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (conn, iterator) = runtime.block_on(async {
+        let mut conn = connect.await.expect("Failed to connect");
+        let iterator = conn
+            .execute(sql)
+            .await
+            .expect("query should succeed")
+            .into_iterator()
+            .expect("a SELECT yields an iterator");
+        (conn, iterator)
+    });
+    (runtime, conn, iterator)
+}
+
+const MAX_NEXT_BATCH_CALLS: usize = 100;
+
+/// Read `iterator` to its end and assert that it then reports no further batch
+/// on two consecutive calls. Fails after `MAX_NEXT_BATCH_CALLS` calls, so a
+/// missing end of stream cannot hang the test.
+///
+/// `next_batch` blocks on the runtime that owns the connection, so the caller
+/// passes that runtime and the helper enters it for the duration of the reads.
+#[allow(dead_code)]
+pub fn drain_iterator(
+    runtime: &tokio::runtime::Runtime,
+    iterator: &mut ResultSetIterator,
+) -> Vec<RecordBatch> {
+    let _guard = runtime.enter();
+    let mut batches = Vec::new();
+    for _ in 0..MAX_NEXT_BATCH_CALLS {
+        match iterator.next_batch() {
+            Some(batch) => batches.push(batch.expect("next_batch should not fail")),
+            None => {
+                assert!(
+                    iterator.next_batch().is_none(),
+                    "the iterator must stay ended after it reports no further batch"
+                );
+                return batches;
+            }
+        }
+    }
+    panic!("the iterator did not end within {MAX_NEXT_BATCH_CALLS} next_batch calls");
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ cargo build --release --features ffi                 # cdylib for the driver man
 cargo test --lib                                     # unit tests
 cargo test --test integration_tests                  # needs Exasol
 cargo test --test driver_manager_tests               # needs the release cdylib
-cargo test --test import_export_tests -- --ignored   # needs Exasol
+REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1  # needs Exasol
 ```
 
 ## Design

@@ -27,7 +27,7 @@ use crate::transport::HttpTransportClient;
 use crate::types::{infer_schema_from_parquet, infer_schema_from_parquet_files, ColumnNameMode};
 
 use super::parallel::{
-    convert_parquet_files_to_csv, resolve_stream_task, stream_files_parallel,
+    convert_parquet_files_to_csv, finish_import, stream_files_parallel,
     stream_parquet_files_parallel, ParallelTransportPool, CHUNK_SIZE as CHUNKED_TRANSFER_SIZE,
 };
 use super::source::IntoFileSources;
@@ -352,10 +352,7 @@ where
             .map_err(ImportError::TransportError)
     });
 
-    let sql_result = execute_sql(sql).await;
-    resolve_stream_task(stream_handle.await)?;
-
-    sql_result.map_err(ImportError::SqlError)
+    finish_import(execute_sql(sql).await, stream_handle).await
 }
 
 /// Stream converted CSV bytes to the server using chunked transfer encoding.
@@ -395,11 +392,7 @@ where
             .map_err(ImportError::TransportError)
     });
 
-    let sql_result = execute_sql(sql).await;
-    // Check the stream task first as it may hold the underlying protocol error.
-    resolve_stream_task(stream_handle.await)?;
-
-    sql_result.map_err(ImportError::SqlError)
+    finish_import(execute_sql(sql).await, stream_handle).await
 }
 
 async fn connect_transport(
@@ -621,10 +614,7 @@ where
         let stream_handle =
             tokio::spawn(async move { stream_parquet_files_parallel(connections, paths).await });
 
-        let sql_result = execute_sql(sql).await;
-        resolve_stream_task(stream_handle.await)?;
-
-        return sql_result.map_err(ImportError::SqlError);
+        return finish_import(execute_sql(sql).await, stream_handle).await;
     }
 
     // Convert all Parquet files to CSV in parallel
@@ -664,14 +654,7 @@ where
         .await
     });
 
-    // Execute the IMPORT SQL in parallel
-    let sql_result = execute_sql(sql).await;
-
-    // Wait for streaming to complete; check it first as it holds protocol errors
-    resolve_stream_task(stream_handle.await)?;
-
-    // Return the row count from SQL execution
-    sql_result.map_err(ImportError::SqlError)
+    finish_import(execute_sql(sql).await, stream_handle).await
 }
 
 /// Build an ImportQuery for multi-file Parquet import (CSV conversion path).
@@ -1057,6 +1040,7 @@ fn format_decimal128(value: i128, scale: i8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_support::FakeExasolServer;
     use arrow::array::{ArrayRef, StringBuilder};
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -2000,6 +1984,37 @@ mod tests {
         )
         .await;
         assert!(created.is_ok());
+    }
+
+    /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
+    #[tokio::test]
+    async fn test_serve_parquet_bytes_returns_statement_error_and_closes_a_silent_tunnel() {
+        let hang_limit = std::time::Duration::from_secs(5);
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+        let options = ParquetImportOptions::default()
+            .with_exasol_host(server.host.clone())
+            .with_exasol_port(server.port)
+            .use_tls(false);
+
+        let result = tokio::time::timeout(
+            hang_limit,
+            serve_parquet_bytes(
+                |_sql: String| async { Err::<u64, String>("object T not found".to_string()) },
+                "t",
+                &options,
+                b"PAR1".to_vec(),
+            ),
+        )
+        .await
+        .expect("a failed IMPORT statement must not wait for the tunnel");
+
+        assert!(
+            matches!(&result, Err(ImportError::SqlError(m)) if m == "object T not found"),
+            "got: {result:?}"
+        );
+        tokio::time::timeout(hang_limit, server.wait_for_disconnect())
+            .await
+            .expect("the tunnel connection must reach end of stream within 5 seconds");
     }
 
     #[test]

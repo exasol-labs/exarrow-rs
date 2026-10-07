@@ -28,10 +28,10 @@
 //! cargo build --release --features ffi
 //!
 //! # Then run the driver manager tests
-//! cargo test --test driver_manager_tests -- --ignored
+//! cargo test --test driver_manager_tests -- --include-ignored
 //!
 //! # Run with verbose output
-//! cargo test --test driver_manager_tests -- --ignored --nocapture
+//! cargo test --test driver_manager_tests -- --include-ignored --nocapture
 //! ```
 
 mod common;
@@ -45,9 +45,7 @@ use arrow::array::{
     Array, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use common::{
-    generate_unique_test_name, get_host, get_password, get_port, get_user, is_exasol_available,
-};
+use common::{generate_unique_test_name, get_host, get_password, get_port, get_user};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -82,20 +80,6 @@ fn get_test_uri() -> String {
         get_host(),
         get_port()
     )
-}
-
-/// Skip test if Exasol is not available.
-macro_rules! skip_if_no_exasol {
-    () => {
-        if !is_exasol_available() {
-            eprintln!(
-                "Skipping test: Exasol not available at {}:{}",
-                get_host(),
-                get_port()
-            );
-            return;
-        }
-    };
 }
 
 /// Skip test if the FFI library is not built.
@@ -2630,9 +2614,9 @@ fn test_autocommit_toggle_with_dml() {
 ///
 /// Per CLAUDE.md: this test loads `target/release/libexarrow_rs.so` (or
 /// `.dylib`); run `cargo build --release --features ffi` before
-/// `cargo test --test driver_manager_tests -- --ignored`.
+/// `cargo test --test driver_manager_tests -- --include-ignored`.
 #[test]
-#[ignore]
+#[ignore = "loads the release cdylib, so it needs `cargo build --release --features ffi` first"]
 fn test_ffi_uri_schema_is_opened_on_connect() {
     skip_if_no_library!();
     skip_if_no_exasol!();
