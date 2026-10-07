@@ -13,6 +13,8 @@ The transport export maps BOOLEAN, CHAR, VARCHAR, DECIMAL, DOUBLE, DATE, and TIM
 
 Exasol writes NULL as an empty field, and Exasol stores an empty string as NULL. The transport export therefore reads an empty field as NULL and keeps every other field verbatim. It does not apply `ParquetExportOptions::null_value`, because the driver passes no NULL clause to the EXPORT statement. The CSV-bytes entry points keep every field verbatim as well: an empty field is NULL when `null_value` is unset, and a field equal to `null_value` is NULL. Neither kind of entry point trims whitespace. Typed values are parsed in the text form of Exasol's default session formats, for example `YYYY-MM-DD` for `NLS_DATE_FORMAT`.
 
+The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builders.
+
 ## Scenarios
 
 <!-- DELTA:NEW -->

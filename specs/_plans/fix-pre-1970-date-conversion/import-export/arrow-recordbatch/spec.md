@@ -28,3 +28,11 @@ Arrow RecordBatch import converts RecordBatch data to CSV format for streaming t
 * *AND* the `Microsecond` value -43200000000 SHALL convert to `1969-12-31 12:00:00.000000`
 * *AND* the `Microsecond` value -62135596800000000 SHALL convert to `0001-01-01 00:00:00.000000`
 <!-- /DELTA:NEW -->
+
+<!-- DELTA:NEW -->
+### Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
+
+* *GIVEN* a RecordBatch with a Date32 value 2932897 (10000-01-01), a Date32 value -719163 (0000-12-31), a `Timestamp(Second, None)` value 9223372036854775807, or a `Timestamp(Microsecond, None)` value 253402300800000000 (10000-01-01 00:00:00)
+* *WHEN* the import converts the value to CSV text
+* *THEN* the conversion SHALL return `ImportError::ConversionError` that names the value, and the import SHALL fail
+<!-- /DELTA:NEW -->

@@ -6,7 +6,7 @@ Specifies Parquet file import. Import streams Parquet bytes through the HTTP tra
 
 Parquet import operates over the same HTTP tunnel as CSV import but selects between two on-the-wire transport models based on the connected server's `release_version`:
 
-- On Exasol 2025.1.11 and newer the server requests the Parquet file from the driver using **HTTP range requests**. The driver responds to `HEAD` with `200 OK` plus `Content-Length` and to `GET` with `Range: bytes=X-Y` using `206 Partial Content` carrying the requested byte slice. Multiple sequential HEAD/GET-Range requests typically arrive on the same connection (footer first, then row groups) until the server closes it. The generated SQL is `IMPORT INTO ... FROM PARQUET AT '...;MaxConcurrentReads=1' [PUBLIC KEY '...'] FILE '...parquet'`.
+- On Exasol 2025.1.11 and newer the driver selects native Parquet import, and the server requests the Parquet file from the driver using **HTTP range requests**. The driver responds to `HEAD` with `200 OK` plus `Content-Length` and to `GET` with `Range: bytes=X-Y` using `206 Partial Content` carrying the requested byte slice. Multiple sequential HEAD/GET-Range requests typically arrive on the same connection (footer first, then row groups) until the server closes it. The generated SQL is `IMPORT INTO ... FROM PARQUET AT '...;MaxConcurrentReads=1' [PUBLIC KEY '...'] FILE '...parquet'`.
 - On older servers the driver reads each Parquet `RecordBatch`, converts to CSV via `record_batch_to_csv`, streams the CSV body through the existing chunked-encoding response, and emits `FROM CSV ... FILE '...csv'`.
 
 The Parquet variant of the IMPORT statement omits all CSV format options (no `ENCODING`, `COLUMN SEPARATOR`, `COLUMN DELIMITER`, `ROW SEPARATOR`, `SKIP`, `NULL`, `TRIM`, `REJECT LIMIT`) and never emits the `MULTIPLE LOCAL FILES` tag (Exasol opens one HTTP server per file for native Parquet import). The `;MaxConcurrentReads=1` suffix is appended inside the `AT '...'` URL of every file entry, matching the JDBC reference behavior. Path selection is automatic by default and can be overridden via `ParquetImportOptions::with_native_parquet(Some(true|false))`.
@@ -31,4 +31,12 @@ The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builder
 * *WHEN* the CSV path converts the value to CSV text for the time units `Second`, `Millisecond`, `Microsecond`, and `Nanosecond`
 * *THEN* the text SHALL be `1969-12-31 23:59:59.000000`, `1969-12-31 23:59:59.999000`, `1969-12-31 23:59:59.999999`, and `1969-12-31 23:59:59.999999`, in that order
 * *AND* the `Microsecond` value -500000 SHALL convert to `1969-12-31 23:59:59.500000`
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:NEW -->
+### Scenario: CSV-path Parquet import rejects DATE and TIMESTAMP values outside Exasol's range
+
+* *GIVEN* a Parquet RecordBatch with a Date32 value 2932897 (10000-01-01), a Date32 value -719163 (0000-12-31), a `Timestamp(Second, None)` value 9223372036854775807, or a `Timestamp(Microsecond, None)` value 253402300800000000 (10000-01-01 00:00:00)
+* *WHEN* the CSV path converts the value to CSV text
+* *THEN* the conversion SHALL return `ImportError::ConversionError` that names the value, and the import SHALL fail
 <!-- /DELTA:NEW -->
