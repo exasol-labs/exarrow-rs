@@ -272,7 +272,10 @@ where
         return serve_parquet_bytes(execute_sql, table, &options, file_bytes).await;
     }
 
-    let csv_data = parquet_to_csv_bytes(std::fs::File::open(file_path)?, &options)?;
+    let csv_data = parquet_to_csv_bytes(
+        tokio::fs::File::open(file_path).await?.into_std().await,
+        &options,
+    )?;
 
     if csv_data.is_empty() {
         return Ok(0);

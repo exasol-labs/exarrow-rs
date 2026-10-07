@@ -211,7 +211,7 @@ mod tests {
     /// Test struct with optional data field
     #[derive(Debug, Deserialize)]
     struct TestDataOption {
-        #[serde(deserialize_with = "to_row_major_option")]
+        #[serde(default, deserialize_with = "to_row_major_option")]
         data: Option<Vec<Vec<Value>>>,
     }
 
@@ -306,6 +306,12 @@ mod tests {
     fn test_option_none() {
         let json = json!({ "data": null });
         let result: TestDataOption = serde_json::from_value(json).unwrap();
+        assert!(result.data.is_none());
+    }
+
+    #[test]
+    fn test_option_missing_field_defaults_to_none() {
+        let result: TestDataOption = serde_json::from_value(json!({})).unwrap();
         assert!(result.data.is_none());
     }
 
