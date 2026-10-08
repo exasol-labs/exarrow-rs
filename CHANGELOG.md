@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+- Fix: ADBC `username` and `password` database options reach the server exactly as set. A password with `?`, `@`, `#`, or a `%XX` sequence no longer fails to log in. Fixes #74.
+- Fix: an `@` in a URI query parameter value, such as `client_name=dbt@ci`, no longer sends a driver manager connection and its option credentials to another host.
+- Fix: a `password` or `pass` query parameter applies when the URI userinfo names only the user. Credential query parameters no longer appear in the `Debug` output of `ConnectionParams`, and the `Debug` output of `ConnectionBuilder` no longer shows the password.
+- Fix: a connection URI parse error no longer shows part of a password that is not percent-encoded, such as the one in `exasol://u:pa?ss@host`.
+- Breaking: a driver manager connection with no username in the URI or in the `username` option fails with `Username is required`. It used to log in as `sys`.
+- Changed: the driver manager path checks the URI and the credentials when the connection is created and reports a problem with status `InvalidArguments`. It used to report it at the first statement with status `Internal`.
+- Changed: URI parse errors name the field, or the position of a query parameter without `=`, and no longer show the invalid value. An invalid boolean value names its query key, such as `tls`, instead of `boolean`.
+
 ## 0.18.0
 
 - Fix: DATE and TIMESTAMP values before 1970 now convert to the correct day in query results on both transports and in `export_to_parquet`, `export_to_record_batches`, and `export_to_arrow_ipc`. Many such values came back one day late, some before 1902 one day early, and TIMESTAMP values were shifted by 24 hours. Dates before 1582-10-15 convert by their year, month, and day, as `docs/type-mapping.md` describes. Fixes #84.
