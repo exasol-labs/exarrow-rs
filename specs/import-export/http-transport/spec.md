@@ -122,3 +122,21 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *THEN* the system SHALL stop serving the tunnel connections and SHALL return the Exasol error to the caller
 * *AND* the system MUST NOT wait for Exasol to close a tunnel connection
 * *AND* when a tunnel task has failed before the IMPORT statement returns its error, the system SHALL return that task's error
+
+### Scenario: Tunnel setup fails with the step named when the peer stops answering
+
+* *GIVEN* an HTTP tunnel opened through `HttpTransportClient::connect_with_timeout` with a setup bound of N milliseconds
+* *AND* the peer accepts the TCP connection and then stops answering, either before it sends the EXA handshake response or, with TLS enabled, after the EXA handshake and before it completes the TLS handshake
+* *WHEN* the setup bound elapses
+* *THEN* the client SHALL fail the tunnel setup with an error message that contains `HTTP tunnel setup timeout after <N>ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`
+* *AND* one deadline SHALL bound the TCP connect, the EXA handshake, and the TLS handshake together, so time spent in one step SHALL NOT be granted again to a later step
+* *AND* the client SHALL close the tunnel connection
+
+### Scenario: Tunnel setup is bounded by 30 seconds by default
+
+* *GIVEN* an import or an export that opens its HTTP tunnel
+* *AND* the tunnel peer accepts the TCP connection and never sends the EXA handshake response
+* *WHEN* 30 seconds pass after the tunnel setup started
+* *THEN* the import or export SHALL fail with an error message that contains `HTTP tunnel setup timeout after 30000ms (EXA handshake)`
+* *AND* the driver MUST NOT send the IMPORT or EXPORT statement
+* *AND* the bound SHALL apply whether or not `CsvExportOptions::timeout_ms` is set, because that export timeout covers only the work after tunnel setup
