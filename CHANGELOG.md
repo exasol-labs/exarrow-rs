@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.19.0
 
 - Fix: ADBC `username` and `password` database options reach the server exactly as set. A password with `?`, `@`, `#`, or a `%XX` sequence no longer fails to log in. Fixes #74.
 - Fix: an `@` in a URI query parameter value, such as `client_name=dbt@ci`, no longer sends a driver manager connection and its option credentials to another host.
