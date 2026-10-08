@@ -1574,4 +1574,53 @@ mod tests {
 
         assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
     }
+
+    /// Scenario: Tunnel setup is bounded by 30 seconds by default
+    #[tokio::test]
+    async fn test_import_from_callback_bounds_a_stalled_tunnel_setup_by_30_seconds() {
+        use crate::transport::test_support::FakeExasolServer;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut server = FakeExasolServer::silent_before_handshake().await;
+        let statement_sent = AtomicBool::new(false);
+        let execute_sql = |_sql: String| async {
+            statement_sent.store(true, Ordering::SeqCst);
+            Ok::<u64, String>(0)
+        };
+        let options = CsvImportOptions::default()
+            .exasol_host(&server.host)
+            .exasol_port(server.port)
+            .use_tls(false);
+
+        let import = import_from_callback(
+            execute_sql,
+            "t",
+            |_sender: DataPipeSender| async { Ok(()) },
+            options,
+        );
+        tokio::pin!(import);
+
+        // The clock pauses only after the peer holds the magic packet, because
+        // auto-advance would otherwise fire the deadline during the connect.
+        tokio::select! {
+            outcome = &mut import => panic!("the import ended before the peer saw its handshake: {outcome:?}"),
+            () = server.wait_for_magic_packet() => {}
+        }
+        tokio::time::pause();
+        let error = import
+            .await
+            .expect_err("a stalled tunnel setup must fail the import");
+
+        let ImportError::HttpTransportError(message) = error else {
+            panic!("expected an HttpTransportError, got {error:?}");
+        };
+        assert!(
+            message.contains("HTTP tunnel setup timeout after 30000ms (EXA handshake)"),
+            "{message}"
+        );
+        assert!(
+            !statement_sent.load(Ordering::SeqCst),
+            "the IMPORT statement must not be sent before the tunnel is set up"
+        );
+    }
 }

@@ -20,6 +20,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use rcgen::{CertifiedKey, KeyPair};
@@ -33,6 +34,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::TransportError;
 
+use super::deadline::{SetupDeadline, SetupStep};
 use super::tls::NoVerifier;
 
 /// EXA tunneling protocol magic number.
@@ -53,6 +55,9 @@ pub const EXA_RESPONSE_PACKET_SIZE: usize = 24;
 
 /// HTTP chunk size for data transfer (64KB).
 pub const HTTP_CHUNK_SIZE: usize = 64 * 1024;
+
+/// The bound that [`HttpTransportClient::connect`] puts on tunnel setup.
+const TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Generates the EXA tunneling magic packet.
 ///
@@ -317,18 +322,14 @@ pub struct HttpTransportClient {
 }
 
 impl HttpTransportClient {
-    /// Connects to Exasol and performs the EXA tunneling handshake.
+    /// Connects to Exasol and performs the EXA tunneling handshake, within a
+    /// fixed 30-second setup deadline.
     ///
-    /// # Protocol Flow
-    ///
-    /// The EXA tunneling protocol requires a specific order of operations:
-    /// 1. Connect TCP to Exasol (unencrypted)
-    /// 2. Send magic packet over plain TCP
-    /// 3. Receive response packet with internal address over plain TCP
-    /// 4. If TLS is enabled, wrap the connection with TLS
-    /// 5. Send/receive HTTP data (optionally over TLS)
-    ///
-    /// This order is critical - TLS must be applied AFTER the handshake, not before.
+    /// One deadline bounds the TCP connect, the EXA handshake, and the TLS
+    /// handshake together. It does not follow the connection timeout of any
+    /// `Connection`, and `CsvExportOptions::timeout_ms` does not cover it. A
+    /// stalled setup fails with `HTTP tunnel setup timeout after 30000ms (<step>)`.
+    /// Use [`connect_with_timeout`](Self::connect_with_timeout) to choose the bound.
     ///
     /// # Arguments
     ///
@@ -342,63 +343,111 @@ impl HttpTransportClient {
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if connection or handshake fails.
+    /// Returns `TransportError` if connection or handshake fails, or if setup
+    /// does not finish within 30 seconds.
     pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Self, TransportError> {
+        Self::connect_with_timeout(host, port, use_tls, TUNNEL_SETUP_TIMEOUT).await
+    }
+
+    /// Connects to Exasol and performs the EXA tunneling handshake, within
+    /// `setup_timeout`.
+    ///
+    /// # Protocol Flow
+    ///
+    /// The EXA tunneling protocol requires a specific order of operations:
+    /// 1. Connect TCP to Exasol (unencrypted)
+    /// 2. Send magic packet over plain TCP
+    /// 3. Receive response packet with internal address over plain TCP
+    /// 4. If TLS is enabled, wrap the connection with TLS
+    /// 5. Send/receive HTTP data (optionally over TLS)
+    ///
+    /// This order is critical - TLS must be applied AFTER the handshake, not before.
+    ///
+    /// One deadline of `setup_timeout` bounds steps 1 to 4 together: time spent
+    /// in one step is not granted again to the next. `CsvExportOptions::timeout_ms`
+    /// does not cover this setup. When the deadline passes, the error reads
+    /// `HTTP tunnel setup timeout after <ms>ms (<step>)` with the step that was
+    /// running (`TCP connect`, `EXA handshake`, or `TLS handshake`), and the
+    /// socket is released.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The Exasol host to connect to
+    /// * `port` - The port to connect to (same as WebSocket port)
+    /// * `use_tls` - Whether to use TLS encryption for data transfer
+    /// * `setup_timeout` - The bound on the whole setup
+    ///
+    /// # Returns
+    ///
+    /// A connected `HttpTransportClient` ready for data transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if connection or handshake fails, or if setup
+    /// does not finish within `setup_timeout`.
+    pub async fn connect_with_timeout(
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        setup_timeout: Duration,
+    ) -> Result<Self, TransportError> {
         let addr = format!("{host}:{port}");
+        let deadline = SetupDeadline::start("HTTP tunnel setup", setup_timeout);
 
-        // Connect to Exasol
-        let mut tcp_stream = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| TransportError::IoError(format!("Failed to connect to {addr}: {e}")))?;
+        let mut tcp_stream = deadline
+            .run(SetupStep::TcpConnect, async {
+                TcpStream::connect(&addr).await.map_err(|e| {
+                    TransportError::IoError(format!("Failed to connect to {addr}: {e}"))
+                })
+            })
+            .await?;
 
-        // IMPORTANT: Perform EXA handshake BEFORE TLS wrapping
-        // The magic packet handshake must happen over plain TCP
-        let (ip, internal_port) = perform_handshake(&mut tcp_stream).await?;
+        // The magic packet handshake must happen over plain TCP, before TLS wrapping.
+        let (ip, internal_port) = deadline
+            .run(SetupStep::ExaHandshake, perform_handshake(&mut tcp_stream))
+            .await?;
         let internal_addr = format!("{ip}:{internal_port}");
 
-        if use_tls {
-            // Generate ad-hoc TLS certificate for fingerprint
-            let cert = TlsCertificate::generate()?;
-
-            // Convert certificate and key to rustls format for client auth
-            let cert_der = CertificateDer::from(cert.certificate_der.clone());
-            let key_der = PrivatePkcs8KeyDer::from(cert.private_key_der.clone());
-
-            // Create TLS connector with custom verifier that accepts any cert
-            // and presents our client certificate for Exasol's fingerprint verification
-            let connector = TlsConnector::from(Arc::new(
-                ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                    .with_client_auth_cert(vec![cert_der], key_der.into())
-                    .map_err(|e| {
-                        TransportError::TlsError(format!("Failed to set client cert: {e}"))
-                    })?,
-            ));
-
-            // Use a dummy server name since we're not verifying
-            let server_name = "exasol"
-                .try_into()
-                .map_err(|e| TransportError::TlsError(format!("Invalid server name: {e:?}")))?;
-
-            // Wrap the existing TCP connection with TLS AFTER the handshake
-            let tls_stream = connector
-                .connect(server_name, tcp_stream)
-                .await
-                .map_err(|e| TransportError::TlsError(format!("TLS handshake failed: {e}")))?;
-
-            Ok(Self {
-                stream: ClientConnectionStream::Tls(Box::new(tls_stream)),
-                internal_addr,
-                tls_certificate: Some(cert),
-            })
-        } else {
-            Ok(Self {
+        if !use_tls {
+            return Ok(Self {
                 stream: ClientConnectionStream::Tcp(tcp_stream),
                 internal_addr,
                 tls_certificate: None,
-            })
+            });
         }
+
+        // Generating the certificate takes no I/O, so it stays outside any step.
+        let cert = TlsCertificate::generate()?;
+        let cert_der = CertificateDer::from(cert.certificate_der.clone());
+        let key_der = PrivatePkcs8KeyDer::from(cert.private_key_der.clone());
+
+        // Exasol authenticates the tunnel by the fingerprint of this client
+        // certificate, so the server certificate is accepted unchecked.
+        let connector = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_client_auth_cert(vec![cert_der], key_der.into())
+                .map_err(|e| TransportError::TlsError(format!("Failed to set client cert: {e}")))?,
+        ));
+        let server_name = "exasol"
+            .try_into()
+            .map_err(|e| TransportError::TlsError(format!("Invalid server name: {e:?}")))?;
+
+        let tls_stream = deadline
+            .run(SetupStep::TlsHandshake, async {
+                connector
+                    .connect(server_name, tcp_stream)
+                    .await
+                    .map_err(|e| TransportError::TlsError(format!("TLS handshake failed: {e}")))
+            })
+            .await?;
+
+        Ok(Self {
+            stream: ClientConnectionStream::Tls(Box::new(tls_stream)),
+            internal_addr,
+            tls_certificate: Some(cert),
+        })
     }
 
     /// Returns the internal address to use in IMPORT/EXPORT SQL statements.
@@ -1367,7 +1416,12 @@ pub fn build_ok_response() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::test_support::exa_response_packet;
+    use crate::transport::test_support::{
+        exa_response_packet, finish_within, FakeExasolServer, SilentServer, DISCONNECT_BOUND,
+        LOOPBACK_TEST_BOUND,
+    };
+
+    const SETUP_BOUND: Duration = Duration::from_millis(300);
 
     #[test]
     fn test_generate_magic_packet() {
@@ -2638,5 +2692,75 @@ mod tests {
 
         drop(client);
         assert!(handler.await.expect("handler task panicked").is_ok());
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    #[tokio::test]
+    async fn connect_with_timeout_fails_at_the_exa_handshake_when_the_peer_never_answers() {
+        let mut server = SilentServer::accepting().await;
+
+        let error = finish_within(
+            LOOPBACK_TEST_BOUND,
+            HttpTransportClient::connect_with_timeout(
+                &server.host,
+                server.port,
+                false,
+                SETUP_BOUND,
+            ),
+        )
+        .await
+        .err()
+        .expect("a peer that never answers the magic packet must fail the setup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP tunnel setup timeout after 300ms (EXA handshake)"),
+            "{error}"
+        );
+        finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    #[tokio::test]
+    async fn connect_with_timeout_fails_at_the_tls_handshake_when_the_peer_goes_silent_after_the_handshake(
+    ) {
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+
+        let error = finish_within(
+            LOOPBACK_TEST_BOUND,
+            HttpTransportClient::connect_with_timeout(&server.host, server.port, true, SETUP_BOUND),
+        )
+        .await
+        .err()
+        .expect("a peer that never answers the TLS handshake must fail the setup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP tunnel setup timeout after 300ms (TLS handshake)"),
+            "{error}"
+        );
+        finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+    }
+
+    /// Scenario: EXA tunneling handshake in client mode
+    #[tokio::test]
+    async fn connect_with_timeout_returns_the_internal_address_within_the_bound() {
+        let server = FakeExasolServer::silent_after_handshake().await;
+
+        let client = finish_within(
+            LOOPBACK_TEST_BOUND,
+            HttpTransportClient::connect_with_timeout(
+                &server.host,
+                server.port,
+                false,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("a peer that answers the handshake in time completes the setup");
+
+        assert_eq!(client.internal_address(), "10.0.0.5:8563");
     }
 }

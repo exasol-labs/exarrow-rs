@@ -1,7 +1,12 @@
-//! Shared rustls certificate verifiers used across the transport implementations.
+//! The TLS client step of the native and WebSocket transports, and the rustls
+//! certificate verifiers it selects.
 //!
-//! The WebSocket, HTTP-transport, and native-TCP code paths all need the same two
-//! custom [`rustls::client::danger::ServerCertVerifier`] implementations:
+//! [`client_config`] chooses the verifier from the connection parameters, and
+//! [`client_handshake`] runs the handshake on an open TCP stream. Both
+//! transports call them, so a TLS change is made once. Each caller keeps its own
+//! socket options, deadline, and stream wrapping.
+//!
+//! The two custom [`rustls::client::danger::ServerCertVerifier`] implementations:
 //!
 //! - [`NoVerifier`] accepts any certificate (used when validation is disabled).
 //! - [`FingerprintVerifier`] validates by SHA-256 fingerprint of the DER-encoded
@@ -10,7 +15,75 @@
 //! Both report the same set of supported signature schemes via
 //! [`all_supported_verify_schemes`].
 
+#[cfg(any(feature = "websocket", feature = "native"))]
+use std::sync::Arc;
+
 use rustls::pki_types::CertificateDer;
+#[cfg(any(feature = "websocket", feature = "native"))]
+use rustls::pki_types::ServerName;
+#[cfg(any(feature = "websocket", feature = "native"))]
+use tokio::net::TcpStream;
+#[cfg(any(feature = "websocket", feature = "native"))]
+use tokio_rustls::client::TlsStream;
+
+#[cfg(any(feature = "websocket", feature = "native"))]
+use crate::error::TransportError;
+
+/// Builds the TLS client configuration of a connection: a certificate
+/// fingerprint pins the certificate and takes precedence; otherwise
+/// validation trusts the native root certificates, and without it any
+/// certificate is accepted.
+#[cfg(any(feature = "websocket", feature = "native"))]
+pub(crate) fn client_config(
+    certificate_fingerprint: Option<&str>,
+    validate_server_certificate: bool,
+) -> rustls::ClientConfig {
+    if let Some(fingerprint) = certificate_fingerprint {
+        return rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
+                expected_fingerprint: fingerprint.to_string(),
+            }))
+            .with_no_client_auth();
+    }
+    if validate_server_certificate {
+        let mut root_store = rustls::RootCertStore::empty();
+        for certificate in rustls_native_certs::load_native_certs().certs {
+            // Some systems ship malformed root certificates; skipping them keeps the rest usable.
+            let _ = root_store.add(certificate);
+        }
+        return rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+    }
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth()
+}
+
+/// Runs the TLS handshake for `host` on an open TCP stream.
+///
+/// It starts no timer and sets no socket option, so each transport runs it
+/// under its own connection deadline.
+///
+/// # Errors
+///
+/// Returns `TransportError::TlsError` for a host that is not a valid server
+/// name and for a failed handshake.
+#[cfg(any(feature = "websocket", feature = "native"))]
+pub(crate) async fn client_handshake(
+    tcp: TcpStream,
+    host: &str,
+    config: rustls::ClientConfig,
+) -> Result<TlsStream<TcpStream>, TransportError> {
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|e| TransportError::TlsError(format!("Invalid server name: {e}")))?;
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| TransportError::TlsError(e.to_string()))
+}
 
 /// The signature schemes advertised by the custom verifiers.
 pub(crate) fn all_supported_verify_schemes() -> Vec<rustls::SignatureScheme> {
@@ -363,5 +436,88 @@ mod tests {
         assert_shared_verifier_members_are_permissive(&FingerprintVerifier {
             expected_fingerprint: CERTIFICATE_SHA256_HEX.to_string(),
         });
+    }
+
+    #[cfg(any(feature = "websocket", feature = "native"))]
+    mod handshake {
+        use super::super::{client_config, client_handshake};
+        use crate::error::TransportError;
+        use crate::transport::test_support::{finish_within, SilentServer, LOOPBACK_TEST_BOUND};
+        use sha2::{Digest, Sha256};
+        use tokio::net::TcpStream;
+
+        /// The name the self-signed certificate of `SilentServer::after_tls` is issued for.
+        const HOST: &str = "localhost";
+
+        async fn handshake_with(
+            server: &SilentServer,
+            config: rustls::ClientConfig,
+        ) -> Result<(), TransportError> {
+            let tcp = TcpStream::connect((server.host.as_str(), server.port))
+                .await
+                .expect("connect to the loopback server");
+            client_handshake(tcp, HOST, config).await.map(drop)
+        }
+
+        fn lowercase_sha256_hex(der: &[u8]) -> String {
+            hex::encode(Sha256::digest(der))
+        }
+
+        #[tokio::test]
+        async fn client_handshake_completes_with_no_verifier_or_a_matching_fingerprint() {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                let unverified = SilentServer::after_tls().await;
+                handshake_with(&unverified, client_config(None, false))
+                    .await
+                    .expect("NoVerifier accepts the self-signed certificate");
+
+                let pinned = SilentServer::after_tls().await;
+                let fingerprint = lowercase_sha256_hex(pinned.certificate_der());
+                handshake_with(&pinned, client_config(Some(&fingerprint), true))
+                    .await
+                    .expect("a matching fingerprint takes precedence over certificate validation");
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn client_handshake_fails_with_a_tls_error_for_a_host_that_is_not_a_server_name() {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                let server = SilentServer::accepting().await;
+                let tcp = TcpStream::connect((server.host.as_str(), server.port))
+                    .await
+                    .expect("connect to the loopback server");
+
+                let result = client_handshake(tcp, "not a host name", client_config(None, false)).await;
+
+                assert!(
+                    matches!(&result, Err(TransportError::TlsError(message)) if message.starts_with("Invalid server name")),
+                    "{:?}",
+                    result.map(drop)
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn client_handshake_fails_with_a_tls_error_for_a_wrong_fingerprint_or_an_untrusted_certificate(
+        ) {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                let wrong_fingerprint = "0".repeat(64);
+                let configs = [
+                    client_config(Some(&wrong_fingerprint), false),
+                    client_config(None, true),
+                ];
+
+                for config in configs {
+                    let server = SilentServer::after_tls().await;
+                    let error = handshake_with(&server, config)
+                        .await
+                        .expect_err("the client must reject the certificate");
+                    assert!(matches!(error, TransportError::TlsError(_)), "{error:?}");
+                }
+            })
+            .await;
+        }
     }
 }

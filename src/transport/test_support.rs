@@ -10,12 +10,14 @@
 //! Doubles here: `MockTransport` and `StalledQueryTransport` for the
 //! `TransportProtocol` trait with `transport_session_info` as the session a
 //! mocked login reports, `FakeExasolServer` for the HTTP-tunnel wire
-//! format, and `FakeWebSocketServer` (`websocket` feature) for scripted
-//! WebSocket API exchanges.
+//! format (answering, or silent before or after its handshake),
+//! `SilentServer` for a peer that accepts and then never answers (plain,
+//! after TLS, or after the WebSocket upgrade), and `FakeWebSocketServer`
+//! (`websocket` feature) for scripted WebSocket API exchanges.
 
 use crate::error::TransportError;
 use crate::transport::http_transport::{
-    generate_magic_packet, EXA_MAGIC_PACKET_SIZE, EXA_RESPONSE_PACKET_SIZE,
+    generate_magic_packet, TlsCertificate, EXA_MAGIC_PACKET_SIZE, EXA_RESPONSE_PACKET_SIZE,
 };
 use crate::transport::messages::{ResultData, ResultSetHandle, SessionInfo};
 use crate::transport::protocol::{
@@ -24,8 +26,11 @@ use crate::transport::protocol::{
 use crate::transport::TransportProtocol;
 use async_trait::async_trait;
 use mockall::mock;
+use std::future::Future;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 mock! {
@@ -177,6 +182,7 @@ pub(crate) struct FakeExasolServer {
     pub(crate) host: String,
     pub(crate) port: u16,
     peer: JoinHandle<()>,
+    magic_packet_received: Option<oneshot::Receiver<()>>,
 }
 
 impl FakeExasolServer {
@@ -197,7 +203,12 @@ impl FakeExasolServer {
             let mut acknowledgement = Vec::new();
             let _ = stream.read_to_end(&mut acknowledgement).await;
         });
-        Self { host, port, peer }
+        Self {
+            host,
+            port,
+            peer,
+            magic_packet_received: None,
+        }
     }
 
     /// Answers the handshake and then sends nothing, leaving the export's
@@ -206,10 +217,47 @@ impl FakeExasolServer {
         let (listener, host, port) = bind_loopback().await;
         let peer = tokio::spawn(async move {
             let mut stream = accept_and_handshake(&listener).await;
-            let mut discarded = Vec::new();
-            let _ = stream.read_to_end(&mut discarded).await;
+            discard_until_end_of_stream(&mut stream).await;
         });
-        Self { host, port, peer }
+        Self {
+            host,
+            port,
+            peer,
+            magic_packet_received: None,
+        }
+    }
+
+    /// Reads the magic packet and then never answers it, so a client stays in
+    /// its EXA handshake. Await [`wait_for_magic_packet`](Self::wait_for_magic_packet)
+    /// to know that the client reached that step.
+    pub(crate) async fn silent_before_handshake() -> Self {
+        let (listener, host, port) = bind_loopback().await;
+        let (received, magic_packet_received) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept the tunnel connection");
+            read_magic_packet(&mut stream).await;
+            let _ = received.send(());
+            discard_until_end_of_stream(&mut stream).await;
+        });
+        Self {
+            host,
+            port,
+            peer,
+            magic_packet_received: Some(magic_packet_received),
+        }
+    }
+
+    /// Waits until the peer of [`silent_before_handshake`](Self::silent_before_handshake)
+    /// has read the magic packet.
+    pub(crate) async fn wait_for_magic_packet(&mut self) {
+        self.magic_packet_received
+            .take()
+            .expect("only silent_before_handshake reports the magic packet, and only once")
+            .await
+            .expect("the peer must read the magic packet before it ends");
     }
 
     /// Waits for the peer task, which ends once the driver closes its end of
@@ -227,6 +275,145 @@ impl Drop for FakeExasolServer {
     }
 }
 
+/// Awaits `future` and panics once `limit` passes, so a loopback test whose
+/// deadline regressed fails instead of hanging CI.
+pub(crate) async fn finish_within<T>(limit: Duration, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(limit, future)
+        .await
+        .unwrap_or_else(|_| panic!("the loopback test must finish within {limit:?}"))
+}
+
+/// Outer bound of a loopback test whose own deadline is under test.
+pub(crate) const LOOPBACK_TEST_BOUND: Duration = Duration::from_secs(10);
+
+/// How long a loopback test waits for the peer to see the client disconnect.
+pub(crate) const DISCONNECT_BOUND: Duration = Duration::from_secs(5);
+
+/// Connection timeout the tests give a `SilentServer` client.
+pub(crate) const SILENT_SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_millis(300);
+
+const TERMINATED_CAUSE: &str =
+    "Transport was terminated after an export gave up on an in-flight response";
+
+pub(crate) fn test_credentials() -> Credentials {
+    Credentials::new("sys".to_string(), "exasol".to_string())
+}
+
+/// TLS on without certificate validation, and a 300 ms connection timeout.
+pub(crate) fn silent_server_params(server: &SilentServer) -> ConnectionParams {
+    ConnectionParams::new(server.host.clone(), server.port)
+        .with_validate_server_certificate(false)
+        .with_timeout(SILENT_SERVER_CONNECTION_TIMEOUT.as_millis() as u64)
+}
+
+/// Asserts that `error` tells the caller the transport was terminated and must
+/// be reconnected, rather than blaming a missing login or a repeated connect.
+pub(crate) fn assert_names_the_termination(error: &TransportError) {
+    let message = error.to_string();
+    assert!(message.contains(TERMINATED_CAUSE), "{message}");
+    assert!(message.contains("reconnect"), "{message}");
+    assert!(!message.contains("Must"), "{message}");
+    assert!(!message.contains("Already"), "{message}");
+}
+
+/// A loopback peer that accepts one connection and then never answers, so a
+/// test can show which setup step a client-side deadline interrupts.
+pub(crate) struct SilentServer {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    certificate_der: Option<Vec<u8>>,
+    peer: JoinHandle<()>,
+}
+
+impl SilentServer {
+    /// Accepts one connection, never writes, and reads until end of stream.
+    pub(crate) async fn accepting() -> Self {
+        let (listener, host, port) = bind_loopback().await;
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept the connection");
+            discard_until_end_of_stream(&mut stream).await;
+        });
+        Self {
+            host,
+            port,
+            certificate_der: None,
+            peer,
+        }
+    }
+
+    /// Completes a server-side TLS handshake with a self-signed certificate
+    /// for `localhost`, then reads until end of stream without writing.
+    pub(crate) async fn after_tls() -> Self {
+        let certificate = TlsCertificate::generate().expect("generate a test certificate");
+        let server_config = certificate
+            .to_server_config()
+            .expect("build the test server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let (listener, host, port) = bind_loopback().await;
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept the connection");
+            // A client that rejects the certificate fails the handshake; that ends the peer.
+            if let Ok(mut tls_stream) = acceptor.accept(stream).await {
+                discard_until_end_of_stream(&mut tls_stream).await;
+            }
+        });
+        Self {
+            host,
+            port,
+            certificate_der: Some(certificate.certificate_der),
+            peer,
+        }
+    }
+
+    /// Completes the WebSocket upgrade on a plain connection, then reads until
+    /// the client closes without sending a frame.
+    #[cfg(feature = "websocket")]
+    pub(crate) async fn after_websocket_upgrade() -> Self {
+        use futures_util::StreamExt;
+
+        let (listener, host, port) = bind_loopback().await;
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept the connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("complete the WebSocket upgrade");
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        Self {
+            host,
+            port,
+            certificate_der: None,
+            peer,
+        }
+    }
+
+    /// The DER bytes of the certificate that [`after_tls`](Self::after_tls) presents.
+    pub(crate) fn certificate_der(&self) -> &[u8] {
+        self.certificate_der
+            .as_deref()
+            .expect("only SilentServer::after_tls presents a certificate")
+    }
+
+    /// Waits until the peer saw end of stream, which shows that the client
+    /// released its socket.
+    pub(crate) async fn wait_for_disconnect(&mut self) {
+        (&mut self.peer)
+            .await
+            .expect("the silent peer must not panic");
+    }
+}
+
+impl Drop for SilentServer {
+    fn drop(&mut self) {
+        self.peer.abort();
+    }
+}
+
+async fn discard_until_end_of_stream(stream: &mut (impl tokio::io::AsyncRead + Unpin)) {
+    let mut discarded = Vec::new();
+    let _ = stream.read_to_end(&mut discarded).await;
+}
+
 async fn bind_loopback() -> (TcpListener, String, u16) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -237,11 +424,7 @@ async fn bind_loopback() -> (TcpListener, String, u16) {
     (listener, address.ip().to_string(), address.port())
 }
 
-async fn accept_and_handshake(listener: &TcpListener) -> TcpStream {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .expect("accept the export connection");
+async fn read_magic_packet(stream: &mut TcpStream) {
     let mut magic = [0u8; EXA_MAGIC_PACKET_SIZE];
     stream
         .read_exact(&mut magic)
@@ -252,6 +435,14 @@ async fn accept_and_handshake(listener: &TcpListener) -> TcpStream {
         generate_magic_packet(),
         "the driver must open the tunnel with the EXA magic packet"
     );
+}
+
+async fn accept_and_handshake(listener: &TcpListener) -> TcpStream {
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .expect("accept the export connection");
+    read_magic_packet(&mut stream).await;
     stream
         .write_all(&exa_response_packet(INTERNAL_IP, INTERNAL_PORT))
         .await

@@ -16,11 +16,13 @@ use tokio_rustls::client::TlsStream;
 
 use crate::error::TransportError;
 
+use super::deadline::SetupStep;
+use super::lifecycle::{self, ConnectionLifecycle, ConnectionState, LifecycleSteps};
 use super::messages::{ColumnInfo, ResultData, ResultPayload, ResultSetHandle, SessionInfo};
 use super::protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult, TransportProtocol,
 };
-use super::tls::{FingerprintVerifier, NoVerifier};
+use super::tls;
 
 use self::attributes::{AttributeSet, AttributeValue};
 use self::constants::{
@@ -36,15 +38,6 @@ use self::constants::{
 use self::encryption::ChaCha20Encryptor;
 use self::framing::{MessageHeader, SerialCounter};
 use self::result_parser::{NativeColumnMeta, NativeResponse, NativeResponseEnvelope};
-
-/// Connection state for the native TCP transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionState {
-    Disconnected,
-    Connected,
-    Authenticated,
-    Closed,
-}
 
 /// Abstraction over plain TCP or TLS-wrapped TCP stream.
 enum NativeStream {
@@ -103,7 +96,7 @@ impl NativeStream {
 /// with ChaCha20 encryption for message payloads after the handshake.
 pub struct NativeTcpTransport {
     stream: Option<NativeStream>,
-    state: ConnectionState,
+    lifecycle: ConnectionLifecycle,
     serial: SerialCounter,
     encryptor: ChaCha20Encryptor,
     session: Option<SessionInfo>,
@@ -117,7 +110,7 @@ impl NativeTcpTransport {
     pub fn new() -> Self {
         Self {
             stream: None,
-            state: ConnectionState::Disconnected,
+            lifecycle: ConnectionLifecycle::new(),
             serial: SerialCounter::new(),
             encryptor: ChaCha20Encryptor::new(),
             session: None,
@@ -762,83 +755,15 @@ fn reject_exception(context: &str, result_data: &[u8]) -> Result<(), TransportEr
 }
 
 #[async_trait]
-impl TransportProtocol for NativeTcpTransport {
-    async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Disconnected {
-            return Err(TransportError::ProtocolError(
-                "Already connected".to_string(),
-            ));
-        }
-
-        let addr = format!("{}:{}", params.host, params.port);
-
-        let tcp_stream = tokio::time::timeout(
-            tokio::time::Duration::from_millis(params.timeout_ms),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| {
-            TransportError::IoError(format!("Connection timeout after {}ms", params.timeout_ms))
-        })?
-        .map_err(|e| TransportError::IoError(e.to_string()))?;
-
-        tcp_stream
-            .set_nodelay(true)
-            .map_err(|e| TransportError::IoError(e.to_string()))?;
-
-        if params.use_tls {
-            let tls_config = if let Some(ref fingerprint) = params.certificate_fingerprint {
-                rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
-                        expected_fingerprint: fingerprint.clone(),
-                    }))
-                    .with_no_client_auth()
-            } else if params.validate_server_certificate {
-                let mut root_store = rustls::RootCertStore::empty();
-                let certs = rustls_native_certs::load_native_certs();
-                for cert in certs.certs {
-                    let _ = root_store.add(cert);
-                }
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth()
-            } else {
-                rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                    .with_no_client_auth()
-            };
-
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-            let server_name = rustls::pki_types::ServerName::try_from(params.host.clone())
-                .map_err(|e| TransportError::TlsError(format!("Invalid server name: {}", e)))?;
-
-            let tls_stream = connector
-                .connect(server_name, tcp_stream)
-                .await
-                .map_err(|e| TransportError::TlsError(e.to_string()))?;
-
-            self.stream = Some(NativeStream::Tls(Box::new(tls_stream)));
-            self.tls_active = true;
-        } else {
-            self.stream = Some(NativeStream::Plain(tcp_stream));
-        }
-
-        self.state = ConnectionState::Connected;
-        Ok(())
+impl LifecycleSteps for NativeTcpTransport {
+    fn lifecycle_mut(&mut self) -> &mut ConnectionLifecycle {
+        &mut self.lifecycle
     }
 
-    async fn authenticate(
+    async fn login_exchange(
         &mut self,
         credentials: &Credentials,
     ) -> Result<SessionInfo, TransportError> {
-        if self.state != ConnectionState::Connected {
-            return Err(TransportError::ProtocolError(
-                "Must connect before authenticating".to_string(),
-            ));
-        }
-
         // Phase 1: Send login packet
         let login_packet = handshake::build_login_packet(&credentials.username);
         self.send_raw(&login_packet).await?;
@@ -950,17 +875,76 @@ impl TransportProtocol for NativeTcpTransport {
         };
 
         self.session = Some(session_info.clone());
-        self.state = ConnectionState::Authenticated;
-
         Ok(session_info)
     }
 
-    async fn execute_query(&mut self, sql: &str) -> Result<QueryResult, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before executing queries".to_string(),
-            ));
+    async fn send_disconnect(&mut self) {
+        if self.lifecycle.state() == ConnectionState::Authenticated {
+            let empty_attrs = AttributeSet::new();
+            let _ = self
+                .send_and_receive(CMD_DISCONNECT, &empty_attrs, None)
+                .await;
         }
+    }
+
+    fn release_connection(&mut self) {
+        self.stream = None;
+        self.session = None;
+    }
+}
+
+#[async_trait]
+impl TransportProtocol for NativeTcpTransport {
+    async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
+        let deadline = self.lifecycle.begin_connect(params.timeout_ms)?;
+        let addr = format!("{}:{}", params.host, params.port);
+
+        let tcp_stream = deadline
+            .run(SetupStep::TcpConnect, async {
+                TcpStream::connect(&addr)
+                    .await
+                    .map_err(|e| TransportError::IoError(e.to_string()))
+            })
+            .await?;
+
+        tcp_stream
+            .set_nodelay(true)
+            .map_err(|e| TransportError::IoError(e.to_string()))?;
+
+        if params.use_tls {
+            let config = tls::client_config(
+                params.certificate_fingerprint.as_deref(),
+                params.validate_server_certificate,
+            );
+            let tls_stream = deadline
+                .run(
+                    SetupStep::TlsHandshake,
+                    tls::client_handshake(tcp_stream, &params.host, config),
+                )
+                .await?;
+
+            self.stream = Some(NativeStream::Tls(Box::new(tls_stream)));
+            self.tls_active = true;
+        } else {
+            self.stream = Some(NativeStream::Plain(tcp_stream));
+        }
+
+        self.lifecycle.connected(deadline);
+        Ok(())
+    }
+
+    async fn authenticate(
+        &mut self,
+        credentials: &Credentials,
+    ) -> Result<SessionInfo, TransportError> {
+        lifecycle::authenticate_within_deadline(self, credentials).await
+    }
+
+    async fn execute_query(&mut self, sql: &str) -> Result<QueryResult, TransportError> {
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before executing queries",
+        )?;
 
         let attrs = AttributeSet::new();
         let header = self
@@ -988,11 +972,10 @@ impl TransportProtocol for NativeTcpTransport {
         &mut self,
         handle: ResultSetHandle,
     ) -> Result<ResultData, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before fetching results".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before fetching results",
+        )?;
 
         let handle_id = handle.as_i32();
         let start_position = *self.fetch_positions.get(&handle_id).unwrap_or(&0);
@@ -1074,11 +1057,10 @@ impl TransportProtocol for NativeTcpTransport {
     }
 
     async fn close_result_set(&mut self, handle: ResultSetHandle) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before closing result sets".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before closing result sets",
+        )?;
 
         self.fetch_positions.remove(&handle.as_i32());
         self.result_columns.remove(&handle.as_i32());
@@ -1101,11 +1083,10 @@ impl TransportProtocol for NativeTcpTransport {
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementHandle, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before creating prepared statements".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before creating prepared statements",
+        )?;
 
         let attrs = AttributeSet::new();
         let sql_bytes = sql.as_bytes();
@@ -1155,11 +1136,10 @@ impl TransportProtocol for NativeTcpTransport {
         handle: &PreparedStatementHandle,
         parameters: Option<Vec<Vec<serde_json::Value>>>,
     ) -> Result<QueryResult, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before executing prepared statements".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before executing prepared statements",
+        )?;
 
         let data = Self::build_execute_prepared_payload(handle, parameters.as_deref())?;
 
@@ -1175,11 +1155,10 @@ impl TransportProtocol for NativeTcpTransport {
         &mut self,
         handle: &PreparedStatementHandle,
     ) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before closing prepared statements".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before closing prepared statements",
+        )?;
 
         // Send handle as data payload
         let data = handle.handle.to_le_bytes();
@@ -1195,40 +1174,22 @@ impl TransportProtocol for NativeTcpTransport {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        if self.state == ConnectionState::Disconnected || self.state == ConnectionState::Closed {
-            return Ok(());
-        }
-
-        if self.state == ConnectionState::Authenticated {
-            let empty_attrs = AttributeSet::new();
-            let _ = self
-                .send_and_receive(CMD_DISCONNECT, &empty_attrs, None)
-                .await;
-        }
-
-        self.terminate();
-        Ok(())
+        lifecycle::close_gracefully(self).await
     }
 
     fn terminate(&mut self) {
-        self.stream = None;
-        self.state = ConnectionState::Closed;
-        self.session = None;
+        lifecycle::terminate(self);
     }
 
     fn is_connected(&self) -> bool {
-        matches!(
-            self.state,
-            ConnectionState::Connected | ConnectionState::Authenticated
-        )
+        self.lifecycle.is_open()
     }
 
     async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before setting attributes".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before setting attributes",
+        )?;
 
         let mut attrs = AttributeSet::new();
         attrs.add(ATTR_AUTOCOMMIT, AttributeValue::Bool(enabled));
@@ -1244,11 +1205,10 @@ impl TransportProtocol for NativeTcpTransport {
     }
 
     async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before setting attributes".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before setting attributes",
+        )?;
 
         let timeout_secs_i32 = i32::try_from(timeout_secs).map_err(|_| {
             TransportError::ProtocolError(format!(
@@ -1273,12 +1233,18 @@ impl TransportProtocol for NativeTcpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::lifecycle::{ConnectionLifecycle, ConnectionState};
+    use crate::transport::test_support::{
+        assert_names_the_termination, finish_within, silent_server_params, test_credentials,
+        SilentServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND, SILENT_SERVER_CONNECTION_TIMEOUT,
+    };
+    use std::time::Instant;
 
     #[test]
     fn transport_new_is_disconnected() {
         let transport = NativeTcpTransport::new();
         assert!(!transport.is_connected());
-        assert_eq!(transport.state, ConnectionState::Disconnected);
+        assert_eq!(transport.lifecycle.state(), ConnectionState::Disconnected);
     }
 
     #[test]
@@ -1290,11 +1256,92 @@ mod tests {
     #[tokio::test]
     async fn connect_requires_disconnected_state() {
         let mut transport = NativeTcpTransport::new();
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
 
         let params = ConnectionParams::new("localhost".to_string(), 8563);
         let result = transport.connect(&params).await;
         assert!(result.is_err());
+    }
+
+    /// Scenario: Server that never answers the TLS handshake
+    #[tokio::test]
+    async fn connect_fails_at_the_tls_handshake_when_the_server_never_answers() {
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            let mut server = SilentServer::accepting().await;
+            let mut transport = NativeTcpTransport::new();
+            let started = Instant::now();
+
+            let error = transport
+                .connect(&silent_server_params(&server))
+                .await
+                .expect_err("a server that never answers must fail the connection");
+
+            assert!(started.elapsed() >= SILENT_SERVER_CONNECTION_TIMEOUT);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Connection timeout after 300ms (TLS handshake)"),
+                "{error}"
+            );
+            finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        })
+        .await;
+    }
+
+    /// Scenario: Server that never answers the login
+    #[tokio::test]
+    async fn authenticate_fails_at_login_when_the_server_goes_silent_after_tls() {
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            let mut server = SilentServer::after_tls().await;
+            let mut transport = NativeTcpTransport::new();
+            let started = Instant::now();
+
+            transport
+                .connect(&silent_server_params(&server))
+                .await
+                .expect("the TLS handshake completes");
+            let error = transport
+                .authenticate(&test_credentials())
+                .await
+                .expect_err("a server that never answers the login must fail it");
+
+            assert!(started.elapsed() >= SILENT_SERVER_CONNECTION_TIMEOUT);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Connection timeout after 300ms (login)"),
+                "{error}"
+            );
+            assert!(!transport.is_connected());
+            finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        })
+        .await;
+    }
+
+    /// Scenario: Terminate a connection whose in-flight response is no longer trusted
+    /// Scenario: Operations after an export timeout name the termination
+    #[tokio::test]
+    async fn operations_after_terminate_report_the_terminated_transport() {
+        let mut transport = NativeTcpTransport::new();
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
+
+        transport.terminate();
+        let error = transport
+            .execute_query("SELECT 1")
+            .await
+            .expect_err("a terminated transport refuses queries");
+        transport
+            .close()
+            .await
+            .expect("closing a terminated transport succeeds");
+        let error_after_close = transport
+            .execute_query("SELECT 1")
+            .await
+            .expect_err("a closed terminated transport still refuses queries");
+
+        assert_names_the_termination(&error);
+        assert_names_the_termination(&error_after_close);
+        assert!(!transport.is_connected());
     }
 
     #[tokio::test]
@@ -1316,14 +1363,15 @@ mod tests {
     async fn close_is_idempotent() {
         let mut transport = NativeTcpTransport::new();
         assert!(transport.close().await.is_ok());
-        transport.state = ConnectionState::Closed;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Closed);
         assert!(transport.close().await.is_ok());
     }
 
+    /// Scenario: Terminate a connection whose in-flight response is no longer trusted
     #[test]
     fn terminate_drops_the_session_and_reports_the_transport_disconnected() {
         let mut transport = NativeTcpTransport::new();
-        transport.state = ConnectionState::Authenticated;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
         transport.session = Some(SessionInfo {
             session_id: "12345".to_string(),
             protocol_version: 3,

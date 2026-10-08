@@ -145,16 +145,28 @@ impl PreparedStatementHandle {
 pub trait TransportProtocol: Send + Sync {
     /// Connect to the database server.
     ///
+    /// Starts the connection-timeout deadline (`params.timeout_ms`). That one
+    /// deadline bounds the TCP connect, the TLS handshake, and the WebSocket
+    /// upgrade together, and [`authenticate`](Self::authenticate) gets only
+    /// what remains of it. A step that runs out of time fails with
+    /// `Connection timeout after <ms>ms (<step>)`, naming the step.
+    ///
     /// # Arguments
     ///
     /// * `params` - Connection parameters
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if connection fails.
+    /// Returns `TransportError` if connection fails or the deadline elapses.
     async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError>;
 
     /// Authenticate with the database.
+    ///
+    /// The login is bounded by what remains of the deadline that
+    /// [`connect`](Self::connect) started, so connect and login together never
+    /// take longer than the connection timeout. A login that runs out of time
+    /// fails with `Connection timeout after <ms>ms (login)` and closes the
+    /// connection, because the abandoned response would corrupt a retry.
     ///
     /// # Arguments
     ///
@@ -288,8 +300,10 @@ pub trait TransportProtocol: Send + Sync {
     /// The non-async signature is what forbids awaited I/O here, so no
     /// implementation can reintroduce a round-trip.
     ///
-    /// Afterwards [`is_connected`](Self::is_connected) reports `false` and every
-    /// other operation fails instead of reading the abandoned response.
+    /// Afterwards [`is_connected`](Self::is_connected) reports `false`,
+    /// [`close`](Self::close) succeeds without I/O, and every other operation
+    /// fails with the terminated-transport error, which tells the caller to
+    /// reconnect, instead of reading the abandoned response.
     fn terminate(&mut self);
 
     /// Check if the connection is still active.
