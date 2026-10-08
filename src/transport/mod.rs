@@ -39,8 +39,11 @@
 //! # }
 //! ```
 
+pub(crate) mod deadline;
 pub mod deserialize;
 pub mod http_transport;
+#[cfg(any(feature = "native", feature = "websocket"))]
+pub(crate) mod lifecycle;
 pub mod messages;
 #[cfg(feature = "native")]
 pub mod native;

@@ -84,7 +84,7 @@ All parameters are set via URL query string (`?key=value&key2=value2`).
 | `tls` | `ssl`, `use_tls` | `true` | Enable TLS/SSL encryption |
 | `validate_certificate` | `verify_certificate`, `validateservercertificate` | `true` | Validate the server's TLS certificate |
 | `certificate_fingerprint` | `certificatefingerprint` | — | Pin connection to a specific server certificate (SHA-256 hex of DER cert) |
-| `connection_timeout` | `timeout` | `30` | Connection timeout in seconds (max 300) |
+| `connection_timeout` | `timeout` | `30` | Time limit in seconds for opening a connection: TCP connect, TLS handshake, WebSocket upgrade, and login together (max 300, see [Timeouts](#timeouts)) |
 | `query_timeout` | — | unset | Query timeout in seconds, forwarded to Exasol as the server-enforced `queryTimeout` session attribute (see [Session Attributes](#session-attributes)). When unset, no attribute is set and the server's own `QUERY_TIMEOUT` governs — the driver imposes no client-side timer. |
 | `idle_timeout` | — | `600` | Idle connection timeout in seconds |
 | `client_name` | — | `exarrow-rs` | Client application name sent to server |
@@ -170,6 +170,16 @@ let database = driver.open(
     "exasol://user:password@host:8563?connection_timeout=60&query_timeout=600"
 )?;
 ```
+
+The connection timeout is one deadline for opening a connection. The deadline starts with the TCP connect and covers the TLS handshake when TLS is enabled, the WebSocket upgrade on the WebSocket transport, and the login. Time spent in one step is not available to a later step.
+
+When a server accepts the TCP connection and then stops answering, opening the connection fails when the deadline passes. The error message contains `Connection timeout after <ms>ms (<step>)`, where `<ms>` is the connection timeout in milliseconds and `<step>` is `TCP connect`, `TLS handshake`, `WebSocket upgrade`, or `login`. With `connection_timeout=60`, a server that never answers the TLS handshake fails the connection with `Connection timeout after 60000ms (TLS handshake)`.
+
+A timeout in the TCP connect, the TLS handshake, or the WebSocket upgrade is reported as `ConnectionError::ConnectionFailed`. A login that runs out of time is reported as `ConnectionError::AuthenticationFailed`.
+
+The connection timeout does not bound query execution, including the `OPEN SCHEMA` statement that `connect()` runs after the login for a schema in the URI. Exasol enforces `query_timeout` on the server, as [Parameters](#parameters) describes.
+
+HTTP tunnel setup for imports and exports has its own 30-second bound, which the connection timeout does not change. See [Tunnel Setup Timeout](import-export.md#tunnel-setup-timeout).
 
 ## Transport Protocol
 

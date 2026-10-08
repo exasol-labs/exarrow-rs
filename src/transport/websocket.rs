@@ -4,7 +4,6 @@
 //! Exasol databases using the Exasol WebSocket protocol.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -14,13 +13,14 @@ use futures_util::{SinkExt, StreamExt};
 use num_bigint::BigUint;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async_tls_with_config,
     tungstenite::{protocol::WebSocketConfig, Message},
-    Connector, MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream,
 };
 
 use crate::error::TransportError;
 
+use super::deadline::SetupStep;
+use super::lifecycle::{self, ConnectionLifecycle, ConnectionState, LifecycleSteps};
 use super::messages::{
     AuthRequest, ClosePreparedStatementRequest, ClosePreparedStatementResponse,
     CloseResultSetRequest, CloseResultSetResponse, CreatePreparedStatementRequest,
@@ -32,7 +32,7 @@ use super::messages::{
 use super::protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult, TransportProtocol,
 };
-use super::tls::{FingerprintVerifier, NoVerifier};
+use super::tls;
 
 /// WebSocket transport implementation.
 ///
@@ -42,23 +42,9 @@ pub struct WebSocketTransport {
     ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     /// Current session information (None if not authenticated)
     session_info: Option<SessionInfo>,
-    /// Connection state
-    state: ConnectionState,
+    lifecycle: ConnectionLifecycle,
     /// Next fetch start position per open result set handle
     fetch_positions: HashMap<i32, i64>,
-}
-
-/// Connection state tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionState {
-    /// Not connected
-    Disconnected,
-    /// Connected but not authenticated
-    Connected,
-    /// Connected and authenticated
-    Authenticated,
-    /// Connection closed
-    Closed,
 }
 
 impl WebSocketTransport {
@@ -67,7 +53,7 @@ impl WebSocketTransport {
         Self {
             ws_stream: None,
             session_info: None,
-            state: ConnectionState::Disconnected,
+            lifecycle: ConnectionLifecycle::new(),
             fetch_positions: HashMap::new(),
         }
     }
@@ -407,89 +393,15 @@ impl Default for WebSocketTransport {
 }
 
 #[async_trait]
-impl TransportProtocol for WebSocketTransport {
-    async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Disconnected {
-            return Err(TransportError::ProtocolError(
-                "Already connected".to_string(),
-            ));
-        }
-
-        let url = params.to_websocket_url();
-
-        // Create TLS connector if needed
-        let connector = if params.use_tls {
-            let tls_connector = if let Some(ref fingerprint) = params.certificate_fingerprint {
-                let config = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
-                        expected_fingerprint: fingerprint.clone(),
-                    }))
-                    .with_no_client_auth();
-                Connector::Rustls(Arc::new(config))
-            } else if params.validate_server_certificate {
-                // Use default rustls config with native root certificates
-                let mut root_store = rustls::RootCertStore::empty();
-                let certs = rustls_native_certs::load_native_certs();
-                for cert in certs.certs {
-                    // Ignore invalid certificates - some systems have malformed certs
-                    let _ = root_store.add(cert);
-                }
-                let config = rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth();
-                Connector::Rustls(Arc::new(config))
-            } else {
-                let config = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                    .with_no_client_auth();
-                Connector::Rustls(Arc::new(config))
-            };
-            Some(tls_connector)
-        } else {
-            None
-        };
-
-        // Connect with optional TLS connector
-        // Set unlimited frame and message sizes because Exasol sends large frames
-        // for result sets that can exceed the tungstenite default of 16 MiB.
-        let mut ws_config = WebSocketConfig::default();
-        ws_config.max_frame_size = None;
-        ws_config.max_message_size = None;
-        let connect_future = connect_async_tls_with_config(
-            &url,
-            Some(ws_config),
-            false,     // disable_nagle
-            connector, // TLS connector
-        );
-
-        let (ws_stream, _) = tokio::time::timeout(
-            tokio::time::Duration::from_millis(params.timeout_ms),
-            connect_future,
-        )
-        .await
-        .map_err(|_| {
-            TransportError::IoError(format!("Connection timeout after {}ms", params.timeout_ms))
-        })?
-        .map_err(|e| TransportError::WebSocketError(e.to_string()))?;
-
-        self.ws_stream = Some(ws_stream);
-        self.state = ConnectionState::Connected;
-
-        Ok(())
+impl LifecycleSteps for WebSocketTransport {
+    fn lifecycle_mut(&mut self) -> &mut ConnectionLifecycle {
+        &mut self.lifecycle
     }
 
-    async fn authenticate(
+    async fn login_exchange(
         &mut self,
         credentials: &Credentials,
     ) -> Result<SessionInfo, TransportError> {
-        if self.state != ConnectionState::Connected {
-            return Err(TransportError::ProtocolError(
-                "Must connect before authenticating".to_string(),
-            ));
-        }
-
         // Step 1: Send login init request to get the server's public key
         let init_request = LoginInitRequest::new();
         let key_response: PublicKeyResponse = self.send_receive(&init_request).await?;
@@ -525,17 +437,102 @@ impl TransportProtocol for WebSocketTransport {
         let session_info: SessionInfo = session_data.into();
 
         self.session_info = Some(session_info.clone());
-        self.state = ConnectionState::Authenticated;
-
         Ok(session_info)
     }
 
-    async fn execute_query(&mut self, sql: &str) -> Result<QueryResult, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before executing queries".to_string(),
-            ));
+    async fn send_disconnect(&mut self) {
+        // The server may close the connection before it answers, so errors are ignored.
+        if self.lifecycle.state() == ConnectionState::Authenticated {
+            let request = DisconnectRequest::new();
+            let _ = self.send_receive::<_, DisconnectResponse>(&request).await;
         }
+
+        if let Some(mut ws_stream) = self.ws_stream.take() {
+            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+            let close_frame = CloseFrame {
+                code: CloseCode::Normal,
+                reason: "Client closing connection".into(),
+            };
+            let _ = ws_stream.close(Some(close_frame)).await;
+
+            // Drain any remaining messages to complete the close handshake
+            while let Ok(Some(_)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws_stream.next()).await
+            {
+            }
+        }
+    }
+
+    fn release_connection(&mut self) {
+        self.ws_stream = None;
+        self.session_info = None;
+    }
+}
+
+#[async_trait]
+impl TransportProtocol for WebSocketTransport {
+    async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
+        let deadline = self.lifecycle.begin_connect(params.timeout_ms)?;
+
+        let tcp_stream = deadline
+            .run(SetupStep::TcpConnect, async {
+                TcpStream::connect((params.host.as_str(), params.port))
+                    .await
+                    .map_err(|e| TransportError::WebSocketError(e.to_string()))
+            })
+            .await?;
+
+        let stream = if params.use_tls {
+            let config = tls::client_config(
+                params.certificate_fingerprint.as_deref(),
+                params.validate_server_certificate,
+            );
+            let tls_stream = deadline
+                .run(
+                    SetupStep::TlsHandshake,
+                    tls::client_handshake(tcp_stream, &params.host, config),
+                )
+                .await?;
+            MaybeTlsStream::Rustls(tls_stream)
+        } else {
+            MaybeTlsStream::Plain(tcp_stream)
+        };
+
+        // Exasol sends result set frames that can exceed the tungstenite default of 16 MiB.
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_frame_size = None;
+        ws_config.max_message_size = None;
+        let (ws_stream, _) = deadline
+            .run(SetupStep::WebSocketUpgrade, async {
+                tokio_tungstenite::client_async_with_config(
+                    params.to_websocket_url(),
+                    stream,
+                    Some(ws_config),
+                )
+                .await
+                .map_err(|e| TransportError::WebSocketError(e.to_string()))
+            })
+            .await?;
+
+        self.ws_stream = Some(ws_stream);
+        self.lifecycle.connected(deadline);
+        Ok(())
+    }
+
+    async fn authenticate(
+        &mut self,
+        credentials: &Credentials,
+    ) -> Result<SessionInfo, TransportError> {
+        lifecycle::authenticate_within_deadline(self, credentials).await
+    }
+
+    async fn execute_query(&mut self, sql: &str) -> Result<QueryResult, TransportError> {
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before executing queries",
+        )?;
 
         // Send execute request
         let request = ExecuteRequest::new(sql.to_string());
@@ -548,11 +545,10 @@ impl TransportProtocol for WebSocketTransport {
         &mut self,
         handle: ResultSetHandle,
     ) -> Result<ResultData, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before fetching results".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before fetching results",
+        )?;
 
         // Get max data message size from session info
         let max_bytes = self
@@ -594,11 +590,10 @@ impl TransportProtocol for WebSocketTransport {
     }
 
     async fn close_result_set(&mut self, handle: ResultSetHandle) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before closing result sets".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before closing result sets",
+        )?;
 
         self.fetch_positions.remove(&handle.as_i32());
 
@@ -616,11 +611,10 @@ impl TransportProtocol for WebSocketTransport {
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementHandle, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before creating prepared statements".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before creating prepared statements",
+        )?;
 
         // Send create prepared statement request
         let request = CreatePreparedStatementRequest::new(sql);
@@ -664,11 +658,10 @@ impl TransportProtocol for WebSocketTransport {
         handle: &PreparedStatementHandle,
         parameters: Option<Vec<Vec<serde_json::Value>>>,
     ) -> Result<QueryResult, TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before executing prepared statements".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before executing prepared statements",
+        )?;
 
         // Build execution request
         let mut request = ExecutePreparedStatementRequest::new(handle.handle);
@@ -716,11 +709,10 @@ impl TransportProtocol for WebSocketTransport {
         &mut self,
         handle: &PreparedStatementHandle,
     ) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before closing prepared statements".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before closing prepared statements",
+        )?;
 
         // Send close prepared statement request
         let request = ClosePreparedStatementRequest::new(handle.handle);
@@ -733,64 +725,22 @@ impl TransportProtocol for WebSocketTransport {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        if self.state == ConnectionState::Disconnected || self.state == ConnectionState::Closed {
-            return Ok(());
-        }
-
-        // Send disconnect request if authenticated
-        // We ignore errors here because:
-        // 1. The server may close the connection before responding
-        // 2. We're closing anyway, so errors don't matter
-        if self.state == ConnectionState::Authenticated {
-            let request = DisconnectRequest::new();
-            // Try to send disconnect, but don't fail if it doesn't work
-            let _ = self.send_receive::<_, DisconnectResponse>(&request).await;
-        }
-
-        // Close WebSocket connection with proper close handshake
-        if let Some(mut ws_stream) = self.ws_stream.take() {
-            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-
-            // Send close frame with normal closure code
-            let close_frame = CloseFrame {
-                code: CloseCode::Normal,
-                reason: "Client closing connection".into(),
-            };
-            let _ = ws_stream.close(Some(close_frame)).await;
-
-            // Drain any remaining messages to complete the close handshake
-            use futures_util::StreamExt;
-            while let Ok(Some(_)) =
-                tokio::time::timeout(std::time::Duration::from_millis(100), ws_stream.next()).await
-            {
-            }
-        }
-
-        self.terminate();
-
-        Ok(())
+        lifecycle::close_gracefully(self).await
     }
 
     fn terminate(&mut self) {
-        self.ws_stream = None;
-        self.state = ConnectionState::Closed;
-        self.session_info = None;
+        lifecycle::terminate(self);
     }
 
     fn is_connected(&self) -> bool {
-        matches!(
-            self.state,
-            ConnectionState::Connected | ConnectionState::Authenticated
-        )
+        self.lifecycle.is_open()
     }
 
     async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before setting attributes".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before setting attributes",
+        )?;
 
         let request = SetAttributesRequest::autocommit(enabled);
         let response: SetAttributesResponse = self.send_receive(&request).await?;
@@ -799,11 +749,10 @@ impl TransportProtocol for WebSocketTransport {
     }
 
     async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
-        if self.state != ConnectionState::Authenticated {
-            return Err(TransportError::ProtocolError(
-                "Must authenticate before setting attributes".to_string(),
-            ));
-        }
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before setting attributes",
+        )?;
 
         let request = SetAttributesRequest::query_timeout(timeout_secs);
         let response: SetAttributesResponse = self.send_receive(&request).await?;
@@ -815,14 +764,21 @@ impl TransportProtocol for WebSocketTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::test_support::FakeWebSocketServer;
+    use crate::transport::test_support::{
+        assert_names_the_termination, finish_within, silent_server_params, test_credentials,
+        FakeWebSocketServer, SilentServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+        SILENT_SERVER_CONNECTION_TIMEOUT,
+    };
     use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+
+    const REJECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn test_websocket_transport_new() {
         let transport = WebSocketTransport::new();
         assert!(!transport.is_connected());
-        assert_eq!(transport.state, ConnectionState::Disconnected);
+        assert_eq!(transport.lifecycle.state(), ConnectionState::Disconnected);
     }
 
     #[test]
@@ -834,23 +790,24 @@ mod tests {
     #[test]
     fn test_connection_state_transitions() {
         let mut transport = WebSocketTransport::new();
-        assert_eq!(transport.state, ConnectionState::Disconnected);
+        assert_eq!(transport.lifecycle.state(), ConnectionState::Disconnected);
 
         // Simulate state changes
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
         assert!(transport.is_connected());
 
-        transport.state = ConnectionState::Authenticated;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
         assert!(transport.is_connected());
 
-        transport.state = ConnectionState::Closed;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Closed);
         assert!(!transport.is_connected());
     }
 
+    /// Scenario: Terminate a connection whose in-flight response is no longer trusted
     #[test]
     fn terminate_drops_the_session_and_reports_the_transport_disconnected() {
         let mut transport = WebSocketTransport::new();
-        transport.state = ConnectionState::Authenticated;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
         transport.session_info = Some(SessionInfo {
             session_id: "12345".to_string(),
             protocol_version: 3,
@@ -873,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_requires_disconnected_state() {
         let mut transport = WebSocketTransport::new();
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
 
         let params = ConnectionParams::new("localhost".to_string(), 8563);
         let result = transport.connect(&params).await;
@@ -886,10 +843,133 @@ mod tests {
         }
     }
 
+    /// Scenario: Server that never answers the TLS handshake
+    #[tokio::test]
+    async fn connect_fails_at_the_tls_handshake_when_the_server_never_answers() {
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            let mut server = SilentServer::accepting().await;
+            let mut transport = WebSocketTransport::new();
+            let started = Instant::now();
+
+            let error = transport
+                .connect(&silent_server_params(&server))
+                .await
+                .expect_err("a server that never answers must fail the connection");
+
+            assert!(started.elapsed() >= SILENT_SERVER_CONNECTION_TIMEOUT);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Connection timeout after 300ms (TLS handshake)"),
+                "{error}"
+            );
+            finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connect_reports_a_rejected_server_certificate_as_a_tls_error() {
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            let server = SilentServer::after_tls().await;
+            let params = ConnectionParams::new(server.host.clone(), server.port)
+                .with_timeout(REJECTION_TIMEOUT.as_millis() as u64);
+
+            let error = WebSocketTransport::new()
+                .connect(&params)
+                .await
+                .expect_err("an untrusted certificate must fail the connection");
+
+            assert!(matches!(error, TransportError::TlsError(_)), "{error:?}");
+        })
+        .await;
+    }
+
+    /// Scenario: WebSocket server that never answers the upgrade
+    #[tokio::test]
+    async fn connect_fails_at_the_websocket_upgrade_when_the_server_never_answers() {
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            let mut server = SilentServer::accepting().await;
+            let mut transport = WebSocketTransport::new();
+            let started = Instant::now();
+
+            let error = transport
+                .connect(&silent_server_params(&server).with_tls(false))
+                .await
+                .expect_err("a server that never answers the upgrade must fail the connection");
+
+            assert!(started.elapsed() >= SILENT_SERVER_CONNECTION_TIMEOUT);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Connection timeout after 300ms (WebSocket upgrade)"),
+                "{error}"
+            );
+            finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        })
+        .await;
+    }
+
+    /// Scenario: Server that never answers the login
+    #[tokio::test]
+    async fn authenticate_fails_at_login_when_the_server_goes_silent_after_the_upgrade() {
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            let mut server = SilentServer::after_websocket_upgrade().await;
+            let mut transport = WebSocketTransport::new();
+            let started = Instant::now();
+
+            transport
+                .connect(&silent_server_params(&server).with_tls(false))
+                .await
+                .expect("the WebSocket upgrade completes");
+            let error = transport
+                .authenticate(&test_credentials())
+                .await
+                .expect_err("a server that never answers the login must fail it");
+
+            assert!(started.elapsed() >= SILENT_SERVER_CONNECTION_TIMEOUT);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Connection timeout after 300ms (login)"),
+                "{error}"
+            );
+            assert!(!transport.is_connected());
+            finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        })
+        .await;
+    }
+
+    /// Scenario: Terminate a connection whose in-flight response is no longer trusted
+    /// Scenario: Operations after an export timeout name the termination
+    #[tokio::test]
+    async fn operations_after_terminate_report_the_terminated_transport() {
+        let mut transport = WebSocketTransport::new();
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
+
+        transport.terminate();
+        let error = transport
+            .execute_query("SELECT 1")
+            .await
+            .expect_err("a terminated transport refuses queries");
+        transport
+            .close()
+            .await
+            .expect("closing a terminated transport succeeds");
+        let error_after_close = transport
+            .execute_query("SELECT 1")
+            .await
+            .expect_err("a closed terminated transport still refuses queries");
+
+        assert_names_the_termination(&error);
+        assert_names_the_termination(&error_after_close);
+        assert!(!transport.is_connected());
+    }
+
     #[tokio::test]
     async fn test_authenticate_requires_connected_state() {
         let mut transport = WebSocketTransport::new();
-        assert_eq!(transport.state, ConnectionState::Disconnected);
+        assert_eq!(transport.lifecycle.state(), ConnectionState::Disconnected);
 
         let credentials = Credentials::new("user".to_string(), "pass".to_string());
         let result = transport.authenticate(&credentials).await;
@@ -969,10 +1049,10 @@ mod tests {
         // Close when disconnected should be ok
         let result = transport.close().await;
         assert!(result.is_ok());
-        assert_eq!(transport.state, ConnectionState::Disconnected);
+        assert_eq!(transport.lifecycle.state(), ConnectionState::Disconnected);
 
         // Close when already closed should be ok
-        transport.state = ConnectionState::Closed;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Closed);
         let result = transport.close().await;
         assert!(result.is_ok());
     }
@@ -1390,7 +1470,7 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
     #[tokio::test]
     async fn test_fetch_results_requires_authenticated_state_from_connected() {
         let mut transport = WebSocketTransport::new();
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
         let handle = super::super::messages::ResultSetHandle::new(1);
 
         let result = transport.fetch_results(handle).await;
@@ -1421,7 +1501,7 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
     #[tokio::test]
     async fn test_close_result_set_requires_authenticated_state_from_connected() {
         let mut transport = WebSocketTransport::new();
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
         let handle = super::super::messages::ResultSetHandle::new(1);
 
         let result = transport.close_result_set(handle).await;
@@ -1437,14 +1517,14 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
     #[tokio::test]
     async fn test_close_from_connected_state_succeeds() {
         let mut transport = WebSocketTransport::new();
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
 
         // Close when connected (but not authenticated) should succeed
         // and should NOT try to send disconnect request
         let result = transport.close().await;
 
         assert!(result.is_ok());
-        assert_eq!(transport.state, ConnectionState::Closed);
+        assert_eq!(transport.lifecycle.state(), ConnectionState::Closed);
     }
 
     #[tokio::test]
@@ -1452,7 +1532,7 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
         use super::super::messages::SessionInfo;
 
         let mut transport = WebSocketTransport::new();
-        transport.state = ConnectionState::Connected;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Connected);
         transport.session_info = Some(SessionInfo {
             session_id: "12345".to_string(),
             protocol_version: 3,
@@ -1510,7 +1590,7 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
         let mut transport = WebSocketTransport::new();
         let params = ConnectionParams::new("127.0.0.1".to_string(), server.port).with_tls(false);
         transport.connect(&params).await.expect("connect");
-        transport.state = ConnectionState::Authenticated;
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
         transport.session_info = Some(SessionInfo {
             session_id: "1".to_string(),
             protocol_version: 3,
