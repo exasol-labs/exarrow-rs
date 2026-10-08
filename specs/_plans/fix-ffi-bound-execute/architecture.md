@@ -1,5 +1,5 @@
 # Architecture Delta: fix-ffi-bound-execute
-<!-- BASE: f88a7efd9f811195bd48ff5d204f1cc9657fe3eb -->
+<!-- BASE: 35d6222b02ed3458266a38f69dc44bc6d199cf6a -->
 
 <!-- DELTA:CHANGED -->
 ## Constraints
@@ -8,6 +8,8 @@
 - Cargo feature `native` is the default transport, `websocket` is optional, `ffi` enables `native`, and a build without either transport rejects every connection
 - TLS and server certificate validation are on by default
 - Connection timeout defaults to 30 seconds and cannot exceed 300 seconds, and idle timeout defaults to 600 seconds
+- The connection timeout is one deadline that bounds the TCP connect, the TLS handshake, the WebSocket upgrade, and the login together, and its error names the step that ran out
+- HTTP tunnel setup (TCP connect, EXA handshake, TLS handshake) is bounded by one 30-second deadline for every import and export, independent of the connection timeout and of the opt-in CSV export timeout, and its error names the step that ran out
 - The native transport fetches up to the server's maximum data message size per batch, with a 64 MiB fallback
 - The native transport runs the parameter set of a statement that returns an affected-row count as consecutive prepared-statement executions when one data message would exceed the server's maximum data message size, and each execution's data message stays within that size unless it holds a single row
 - The FFI runtime is a multi-thread Tokio runtime with 2 workers so that import can run WebSocket and HTTP I/O at the same time inside `block_on`

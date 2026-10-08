@@ -26,21 +26,14 @@ A statement returns either an affected-row count, as INSERT, UPDATE, DELETE, and
 * *AND* the driver MUST NOT return an error because the execution returned an affected-row count instead of a result set
 * *AND* the statement SHALL take effect for every bound row
 
-### Scenario: execute runs a result-set statement once for a one-row bound batch
-
-* *GIVEN* an ADBC statement whose SQL returns a result set, such as a parameterized SELECT, and a RecordBatch of one row bound via `bind()`
-* *WHEN* `execute` is called
-* *THEN* the driver SHALL prepare the statement if it is not prepared yet
-* *AND* the driver SHALL run one prepared-statement execution with the parameter values of the bound row
-* *AND* the driver SHALL return the result set as Arrow RecordBatches
-
 ### Scenario: execute runs a result-set statement once per bound row
 
-* *GIVEN* an ADBC statement whose SQL returns a result set, such as a parameterized SELECT, and a RecordBatch of two or more rows bound via `bind()`
+* *GIVEN* an ADBC statement whose SQL returns a result set, such as a parameterized SELECT, and a RecordBatch of one or more rows bound via `bind()`
 * *WHEN* `execute` is called
-* *THEN* the driver SHALL run one prepared-statement execution per bound row, each with the parameter values of that row
-* *AND* the driver MUST NOT send the bound rows to Exasol as one multi-row parameter set
-* *AND* the driver SHALL return the result rows of all executions in one RecordBatchReader, in the order of the bound rows
+* *THEN* the driver SHALL prepare the statement if it is not prepared yet
+* *AND* the driver SHALL run one prepared-statement execution per bound row, each with the parameter values of that row
+* *AND* the driver MUST NOT send two or more bound rows to Exasol as one multi-row parameter set
+* *AND* the driver SHALL return the result rows of all executions as Arrow RecordBatches in one RecordBatchReader, in the order of the bound rows
 
 ### Scenario: A failed bound batch stores none of its rows
 
@@ -72,6 +65,14 @@ A statement returns either an affected-row count, as INSERT, UPDATE, DELETE, and
 * *GIVEN* an ADBC statement with a parameterized INSERT and a bound RecordBatch of several rows, one of which holds a value that cannot be converted to an Exasol parameter, such as the Date32 value 2932897, which lies after 9999-12-31
 * *WHEN* `execute_update` or `execute` is called
 * *THEN* the driver SHALL return an error with status `InvalidArguments`
+* *AND* the driver MUST NOT send an execution request to Exasol
+* *AND* the target table SHALL contain none of the bound rows
+
+### Scenario: A bound batch with the wrong column count fails before execution
+
+* *GIVEN* an ADBC statement whose SQL has N parameter markers, such as a parameterized INSERT, and a bound RecordBatch of one or more rows whose column count differs from N
+* *WHEN* `execute_update` or `execute` is called
+* *THEN* the driver SHALL return an error with status `InvalidArguments` whose message states N as the parameter count that the statement expects
 * *AND* the driver MUST NOT send an execution request to Exasol
 * *AND* the target table SHALL contain none of the bound rows
 
