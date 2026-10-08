@@ -2789,14 +2789,10 @@ fn current_user<C: AdbcConnection>(conn: &mut C) -> String {
     users.into_iter().next().unwrap()
 }
 
-/// Log in through the driver manager with credential options only, and report
-/// the user the server sees.
-fn login_with_options(username: &str, password: &str) -> String {
-    let db = open_database(
-        &get_test_uri_without_credentials(),
-        Some(username),
-        Some(password),
-    );
+/// Log in through the driver manager on `uri` with the given credential
+/// options, and report the user the server sees.
+fn login_as(uri: &str, username: Option<&str>, password: Option<&str>) -> String {
+    let db = open_database(uri, username, password);
     let mut conn = db.new_connection().expect("Failed to create connection");
     current_user(&mut conn)
 }
@@ -2836,10 +2832,9 @@ fn test_driver_manager_option_credentials_override_uri_credentials() {
         get_host(),
         get_port()
     );
-    let db = open_database(&uri, Some(&get_user()), Some(&get_password()));
-    let mut conn = db.new_connection().expect("Failed to create connection");
+    let user = login_as(&uri, Some(&get_user()), Some(&get_password()));
 
-    assert_eq!(current_user(&mut conn), get_user().to_uppercase());
+    assert_eq!(user, get_user().to_uppercase());
 }
 
 /// Scenario: A single credential option replaces only its own field
@@ -2854,10 +2849,9 @@ fn test_driver_manager_password_option_keeps_uri_username() {
         get_host(),
         get_port()
     );
-    let db = open_database(&uri, None, Some(&get_password()));
-    let mut conn = db.new_connection().expect("Failed to create connection");
+    let user = login_as(&uri, None, Some(&get_password()));
 
-    assert_eq!(current_user(&mut conn), get_user().to_uppercase());
+    assert_eq!(user, get_user().to_uppercase());
 }
 
 /// Scenario: Option password reaches the server verbatim
@@ -2878,7 +2872,14 @@ fn test_driver_manager_option_password_reaches_server_verbatim() {
             &mut admin_conn,
             format!("ALTER USER {} IDENTIFIED BY \"{}\"", name, password),
         );
-        logins.push((password, login_with_options(&name, password)));
+        logins.push((
+            password,
+            login_as(
+                &get_test_uri_without_credentials(),
+                Some(&name),
+                Some(password),
+            ),
+        ));
     }
     drop_temporary_user(&mut admin_conn, &name);
 
@@ -2894,10 +2895,9 @@ fn test_driver_manager_at_sign_in_query_value_keeps_host() {
     skip_if_no_exasol!();
 
     let uri = format!("{}&client_name=dbt@ci", get_test_uri_without_credentials());
-    let db = open_database(&uri, Some(&get_user()), Some(&get_password()));
-    let mut conn = db.new_connection().expect("Failed to create connection");
+    let user = login_as(&uri, Some(&get_user()), Some(&get_password()));
 
-    assert_eq!(current_user(&mut conn), get_user().to_uppercase());
+    assert_eq!(user, get_user().to_uppercase());
 }
 
 /// Scenario: Missing username is rejected
@@ -2939,11 +2939,7 @@ fn test_driver_manager_uri_credentials_apply_without_options() {
         get_host(),
         get_port()
     );
-    let user = {
-        let db = open_database(&uri, None, None);
-        let mut conn = db.new_connection().expect("Failed to create connection");
-        current_user(&mut conn)
-    };
+    let user = login_as(&uri, None, None);
     drop_temporary_user(&mut admin_conn, &name);
 
     assert_eq!(user, name);

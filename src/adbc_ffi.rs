@@ -3700,24 +3700,38 @@ mod tests {
         db
     }
 
+    /// Assert that opening a connection fails with `status`, naming
+    /// `expected` and repeating none of the `leaked` values.
+    fn assert_connection_refused(
+        db: &FfiDatabase,
+        status: AdbcStatus,
+        expected: &str,
+        leaked: &[&str],
+    ) {
+        let error = db
+            .new_connection()
+            .err()
+            .expect("the connection must be refused");
+
+        assert_eq!(error.status, status);
+        assert!(error.message.contains(expected), "got: {}", error.message);
+        for value in leaked {
+            assert!(!error.message.contains(value), "got: {}", error.message);
+        }
+    }
+
     #[test]
     fn test_ffi_database_without_uri_rejects_connection() {
         let mut db = FfiDatabase::new();
         db.set_option(OptionDatabase::Password, "Secret1".into())
             .expect("set password");
 
-        let error = db
-            .new_connection()
-            .err()
-            .expect("a connection without a URI must be refused");
-
-        assert_eq!(error.status, AdbcStatus::InvalidState);
-        assert!(
-            error.message.contains("uri database option"),
-            "got: {}",
-            error.message
+        assert_connection_refused(
+            &db,
+            AdbcStatus::InvalidState,
+            "uri database option",
+            &["Secret1"],
         );
-        assert!(!error.message.contains("Secret1"), "got: {}", error.message);
     }
 
     /// Scenario: Missing username is rejected
@@ -3725,18 +3739,12 @@ mod tests {
     fn test_ffi_database_without_username_rejects_connection() {
         let db = database_with("exasol://localhost:8563", None, Some("Secret1"));
 
-        let error = db
-            .new_connection()
-            .err()
-            .expect("a connection without a username must be refused");
-
-        assert_eq!(error.status, AdbcStatus::InvalidArguments);
-        assert!(
-            error.message.contains("Username is required"),
-            "got: {}",
-            error.message
+        assert_connection_refused(
+            &db,
+            AdbcStatus::InvalidArguments,
+            "Username is required",
+            &["Secret1"],
         );
-        assert!(!error.message.contains("Secret1"), "got: {}", error.message);
     }
 
     /// Scenario: Option password reaches the server verbatim
@@ -3790,19 +3798,12 @@ mod tests {
             Some("Secret1"),
         );
 
-        let error = db
-            .new_connection()
-            .err()
-            .expect("a URI with an unencoded '?' in the password must be refused");
-
-        assert_eq!(error.status, AdbcStatus::InvalidArguments);
-        assert!(
-            error.message.contains("position 1"),
-            "got: {}",
-            error.message
+        assert_connection_refused(
+            &db,
+            AdbcStatus::InvalidArguments,
+            "position 1",
+            &["Qx7", "Kp9"],
         );
-        assert!(!error.message.contains("Qx7"), "got: {}", error.message);
-        assert!(!error.message.contains("Kp9"), "got: {}", error.message);
     }
 
     #[test]
