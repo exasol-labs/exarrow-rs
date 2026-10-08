@@ -6,9 +6,14 @@
 - Fix: an `@` in a URI query parameter value, such as `client_name=dbt@ci`, no longer sends a driver manager connection and its option credentials to another host.
 - Fix: a `password` or `pass` query parameter applies when the URI userinfo names only the user. Credential query parameters no longer appear in the `Debug` output of `ConnectionParams`, and the `Debug` output of `ConnectionBuilder` no longer shows the password.
 - Fix: a connection URI parse error no longer shows part of a password that is not percent-encoded, such as the one in `exasol://u:pa?ss@host`.
+- Fix: the connection timeout (`timeout` or `connection_timeout`, default 30 seconds) now bounds the TCP connect, the TLS handshake, the WebSocket upgrade, and the login together. A server that accepts the connection and then stops answering fails the connection with `Connection timeout after <ms>ms (<step>)` instead of hanging. A login that runs out of time is reported as `ConnectionError::AuthenticationFailed`. Fixes #76.
+- Fix: after an export timeout terminated the transport, the next operation fails with `Transport was terminated after an export gave up on an in-flight response; reconnect before the next operation` instead of `Must authenticate before executing queries`. Fixes #56.
+- Fix: HTTP tunnel setup for imports and exports (TCP connect, EXA handshake, TLS handshake) is bounded by 30 seconds and fails with `HTTP tunnel setup timeout after 30000ms (<step>)` instead of hanging. `CsvExportOptions::timeout_ms` does not cover tunnel setup. Fixes #57.
 - Breaking: a driver manager connection with no username in the URI or in the `username` option fails with `Username is required`. It used to log in as `sys`.
 - Changed: the driver manager path checks the URI and the credentials when the connection is created and reports a problem with status `InvalidArguments`. It used to report it at the first statement with status `Internal`.
 - Changed: URI parse errors name the field, or the position of a query parameter without `=`, and no longer show the invalid value. An invalid boolean value names its query key, such as `tls`, instead of `boolean`.
+- Changed: on the WebSocket transport, a failed TLS handshake is reported as a TLS error (`TransportError::TlsError`) instead of a WebSocket error (`TransportError::WebSocketError`), as on the native transport.
+- Added: `HttpTransportClient::connect_with_timeout` opens an import or export tunnel with a setup bound that the caller chooses. `HttpTransportClient::connect` applies 30 seconds.
 
 ## 0.18.0
 

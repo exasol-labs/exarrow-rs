@@ -60,7 +60,8 @@ use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::ResultSetIterator;
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 // Connection Constants with Default Values
 
@@ -317,6 +318,58 @@ macro_rules! skip_if_no_exasol {
             return;
         }
     };
+}
+
+/// Start a loopback server that accepts every connection and holds it open
+/// without writing, so a client stalls at its next connection setup step.
+///
+/// Returns the port and the accepting task; aborting the task releases the sockets.
+#[allow(dead_code)]
+pub async fn start_silent_server() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the loopback interface must accept an ephemeral port");
+    let port = listener
+        .local_addr()
+        .expect("a bound listener has an address")
+        .port();
+    let task = tokio::spawn(async move {
+        let mut held_open = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held_open.push(stream);
+        }
+    });
+    (port, task)
+}
+
+/// Open a connection with a one-second connection timeout and the extra URI
+/// parameters `query` to a [`start_silent_server`], check that the attempt
+/// failed no earlier than that second, and return the error text.
+///
+/// Panics when the attempt is still running after 10 seconds, so a regressed
+/// deadline fails the test instead of hanging it.
+#[allow(dead_code)]
+pub async fn connection_error_from_a_silent_server(query: &str) -> String {
+    let (port, server) = start_silent_server().await;
+    let uri = format!("exasol://sys:exasol@127.0.0.1:{port}?timeout=1&{query}");
+    let params = exarrow_rs::connection::ConnectionParams::from_str(&uri)
+        .expect("the connection string is valid");
+    let started = Instant::now();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), Connection::from_params(params))
+        .await
+        .expect("the connection timeout must end the attempt within 10 seconds");
+    let elapsed = started.elapsed();
+    server.abort();
+
+    let Err(error) = result else {
+        panic!("a server that never answers must fail the connection");
+    };
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the attempt failed after {elapsed:?}, before the connection timeout"
+    );
+    error.to_string()
 }
 
 /// Generate a unique test object name.

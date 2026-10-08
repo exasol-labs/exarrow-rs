@@ -70,6 +70,14 @@ connection.import_csv_from_files("my_table", &["data.csv"], options).await?;
 
 **Default**: `.use_tls(false)` is the Docker-safe default. Switch to `.use_tls(true)` for any production or SaaS Exasol host. The same `.use_tls(bool)` method is available on all six option builders: `CsvImportOptions`, `CsvExportOptions`, `ParquetImportOptions`, `ParquetExportOptions`, `ArrowImportOptions`, and `ArrowExportOptions`.
 
+## Tunnel Setup Timeout
+
+Every import and export opens an HTTP tunnel to Exasol before it sends its statement. One 30-second deadline bounds the whole setup: the TCP connect, the EXA handshake, and the TLS handshake share it, so time spent in one step is not granted again to the next.
+
+A stalled setup fails with `HTTP tunnel setup timeout after 30000ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`. The error is `ImportError::HttpTransportError` for an import and `ExportError::HttpTransportError` for an export. The driver has sent no IMPORT or EXPORT statement at that point.
+
+Neither the connection timeout nor `CsvExportOptions::timeout_ms` changes this bound.
+
 ## Supported Formats
 
 | Format    | Import | Export | Notes                         |
@@ -270,7 +278,7 @@ let rows = connection.export_csv_to_file(source, Path::new("/tmp/export.csv"), o
 
 By default, `CsvExportOptions::default()` arms no client-side timer. The export runs for as long as the EXPORT statement takes on the server, and completes even if that takes longer than five minutes.
 
-Call `.timeout_ms(ms)` to opt in to a client-side bound on the whole export (SQL execution, HTTP transfer, and your callback, together):
+Call `.timeout_ms(ms)` to opt in to a client-side bound on the export after tunnel setup (SQL execution, HTTP transfer, and your callback, together). Tunnel setup has its own 30-second limit, described in [Tunnel Setup Timeout](#tunnel-setup-timeout):
 
 ```rust
 let options = CsvExportOptions::default().timeout_ms(30_000); // 30-second client-side bound
@@ -278,7 +286,7 @@ let options = CsvExportOptions::default().timeout_ms(30_000); // 30-second clien
 
 When the timeout elapses, the export returns `ExportError::Timeout { timeout_ms, transport_terminated }`. `transport_terminated` tells you whether the connection is still usable:
 
-- `transport_terminated: true` — the timeout fired before the driver had read the EXPORT response. The driver can no longer match that response to a later one, so it terminates the transport. Reconnect before issuing another statement on this connection.
+- `transport_terminated: true` — the timeout fired before the driver had read the EXPORT response. The driver can no longer match that response to a later one, so it terminates the transport. Reconnect before issuing another statement on this connection. A statement issued on that connection afterwards fails with `Transport was terminated after an export gave up on an in-flight response; reconnect before the next operation`.
 - `transport_terminated: false` — the timeout fired later, for example while your callback was still processing data already received. The EXPORT response was already read, so the connection remains usable for the next statement.
 
 In both cases, treat any output already written to your file, stream, or callback as an incomplete CSV document and discard it. The driver gives no guarantee that a timed-out export left a complete file behind.

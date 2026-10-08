@@ -126,6 +126,8 @@ pub struct CsvExportOptions {
     /// callback together. When such a bound elapses before the EXPORT response
     /// has been read, the driver terminates the transport, because that
     /// response can no longer be matched to a request.
+    ///
+    /// Tunnel setup comes before this bound and has its own 30-second limit.
     pub timeout_ms: Option<u64>,
 
     /// Exasol host for HTTP transport connection.
@@ -210,7 +212,8 @@ impl CsvExportOptions {
         self
     }
 
-    /// Bounds the whole export with a client-side timer.
+    /// Bounds SQL execution, tunnel transfer, and the callback together with a
+    /// client-side timer. Tunnel setup is not part of it.
     ///
     /// Unset by default. An elapsed bound can terminate the transport; see the
     /// `timeout_ms` field for when that happens.
@@ -425,13 +428,16 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
 ///
 /// # Timeout behavior
 ///
-/// `options.timeout_ms` is the only client-side bound on the whole operation,
-/// and it is unset by default: the HTTP tunnel read has no timeout of its own,
-/// so a failing EXPORT statement aborts the pending transport task instead of
-/// being awaited alongside it.
+/// Tunnel setup comes first and is bounded by the 30-second setup deadline of
+/// `HttpTransportClient::connect`, whatever `options.timeout_ms` says. A stalled
+/// setup fails with `ExportError::HttpTransportError`.
 ///
-/// A configured bound spans SQL execution, tunnel transfer, and the callback.
-/// When it elapses, the transport is terminated only if the EXPORT response
+/// `options.timeout_ms` bounds what follows (SQL execution, tunnel transfer,
+/// and the callback) and is unset by default. The tunnel read after setup has
+/// no timeout of its own, so a failing EXPORT statement aborts the pending
+/// transport task instead of being awaited alongside it.
+///
+/// When a configured bound elapses, the transport is terminated only if the EXPORT response
 /// had not been read yet, because an elapse during the callback leaves the
 /// transport in sync and terminating it would break a healthy connection.
 /// Tracking that with an `AtomicBool` rather than a `Cell` is deliberate:
@@ -973,6 +979,8 @@ mod tests {
     /// tunnel and enter the SQL leg: auto-advance would otherwise jump past a
     /// timer that was not armed yet. Starting late cannot turn this red, since
     /// `StalledQueryTransport::execute_query` never resolves.
+    ///
+    /// Scenario: No client-side export timeout by default
     #[tokio::test]
     async fn test_export_to_callback_arms_no_timer_when_the_deadline_is_left_unset() {
         let server = FakeExasolServer::silent_after_handshake().await;
@@ -1014,6 +1022,66 @@ mod tests {
                 REMOVED_DEFAULT_BOUND_MS * 2
             );
         }
+    }
+
+    /// Starts an export against a tunnel peer that never answers the magic
+    /// packet and returns its error once the paused clock reaches the setup
+    /// deadline. The clock pauses only after the peer holds the magic packet,
+    /// because auto-advance would otherwise fire the deadline during the connect.
+    async fn export_against_a_stalled_tunnel_setup(timeout_ms: Option<u64>) -> ExportError {
+        let mut server = FakeExasolServer::silent_before_handshake().await;
+        // No expectations: the EXPORT statement must not be sent.
+        let mut transport = MockTransport::new();
+        let mut options = tunnel_options(&server);
+        if let Some(timeout_ms) = timeout_ms {
+            options = options.timeout_ms(timeout_ms);
+        }
+
+        let export = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            options,
+            collect_body,
+        );
+        tokio::pin!(export);
+
+        tokio::select! {
+            outcome = &mut export => panic!("the export ended before the peer saw its handshake: {outcome:?}"),
+            () = server.wait_for_magic_packet() => {}
+        }
+        tokio::time::pause();
+        export
+            .await
+            .expect_err("a stalled tunnel setup must fail the export")
+    }
+
+    fn assert_tunnel_setup_timed_out_at_the_exa_handshake(error: ExportError) {
+        let ExportError::HttpTransportError { message } = error else {
+            panic!("expected an HttpTransportError, got {error:?}");
+        };
+        assert!(
+            message.contains("HTTP tunnel setup timeout after 30000ms (EXA handshake)"),
+            "{message}"
+        );
+    }
+
+    /// Scenario: Tunnel setup is bounded by 30 seconds by default
+    /// Scenario: No client-side export timeout by default
+    #[tokio::test]
+    async fn test_export_to_callback_bounds_a_stalled_tunnel_setup_by_30_seconds() {
+        let error = export_against_a_stalled_tunnel_setup(None).await;
+
+        assert_tunnel_setup_timed_out_at_the_exa_handshake(error);
+    }
+
+    /// Scenario: Tunnel setup is bounded by 30 seconds by default
+    #[tokio::test]
+    async fn test_export_to_callback_bounds_a_stalled_tunnel_setup_even_with_an_export_timeout() {
+        let error = export_against_a_stalled_tunnel_setup(Some(1_000)).await;
+
+        assert_tunnel_setup_timed_out_at_the_exa_handshake(error);
     }
 
     #[tokio::test]

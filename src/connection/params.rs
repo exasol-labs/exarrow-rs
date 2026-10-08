@@ -674,6 +674,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Scenario: Connection timeout default and maximum
     #[test]
     fn test_builder_validation_timeout() {
         let result = ConnectionBuilder::new()
@@ -682,7 +683,10 @@ mod tests {
             .connection_timeout(Duration::from_secs(400))
             .build();
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ConnectionError::InvalidParameter { parameter, .. } if parameter == "connection_timeout"
+        ));
     }
 
     #[test]
@@ -898,6 +902,7 @@ mod tests {
         assert_eq!(params.client_version, "1.2.3");
     }
 
+    /// Scenario: Connection timeout default and maximum
     #[test]
     fn test_builder_default_values() {
         let params = ConnectionBuilder::new()
@@ -961,6 +966,21 @@ mod tests {
             ConnectionParams::from_str("exasol://user@localhost?connection_timeout=15").unwrap();
 
         assert_eq!(params.connection_timeout, Duration::from_secs(15));
+    }
+
+    /// Scenario: Connection timeout default and maximum
+    #[test]
+    fn test_parse_connection_timeout_default_and_maximum() {
+        let default = ConnectionParams::from_str("exasol://user@localhost").unwrap();
+        let maximum = ConnectionParams::from_str("exasol://user@localhost?timeout=300").unwrap();
+        let above_maximum = ConnectionParams::from_str("exasol://user@localhost?timeout=301");
+
+        assert_eq!(default.connection_timeout, Duration::from_secs(30));
+        assert_eq!(maximum.connection_timeout, Duration::from_secs(300));
+        assert!(matches!(
+            above_maximum.unwrap_err(),
+            ConnectionError::InvalidParameter { parameter, .. } if parameter == "connection_timeout"
+        ));
     }
 
     #[test]

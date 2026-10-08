@@ -75,11 +75,11 @@ mod common;
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    assert_every_key_once, assert_partly_inline, disable_query_cache, drain_iterator,
-    end_of_stream_query, generate_test_schema_name, get_host, get_port, get_test_connection,
-    get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
-    multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
-    PARTIAL_INLINE_ROWS,
+    assert_every_key_once, assert_partly_inline, connection_error_from_a_silent_server,
+    disable_query_cache, drain_iterator, end_of_stream_query, generate_test_schema_name, get_host,
+    get_port, get_test_connection, get_test_connection_string, get_user, is_exasol_available,
+    long_running_count_query, multi_fetch_query, open_iterator, partial_inline_query,
+    END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
 #[cfg(feature = "native")]
 use common::{get_password, get_test_connection_with_transport};
@@ -241,6 +241,29 @@ async fn test_connection_fails_with_invalid_credentials() {
         error_msg.contains("auth") || error_msg.contains("failed") || error_msg.contains("invalid"),
         "Error should indicate authentication failure, got: {}",
         error
+    );
+}
+
+/// Scenario: Server that never answers the TLS handshake
+#[tokio::test]
+async fn test_connection_timeout_fails_a_silent_tls_server_at_the_tls_handshake() {
+    let error = connection_error_from_a_silent_server("validateservercertificate=0").await;
+
+    assert!(
+        error.contains("Connection timeout after 1000ms (TLS handshake)"),
+        "{error}"
+    );
+}
+
+/// Scenario: Server that never answers the login
+#[tokio::test]
+async fn test_connection_timeout_fails_a_silent_server_at_login_without_tls() {
+    let error =
+        connection_error_from_a_silent_server("validateservercertificate=0&tls=false").await;
+
+    assert!(
+        error.contains("Connection timeout after 1000ms (login)"),
+        "{error}"
     );
 }
 
@@ -3440,13 +3463,16 @@ async fn test_csv_export_server_timeout_aborts_and_keeps_connection_usable() {
 /// Teardown still goes through `close()`, like every other test in this
 /// section. `Session::close()` only mutates in-memory state, and
 /// `NativeTcpTransport::close()` returns early once `terminate()` has left the
-/// transport in `Closed`, so `close()` succeeds without attempting the
+/// transport terminated, so `close()` succeeds without attempting the
 /// disconnect round-trip the abandoned EXPORT would still be occupying.
 ///
 /// Whether Exasol then reaps the abandoned session is a property of the
 /// server, not of `terminate()`, so it is checked by the `#[ignore]`d
 /// `test_terminated_export_session_is_reaped_server_side` below rather than
 /// here, where a drifting reap latency would fail a required check.
+///
+/// Scenario: Terminate a connection whose in-flight response is no longer trusted
+/// Scenario: Operations after an export timeout name the termination
 #[tokio::test]
 async fn test_csv_export_explicit_timeout_terminates_connection() {
     skip_if_no_exasol!();
@@ -3497,11 +3523,19 @@ async fn test_csv_export_explicit_timeout_terminates_connection() {
          tore its transport down, even though nothing has closed the session"
     );
 
-    conn.query("SELECT 1").await.expect_err(
+    let error = conn.query("SELECT 1").await.expect_err(
         "A query issued after a terminating export timeout must fail — returning rows here \
          would mean the driver matched the response to the wrong request and served data \
          read off the abandoned EXPORT",
     );
+    let message = error.to_string();
+    assert!(
+        message
+            .contains("Transport was terminated after an export gave up on an in-flight response"),
+        "{message}"
+    );
+    assert!(message.contains("reconnect"), "{message}");
+    assert!(!message.contains("Must authenticate"), "{message}");
 
     conn.close()
         .await
