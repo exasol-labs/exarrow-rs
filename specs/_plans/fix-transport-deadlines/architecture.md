@@ -1,12 +1,12 @@
 # Architecture Delta: fix-transport-deadlines
-<!-- BASE: 3e25a7edb471df5f4aa3f61f698f9b0545e3bf28 -->
+<!-- BASE: f88a7efd9f811195bd48ff5d204f1cc9657fe3eb -->
 
 <!-- DELTA:CHANGED -->
 ## Components
 
 - adbc (src/adbc/): public ADBC API, where Driver opens a Database from a URI and Connection runs statements, prepared statements, transactions, metadata queries, imports, exports, and blocking wrappers | owns: transport handle shared as Arc<Mutex<dyn TransportProtocol>>, session state, connection parameters, a process-global current-thread Tokio runtime for blocking calls | depends on: connection, query, transport, import, export, error
-- adbc_ffi (src/adbc_ffi.rs): C ABI ADBC driver for driver managers, built only with the `ffi` feature, that maps ADBC options, GetObjects, statement binding, and bulk ingest onto the adbc Connection | owns: process-global multi-thread Tokio runtime with 2 workers | depends on: adbc, connection, query, import, transport, types, error
-- connection (src/connection/): parses `exasol://` URIs and builder settings, holds session state, and checks the server version for features | owns: ConnectionParams, Session state, native Parquet support flag | depends on: error
+- adbc_ffi (src/adbc_ffi.rs): C ABI ADBC driver for driver managers, built only with the `ffi` feature, that maps ADBC options, GetObjects, statement binding, and bulk ingest onto the adbc Connection, and passes the `username` and `password` database options to connection without touching the URI string | owns: process-global multi-thread Tokio runtime with 2 workers, the parsed ConnectionParams of each FFI connection | depends on: adbc, connection, query, import, transport, types, error
+- connection (src/connection/): parses `exasol://` URIs and builder settings, merges ADBC option credentials into the parsed URI, holds session state, and checks the server version for features | owns: ConnectionParams, the credential precedence rule, Session state, native Parquet support flag | depends on: error
 - query (src/query/): Statement data container, PreparedStatement, ResultSet with lazy batch fetching, and builders for IMPORT and EXPORT SQL | owns: result set handles, bound parameters | depends on: transport, types, error
 - transport core (src/transport/protocol.rs, src/transport/messages.rs, src/transport/deadline.rs, src/transport/lifecycle.rs): TransportProtocol trait, shared message types for connect, authenticate, execute, fetch, prepare, and close, the setup deadline that bounds the ordered steps of a connection or tunnel setup and names the step that ran out, and the connection lifecycle that both transports run: the connection state, the state guards, the error that every operation on a terminated transport returns, the login under the remaining connection-setup deadline, and the close and terminate rules | owns: Credentials, which clear the password on drop, ConnectionState | depends on: error
 - native transport (src/transport/native/): default Exasol binary TCP protocol with TLS, RSA password login, ChaCha20 stream encryption, 21-byte little-endian message headers, and fetch results parsed directly into Arrow RecordBatches | owns: TCP stream, cipher state, message serial counter, one connection lifecycle with its state and setup deadline | depends on: transport core, tls, types, error
@@ -30,6 +30,7 @@
 - Parquet export source -> SELECT text -> TransportProtocol::create_prepared_statement -> result-set column metadata -> Arrow schema -> TransportProtocol::close_prepared_statement, all before the EXPORT SQL runs
 - EXPORT SQL through the Connection transport -> Exasol pushes CSV through the http_transport tunnel -> export -> file, stream, list, callback, Parquet, RecordBatches, or Arrow IPC
 - ADBC driver manager -> AdbcDriverExasolInit or ExarrowDriverInit -> adbc_ffi -> adbc Connection on the 2-worker runtime -> RecordBatchReader returned over the C ABI
+- ADBC database options `uri`, `username`, and `password` -> adbc_ffi at connection creation -> connection parses the URI once and merges the option credentials into ConnectionParams -> adbc_ffi keeps the ConnectionParams, never the URI string -> Connection::from_params on first use
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
@@ -45,9 +46,11 @@
 - The FFI runtime is a multi-thread Tokio runtime with 2 workers so that import can run WebSocket and HTTP I/O at the same time inside `block_on`
 - Native Parquet import requires Exasol 2025.1.11 or later, and older servers receive Parquet converted to CSV
 - Password encryption uses RSA PKCS#1 v1.5 through num-bigint because Exasol servers can send 1024-bit keys, which aws-lc-rs rejects
-- Credentials are never logged or exposed, and Connection debug output omits the password
+- Credentials are never logged or exposed, the Debug output of Connection, ConnectionParams, and ConnectionBuilder omits the password, a credential query parameter is never kept as a connection attribute, and a connection URI parse error names the field or the query parameter position and never repeats a value from the URI
 - Results stream as Arrow RecordBatches, and conversion is Arrow-native and zero-copy where possible
-- CI rejects clippy warnings, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
+- CI rejects clippy warnings, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, a failing library unit test with the default features, the `websocket` feature, or the `ffi` feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
+- Library unit tests run in CI without a database server, so a unit test uses a test double, such as a mock transport or a local fake server, and never connects to Exasol
+- The `ffi` unit tests run in CI outside the coverage run, because cargo-llvm-cov with the `ffi` feature deadlocks
 - Integration tests require a running Exasol instance on port 8563, CI uses the image `exasol/docker-db:2025.2.1`, and the CI integration job runs every integration test target under `tests/`
 - DATE and TIMESTAMP values convert between Exasol and Arrow by the year, month, and day that Exasol reports, counted in the proleptic Gregorian calendar, on every read and write path
 <!-- /DELTA:CHANGED -->
