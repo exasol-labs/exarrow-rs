@@ -41,6 +41,26 @@ TLS is enabled by default and required for production Exasol instances. The `val
 exasol://user:password@host:port?tls=true
 ```
 
+### Credentials as database options
+
+The username and password can also be passed as the ADBC `username` and `password` database options instead of in the URI:
+
+```python
+import adbc_driver_manager.dbapi
+
+conn = adbc_driver_manager.dbapi.connect(
+    driver="/path/to/libexarrow_rs.so",
+    entrypoint="ExarrowDriverInit",
+    db_kwargs={
+        "uri": "exasol://localhost:8563?tls=true&validateservercertificate=0",
+        "username": "user",
+        "password": "p@ss?word",
+    },
+)
+```
+
+Option values need no URL-encoding: the driver uses them exactly as given. A set option replaces the matching credential in the URI, and an unset option leaves the URI credential in place. A connection without a username in the URI or in the `username` option fails with `Username is required`.
+
 ## Using with ADBC Driver Manager
 
 ### Python (adbc-driver-manager)

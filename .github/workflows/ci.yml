@@ -141,8 +141,8 @@ jobs:
         run: cargo test --lib --features websocket
 
       # Outside the coverage run: cargo-llvm-cov with the ffi feature deadlocks (AGENTS.md).
-      - name: Run FFI parameter binding unit tests
-        run: cargo test --lib --features ffi arrow_value_to_parameter
+      - name: Run FFI unit tests
+        run: cargo test --lib --features ffi
 
       # cargo llvm-cov instruments #[cfg(test)] modules too, so the raw report
       # counts the unit tests in their own denominator. Everything downstream
