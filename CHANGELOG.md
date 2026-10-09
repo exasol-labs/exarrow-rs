@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+- Fix: a prepared INSERT, UPDATE, DELETE, or MERGE run through ADBC `execute` with bound parameters, such as Python `cursor.execute(sql, params)`, no longer fails with `Cannot fetch batches from row count result` after it wrote data, and it writes every row of a bound batch. Fixes #78.
+- Fix: ADBC `execute_update` and `execute` send all rows of a bound batch to Exasol in one prepared-statement execution instead of one execution per row. A SELECT with several bound rows still runs once per row, because Exasol rejects a multi-row parameter set for a statement that returns rows. Fixes #67.
+- Fix: over the native protocol, a prepared batch whose parameter values exceed the server's maximum data message size (64 MiB on the tested `exasol/docker-db` 2026.1.0 image) runs as consecutive executions instead of breaking the connection. This applies to `Connection::execute_batch_update`, ADBC `execute_update` and `execute`, and Python `executemany`.
+- Changed: a bound batch that fits in one data message stores all of its rows or none. A batch with a value that cannot be converted, or with a row that Exasol rejects, stores no row. Before, the rows ahead of the failing row stayed written. Over the native protocol, a larger batch runs as consecutive executions, and with autocommit on a failing execution leaves the rows of the earlier executions committed.
+- Changed: `rowcount` after ADBC `execute` is -1 (unknown) instead of 0. `execute_update` and Python `executemany` report the affected-row count.
+- Changed: a bound batch whose column count differs from the parameter count of the statement fails with status `InvalidArguments` before any execution, and Python raises `ProgrammingError`. It used to fail with status `Internal`.
+- Breaking: the `ffi` feature uses `adbc_core` and `adbc_ffi` 0.24. Rust code that uses `adbc_core` types with the exarrow-rs FFI driver must move to `adbc_core` 0.24.
+
 ## 0.19.0
 
 - Fix: ADBC `username` and `password` database options reach the server exactly as set. A password with `?`, `@`, `#`, or a `%XX` sequence no longer fails to log in. Fixes #74.

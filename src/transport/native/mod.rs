@@ -7,6 +7,7 @@ pub mod handshake;
 pub mod result_parser;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -88,6 +89,30 @@ impl NativeStream {
                 .map_err(|e| TransportError::SendError(e.to_string())),
         }
     }
+}
+
+/// The payload of CMD_EXECUTE_PREPARED holds one table of parameter rows.
+const PARAMETER_TABLE_COUNT: i32 = 1;
+const IS_TABLE: u8 = 1;
+
+/// Wire layout of one parameter column, shared by every data message of a batch.
+struct ParameterColumn {
+    name: String,
+    wire_type: u32,
+    scale: i32,
+}
+
+/// A run of consecutive parameter rows and the span of `EncodedParameterRows::bytes` that holds them.
+struct RowRange {
+    rows: Range<usize>,
+    bytes: Range<usize>,
+}
+
+/// Parameter rows encoded once, with the ranges that keep each data message within a size limit.
+struct EncodedParameterRows {
+    columns: Vec<ParameterColumn>,
+    bytes: Vec<u8>,
+    ranges: Vec<RowRange>,
 }
 
 /// Native binary TCP transport for Exasol.
@@ -351,53 +376,127 @@ impl NativeTcpTransport {
     /// [handle:4 LE][num_tables:4 LE=1][is_table:1=1][num_columns:4 LE]
     /// [total_rows:8 LE][rows_in_msg:8 LE]
     /// For each column: [name_len:4 LE][name_bytes][type_id:4 LE][type-specific metadata]
-    /// For each column, for each row: [null_marker:1] [value (type-specific)]
+    /// For each row, for each column: [null_marker:1] [value (type-specific)]
     /// ```
     fn build_execute_prepared_payload(
         handle: &PreparedStatementHandle,
         parameters: Option<&[Vec<serde_json::Value>]>,
     ) -> Result<Vec<u8>, TransportError> {
-        let mut buf = Vec::with_capacity(64);
+        let cols = parameters.unwrap_or(&[]);
+        let num_rows = cols.first().map_or(0, Vec::len);
+        let columns = Self::parameter_columns(handle, cols);
 
-        buf.extend_from_slice(&handle.handle.to_le_bytes());
-        buf.extend_from_slice(&1i32.to_le_bytes()); // num_tables = 1
-        buf.push(1u8); // is_table = 1
-
-        let (num_cols, num_rows) = match parameters {
-            Some(cols) if !cols.is_empty() => {
-                let rows = cols[0].len();
-                (cols.len(), rows)
-            }
-            _ => (0, 0),
-        };
-
-        buf.extend_from_slice(&(num_cols as i32).to_le_bytes());
-        buf.extend_from_slice(&(num_rows as i64).to_le_bytes()); // total_rows
-        buf.extend_from_slice(&(num_rows as i64).to_le_bytes()); // rows_in_msg
-
-        let Some(cols) = parameters else {
-            return Ok(buf);
-        };
-
-        Self::write_column_headers(&mut buf, handle, cols);
-        Self::write_parameter_rows(&mut buf, handle, cols, num_rows)?;
-
+        let mut buf = Self::payload_prefix(handle, &columns, num_rows);
+        Self::write_parameter_rows(&mut buf, cols, &columns, 0..num_rows)?;
         Ok(buf)
     }
 
-    fn write_column_headers(
-        buf: &mut Vec<u8>,
+    /// Encode the rows of a parameter set once and split them into consecutive row ranges.
+    ///
+    /// Rows join a range while the whole message of that range stays within `limit`:
+    /// the message header, the empty attribute set, the payload prefix with the column
+    /// metadata, and the row bytes. A row whose message alone exceeds `limit` forms a
+    /// range of its own. Builds no payload: `build_range_payload` does, one range at a time.
+    fn split_parameter_rows(
         handle: &PreparedStatementHandle,
         cols: &[Vec<serde_json::Value>],
-    ) {
-        for (i, col_values) in cols.iter().enumerate() {
-            let (wire_type, col_name) = Self::infer_wire_type(handle, i, col_values);
-            let name_bytes = col_name.as_bytes();
+        limit: usize,
+    ) -> Result<EncodedParameterRows, TransportError> {
+        let num_rows = cols.first().map_or(0, Vec::len);
+        let columns = Self::parameter_columns(handle, cols);
+
+        let message_overhead = HEADER_SIZE
+            + Self::execute_prepared_attributes().serialize().len()
+            + Self::payload_prefix(handle, &columns, 0).len();
+
+        let mut bytes = Vec::new();
+        let mut ranges = Vec::new();
+        let (mut first_row, mut first_byte) = (0, 0);
+        for row in 0..num_rows {
+            let row_start = bytes.len();
+            Self::write_parameter_rows(&mut bytes, cols, &columns, row..row + 1)?;
+            if row > first_row && message_overhead + (bytes.len() - first_byte) > limit {
+                ranges.push(RowRange {
+                    rows: first_row..row,
+                    bytes: first_byte..row_start,
+                });
+                (first_row, first_byte) = (row, row_start);
+            }
+        }
+        if num_rows > 0 {
+            ranges.push(RowRange {
+                rows: first_row..num_rows,
+                bytes: first_byte..bytes.len(),
+            });
+        }
+
+        Ok(EncodedParameterRows {
+            columns,
+            bytes,
+            ranges,
+        })
+    }
+
+    /// Build the CMD_EXECUTE_PREPARED payload of one range of `encoded` rows.
+    fn build_range_payload(
+        handle: &PreparedStatementHandle,
+        encoded: &EncodedParameterRows,
+        range: &RowRange,
+    ) -> Vec<u8> {
+        let mut buf = Self::payload_prefix(handle, &encoded.columns, range.rows.len());
+        buf.reserve(range.bytes.len());
+        buf.extend_from_slice(&encoded.bytes[range.bytes.clone()]);
+        buf
+    }
+
+    /// Derive each column's wire type and scale from the whole parameter set.
+    ///
+    /// A range must not infer its own types, because `infer_wire_type` reads the
+    /// first value of a column and a later range could start with a different type.
+    fn parameter_columns(
+        handle: &PreparedStatementHandle,
+        cols: &[Vec<serde_json::Value>],
+    ) -> Vec<ParameterColumn> {
+        cols.iter()
+            .enumerate()
+            .map(|(i, col_values)| {
+                let (wire_type, name) = Self::infer_wire_type(handle, i, col_values);
+                let scale = if wire_type == T_DECIMAL {
+                    Self::decimal_metadata(handle, i).1
+                } else {
+                    0
+                };
+                ParameterColumn {
+                    name,
+                    wire_type,
+                    scale,
+                }
+            })
+            .collect()
+    }
+
+    /// The bytes that precede the row data: the statement header and the column headers.
+    fn payload_prefix(
+        handle: &PreparedStatementHandle,
+        columns: &[ParameterColumn],
+        num_rows: usize,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&handle.handle.to_le_bytes());
+        buf.extend_from_slice(&PARAMETER_TABLE_COUNT.to_le_bytes());
+        buf.push(IS_TABLE);
+        buf.extend_from_slice(&(columns.len() as i32).to_le_bytes());
+        buf.extend_from_slice(&(num_rows as i64).to_le_bytes()); // total_rows
+        buf.extend_from_slice(&(num_rows as i64).to_le_bytes()); // rows_in_msg
+
+        for (i, column) in columns.iter().enumerate() {
+            let name_bytes = column.name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as i32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
-            buf.extend_from_slice(&(wire_type as i32).to_le_bytes());
-            Self::write_column_metadata(buf, handle, i, wire_type);
+            buf.extend_from_slice(&(column.wire_type as i32).to_le_bytes());
+            Self::write_column_metadata(&mut buf, handle, i, column.wire_type);
         }
+        buf
     }
 
     /// Append the type-specific metadata a column header carries.
@@ -423,36 +522,19 @@ impl NativeTcpTransport {
         }
     }
 
-    /// Append parameter data in row-major order: col0_row0, col1_row0, col0_row1, ...
+    /// Append the parameter data of `rows` in row-major order: col0_row0, col1_row0, col0_row1, ...
     ///
     /// Exasol's native prepared-statement protocol requires this interleaving.
-    /// Column-major encoding causes the server to drop the connection for num_rows > 1;
-    /// the two orderings coincide for num_rows = 1, which is why single-row execution
-    /// was unaffected before this fix.
+    /// Column-major encoding causes the server to drop the connection for num_rows > 1.
     fn write_parameter_rows(
         buf: &mut Vec<u8>,
-        handle: &PreparedStatementHandle,
         cols: &[Vec<serde_json::Value>],
-        num_rows: usize,
+        columns: &[ParameterColumn],
+        rows: Range<usize>,
     ) -> Result<(), TransportError> {
-        let wire_types_and_scales: Vec<(u32, i32)> = cols
-            .iter()
-            .enumerate()
-            .map(|(i, col_values)| {
-                let (wire_type, _) = Self::infer_wire_type(handle, i, col_values);
-                let scale = if wire_type == T_DECIMAL {
-                    Self::decimal_metadata(handle, i).1
-                } else {
-                    0
-                };
-                (wire_type, scale)
-            })
-            .collect();
-
-        for row_idx in 0..num_rows {
-            for (col_idx, col_values) in cols.iter().enumerate() {
-                let (wire_type, scale) = wire_types_and_scales[col_idx];
-                Self::write_param_value(buf, wire_type, &col_values[row_idx], scale)?;
+        for row_idx in rows {
+            for (col_values, column) in cols.iter().zip(columns) {
+                Self::write_param_value(buf, column.wire_type, &col_values[row_idx], column.scale)?;
             }
         }
         Ok(())
@@ -700,6 +782,46 @@ impl NativeTcpTransport {
             }
         }
         Self::native_result_to_query_result(response)
+    }
+
+    /// The server's maximum data message size, or the documented default before login.
+    fn max_data_message_size(&self) -> i64 {
+        self.session
+            .as_ref()
+            .map(|s| s.max_data_message_size)
+            .unwrap_or(MAX_DATA_MESSAGE_SIZE as i64)
+    }
+
+    /// Every CMD_EXECUTE_PREPARED message carries these attributes, and `split_parameter_rows` counts their size.
+    fn execute_prepared_attributes() -> AttributeSet {
+        AttributeSet::new()
+    }
+
+    /// Send one CMD_EXECUTE_PREPARED message and convert its answer.
+    async fn run_execute_prepared(&mut self, data: &[u8]) -> Result<QueryResult, TransportError> {
+        let attrs = Self::execute_prepared_attributes();
+        let (header, payload) = self
+            .send_and_receive(CMD_EXECUTE_PREPARED, &attrs, Some(data))
+            .await?;
+        let response = Self::check_response(&header, &payload)?.terminal;
+        self.convert_and_cache_result(response)
+    }
+
+    /// Run one execution per range of `encoded`, sum the row counts, and stop at a result set.
+    async fn execute_prepared_ranges(
+        &mut self,
+        handle: &PreparedStatementHandle,
+        encoded: &EncodedParameterRows,
+    ) -> Result<QueryResult, TransportError> {
+        let mut affected_rows = 0;
+        for range in &encoded.ranges {
+            let data = Self::build_range_payload(handle, encoded, range);
+            match self.run_execute_prepared(&data).await? {
+                QueryResult::RowCount { count } => affected_rows += count,
+                result_set => return Ok(result_set),
+            }
+        }
+        Ok(QueryResult::row_count(affected_rows))
     }
 }
 
@@ -979,11 +1101,7 @@ impl TransportProtocol for NativeTcpTransport {
 
         let handle_id = handle.as_i32();
         let start_position = *self.fetch_positions.get(&handle_id).unwrap_or(&0);
-        let fetch_size_bytes = self
-            .session
-            .as_ref()
-            .map(|s| s.max_data_message_size)
-            .unwrap_or(MAX_DATA_MESSAGE_SIZE as i64);
+        let fetch_size_bytes = self.max_data_message_size();
 
         // CMD_FETCH2 payload: [handle:4 LE] [start_position:8 LE] [fetch_size_bytes:8 LE]
         let mut data = Vec::with_capacity(20);
@@ -1131,6 +1249,11 @@ impl TransportProtocol for NativeTcpTransport {
         }
     }
 
+    /// Executes a prepared statement.
+    ///
+    /// A statement that returns an affected-row count runs as consecutive executions when its
+    /// parameter values exceed the server's maximum data message size, and returns the summed
+    /// row count. Exasol drops the connection on a larger message.
     async fn execute_prepared_statement(
         &mut self,
         handle: &PreparedStatementHandle,
@@ -1141,14 +1264,20 @@ impl TransportProtocol for NativeTcpTransport {
             "Must authenticate before executing prepared statements",
         )?;
 
-        let data = Self::build_execute_prepared_payload(handle, parameters.as_deref())?;
+        if let Some(cols) = parameters
+            .as_deref()
+            .filter(|_| handle.result_columns.is_empty())
+        {
+            let limit = usize::try_from(self.max_data_message_size())
+                .unwrap_or(MAX_DATA_MESSAGE_SIZE as usize);
+            let encoded = Self::split_parameter_rows(handle, cols, limit)?;
+            if !encoded.ranges.is_empty() {
+                return self.execute_prepared_ranges(handle, &encoded).await;
+            }
+        }
 
-        let attrs = AttributeSet::new();
-        let (header, payload) = self
-            .send_and_receive(CMD_EXECUTE_PREPARED, &attrs, Some(&data))
-            .await?;
-        let response = Self::check_response(&header, &payload)?.terminal;
-        self.convert_and_cache_result(response)
+        let data = Self::build_execute_prepared_payload(handle, parameters.as_deref())?;
+        self.run_execute_prepared(&data).await
     }
 
     async fn close_prepared_statement(
@@ -2072,6 +2201,159 @@ mod tests {
         expected.extend_from_slice(&123i64.to_le_bytes());
 
         assert_eq!(payload, expected);
+    }
+
+    // --- Splitting a parameter set into data messages ---
+
+    const TOTAL_ROWS_BYTES: Range<usize> = 13..21;
+    const ROWS_IN_MSG_BYTES: Range<usize> = 21..29;
+    const FIXED_PREFIX_LEN: usize = 29;
+    const DECIMAL_VALUE_LEN: usize = 1 + 8;
+
+    /// Bytes of one string value: null marker, length, characters.
+    const fn string_value_len(chars: usize) -> usize {
+        1 + 4 + chars
+    }
+
+    fn varchar_handle() -> PreparedStatementHandle {
+        PreparedStatementHandle::new(
+            9,
+            1,
+            vec![data_type("VARCHAR")],
+            vec![Some("NAME".to_string())],
+        )
+    }
+
+    fn one_string_column(values: &[String]) -> Vec<Vec<serde_json::Value>> {
+        vec![values.iter().map(|v| serde_json::json!(v)).collect()]
+    }
+
+    fn message_size(payload: &[u8]) -> usize {
+        HEADER_SIZE
+            + NativeTcpTransport::execute_prepared_attributes()
+                .serialize()
+                .len()
+            + payload.len()
+    }
+
+    fn range_payloads(
+        handle: &PreparedStatementHandle,
+        encoded: &EncodedParameterRows,
+    ) -> Vec<Vec<u8>> {
+        encoded
+            .ranges
+            .iter()
+            .map(|range| NativeTcpTransport::build_range_payload(handle, encoded, range))
+            .collect()
+    }
+
+    /// Scenario: Batch update larger than one data message over the native protocol
+    #[test]
+    fn prepared_payload_ranges_keep_each_message_within_the_limit() {
+        let handle = varchar_handle();
+        let parameters = one_string_column(&vec!["x".repeat(100); 10]);
+        let single =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)).unwrap();
+        let prefix_len = single.len() - 10 * string_value_len(100);
+        let limit = message_size(&single) - 7 * string_value_len(100);
+
+        let encoded =
+            NativeTcpTransport::split_parameter_rows(&handle, &parameters, limit).unwrap();
+        let payloads = range_payloads(&handle, &encoded);
+
+        let row_ranges: Vec<_> = encoded.ranges.iter().map(|r| r.rows.clone()).collect();
+        assert_eq!(row_ranges, vec![0..3, 3..6, 6..9, 9..10]);
+        let mut joined_rows = Vec::new();
+        for (payload, range) in payloads.iter().zip(&encoded.ranges) {
+            assert!(message_size(payload) <= limit);
+            let declared = (range.rows.len() as i64).to_le_bytes();
+            assert_eq!(payload[TOTAL_ROWS_BYTES], declared, "total_rows");
+            assert_eq!(payload[ROWS_IN_MSG_BYTES], declared, "rows_in_msg");
+            joined_rows.extend_from_slice(&payload[prefix_len..]);
+        }
+        assert_eq!(joined_rows, single[prefix_len..]);
+    }
+
+    /// Scenario: Batch update larger than one data message over the native protocol
+    #[test]
+    fn prepared_payload_without_rows_forms_no_range() {
+        let encoded = NativeTcpTransport::split_parameter_rows(
+            &varchar_handle(),
+            &one_string_column(&[]),
+            usize::MAX,
+        )
+        .unwrap();
+
+        assert!(encoded.ranges.is_empty());
+    }
+
+    /// Scenario: Batch update larger than one data message over the native protocol
+    #[test]
+    fn prepared_payload_that_fits_forms_one_range() {
+        let handle = varchar_handle();
+        let parameters = one_string_column(&vec!["x".repeat(100); 10]);
+        let single =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)).unwrap();
+
+        let encoded =
+            NativeTcpTransport::split_parameter_rows(&handle, &parameters, message_size(&single))
+                .unwrap();
+        let payloads = range_payloads(&handle, &encoded);
+
+        assert_eq!(payloads, vec![single]);
+    }
+
+    /// Scenario: Batch update larger than one data message over the native protocol
+    #[test]
+    fn prepared_payload_row_above_the_limit_forms_its_own_range() {
+        let handle = varchar_handle();
+        let values = ["x".repeat(10), "y".repeat(1000), "z".repeat(10)];
+        let parameters = one_string_column(&values);
+        let single =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)).unwrap();
+        let prefix_len =
+            single.len() - (string_value_len(10) + string_value_len(1000) + string_value_len(10));
+        let limit = message_size(&single[..prefix_len]) + 2 * string_value_len(10);
+
+        let encoded =
+            NativeTcpTransport::split_parameter_rows(&handle, &parameters, limit).unwrap();
+
+        let row_ranges: Vec<_> = encoded.ranges.iter().map(|r| r.rows.clone()).collect();
+        assert_eq!(row_ranges, vec![0..1, 1..2, 2..3]);
+    }
+
+    /// Scenario: Batch update larger than one data message over the native protocol
+    #[test]
+    fn prepared_payload_ranges_reuse_the_wire_types_of_the_whole_batch() {
+        let handle = PreparedStatementHandle::new(1, 1, Vec::new(), Vec::new());
+        // The first value infers DECIMAL for the column. The first value of the
+        // second range would infer DOUBLE if each range inferred its own type.
+        let parameters = vec![vec![
+            serde_json::json!(1),
+            serde_json::json!(2),
+            serde_json::json!(1.5),
+            serde_json::json!(2.5),
+        ]];
+        let single =
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)).unwrap();
+        let prefix_len = single.len() - 4 * DECIMAL_VALUE_LEN;
+        let limit = message_size(&single[..prefix_len]) + 2 * DECIMAL_VALUE_LEN;
+
+        let encoded =
+            NativeTcpTransport::split_parameter_rows(&handle, &parameters, limit).unwrap();
+        let payloads = range_payloads(&handle, &encoded);
+
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(
+                payload[FIXED_PREFIX_LEN..prefix_len],
+                single[FIXED_PREFIX_LEN..prefix_len]
+            );
+        }
+        assert_eq!(
+            payloads[1][prefix_len..],
+            single[prefix_len + 2 * DECIMAL_VALUE_LEN..]
+        );
     }
 
     #[test]

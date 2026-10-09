@@ -60,8 +60,8 @@ base64 = "0.22"
 num-bigint = "0.4"
 
 # ADBC core traits (optional, for FFI export)
-adbc_core = { version = "0.23.0", optional = true }
-adbc_ffi = { version = "0.23.0", optional = true }
+adbc_core = { version = "0.24.0", optional = true }
+adbc_ffi = { version = "0.24.0", optional = true }
 
 # TLS certificate generation for secure import/export
 rcgen = "0.13"
@@ -104,8 +104,12 @@ mockall = "0.14.0"
 # Virtual clock (tokio::time::pause/advance) for tests asserting on long deadlines
 tokio = { version = "1.42", features = ["test-util"] }
 # ADBC driver manager and core for integration testing
-adbc_driver_manager = "0.23"
-adbc_core = "0.23"
+adbc_driver_manager = "0.24"
+adbc_core = "0.24"
+# C ABI test of the exported driver (tests/driver_manager_tests.rs)
+adbc_ffi = "0.24"
+libloading = "0.8"
+arrow = { version = "58", features = ["ffi"] }
 tempfile = "3.24.0"
 # Environment variable loading for examples
 dotenvy = "0.15"

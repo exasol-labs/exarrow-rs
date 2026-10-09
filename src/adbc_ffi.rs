@@ -77,7 +77,7 @@ use crate::adbc::Connection as ExaConnection;
 use crate::connection::ConnectionParams;
 use crate::error::QueryError;
 use crate::query::prepared::PreparedStatement;
-use crate::query::Parameter;
+use crate::query::{Parameter, ResultSet};
 use crate::transport::messages::DataType as TransportDataType;
 use crate::types::{ExasolType, TypeMapper};
 
@@ -445,17 +445,41 @@ type TablesBySchema = std::collections::HashMap<String, Vec<(String, String)>>;
 /// Statement option naming the table a bulk ingest writes into.
 const INGEST_TARGET_TABLE_OPTION: &str = "adbc.ingest.target_table";
 
-/// Bind row `row_idx` of `batch` as the statement's positional parameters.
-fn bind_row_as_parameters(
-    prepared: &mut PreparedStatement,
-    batch: &RecordBatch,
-    row_idx: usize,
-) -> AdbcResult<()> {
-    for col_idx in 0..batch.num_columns() {
-        let param = arrow_value_to_parameter(batch.column(col_idx).as_ref(), row_idx)?;
-        prepared.bind(col_idx, param).map_err(to_adbc_error)?;
+/// Convert every row of a bound batch into row-major parameters.
+///
+/// Stops at the first value that cannot be converted and names its zero-based
+/// column and row in the error.
+fn bound_rows(batch: &RecordBatch) -> AdbcResult<Vec<Vec<Parameter>>> {
+    (0..batch.num_rows())
+        .map(|row| {
+            (0..batch.num_columns())
+                .map(|col| {
+                    arrow_value_to_parameter(batch.column(col).as_ref(), row).map_err(|mut err| {
+                        err.message = format!("column {col}, row {row}: {}", err.message);
+                        err
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Map a failed batch execution to an ADBC error.
+///
+/// A parameter count mismatch is a caller error, reported as `InvalidArguments`.
+fn batch_execution_error(err: QueryError) -> AdbcError {
+    match err {
+        QueryError::ParameterBindingError { .. } => invalid_argument(err.to_string()),
+        other => to_adbc_error(other),
     }
-    Ok(())
+}
+
+/// The batches of an execution result; an affected-row count has none.
+async fn result_batches(result_set: ResultSet) -> Result<Vec<RecordBatch>, QueryError> {
+    if result_set.row_count().is_some() {
+        return Ok(Vec::new());
+    }
+    result_set.fetch_all().await
 }
 
 /// Wrap `batches` in a reader, taking the schema from the first batch and
@@ -1901,11 +1925,11 @@ impl FfiStatement {
     /// preparing on first use.
     fn prepared_with_connection(
         &mut self,
-    ) -> AdbcResult<(&mut PreparedStatement, Arc<Mutex<ExaConnection>>)> {
+    ) -> AdbcResult<(&PreparedStatement, Arc<Mutex<ExaConnection>>)> {
         if self.prepared.is_none() {
             adbc_core::Statement::prepare(self)?;
         }
-        let prepared = self.prepared.as_mut().ok_or_else(|| {
+        let prepared = self.prepared.as_ref().ok_or_else(|| {
             AdbcError::with_message_and_status(
                 "Failed to prepare statement",
                 AdbcStatus::InvalidState,
@@ -1917,44 +1941,61 @@ impl FfiStatement {
         Ok((prepared, conn_arc))
     }
 
-    /// Execute the prepared statement once per row of the bound batch, and
-    /// collect every result batch the rows produced.
+    /// Execute the prepared statement for the bound batch and collect the
+    /// result batches.
+    ///
+    /// A batch whose parameter values fit in one data message runs as one
+    /// execution, and the native transport runs a larger batch as consecutive
+    /// executions. A statement that returns a result set runs once per bound
+    /// row, because Exasol rejects a multi-row parameter set for it. A value
+    /// that cannot be converted, or a column count that differs from the
+    /// parameter count, sends no execution request.
     fn execute_bound_batch(&mut self, batch: RecordBatch) -> AdbcResult<Vec<RecordBatch>> {
         let (prepared, conn_arc) = self.prepared_with_connection()?;
-
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-        for row_idx in 0..batch.num_rows() {
-            bind_row_as_parameters(prepared, &batch, row_idx)?;
-            let batches = get_runtime()
-                .block_on(async {
-                    let mut conn = conn_arc.lock().await;
-                    let result_set = conn.execute_prepared(prepared).await?;
-                    result_set.fetch_all().await
-                })
-                .map_err(to_adbc_error)?;
-            all_batches.extend(batches);
-            prepared.clear_parameters();
+        let rows = bound_rows(&batch)?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(all_batches)
+
+        let returns_rows = !prepared.handle_ref().result_columns.is_empty();
+        let executions: Vec<&[Vec<Parameter>]> = if returns_rows {
+            rows.chunks(1).collect()
+        } else {
+            vec![rows.as_slice()]
+        };
+        get_runtime()
+            .block_on(async {
+                let mut conn = conn_arc.lock().await;
+                let mut batches = Vec::new();
+                for execution in executions {
+                    let result_set = conn.execute_batch(prepared, execution).await?;
+                    batches.extend(result_batches(result_set).await?);
+                }
+                Ok(batches)
+            })
+            .map_err(batch_execution_error)
     }
 
-    /// Execute the prepared statement once per row of the bound batch, and total
-    /// the affected-row counts.
+    /// Execute the prepared statement for the bound batch and report the
+    /// affected-row count.
+    ///
+    /// A batch whose parameter values fit in one data message runs as one
+    /// execution, and the native transport runs a larger batch as consecutive
+    /// executions. A value that cannot be converted, or a column count that
+    /// differs from the parameter count, sends no execution request.
     fn execute_bound_batch_update(&mut self, batch: RecordBatch) -> AdbcResult<i64> {
         let (prepared, conn_arc) = self.prepared_with_connection()?;
-
-        let mut total_count: i64 = 0;
-        for row_idx in 0..batch.num_rows() {
-            bind_row_as_parameters(prepared, &batch, row_idx)?;
-            total_count += get_runtime()
-                .block_on(async {
-                    let mut conn = conn_arc.lock().await;
-                    conn.execute_prepared_update(prepared).await
-                })
-                .map_err(to_adbc_error)?;
-            prepared.clear_parameters();
+        let rows = bound_rows(&batch)?;
+        if rows.is_empty() {
+            return Ok(0);
         }
-        Ok(total_count)
+
+        get_runtime()
+            .block_on(async {
+                let mut conn = conn_arc.lock().await;
+                conn.execute_batch_update(prepared, &rows).await
+            })
+            .map_err(batch_execution_error)
     }
 
     /// Run `sql` as a query on the parent connection and collect its batches.
@@ -4337,5 +4378,241 @@ mod tests {
                 array.data_type()
             );
         }
+    }
+
+    // ========================================================================
+    // Bound execution
+    // ========================================================================
+
+    use crate::transport::messages::{ColumnInfo, DataType as ExaDataType};
+    use crate::transport::protocol::{PreparedStatementHandle, QueryResult};
+
+    fn prepared_transport(handle: PreparedStatementHandle) -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_create_prepared_statement()
+            .returning(move |_| Ok(handle.clone()));
+        transport
+            .expect_close_prepared_statement()
+            .returning(|_| Ok(()));
+        transport.expect_close().returning(|| Ok(()));
+        transport
+    }
+
+    fn row_count_handle(num_params: i32) -> PreparedStatementHandle {
+        PreparedStatementHandle::new(17, num_params, Vec::new(), Vec::new())
+    }
+
+    fn result_set_handle(num_params: i32) -> PreparedStatementHandle {
+        row_count_handle(num_params).with_result_columns(vec![ColumnInfo {
+            name: "N".to_string(),
+            data_type: ExaDataType::decimal(18, 0),
+        }])
+    }
+
+    fn one_row_result_set(value: i64) -> QueryResult {
+        use crate::transport::messages::{ResultData, ResultPayload};
+        QueryResult::result_set(
+            None,
+            ResultData {
+                columns: vec![ColumnInfo {
+                    name: "N".to_string(),
+                    data_type: ExaDataType::decimal(18, 0),
+                }],
+                data: ResultPayload::Json(vec![vec![serde_json::json!(value)]]),
+                total_rows: 1,
+            },
+        )
+    }
+
+    /// A statement on a mock connection, plus the connection, which closes the
+    /// shared transport when dropped.
+    fn statement_over(transport: MockTransport) -> (FfiStatement, FfiConnection) {
+        let conn = connected_connection(transport);
+        let inner = conn.inner.as_ref().map(Arc::clone).expect("connected");
+        let mut stmt = FfiStatement::with_connection(inner);
+        stmt.set_sql_query("INSERT INTO T VALUES (?, ?)")
+            .expect("sql");
+        (stmt, conn)
+    }
+
+    fn int32_batch(columns: &[(&str, Vec<i32>)]) -> RecordBatch {
+        use arrow::array::{ArrayRef, Int32Array};
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, _)| Field::new(*name, DataType::Int32, false))
+            .collect();
+        let arrays: Vec<ArrayRef> = columns
+            .iter()
+            .map(|(_, values)| Arc::new(Int32Array::from(values.clone())) as ArrayRef)
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("valid batch")
+    }
+
+    fn date32_batch(days: Vec<i32>) -> RecordBatch {
+        use arrow::array::Date32Array;
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("D", DataType::Date32, false)])),
+            vec![Arc::new(Date32Array::from(days))],
+        )
+        .expect("valid batch")
+    }
+
+    /// Scenario: execute_update sends every bound row in one execution
+    #[test]
+    fn bound_execute_update_sends_every_row_in_one_request() {
+        let mut transport = prepared_transport(row_count_handle(2));
+        transport
+            .expect_execute_prepared_statement()
+            .times(1)
+            .withf(|_, params| {
+                let expected = vec![
+                    vec![
+                        serde_json::json!(1),
+                        serde_json::json!(2),
+                        serde_json::json!(3),
+                    ],
+                    vec![
+                        serde_json::json!(4),
+                        serde_json::json!(5),
+                        serde_json::json!(6),
+                    ],
+                ];
+                params.as_ref() == Some(&expected)
+            })
+            .returning(|_, _| Ok(QueryResult::RowCount { count: 3 }));
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.bind(int32_batch(&[("A", vec![1, 2, 3]), ("B", vec![4, 5, 6])]))
+            .expect("bind");
+
+        assert_eq!(stmt.execute_update().expect("update"), Some(3));
+    }
+
+    /// Scenario: execute runs a row-count statement once for the whole bound batch
+    #[test]
+    fn bound_execute_of_a_row_count_statement_returns_no_batches() {
+        let mut transport = prepared_transport(row_count_handle(2));
+        transport
+            .expect_execute_prepared_statement()
+            .times(1)
+            .returning(|_, _| Ok(QueryResult::RowCount { count: 3 }));
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.bind(int32_batch(&[("A", vec![1, 2, 3]), ("B", vec![4, 5, 6])]))
+            .expect("bind");
+
+        let mut reader = stmt.execute().expect("a row-count statement must succeed");
+
+        assert!(reader.next().is_none());
+    }
+
+    /// Scenario: execute runs a result-set statement once per bound row
+    #[test]
+    fn bound_execute_of_a_result_set_statement_sends_one_request_per_row() {
+        let mut transport = prepared_transport(result_set_handle(1));
+        let mut order = mockall::Sequence::new();
+        for (expected, answer) in [(3, 30), (1, 10)] {
+            transport
+                .expect_execute_prepared_statement()
+                .times(1)
+                .in_sequence(&mut order)
+                .withf(move |_, params| {
+                    params.as_ref() == Some(&vec![vec![serde_json::json!(expected)]])
+                })
+                .returning(move |_, _| Ok(one_row_result_set(answer)));
+        }
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("SELECT N FROM T WHERE ID = ?")
+            .expect("sql");
+        stmt.bind(int32_batch(&[("ID", vec![3, 1])])).expect("bind");
+
+        let reader = stmt.execute().expect("execute");
+        let batches: Vec<RecordBatch> = reader.map(|b| b.expect("valid")).collect();
+
+        assert_eq!(batches.len(), 2);
+        let values: Vec<i64> = batches
+            .iter()
+            .map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .expect("DECIMAL(18, 0) arrives as Decimal128")
+                    .value(0) as i64
+            })
+            .collect();
+        assert_eq!(values, vec![30, 10]);
+    }
+
+    /// Scenario: A zero-row bound batch runs no execution
+    #[test]
+    fn zero_row_bound_batch_sends_no_execution_request() {
+        let mut transport = prepared_transport(row_count_handle(2));
+        transport.expect_execute_prepared_statement().never();
+        let (mut stmt, _conn) = statement_over(transport);
+        let empty = || int32_batch(&[("A", vec![]), ("B", vec![])]);
+        stmt.bind(empty()).expect("bind");
+
+        assert_eq!(stmt.execute_update().expect("update"), Some(0));
+
+        stmt.bind(empty()).expect("bind again");
+        let mut reader = stmt.execute().expect("execute");
+        assert!(reader.next().is_none());
+    }
+
+    /// Scenario: A bound value that cannot be converted fails the batch before execution
+    #[test]
+    fn unconvertible_bound_value_sends_no_execution_request() {
+        let mut transport = prepared_transport(row_count_handle(1));
+        transport.expect_execute_prepared_statement().never();
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.bind(date32_batch(vec![0, 2_932_897])).expect("bind");
+
+        let error = stmt.execute_update().expect_err("conversion must fail");
+        assert_eq!(error.status, AdbcStatus::InvalidArguments);
+        assert!(
+            error.message.contains("column 0, row 1"),
+            "got: {}",
+            error.message
+        );
+
+        stmt.bind(date32_batch(vec![0, 2_932_897]))
+            .expect("bind again");
+        let error = stmt.execute().err().expect("conversion must fail");
+        assert_eq!(error.status, AdbcStatus::InvalidArguments);
+        assert!(
+            error.message.contains("column 0, row 1"),
+            "got: {}",
+            error.message
+        );
+    }
+
+    /// Scenario: A bound batch with the wrong column count fails before execution
+    #[test]
+    fn bound_batch_with_wrong_column_count_sends_no_execution_request() {
+        let mut transport = prepared_transport(row_count_handle(2));
+        transport.expect_execute_prepared_statement().never();
+        let (mut stmt, _conn) = statement_over(transport);
+        let wide = || int32_batch(&[("A", vec![1, 2]), ("B", vec![3, 4]), ("C", vec![5, 6])]);
+        stmt.bind(wide()).expect("bind");
+
+        let error = stmt.execute_update().expect_err("arity must be checked");
+        assert_eq!(error.status, AdbcStatus::InvalidArguments);
+        assert!(
+            error.message.contains("expects 2"),
+            "got: {}",
+            error.message
+        );
+
+        stmt.bind(wide()).expect("bind again");
+        let error = stmt.execute().err().expect("arity must be checked");
+        assert_eq!(error.status, AdbcStatus::InvalidArguments);
+        assert!(
+            error.message.contains("expects 2"),
+            "got: {}",
+            error.message
+        );
     }
 }

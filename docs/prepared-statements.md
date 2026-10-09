@@ -119,4 +119,8 @@ let batches = result_set.fetch_all().await?;
 connection.close_prepared(prepared).await?;
 ```
 
+`execute_batch` takes one row for a statement that returns rows, because Exasol rejects two or more rows with `Feature not supported: Prepared statement with multiple result tables`.
+
+Over the native protocol, a batch update whose parameter values exceed the server's maximum data message size (64 MiB on the tested `exasol/docker-db` 2026.1.0 image) runs as consecutive executions, and `execute_batch_update` returns the sum of their affected-row counts. With autocommit on, a failing execution leaves the rows of the earlier executions committed.
+
 Every row must supply exactly `prepared.parameter_count()` parameters; a mismatch fails before anything is sent to the server.
