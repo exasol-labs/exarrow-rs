@@ -2873,6 +2873,39 @@ fn test_bind_zero_row_batch_runs_no_execution() {
     drop_test_schema(&mut conn, &schema_name);
 }
 
+/// Scenario: execute_update sends every bound row in one execution
+#[test]
+fn test_bind_zero_column_batch_runs_once_per_bound_row() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_NO_PARAMS");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (id INTEGER)"),
+    );
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!("INSERT INTO {schema_name}.T VALUES (1)"))
+        .unwrap();
+    stmt.prepare().unwrap();
+
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(3));
+    let batch =
+        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options).unwrap();
+    stmt.bind(batch).unwrap();
+    assert_eq!(stmt.execute_update().expect("three rows"), Some(3));
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![3]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
 const WIDE_VALUE_CHARS: usize = 2000;
 const FAILING_ROW: i32 = 42_000;
 

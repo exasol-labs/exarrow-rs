@@ -445,6 +445,13 @@ type TablesBySchema = std::collections::HashMap<String, Vec<(String, String)>>;
 /// Statement option naming the table a bulk ingest writes into.
 const INGEST_TARGET_TABLE_OPTION: &str = "adbc.ingest.target_table";
 
+/// Whether each bound row needs its own execution: Exasol rejects a multi-row
+/// parameter set for a result-set statement, and a parameterless statement has
+/// no parameter column to carry a row count.
+fn runs_per_row(prepared: &PreparedStatement, rows: &[Vec<Parameter>]) -> bool {
+    !prepared.handle_ref().result_columns.is_empty() || rows.first().is_some_and(Vec::is_empty)
+}
+
 /// Convert every row of a bound batch into row-major parameters.
 ///
 /// Stops at the first value that cannot be converted and names its zero-based
@@ -1957,8 +1964,7 @@ impl FfiStatement {
             return Ok(Vec::new());
         }
 
-        let returns_rows = !prepared.handle_ref().result_columns.is_empty();
-        let executions: Vec<&[Vec<Parameter>]> = if returns_rows {
+        let executions: Vec<&[Vec<Parameter>]> = if runs_per_row(prepared, &rows) {
             rows.chunks(1).collect()
         } else {
             vec![rows.as_slice()]
@@ -1990,10 +1996,19 @@ impl FfiStatement {
             return Ok(0);
         }
 
+        let executions: Vec<&[Vec<Parameter>]> = if runs_per_row(prepared, &rows) {
+            rows.chunks(1).collect()
+        } else {
+            vec![rows.as_slice()]
+        };
         get_runtime()
             .block_on(async {
                 let mut conn = conn_arc.lock().await;
-                conn.execute_batch_update(prepared, &rows).await
+                let mut affected = 0;
+                for execution in executions {
+                    affected += conn.execute_batch_update(prepared, execution).await?;
+                }
+                Ok(affected)
             })
             .map_err(batch_execution_error)
     }
