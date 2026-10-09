@@ -1250,8 +1250,6 @@ pub struct FfiConnection {
     options: std::collections::HashMap<String, OptionValue>,
     /// Auto-commit mode
     auto_commit: bool,
-    /// Current schema
-    current_schema: Option<String>,
 }
 
 impl FfiConnection {
@@ -1261,7 +1259,6 @@ impl FfiConnection {
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
-            current_schema: None,
         }
     }
 
@@ -1323,6 +1320,36 @@ impl FfiConnection {
             .map_err(to_adbc_error)
     }
 
+    /// Set the server's current schema, establishing the session first.
+    fn apply_current_schema(&mut self, schema: String) -> AdbcResult<()> {
+        let conn_arc = self.ensure_connected()?;
+        get_runtime()
+            .block_on(async {
+                let mut conn = conn_arc.lock().await;
+                conn.set_schema(schema).await
+            })
+            .map_err(to_adbc_error)
+    }
+
+    /// The server's current schema, or the URI schema while no session exists.
+    ///
+    /// The read never dials: `get_option_string` takes `&self` and cannot store
+    /// a new connection, and the URI schema is what the login will apply.
+    fn read_current_schema(&self) -> AdbcResult<String> {
+        let schema = match &self.inner {
+            Some(conn_arc) => get_runtime()
+                .block_on(async { conn_arc.lock().await.refresh_current_schema().await })
+                .map_err(to_adbc_error)?,
+            None => self.params.schema.clone(),
+        };
+        schema.ok_or_else(|| {
+            AdbcError::with_message_and_status(
+                "The session has no current schema",
+                AdbcStatus::NotFound,
+            )
+        })
+    }
+
     /// Ensure the connection is established.
     fn ensure_connected(&mut self) -> AdbcResult<Arc<Mutex<ExaConnection>>> {
         if self.inner.is_none() {
@@ -1361,11 +1388,8 @@ impl Optionable for FfiConnection {
                 self.apply_auto_commit(requested == "true" || requested == "1")
             }
             OptionConnection::CurrentSchema => {
-                self.current_schema = Some(require_string_option(
-                    value,
-                    "CurrentSchema must be a string",
-                )?);
-                Ok(())
+                let schema = require_string_option(value, "CurrentSchema must be a string")?;
+                self.apply_current_schema(schema)
             }
             OptionConnection::ReadOnly | OptionConnection::IsolationLevel => {
                 self.options.insert(key.as_ref().to_string(), value);
@@ -1392,9 +1416,7 @@ impl Optionable for FfiConnection {
                 Ok(if self.auto_commit { "true" } else { "false" }.to_string())
             }
             OptionConnection::CurrentCatalog => Ok("EXA".to_string()),
-            OptionConnection::CurrentSchema => self.current_schema.clone().ok_or_else(|| {
-                AdbcError::with_message_and_status("CurrentSchema not set", AdbcStatus::NotFound)
-            }),
+            OptionConnection::CurrentSchema => self.read_current_schema(),
             OptionConnection::Other(key) => {
                 if let Some(OptionValue::String(s)) = self.options.get(&key) {
                     Ok(s.clone())
@@ -2423,6 +2445,7 @@ pub unsafe extern "C" fn ExarrowDriverInit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TransportError;
     use crate::transport::test_support::{transport_session_info, MockTransport};
     use adbc_core::{Database, Driver, Statement};
     use arrow::datatypes::{DataType, Field};
@@ -2658,7 +2681,6 @@ mod tests {
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
-            current_schema: None,
         };
 
         // With a catalog filter that doesn't match "EXA", should return empty
@@ -2681,7 +2703,6 @@ mod tests {
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
-            current_schema: None,
         };
 
         // Catalogs-only depth with matching catalog should fail (no connection)
@@ -2704,7 +2725,6 @@ mod tests {
             inner: None,
             options: std::collections::HashMap::new(),
             auto_commit: true,
-            current_schema: None,
         };
 
         let result = adbc_core::Connection::get_table_schema(&conn, None, None, "SOME_TABLE");
@@ -3934,18 +3954,96 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_option_stores_the_current_schema() {
-        let mut conn = unconnected_connection();
+    fn schema_transport() -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_close().returning(|| Ok(()));
+        transport
+    }
 
-        conn.set_option(OptionConnection::CurrentSchema, "SALES".into())
+    #[test]
+    fn set_option_current_schema_sets_the_servers_current_schema() {
+        let mut transport = schema_transport();
+        transport
+            .expect_set_current_schema()
+            .withf(|schema| schema == "sales")
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut conn = connected_connection(transport);
+
+        conn.set_option(OptionConnection::CurrentSchema, "sales".into())
             .expect("set schema");
+    }
+
+    #[test]
+    fn set_option_current_schema_reports_the_servers_rejection() {
+        let mut transport = schema_transport();
+        transport.expect_set_current_schema().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "schema ZZ_TYPO not found (SQL state: 42000)".to_string(),
+            ))
+        });
+        let mut conn = connected_connection(transport);
+
+        let error = conn
+            .set_option(OptionConnection::CurrentSchema, "ZZ_TYPO".into())
+            .expect_err("a rejected schema must fail the option call");
+
+        assert!(
+            error.message.contains("schema ZZ_TYPO not found"),
+            "got: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn get_option_string_asks_the_server_for_the_current_schema_once_connected() {
+        let mut transport = schema_transport();
+        transport
+            .expect_refresh_current_schema()
+            .times(1)
+            .returning(|| Ok(Some("SYS".to_string())));
+        let conn = connected_connection(transport);
 
         assert_eq!(
             conn.get_option_string(OptionConnection::CurrentSchema)
                 .expect("get schema"),
-            "SALES"
+            "SYS"
         );
+    }
+
+    #[test]
+    fn get_option_string_reports_a_session_without_a_current_schema_as_not_found() {
+        let mut transport = schema_transport();
+        transport
+            .expect_refresh_current_schema()
+            .returning(|| Ok(None));
+        let conn = connected_connection(transport);
+
+        let error = conn
+            .get_option_string(OptionConnection::CurrentSchema)
+            .expect_err("no current schema must not read as empty");
+
+        assert_eq!(error.status, AdbcStatus::NotFound);
+    }
+
+    /// Scenario: ADBC db_schema option before the session exists
+    #[test]
+    fn get_option_string_reports_the_uri_schema_before_the_session_exists() {
+        let params: ConnectionParams = "exasol://user@localhost:8563/my_schema"
+            .parse()
+            .expect("the test URI must parse");
+        let conn = FfiConnection::new(params);
+
+        assert_eq!(
+            conn.get_option_string(OptionConnection::CurrentSchema)
+                .expect("get schema"),
+            "my_schema"
+        );
+        assert!(conn.inner.is_none(), "the read must not dial the server");
     }
 
     #[test]
@@ -4075,13 +4173,17 @@ mod tests {
         );
     }
 
+    /// Scenario: ADBC db_schema option before the session exists
     #[test]
     fn get_option_string_reports_an_unset_schema_as_not_found() {
-        let error = unconnected_connection()
+        let conn = unconnected_connection();
+
+        let error = conn
             .get_option_string(OptionConnection::CurrentSchema)
             .expect_err("an unset schema must not be reported as empty");
 
         assert_eq!(error.status, AdbcStatus::NotFound);
+        assert!(conn.inner.is_none(), "the read must not dial the server");
     }
 
     #[test]

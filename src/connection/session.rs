@@ -7,7 +7,7 @@ use crate::connection::version::parse_release_version;
 use crate::error::ConnectionError;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Session configuration.
@@ -53,51 +53,28 @@ impl Default for SessionConfig {
 }
 
 /// Session state.
+///
+/// Only the session lifecycle changes it: executing a statement never does, so
+/// no failed or abandoned operation can leave a state that blocks the next one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// Session is being initialized
-    Initializing,
-
     /// Session is connected and ready
     Ready,
 
-    /// Session is executing a query
-    Executing,
-
     /// Session is in a transaction
     InTransaction,
-
-    /// Session is idle
-    Idle,
 
     /// Session is being closed
     Closing,
 
     /// Session is closed
     Closed,
-
-    /// Session encountered an error
-    Error,
 }
 
 impl SessionState {
-    /// Check if the session is active.
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            SessionState::Ready
-                | SessionState::Executing
-                | SessionState::InTransaction
-                | SessionState::Idle
-        )
-    }
-
     /// Check if the session can execute queries.
     pub fn can_execute(&self) -> bool {
-        matches!(
-            self,
-            SessionState::Ready | SessionState::InTransaction | SessionState::Idle
-        )
+        matches!(self, SessionState::Ready | SessionState::InTransaction)
     }
 }
 
@@ -115,17 +92,11 @@ pub struct Session {
     /// Current session state
     state: Arc<RwLock<SessionState>>,
 
-    /// Last activity timestamp
-    last_activity: Arc<RwLock<Instant>>,
-
     /// Query execution counter
     query_count: AtomicU64,
 
     /// Transaction active flag
     in_transaction: AtomicBool,
-
-    /// Current schema
-    current_schema: Arc<RwLock<Option<String>>>,
 
     /// Memoized native-Parquet-import capability, derived from `server_info.release_version`.
     native_parquet_cache: OnceLock<bool>,
@@ -139,10 +110,8 @@ impl Session {
             server_info,
             config,
             state: Arc::new(RwLock::new(SessionState::Ready)),
-            last_activity: Arc::new(RwLock::new(Instant::now())),
             query_count: AtomicU64::new(0),
             in_transaction: AtomicBool::new(false),
-            current_schema: Arc::new(RwLock::new(None)),
             native_parquet_cache: OnceLock::new(),
         }
     }
@@ -193,12 +162,6 @@ impl Session {
         *state = new_state;
     }
 
-    /// Update last activity timestamp.
-    pub async fn update_activity(&self) {
-        let mut last_activity = self.last_activity.write().await;
-        *last_activity = Instant::now();
-    }
-
     /// Increment query counter.
     pub fn increment_query_count(&self) -> u64 {
         self.query_count.fetch_add(1, Ordering::SeqCst) + 1
@@ -214,12 +177,12 @@ impl Session {
         self.in_transaction.load(Ordering::SeqCst)
     }
 
-    /// Begin a transaction.
-    pub async fn begin_transaction(&self) -> Result<(), ConnectionError> {
-        let state = self.state().await;
-        if !state.can_execute() {
-            return Err(ConnectionError::ConnectionClosed);
-        }
+    /// Check that a transaction can start, without changing any state.
+    ///
+    /// Fails with `ConnectionClosed` for a `Closing` or `Closed` session and
+    /// with "Transaction already active" while a transaction is open.
+    pub(crate) async fn ensure_can_begin_transaction(&self) -> Result<(), ConnectionError> {
+        self.validate_ready().await?;
 
         if self.in_transaction() {
             return Err(ConnectionError::InvalidParameter {
@@ -228,9 +191,15 @@ impl Session {
             });
         }
 
+        Ok(())
+    }
+
+    /// Begin a transaction.
+    pub async fn begin_transaction(&self) -> Result<(), ConnectionError> {
+        self.ensure_can_begin_transaction().await?;
+
         self.in_transaction.store(true, Ordering::SeqCst);
         self.set_state(SessionState::InTransaction).await;
-        self.update_activity().await;
 
         Ok(())
     }
@@ -243,7 +212,6 @@ impl Session {
 
         self.in_transaction.store(false, Ordering::SeqCst);
         self.set_state(SessionState::Ready).await;
-        self.update_activity().await;
 
         Ok(())
     }
@@ -256,21 +224,8 @@ impl Session {
 
         self.in_transaction.store(false, Ordering::SeqCst);
         self.set_state(SessionState::Ready).await;
-        self.update_activity().await;
 
         Ok(())
-    }
-
-    /// Get current schema.
-    pub async fn current_schema(&self) -> Option<String> {
-        self.current_schema.read().await.clone()
-    }
-
-    /// Set current schema.
-    pub async fn set_current_schema(&self, schema: Option<String>) {
-        let mut current_schema = self.current_schema.write().await;
-        *current_schema = schema;
-        self.update_activity().await;
     }
 
     /// Close the session.
@@ -294,21 +249,13 @@ impl Session {
     }
 
     /// Validate session is ready for operations.
+    ///
+    /// A `Closing` or `Closed` session reports `ConnectionError::ConnectionClosed`.
     pub async fn validate_ready(&self) -> Result<(), ConnectionError> {
-        let state = self.state().await;
-
-        match state {
-            SessionState::Closed => Err(ConnectionError::ConnectionClosed),
-            SessionState::Error => Err(ConnectionError::InvalidParameter {
-                parameter: "session".to_string(),
-                message: "Session is in error state".to_string(),
-            }),
-            SessionState::Closing => Err(ConnectionError::ConnectionClosed),
-            _ if !state.is_active() => Err(ConnectionError::InvalidParameter {
-                parameter: "session".to_string(),
-                message: format!("Session is not active: {:?}", state),
-            }),
-            _ => Ok(()),
+        if self.state().await.can_execute() {
+            Ok(())
+        } else {
+            Err(ConnectionError::ConnectionClosed)
         }
     }
 }
@@ -373,11 +320,11 @@ mod tests {
 
         assert_eq!(session.state().await, SessionState::Ready);
 
-        session.set_state(SessionState::Executing).await;
-        assert_eq!(session.state().await, SessionState::Executing);
+        session.set_state(SessionState::InTransaction).await;
+        assert_eq!(session.state().await, SessionState::InTransaction);
 
-        session.set_state(SessionState::Idle).await;
-        assert_eq!(session.state().await, SessionState::Idle);
+        session.set_state(SessionState::Closing).await;
+        assert_eq!(session.state().await, SessionState::Closing);
 
         session.set_state(SessionState::Closed).await;
         assert_eq!(session.state().await, SessionState::Closed);
@@ -412,8 +359,12 @@ mod tests {
         assert_eq!(session.state().await, SessionState::InTransaction);
 
         // Cannot begin another transaction
-        let result = session.begin_transaction().await;
-        assert!(result.is_err());
+        match session.begin_transaction().await {
+            Err(ConnectionError::InvalidParameter { message, .. }) => {
+                assert_eq!(message, "Transaction already active")
+            }
+            other => panic!("expected an active-transaction error, got {:?}", other),
+        }
 
         // Commit transaction
         session.commit_transaction().await.unwrap();
@@ -466,28 +417,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_schema() {
-        let session = Session::new(
-            "sess123".to_string(),
-            mock_server_info(),
-            SessionConfig::default(),
-        );
-
-        assert!(session.current_schema().await.is_none());
-
-        session
-            .set_current_schema(Some("MY_SCHEMA".to_string()))
-            .await;
-        assert_eq!(
-            session.current_schema().await,
-            Some("MY_SCHEMA".to_string())
-        );
-
-        session.set_current_schema(None).await;
-        assert!(session.current_schema().await.is_none());
-    }
-
-    #[tokio::test]
     async fn test_session_close() {
         let session = Session::new(
             "sess123".to_string(),
@@ -502,6 +431,7 @@ mod tests {
         assert_eq!(session.state().await, SessionState::Closed);
     }
 
+    /// Scenario: A closed session rejects operations as closed
     #[tokio::test]
     async fn test_session_validate_ready() {
         let session = Session::new(
@@ -510,28 +440,51 @@ mod tests {
             SessionConfig::default(),
         );
 
-        // Ready state should validate
         assert!(session.validate_ready().await.is_ok());
 
-        // Closed state should fail
-        session.set_state(SessionState::Closed).await;
-        assert!(session.validate_ready().await.is_err());
+        session.set_state(SessionState::InTransaction).await;
+        assert!(session.validate_ready().await.is_ok());
 
-        // Error state should fail
-        session.set_state(SessionState::Error).await;
-        assert!(session.validate_ready().await.is_err());
+        for state in [SessionState::Closing, SessionState::Closed] {
+            session.set_state(state).await;
+            assert!(
+                matches!(
+                    session.validate_ready().await,
+                    Err(ConnectionError::ConnectionClosed)
+                ),
+                "{:?} must report the connection as closed",
+                state
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_begin_transaction_reports_a_closed_session_as_closed() {
+        for state in [SessionState::Closing, SessionState::Closed] {
+            let session = Session::new(
+                "sess123".to_string(),
+                mock_server_info(),
+                SessionConfig::default(),
+            );
+            session.set_state(state).await;
+
+            assert!(
+                matches!(
+                    session.begin_transaction().await,
+                    Err(ConnectionError::ConnectionClosed)
+                ),
+                "{:?} must report the connection as closed",
+                state
+            );
+            assert!(!session.in_transaction());
+        }
     }
 
     #[test]
     fn test_session_state_checks() {
-        assert!(SessionState::Ready.is_active());
-        assert!(SessionState::Executing.is_active());
-        assert!(!SessionState::Closed.is_active());
-        assert!(!SessionState::Error.is_active());
-
         assert!(SessionState::Ready.can_execute());
         assert!(SessionState::InTransaction.can_execute());
-        assert!(!SessionState::Executing.can_execute());
+        assert!(!SessionState::Closing.can_execute());
         assert!(!SessionState::Closed.can_execute());
     }
 

@@ -51,3 +51,19 @@ Native protocol commands share a common binary message envelope: a 21-byte heade
 * *WHEN* setting session attributes (e.g., autocommit, current schema)
 * *THEN* the system SHALL send `CMD_SET_ATTRIBUTES` (35) with the attribute key-value pairs encoded in binary format
 * *AND* the system SHALL validate the server response
+
+### Scenario: Set the current schema attribute
+
+* *GIVEN* an authenticated native TCP session exists
+* *WHEN* the driver sets the session's current schema to a name
+* *THEN* the system SHALL send `CMD_SET_ATTRIBUTES` (35) with attribute 22 (current schema) holding the name as a string
+* *AND* when the response holds an exception, the system SHALL return an error that contains the server's error message and MUST leave the recorded current schema unchanged
+* *AND* after the server accepts the change, the system SHALL send `CMD_GET_ATTRIBUTES` (34) and SHALL record attribute 22 of that response as the session's current schema, where an absent or empty attribute 22 means the session has no current schema
+
+### Scenario: Track the current schema attribute from responses
+
+* *GIVEN* an authenticated native TCP session exists
+* *WHEN* the attribute block of a server response holds attribute 22 (current schema)
+* *THEN* the system SHALL record its value as the session's current schema, where an empty value means the session has no current schema
+* *AND* a response to any command other than `CMD_GET_ATTRIBUTES` whose attribute block lacks attribute 22 MUST leave the recorded current schema unchanged
+* *AND* a response to `CMD_GET_ATTRIBUTES`, including the one the login sends, that lacks attribute 22 SHALL set the recorded current schema to none, because that response reports every session attribute

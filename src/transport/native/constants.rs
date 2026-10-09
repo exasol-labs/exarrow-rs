@@ -79,6 +79,7 @@ pub const ATTR_AUTOCOMMIT: u16 = 7;
 pub const ATTR_CLIENTVERSION: u16 = 10;
 pub const ATTR_TRANSACTION_STATE: u16 = 17;
 pub const ATTR_PROTOCOL_VERSION: u16 = 19;
+pub const ATTR_CURRENT_SCHEMA: u16 = 22;
 pub const ATTR_DATA_MESSAGE_SIZE: u16 = 26;
 pub const ATTR_PUBLIC_KEY: u16 = 32;
 pub const ATTR_RANDOM_PHRASE: u16 = 33;
