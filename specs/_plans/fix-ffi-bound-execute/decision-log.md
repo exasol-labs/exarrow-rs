@@ -81,6 +81,7 @@ After PR #89 merged, the orchestrator passed the new state of the branch and the
 - **Rationale:** A probe against the local container showed that Exasol treats a batched INSERT as one statement. Three rows in which the second string exceeded `VARCHAR(3)` failed with `data exception - string data, right truncation` (SQLSTATE `40001`), and the table held none of the three rows afterwards. With autocommit off, the same error rolled back the open transaction, both for a one-row and for a two-row execution. Batching therefore does not change what Exasol does with earlier work in the transaction.
 - **Consequences:** The changelog states the all-or-nothing behavior. The session-state defect of #72, in which a failed execution leaves the session in `Executing`, is unchanged. `SessionState::is_active` counts `Executing` as active, so later statements on the connection still run.
   - The all-or-nothing rule covers a bound batch whose parameter values fit in one data message. Over the native protocol, a larger batch runs as consecutive executions, and with autocommit on a failing execution leaves the rows of the earlier executions committed (entry [8]).
+  - The conversion error keeps the status of `arrow_value_to_parameter`, and its message starts with the zero-based column index and row index of the failing value, as the recorded `adbc-driver/driver-interface` scenario "Type conversion errors" requires.
 - **Promotes to ADR:** no
 
 ### [5] The plan bumps adbc_core, adbc_ffi, and adbc_driver_manager to 0.24
@@ -129,7 +130,7 @@ After PR #89 merged, the orchestrator passed the new state of the branch and the
   - `Connection::execute_batch_update` in the Rust API gets the same behavior, because the split lives in the native transport.
   - The split runs below the lifecycle guard of `execute_prepared_statement` and changes no lifecycle state. A terminated transport returns the terminated-transport error before the first range.
   - The WebSocket transport keeps one message per execution. It is opt-in, and the WebSocket probes sent up to 80 MB of JSON in one execution without an error.
-  - A bound execution holds three converted copies of the whole batch in driver memory at once: the row-major `Parameter` rows that `src/adbc_ffi.rs` builds, the column-major `serde_json::Value` parameter data that `Connection::execute_batch_update` and `Connection::execute_batch` build with `PreparedStatement::build_batch_parameters_data`, and the rows that the native transport encodes. A split batch also holds the data message of one range, up to the maximum data message size. Each `Parameter` and each `serde_json::Value` is an enum value, so a numeric value takes more memory than its 4 or 8 bytes in Arrow. A bound batch therefore needs several times its Arrow size in driver memory, and a large batch that the per-row loop completes today can exceed the available memory. Bulk ingestion through `adbc.ingest.target_table` stays the documented path for large loads.
+  - A bound execution holds three converted copies of the whole batch in driver memory at once: the row-major `Parameter` rows that `src/adbc_ffi.rs` builds, the column-major `serde_json::Value` parameter data that `Connection::execute_batch_update` and `Connection::execute_batch` build with `PreparedStatement::build_batch_parameters_data`, and the rows that the native transport encodes. A split batch also holds the data message of the range that the native transport sends next, up to the maximum data message size. The native transport builds each range message from the encoded rows just before it sends it, so it holds one range message at a time and never the messages of all ranges. Each `Parameter` and each `serde_json::Value` is an enum value, so a numeric value takes more memory than its 4 or 8 bytes in Arrow. A bound batch therefore needs several times its Arrow size in driver memory, and a large batch that the per-row loop completes today can exceed the available memory. Bulk ingestion through `adbc.ingest.target_table` stays the documented path for large loads.
   - The plan changes `src/transport/native/mod.rs` as it is on `main` and the § Constraints section of `specs/architecture.md`. The requester approved the change to `src/transport/native/mod.rs` (entry [11]).
 - **Promotes to ADR:** no
 
@@ -149,7 +150,7 @@ After PR #89 merged, the orchestrator passed the new state of the branch and the
 
 ### [11] The split builds on the native transport of PR #89 on main and changes one architecture constraint
 
-- **Decision:** This PR targets `main`, which holds the merged PR #89 (plan `fix-transport-deadlines`). The split of entry [8] stays in `src/transport/native/mod.rs` and builds on the code of PR #89 as it is on `main`. The architecture delta changes § Constraints by one bullet: the native transport runs an oversize parameter set of a row-count statement as consecutive executions within the server's maximum data message size. The plan changes `src/adbc_ffi.rs`, `src/transport/native/mod.rs`, `tests/driver_manager_tests.rs`, `Cargo.toml`, `Cargo.lock`, `docs/driver-manager.md`, `docs/prepared-statements.md`, `specs/mission.md`, and `CHANGELOG.md`. It changes nothing in `src/adbc/connection.rs`, `src/query/`, `src/transport/lifecycle.rs`, `src/transport/protocol.rs`, `src/transport/websocket.rs`, or `tests/integration_tests.rs`.
+- **Decision:** This PR targets `main`, which holds the merged PR #89 (plan `fix-transport-deadlines`). The split of entry [8] stays in `src/transport/native/mod.rs` and builds on the code of PR #89 as it is on `main`. The architecture delta changes § Constraints by one bullet: the native transport runs an oversize parameter set of a row-count statement as consecutive executions within the server's maximum data message size. The plan changes `src/adbc_ffi.rs`, `src/transport/native/mod.rs`, `tests/driver_manager_tests.rs`, `tests/integration_tests.rs` (two doc comments), `Cargo.toml`, `Cargo.lock`, `docs/driver-manager.md`, `docs/prepared-statements.md`, `specs/mission.md`, and `CHANGELOG.md`. It changes nothing in `src/adbc/connection.rs`, `src/query/`, `src/transport/lifecycle.rs`, `src/transport/protocol.rs`, or `src/transport/websocket.rs`.
 - **Alternatives:**
   - Keep `src/transport/native/mod.rs` unchanged and split the batch in `src/adbc_ffi.rs` with a conservative per-value size bound: rejected by the requester, and in entry [8].
   - Move the range splitting of task 3.1 and its unit tests into a new child module of `src/transport/native/`: rejected. Review round 2 proposed it to shrink the text overlap with PR #89, and PR #89 is merged, so no overlap remains. The range splitting writes the same payload prefix and column metadata as `build_execute_prepared_payload` and uses the private wire-type helpers next to it, so a child module would put the `CMD_EXECUTE_PREPARED` payload layout in two files.
@@ -159,7 +160,7 @@ After PR #89 merged, the orchestrator passed the new state of the branch and the
   - If `main` changes `src/transport/native/mod.rs`, `specs/architecture.md`, or `CHANGELOG.md` before this PR merges, the branch merges `main` first, and the architecture delta takes the new BASE hash when `specs/architecture.md` changed.
   - `main` released the entries of PR #89 as 0.19.0, and `CHANGELOG.md` has no `## [Unreleased]` heading. The new entries go under a new `## [Unreleased]` heading above `## 0.19.0`, and `Cargo.toml` stays at 0.19.0 (Interview).
   - The diff checks of this PR compare against `main`.
-  - The existing tests `test_execute_batch_update` and `test_execute_batch_select_single_row` cover the changed `prepared-statements/batch-execution` scenarios and keep their doc comments without a `/// Scenario:` line, so this plan does not edit `tests/integration_tests.rs`.
+  - The existing tests `test_execute_batch_update` and `test_execute_batch_select_single_row` cover the changed `prepared-statements/batch-execution` scenarios. Task 4.15 adds `/// Scenario: Batch update execution with affected row count` to the doc comment of `test_execute_batch_update` and `/// Scenario: Batch query execution returning a result set` to the doc comment of `test_execute_batch_select_single_row`, as `AGENTS.md` requires for a test that implements a spec scenario. The edit changes no test code in `tests/integration_tests.rs`.
 - **Promotes to ADR:** no
 
 ### [12] A bound batch with the wrong column count fails with status InvalidArguments
@@ -171,6 +172,7 @@ After PR #89 merged, the orchestrator passed the new state of the branch and the
 - **Rationale:** The Python `adbc_driver_manager` maps status `InvalidArguments` to `ProgrammingError` (`convert_error` in `_lib.pyx`), which PEP 249 names for a wrong number of parameters. The feature already reports a value that cannot be converted with status `InvalidArguments`, so both caller errors of a bound batch get the same status. The 0.19.0 changelog already moves a driver manager URI error from `Internal` to `InvalidArguments`.
 - **Consequences:**
   - The `adbc-driver/ffi-statement-execution` scenario "A bound batch with the wrong column count fails before execution" states the status and that no execution request reaches Exasol.
+  - The FFI layer converts every bound value before `build_batch_parameters_data` checks the column count. A conversion error, reported first, therefore takes precedence over a wrong column count. A batch with both faults fails with the conversion error and its status, such as `NotImplemented` for an extra column of an unsupported Arrow type. The scenario covers only a batch whose values all convert.
   - The changelog marks the status change `Changed:`.
 - **Promotes to ADR:** no
 
@@ -252,4 +254,46 @@ After PR #89 merged, the orchestrator passed the new state of the branch and the
 
 - **Finding:** PR #89 is merged into `main` and released as 0.19.0, and the base of PR #90 is `main`. `plan.md` and entries [5], [8], [11], and [12] still described a PR stacked on an open PR #89. They compared the Checklist diffs against `origin/fix/transport-deadlines`, kept version 0.18.0, and put the changelog entries under an `## [Unreleased]` heading that `main` no longer has.
 - **Direction change:** `plan.md` § Context, § Impact, § Parallelization, tasks 1.1, 5.2, and 6.3, and the Checklist rows "Lockfile" and "Changelog" describe the plan on `main`. The native-transport split changes the code as it is on `main`, and the Checklist diffs compare against `main`. `Cargo.toml` stays at 0.19.0, and task 5.2 adds a new `## [Unreleased]` heading above `## 0.19.0` for the entries of this plan. Entries [5], [8], [11], and [12] and the Interview state the same, and this entry replaces the Checklist note of review finding [6]. Every design decision is unchanged. The source files, symbols, and test helpers that the tasks name exist unchanged on `main`. The architecture delta BASE `35d6222b02ed3458266a38f69dc44bc6d199cf6a` equals the hash of `specs/architecture.md` on `main`.
+- **Promotes to ADR:** no
+
+### [14] [plan-review] A split batch held the payloads of all ranges at once
+
+- **Finding:** Review round 3 (`[NFR_IGNORED]`, ADVISORY) found that task 3.1 returned one payload per range, so a split batch held every range payload next to the encoded rows, while § Impact and entry [8] counted the data message of one range only.
+- **Direction change:** Task 3.1 has a split function that returns the encoded rows and the row ranges and builds no payload, and a range-payload function that builds the payload of one range. Task 3.2 builds each range payload just before it sends it and drops it before the next range. The task 3.3 tests assert on the per-range payloads. § Impact and entry [8] Consequences state that the native transport holds one range message at a time.
+- **Promotes to ADR:** no
+
+### [15] [plan-review] The manual check of the failed batch ran with autocommit off
+
+- **Finding:** Review round 3 (`[UNSTATED_ASSUMPTION]`, ADVISORY) found that the two § Manual Testing rows of the failed batch used `adbc_driver_manager.dbapi.connect`, which turns autocommit off. The Exasol error then rolls back the open transaction, so the per-row loop also leaves 0 rows, and the count did not prove the all-or-nothing rule.
+- **Direction change:** § Manual Testing defines `CONNECT_AC`, which passes `autocommit=True` to `d.connect`, and the two rows of the failed batch use it without `c.commit()`. The expected output states that the per-row loop committed row 1 and printed `(1,)`.
+- **Promotes to ADR:** no
+
+### [16] [plan-review] The wrong-column-count scenario covered batches whose values fail conversion
+
+- **Finding:** Review round 3 (`[REQUIREMENT_CONFLICT]`, ADVISORY) found that the scenario "A bound batch with the wrong column count fails before execution" covered any bound batch whose column count differs from N. Task 2.1 converts every value before the arity check, so an extra column with an unconvertible value fails with the conversion error, which can have status `NotImplemented` and does not state N.
+- **Direction change:** The scenario GIVEN of `adbc-driver/ffi-statement-execution` is limited to a bound batch whose values all convert to Exasol parameters. Entry [12] Consequences states that a conversion error, reported first, takes precedence over a wrong column count. Task 4.13 names the three bound columns as `Int32`, as task 2.5 does.
+- **Promotes to ADR:** no
+
+### [17] [plan-review] The conversion error did not name the column and row
+
+- **Finding:** Review round 3 (`[REQUIREMENT_CONFLICT]`, ADVISORY) found that the recorded `adbc-driver/driver-interface` scenario "Type conversion errors" requires the error to name the column and the row, and task 2.1 returned the error of `arrow_value_to_parameter` unchanged, whose message names neither.
+- **Direction change:** Task 2.1 prefixes the message of the first conversion error with `column <c>, row <r>: `, using the zero-based column index and row index, and keeps the status. The task 2.5 test `unconvertible_bound_value_sends_no_execution_request` asserts that the message contains `column 0, row 1`. Entry [4] Consequences states the rule.
+- **Promotes to ADR:** no
+
+### [18] [plan-review] No scenario stated the WebSocket behavior for a large batch update
+
+- **Finding:** Review round 3 (`[COMPLETENESS_GAP]`, ADVISORY) found that the changed `prepared-statements/batch-execution` scenarios cover a batch that fits one data message and a larger batch over the native protocol only, so the recorded library would say nothing about a large batch over the WebSocket protocol. Task 5.1, § Impact, and the `Changed:` entry of task 5.2 also omitted the transport.
+- **Direction change:** The `prepared-statements/batch-execution` Background states that over the WebSocket protocol a batch update runs as one execution whatever its size. Task 5.1, § Impact, and the `Changed:` entry of task 5.2 state that a larger batch runs as consecutive executions over the native protocol.
+- **Promotes to ADR:** no
+
+### [19] [plan-review] Two batch tests lacked their Scenario lines
+
+- **Finding:** Review round 3 (`[TRACEABILITY_GAP]`, ADVISORY) found that `test_execute_batch_update` and `test_execute_batch_select_single_row` implement two changed `prepared-statements/batch-execution` scenarios without the `/// Scenario:` line that `AGENTS.md` requires, and entry [11] kept `tests/integration_tests.rs` unchanged.
+- **Direction change:** Task 4.15 in group A adds the two `/// Scenario:` lines to the doc comments of these tests. Section 4 of `plan.md`, the group A Knowledge, and the § Scenario Coverage note name the edit. Entry [11] lists `tests/integration_tests.rs` among the changed files, limited to two doc comments, and its last Consequences bullet states the edit. No task number changes.
+- **Promotes to ADR:** no
+
+### [20] [plan-review] Tests that call execute after execute_update did not bind again
+
+- **Finding:** Review round 3 (`[PROSE_UNCLEAR]`, ADVISORY) found that `execute_update` and `execute()` each consume the binding, also when they fail, and that the three task 2.5 tests and tasks 4.9, 4.10, and 4.13 called `execute()` after `execute_update` without stating a new `bind()`.
+- **Direction change:** The task 2.5 preamble states that both calls consume the binding. The tests `zero_row_bound_batch_sends_no_execution_request`, `unconvertible_bound_value_sends_no_execution_request`, and `bound_batch_with_wrong_column_count_sends_no_execution_request`, and tasks 4.9, 4.10, and 4.13 state that the test binds the batch again before it calls `execute()`, as task 4.8 does.
 - **Promotes to ADR:** no

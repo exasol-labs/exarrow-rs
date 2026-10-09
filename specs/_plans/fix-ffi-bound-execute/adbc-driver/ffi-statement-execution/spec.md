@@ -70,7 +70,7 @@ A statement returns either an affected-row count, as INSERT, UPDATE, DELETE, and
 
 ### Scenario: A bound batch with the wrong column count fails before execution
 
-* *GIVEN* an ADBC statement whose SQL has N parameter markers, such as a parameterized INSERT, and a bound RecordBatch of one or more rows whose column count differs from N
+* *GIVEN* an ADBC statement whose SQL has N parameter markers, such as a parameterized INSERT, and a bound RecordBatch of one or more rows whose column count differs from N and whose values all convert to Exasol parameters
 * *WHEN* `execute_update` or `execute` is called
 * *THEN* the driver SHALL return an error with status `InvalidArguments` whose message states N as the parameter count that the statement expects
 * *AND* the driver MUST NOT send an execution request to Exasol

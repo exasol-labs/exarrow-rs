@@ -1,0 +1,80 @@
+# Plan Review Findings: fix-ffi-bound-execute (round 3)
+
+## Summary
+- Axes checked: 6/6
+- Total findings: 7 (Blockers: 0, Advisory: 7)
+- Intent Fidelity blockers: 0
+- Human-escalation blockers: 0
+
+This round was requested outside the 2-round cap, after four unreviewed revisions. Every BLOCKER of rounds 1 and 2 stays resolved on the current base (`main` at 0.19.0, commit b1fe851). The revisions introduced no BLOCKER. The seven advisories below are edge cases, stale wording, and test-clarity gaps.
+
+## Premortem
+
+Six months from now this plan failed. These are the likely reasons:
+
+1. A data engineer runs Python `executemany` with several million narrow rows over the native protocol. The split keeps the connection alive, but the driver holds the `Parameter` rows, the JSON values, the encoded rows, and every range payload at the same time. The process runs out of memory sooner than the documented memory note predicts, because that note counts one range message, not all of them. This story routes to `[NFR_IGNORED]`.
+2. A Rust user on the `websocket` feature reads `docs/prepared-statements.md` and the changelog, expects a large batch to be split, and gets one execution. The recorded `batch-execution` spec now limits its single-execution scenario to a batch that fits one data message and names only the native protocol for a larger one, so it says nothing about the WebSocket case. This story routes to `[COMPLETENESS_GAP]`.
+3. The implementer writes the unit tests of task 2.5 as worded. A test calls `execute()` after a failed `execute_update` without binding again. `bound_data.take()` has consumed the batch, so `execute()` runs the SQL without parameters, and the mock panics on an unexpected `execute_query`. This story routes to `[PROSE_UNCLEAR]`.
+
+## Prior-Round Blocker Recheck
+
+- Resolved: [UNSTATED_ASSUMPTION] (round 1) A native-protocol batch above the data message size breaks the connection: decision-log.md § [8], tasks 3.1 to 3.3, 4.11, and 4.12, and three scenarios specify the split. On `main`, `execute_prepared_statement` (`src/transport/native/mod.rs` lines 1134 to 1152) starts with the lifecycle guard and then builds one payload, as § Context states, so task 3.2 has the place it describes.
+- Resolved: [HIDDEN_DEPENDENCY] (round 1) The C ABI test needs the Arrow ffi feature: task 1.1 adds `arrow = { version = "58", features = ["ffi"] }` under `[dev-dependencies]`.
+- Resolved: [UNSTATED_ASSUMPTION] (round 1) The lockfile claim omitted libloading: the reviewer re-ran the check on a scratch copy of `main` at 0.19.0. With the task 1.1 manifest, `cargo update -p adbc_core -p adbc_ffi -p adbc_driver_manager` changed the version and checksum of the three adbc packages, added `"libloading"` to the `exarrow-rs` entry, and changed nothing else. Task 1.2, task 6.3, the Checklist "Lockfile" row, and decision [5] state exactly this.
+- Resolved: [REQUIREMENT_CONFLICT] (round 1) The recorded batch-execution scenario promised a multi-row result-set batch: the delta changes the GIVEN of "Batch query execution returning a result set" to one row. `speq plan validate fix-ffi-bound-execute` passes.
+- Resolved: [INTENT_DRIFT] (round 2) The native-transport split changed a file reserved for PR #89: the requester kept the split in `src/transport/native/mod.rs` (Interview, decision [11]). PR #89 is merged into `main`, and `git diff main --stat` shows only plan files. § Context and decision [11] describe the merged base. The unsupported sentence "The brief allows an unavoidable overlap" is gone.
+- Resolved: [IMPLEMENTATION_LEAKAGE] (round 2) Two Background sentences named values that no scenario depends on: the FFI Background ends at "Exasol reports a maximum data message size at login.", and the `batch-execution` Background names no SQLSTATE.
+- The round-2 advisories hold as resolved: decision [8] and § Impact name the memory copies, task 3.2 returns a result-set answer unchanged, the wrong-column-count scenario exists, decision [2] records the `Connection::execute_batch` alternative, and the prose fixes are in tasks 2.2, 2.3, and 4.12 and § Manual Testing.
+
+## Intent Fidelity
+[no objection, axis checked: #78 is covered by decision [3] (a row-count result yields no batches), the adbc 0.24 bump of decision [5] for the -1 row count, task 5.1 (docs), and task 5.2 (changelog). #67 is covered by tasks 2.2 and 2.3, which call `Connection::execute_batch_update` and `Connection::execute_batch`. The requester constraints hold: `Cargo.toml` stays at 0.19.0 (task 1.1, Checklist "Changelog" row), the entries go under a new `## [Unreleased]` above `## 0.19.0` (task 5.2; `CHANGELOG.md` on `main` starts with `## 0.19.0`), and the diffs compare against `main`. The requester decisions are executed as given: the split is in `src/transport/native/mod.rs` (task 3.1), the multi-row SELECT routing is in the FFI layer only (task 2.3), and a result-set answer of a split range is returned unchanged so that `Connection::execute_batch_update` reports `UnexpectedResultSet` (task 3.2). The `InvalidArguments` status change traces to review advisories of rounds 1 and 2, not to an unrequested extra.]
+
+## Feasibility
+
+Checked against the code on `main`. These claims hold: `build_batch_parameters_data` returns `ParameterBindingError` with "Row {i} has {n} parameters but statement expects {expected}" (`src/query/prepared.rs` lines 121 to 133), so the message contains `expects 2`. `format_date32(2932897)` fails, because day 2932897 is 10000-01-01. `HEADER_SIZE` is 21, an empty `AttributeSet` serializes to no bytes, and `write_parameter_rows` writes values row by row. `fetch_results` reads `max_data_message_size` from `self.session` with the 64 MiB fallback. adbc_ffi 0.24.0 `statement_execute_query` writes -1 to `rows_affected` when a stream is requested (`driver_exporter.rs` lines 1710 to 1718). `connected_connection`, `single_decimal_result_set`, `bind_table_batch`, `read_bind_table`, `integers_in`, and both entry points `AdbcDriverExasolInit` and `ExarrowDriverInit` exist. `src/transport/native/mod.rs` has 63.2% production line coverage in the local summary, so the untested loop lines of task 3.2 leave it above the 50% floor.
+
+#### [NFR_IGNORED] ADVISORY
+- Location: plan.md § Implementation Tasks 3.1 and 3.3, § Impact (memory bullet); decision-log.md § [8] Consequences (memory bullet)
+- Issue: § Impact and decision [8] state that a bound execution holds three converted copies of the batch and that "A split batch also holds the data message of one range". Task 3.1 describes a function that "returns one payload per range", and the test `prepared_payload_ranges_keep_each_message_within_the_limit` inspects all range payloads together. A function with that shape holds every range payload at once, next to the encoded rows from which it copies them. A split batch then holds the encoded batch twice, not once plus one range message. For the 141 MB batch of task 4.12, this adds about 141 MB to the stated peak.
+- Fix: In plan.md task 3.1, have the function return the encoded rows and the row ranges, or have it build the payload of one range on request, so that task 3.2 builds each range message just before it sends it. Keep the task 3.3 tests on the per-range payloads. If the function keeps returning every payload, change plan.md § Impact and decision-log.md § [8] Consequences to say that a split batch holds the payloads of all ranges at once.
+
+#### [UNSTATED_ASSUMPTION] ADVISORY
+- Location: plan.md § Manual Testing, rows "FFI Statement Execution" that run `executemany` with `TOOLONG` and then `SELECT COUNT(*) FROM ZZ_B4.V`
+- Issue: The expected output "Prints `(0,)`: the failed batch stored no row" presents the count as proof of the all-or-nothing rule. `adbc_driver_manager.dbapi.connect` turns autocommit off by default. Decision [4] records that with autocommit off an Exasol error rolls back the open transaction, and the process exits without a commit. The per-row loop of today therefore also leaves 0 rows. The manual check cannot tell the new behavior from the old one. Task 4.8 does test the rule with autocommit on.
+- Fix: In plan.md § Manual Testing, pass `autocommit=True` to `d.connect` in the `CONNECT` string, or in a separate connect string for the two rows of the failed batch, so the count of 0 shows the all-or-nothing rule. Alternatively, change the expected-output text so that it states only that the batch raised an error.
+
+## Requirement Quality
+
+#### [REQUIREMENT_CONFLICT] ADVISORY
+- Location: adbc-driver/ffi-statement-execution/spec.md § "A bound batch with the wrong column count fails before execution"; plan.md § Implementation Tasks 2.1 and 2.2
+- Issue: The scenario applies to any bound batch "whose column count differs from N" and requires status `InvalidArguments` with a message that states N. Task 2.1 converts every value before the arity check runs, and it returns the first conversion error unchanged. An extra column with a non-null value of an unsupported Arrow type, such as a List, makes `arrow_value_to_parameter` return status `NotImplemented`. An extra column with an out-of-range Date32 value returns a message that does not state N. The planned tests use `Int32` columns only, so they pass, but the scenario fails for these inputs. Decision [12] rejects a column-count check in `src/adbc_ffi.rs`, so the scenario has to change, not the order.
+- Fix: In adbc-driver/ffi-statement-execution/spec.md, narrow the GIVEN of "A bound batch with the wrong column count fails before execution" to "a bound RecordBatch of one or more rows whose column count differs from N and whose values all convert to Exasol parameters". In decision-log.md § [12] Consequences, state that a conversion error, reported first, takes precedence over a wrong column count.
+
+#### [REQUIREMENT_CONFLICT] ADVISORY
+- Location: plan.md § Implementation Tasks 2.1; recorded specs/adbc-driver/driver-interface/spec.md § "Type conversion errors"
+- Issue: The recorded scenario requires that a failed type conversion "SHALL specify which column and row caused the error". Task 2.1 writes the loop over every row and column and returns "the `AdbcError` of the first failing value unchanged". The Date32 error reads "Date32 value 2932897 is outside 0001-01-01 to 9999-12-31, the range Exasol accepts", which names neither the column nor the row. The per-row loop of today has the same gap, but task 2.1 is new code that already holds both indexes.
+- Fix: In plan.md task 2.1, prefix the message of the conversion error with the column index and the row index of the failing value, and keep its status unchanged. In task 2.5 `unconvertible_bound_value_sends_no_execution_request`, assert that the message names column 0 and row 1.
+
+#### [COMPLETENESS_GAP] ADVISORY
+- Location: prepared-statements/batch-execution/spec.md § "Batch update execution with affected row count" and § "Batch update larger than one data message over the native protocol"; adbc-driver/ffi-statement-execution/spec.md § Background; plan.md § Impact (bullet "Changed: a bound batch whose parameter values fit"), tasks 5.1 and 5.2 (`Changed:` entry)
+- Issue: The recorded scenario "Batch update execution with affected row count" covers a batch of any size today. The delta limits it to a batch that fits one data message, and the new scenario covers a larger batch only over the native protocol. After recording, no scenario states what the WebSocket transport does with a larger batch. Decision [8] states the behavior: one execution, which WebSocket probes confirmed up to 80 MB of JSON. The user-facing text also drops the transport. Task 5.1 and the `Changed:` entry of task 5.2 say that "a larger batch runs as consecutive executions" without "over the native protocol". Task 3.4 and the `Fix:` entry do name the native protocol.
+- Fix: In prepared-statements/batch-execution/spec.md § Background, add: "Over the WebSocket protocol, a batch update runs as one execution whatever its size." In plan.md task 5.1, § Impact, and the `Changed:` entry of task 5.2, write "over the native protocol, a larger batch runs as consecutive executions".
+
+## Task Breakdown
+
+Every scenario of the five deltas maps to a task and a named test in § Scenario Coverage, including the merged result-set scenario (tasks 2.5, 4.6, 4.7) and the wrong-column-count scenario (tasks 2.5, 4.13). Group A depends on group B only through tasks 4.11 and 4.12, and the two groups share no source file.
+
+#### [TRACEABILITY_GAP] ADVISORY
+- Location: decision-log.md § [11] Consequences, last bullet; plan.md § Scenario Coverage rows for "Batch update execution with affected row count" and "Batch query execution returning a result set"
+- Issue: `AGENTS.md` requires that "A test implementing a spec scenario carries one `/// Scenario: <title>` line per scenario". This plan changes both scenarios and maps them to `test_execute_batch_update` and `test_execute_batch_select_single_row`, which carry no such line. Decision [11] keeps `tests/integration_tests.rs` unchanged, and its reason was the overlap with PR #89, which is merged. The code review of `/speq:implement` can flag the missing lines, and the implementer would then edit a file that decision [11] declares unchanged.
+- Fix: Add a task to plan.md group A that adds `/// Scenario: Batch update execution with affected row count` to `test_execute_batch_update` and `/// Scenario: Batch query execution returning a result set` to `test_execute_batch_select_single_row`. Remove `tests/integration_tests.rs` from the unchanged-file list of decision-log.md § [11] Decision, and replace the last Consequences bullet of § [11] with a statement of that edit.
+
+## Design Depth
+[no objection, axis checked: no entry has `Promotes to ADR: yes`. `speq decision-log show` lists no ADR on message size or batch splitting. The plan conforms to ADR-005 (the arity check stays in `build_batch_parameters_data`, before any execution request), ADR-004 (a row-count result has no columns), `server-enforced-query-timeout` and `transport-owns-setup-deadline` (no client timer, and the split runs after login below the lifecycle guard), and ADR-003 (decision [6] records the re-evaluation and keeps the suppression, which `deny.toml` and `code-quality/dependencies` already justify). `client-give-up-terminates-connection` does not apply. The architecture delta follows the template: its BASE `35d6222b02ed3458266a38f69dc44bc6d199cf6a` equals `git hash-object specs/architecture.md` on `main`, and a diff of § Constraints shows one added bullet and the other 17 bullets unchanged. § Components, § Data Flow, and § Interfaces need no change, because no component, boundary, entry point, or external system changes. Task 3.1 keeps the `CMD_EXECUTE_PREPARED` payload layout in one place, and the native transport owns the encoded size, which `adbc_ffi` and `Connection` never see. Two modules read `PreparedStatementHandle::result_columns`, which decision [2] records as the requester's choice.]
+
+## Prose Quality
+
+#### [PROSE_UNCLEAR] ADVISORY
+- Location: plan.md § Implementation Tasks 2.5 (`zero_row_bound_batch_sends_no_execution_request`, `unconvertible_bound_value_sends_no_execution_request`, `bound_batch_with_wrong_column_count_sends_no_execution_request`), 4.9, 4.10, and 4.13
+- Issue: Each of these tests says that "`execute_update` and `execute()` each" fail or return a result. `FfiStatement::execute` and `execute_update` consume the binding with `self.bound_data.take()` (`src/adbc_ffi.rs` lines 2227 and 2241), also when the call fails. A second call without a new `bind()` runs the SQL text without parameters. In a unit test, the mock then panics on an unexpected `execute_query`. In an integration test, Exasol fails the statement with an error that is not `InvalidArguments`. Task 4.8 says "Bind the same batch again", and the other tasks do not.
+- Fix: In plan.md task 2.5 (the three tests named above) and tasks 4.9, 4.10, and 4.13, state that the test binds the batch again before it calls `execute()`, as task 4.8 does.

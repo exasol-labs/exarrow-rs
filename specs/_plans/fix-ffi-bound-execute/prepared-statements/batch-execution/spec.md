@@ -5,7 +5,7 @@ Specifies multi-row batch execution of prepared statements, including column-maj
 <!-- DELTA:CHANGED -->
 ## Background
 
-A batch of rows (each row a list of positional parameters) is assembled into column-major parameter data and executed as one prepared-statement call, which avoids one round trip per row for bulk DML. Exasol accepts a multi-row parameter set only for a statement that returns an affected-row count. For a statement that returns a result set, Exasol rejects a parameter set of two or more rows. A data message is the protocol message that carries the parameter values of one execution. Exasol reports a maximum data message size at login. Over the native protocol, the transport runs a batch update whose data message would exceed that size as consecutive executions.
+A batch of rows (each row a list of positional parameters) is assembled into column-major parameter data and executed as one prepared-statement call, which avoids one round trip per row for bulk DML. Exasol accepts a multi-row parameter set only for a statement that returns an affected-row count. For a statement that returns a result set, Exasol rejects a parameter set of two or more rows. A data message is the protocol message that carries the parameter values of one execution. Exasol reports a maximum data message size at login. Over the native protocol, the transport runs a batch update whose data message would exceed that size as consecutive executions. Over the WebSocket protocol, a batch update runs as one execution whatever its size.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
