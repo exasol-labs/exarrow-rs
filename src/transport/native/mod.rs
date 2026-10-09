@@ -816,12 +816,23 @@ impl NativeTcpTransport {
         let mut affected_rows = 0;
         for range in &encoded.ranges {
             let data = Self::build_range_payload(handle, encoded, range);
-            match self.run_execute_prepared(&data).await? {
-                QueryResult::RowCount { count } => affected_rows += count,
-                result_set => return Ok(result_set),
+            let result = self.run_execute_prepared(&data).await?;
+            if let Some(result_set) = Self::add_range_result(&mut affected_rows, result) {
+                return Ok(result_set);
             }
         }
         Ok(QueryResult::row_count(affected_rows))
+    }
+
+    /// Add a row count to the total, or hand back a result set that ends the batch.
+    fn add_range_result(affected_rows: &mut i64, result: QueryResult) -> Option<QueryResult> {
+        match result {
+            QueryResult::RowCount { count } => {
+                *affected_rows += count;
+                None
+            }
+            result_set => Some(result_set),
+        }
     }
 }
 
@@ -2353,6 +2364,47 @@ mod tests {
         assert_eq!(
             payloads[1][prefix_len..],
             single[prefix_len + 2 * DECIMAL_VALUE_LEN..]
+        );
+    }
+
+    /// Scenario: Batch update larger than one data message over the native protocol
+    #[test]
+    fn range_results_add_up_row_counts() {
+        let mut total = 0;
+
+        assert!(
+            NativeTcpTransport::add_range_result(&mut total, QueryResult::row_count(10)).is_none()
+        );
+        assert!(
+            NativeTcpTransport::add_range_result(&mut total, QueryResult::row_count(20)).is_none()
+        );
+
+        assert_eq!(total, 30);
+    }
+
+    #[test]
+    fn a_result_set_ends_the_range_batch() {
+        let mut total = 5;
+        let result_set = QueryResult::ResultSet {
+            handle: None,
+            data: ResultData {
+                columns: Vec::new(),
+                data: ResultPayload::Json(Vec::new()),
+                total_rows: 0,
+            },
+        };
+
+        let stop = NativeTcpTransport::add_range_result(&mut total, result_set);
+
+        assert!(matches!(stop, Some(QueryResult::ResultSet { .. })));
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn max_data_message_size_defaults_before_login() {
+        assert_eq!(
+            NativeTcpTransport::new().max_data_message_size(),
+            MAX_DATA_MESSAGE_SIZE as i64
         );
     }
 
