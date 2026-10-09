@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.20.0
 
 - Fix: a prepared INSERT, UPDATE, DELETE, or MERGE run through ADBC `execute` with bound parameters, such as Python `cursor.execute(sql, params)`, no longer fails with `Cannot fetch batches from row count result` after it wrote data, and it writes every row of a bound batch. Fixes #78.
 - Fix: ADBC `execute_update` and `execute` send all rows of a bound batch to Exasol in one prepared-statement execution instead of one execution per row. A SELECT with several bound rows still runs once per row, because Exasol rejects a multi-row parameter set for a statement that returns rows. Fixes #67.
