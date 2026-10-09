@@ -7,7 +7,7 @@ Specifies how the session's current schema is set from the connection URI or `Co
 <!-- DELTA:CHANGED -->
 ## Background
 
-The current schema is an Exasol session attribute. The driver sets it with the protocol's set-attributes command and never with an `OPEN SCHEMA` statement, so the driver passes the schema name as a plain string and does not quote it. The server resolves the name in two steps: it opens the schema whose name matches exactly, and otherwise the schema whose name matches the upper-case form of the name. When neither schema exists, the server rejects the change with a `schema ... not found` error and the session keeps its previous current schema. The server reports the current schema in the response to a get-attributes request and in the response to any statement that changes it, such as `OPEN SCHEMA`, `CREATE SCHEMA`, or `DROP SCHEMA` of the current schema. An empty reported value means the session has no current schema. A schema named in the connection URI or in `ConnectionParams` must exist on the server, so a rejected schema fails the connect.
+The current schema is an Exasol session attribute. The driver sets it with the protocol's set-attributes command and never with an `OPEN SCHEMA` statement, so the driver passes the schema name as a plain string and does not quote it. The server resolves the name in two steps: it opens the schema whose name matches exactly, and otherwise the schema whose name matches the upper-case form of the name. When neither schema exists, the server rejects the change with a `schema ... not found` error and the session keeps its previous current schema. The server reports the current schema in the response to a get-attributes request and in the response to any statement that changes it, such as `OPEN SCHEMA`, `CREATE SCHEMA`, `CLOSE SCHEMA`, or `DROP SCHEMA` of the current schema. An empty reported value means the session has no current schema. A schema named in the connection URI or in `ConnectionParams` must exist on the server, so a rejected schema fails the connect.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
@@ -48,10 +48,11 @@ The current schema is an Exasol session attribute. The driver sets it with the p
 <!-- DELTA:NEW -->
 ### Scenario: URI schema name follows the server's case rule
 
-* *GIVEN* the server holds the schemas `"ZZ_MixedCase"`, `"zz-hyphen"`, and `ZZ_UPPER`, and no schema named `zz_mixedcase` or `ZZ_MIXEDCASE`
+* *GIVEN* the server holds the schemas `"ZZ_MixedCase"`, `"zz-hyphen"`, `ZZ_UPPER`, `"zz_both"`, and `ZZ_BOTH`, and no schema named `zz_mixedcase` or `ZZ_MIXEDCASE`
 * *WHEN* the application connects with the URI schema `ZZ_MixedCase`, `zz-hyphen`, or `zz_upper`
 * *THEN* the session's current schema SHALL be `ZZ_MixedCase`, `zz-hyphen`, or `ZZ_UPPER` respectively
 * *AND* `current_schema()` MUST report the name of the schema the server opened, not the name in the URI
+* *AND* a connect with the URI schema `zz_both` SHALL open the schema `zz_both`, not `ZZ_BOTH`
 * *AND* a connect with the URI schema `zz_mixedcase` MUST fail as "Schema activation failure surfaces during connect" describes
 <!-- /DELTA:NEW -->
 
@@ -69,9 +70,9 @@ The current schema is an Exasol session attribute. The driver sets it with the p
 ### Scenario: Current schema follows schema changes made in SQL
 
 * *GIVEN* an open `Connection`
-* *WHEN* a statement on that connection changes the current schema, such as `OPEN SCHEMA S`, `CREATE SCHEMA S`, or `DROP SCHEMA` of the current schema
+* *WHEN* a statement on that connection changes the current schema, such as `OPEN SCHEMA S`, `CREATE SCHEMA S`, `CLOSE SCHEMA` while a schema is open, or `DROP SCHEMA` of the current schema
 * *THEN* `current_schema()` MUST report the current schema that the server reported in the response to that statement, without sending another request to the server
-* *AND* after the current schema is dropped, `current_schema()` MUST return `None`
+* *AND* after the current schema is closed or dropped, `current_schema()` MUST return `None`
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
