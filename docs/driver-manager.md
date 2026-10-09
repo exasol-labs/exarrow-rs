@@ -91,7 +91,7 @@ cursor.close()
 conn.close()
 ```
 
-For DDL/DML statements (CREATE, INSERT, DROP, etc.) that do not return a result set, use the low-level statement API:
+DDL and DML statements (CREATE, INSERT, DROP, etc.) run through `cursor.execute`, and `cursor.rowcount` is -1 afterwards because ADBC `execute` does not report an affected-row count. The low-level `execute_update` returns the affected-row count:
 
 ```python
 import adbc_driver_manager._lib as adbc_lib
@@ -101,6 +101,22 @@ stmt.set_sql_query("CREATE SCHEMA my_schema")
 stmt.execute_update()
 stmt.close()
 ```
+
+### Parameters and row counts
+
+Bind parameters with `cursor.execute` or `cursor.executemany`:
+
+```python
+cursor.execute("INSERT INTO t VALUES (?, ?)", (1, "a"))
+print(cursor.rowcount)  # -1: ADBC execute does not report an affected-row count
+
+cursor.executemany("INSERT INTO t VALUES (?, ?)", [(2, "b"), (3, "c"), (4, "d")])
+print(cursor.rowcount)  # 3: the number of affected rows
+```
+
+A bound batch runs as one execution and stores all of its rows or none when its parameter values fit in the server's maximum data message size (64 MiB on the tested `exasol/docker-db` 2026.1.0 image). Over the native protocol, a larger batch runs as consecutive executions. With autocommit on, a failing execution then keeps the rows of the executions before it. A SELECT with several bound rows runs once per row, because Exasol rejects a multi-row parameter set for a statement that returns rows, and it returns the rows in bound order.
+
+A bound batch needs several times its Arrow size in driver memory. For large loads, use bulk ingestion (`cursor.adbc_ingest`).
 
 ### Python (Polars)
 
@@ -153,9 +169,9 @@ Add the dependencies to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adbc_core = "0.1"
-adbc_driver_manager = "0.1"
-arrow = "53"
+adbc_core = "0.24"
+adbc_driver_manager = "0.24"
+arrow = "58"
 ```
 
 Load the driver, connect, and query:

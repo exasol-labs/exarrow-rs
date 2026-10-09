@@ -65,7 +65,7 @@ Architecture: see specs/architecture.md.
 | Crypto | aws-lc-rs 1 | RSA encryption for Exasol password authentication |
 | Stream cipher | chacha20 0.9 / cipher 0.4 | ChaCha20 encryption for native TCP protocol |
 | Serialization | serde / serde_json | Exasol WebSocket JSON protocol |
-| ADBC FFI | adbc_core / adbc_ffi 0.23 (optional) | C FFI bindings for driver manager integration |
+| ADBC FFI | adbc_core / adbc_ffi 0.24 (optional) | C FFI bindings for driver manager integration |
 | Testing | cargo test / mockall 0.14 | Unit and integration testing with mocking |
 
 ## Commands

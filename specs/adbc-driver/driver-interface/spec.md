@@ -13,7 +13,7 @@ The system implements the ADBC (Arrow Database Connectivity) driver interface to
 * *GIVEN* an ADBC driver manager is ready to load drivers
 * *WHEN* the driver is loaded by an ADBC driver manager
 * *THEN* it SHALL expose driver metadata including name, version, and vendor information
-* *AND* it SHALL be compatible with ADBC driver manager version 0.23
+* *AND* it SHALL be compatible with ADBC driver manager version 0.24
 
 ### Scenario: Driver initialization
 

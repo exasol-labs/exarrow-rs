@@ -2987,6 +2987,8 @@ fn test_arrow_parquet_resolve_to_58_or_above_with_unified_sub_crates() {
 
 /// 11.1 Batch INSERT: execute several rows in one call and verify the affected-row count
 /// and the actual rows stored in the table.
+///
+/// Scenario: Batch update execution with affected row count
 #[tokio::test]
 async fn test_execute_batch_update() {
     skip_if_no_exasol!();
@@ -3074,6 +3076,8 @@ async fn test_execute_batch_update() {
 ///
 /// Note: exercises the `execute_batch` code path with a single-row batch; multi-row
 /// SELECT parameter semantics are out of scope for this test.
+///
+/// Scenario: Batch query execution returning a result set
 #[tokio::test]
 async fn test_execute_batch_select_single_row() {
     skip_if_no_exasol!();

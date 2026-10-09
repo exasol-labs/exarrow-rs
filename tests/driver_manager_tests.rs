@@ -46,6 +46,7 @@ use arrow::array::{
     Array, Int32Array, ListArray, RecordBatch, RecordBatchReader, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use common::{generate_unique_test_name, get_host, get_password, get_port, get_user};
 use std::path::Path;
 use std::sync::Arc;
@@ -2289,6 +2290,7 @@ fn test_query_timestamp_with_local_time_zone() {
 
 // ADBC Compliance Tests
 
+/// Scenario: execute_update sends every bound row in one execution
 #[test]
 fn test_bind_execute_update() {
     skip_if_no_library!();
@@ -2318,12 +2320,10 @@ fn test_bind_execute_update() {
         stmt.prepare().unwrap();
         stmt.bind(bind_table_batch()).unwrap();
 
-        let result = stmt.execute_update();
-        assert!(
-            result.is_ok(),
-            "Bind + execute_update should succeed: {:?}",
-            result.err()
-        );
+        let affected = stmt
+            .execute_update()
+            .expect("Bind + execute_update should succeed");
+        assert_eq!(affected, Some(3), "every bound row is counted");
     }
 
     let (ids, names) = read_bind_table(&mut conn, &schema_name);
@@ -2371,6 +2371,7 @@ fn read_bind_table<C: AdbcConnection>(conn: &mut C, schema_name: &str) -> (Vec<i
     (ids, names)
 }
 
+/// Scenario: execute runs a result-set statement once per bound row
 #[test]
 fn test_bind_execute_query() {
     skip_if_no_library!();
@@ -2457,6 +2458,613 @@ fn test_bind_execute_query() {
             .unwrap();
         stmt.execute_update().unwrap();
     }
+}
+
+// FFI Statement Execution Tests
+
+/// The statement counter of the session, read through a new statement of `conn`.
+///
+/// Exasol's `CURRENT_STATEMENT` counts the statements of the session, so the
+/// difference of two readings shows how many executions ran in between.
+fn current_statement<C: AdbcConnection>(conn: &mut C) -> i64 {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT CURRENT_STATEMENT").unwrap();
+    let batch = stmt
+        .execute()
+        .expect("CURRENT_STATEMENT must run")
+        .next()
+        .expect("CURRENT_STATEMENT returns one batch")
+        .expect("Failed to read batch");
+    integers_in(batch.column(0).as_ref())[0]
+}
+
+/// A two-column batch of `Int32` ids and `Utf8` names, one row per id.
+fn id_name_batch(ids: std::ops::Range<i32>, name_of: impl Fn(i32) -> String) -> RecordBatch {
+    let names: Vec<String> = ids.clone().map(name_of).collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(ids.collect::<Vec<_>>())),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
+
+/// How far the statement counter moved while `run` executed.
+///
+/// The reading itself costs one statement, the same for every measurement.
+fn statements_during<C: AdbcConnection>(conn: &mut C, run: impl FnOnce()) -> i64 {
+    let before = current_statement(conn);
+    run();
+    current_statement(conn) - before
+}
+
+/// Run a one-column integer query and return its values.
+fn integers_from<C: AdbcConnection>(conn: &mut C, sql: String) -> Vec<i64> {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(&sql).unwrap();
+    let mut values = Vec::new();
+    for batch in stmt.execute().unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+        values.extend(integers_in(
+            batch.expect("Failed to read batch").column(0).as_ref(),
+        ));
+    }
+    values
+}
+
+/// Create schema `schema_name` with table `T` holding `columns`, and prepare an INSERT of
+/// two parameters into `T`.
+fn prepare_insert<C: AdbcConnection>(
+    conn: &mut C,
+    schema_name: &str,
+    columns: &str,
+) -> <C as AdbcConnection>::StatementType {
+    execute_ddl(conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(conn, format!("CREATE TABLE {schema_name}.T ({columns})"));
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!("INSERT INTO {schema_name}.T VALUES (?, ?)"))
+        .unwrap();
+    stmt.prepare().unwrap();
+    stmt
+}
+
+/// Read the C status of a driver call, failing with the driver's message.
+fn assert_adbc_ok(status: u8, error: &adbc_ffi::FFI_AdbcError, call: &str) {
+    if status != adbc_core::constants::ADBC_STATUS_OK {
+        let message = if error.message.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(error.message) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        panic!("{call} returned status {status}: {message}");
+    }
+}
+
+/// Scenario: ExecuteQuery with a result stream reports an unknown affected-row count
+#[test]
+fn test_execute_query_reports_unknown_rows_affected() {
+    use adbc_ffi::{FFI_AdbcConnection, FFI_AdbcDatabase, FFI_AdbcDriver, FFI_AdbcError};
+    use adbc_ffi::{FFI_AdbcDriverInitFunc, FFI_AdbcStatement};
+    use std::ffi::{c_void, CString};
+
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_UNKNOWN_ROWS");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (id INTEGER)"),
+    );
+    let sql = CString::new(format!("INSERT INTO {schema_name}.T VALUES (1)")).unwrap();
+    let uri = CString::new(get_test_uri()).unwrap();
+
+    let library = unsafe { libloading::Library::new(get_library_path()) }
+        .expect("Failed to load the driver library");
+    let init: libloading::Symbol<FFI_AdbcDriverInitFunc> =
+        unsafe { library.get(b"AdbcDriverExasolInit") }.expect("AdbcDriverExasolInit must exist");
+
+    let mut driver = FFI_AdbcDriver::default();
+    let mut database = FFI_AdbcDatabase::default();
+    let mut connection = FFI_AdbcConnection::default();
+    let mut statement = FFI_AdbcStatement::default();
+    let mut error = FFI_AdbcError::default();
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let mut rows_affected: i64 = 42;
+
+    unsafe {
+        let status = init(
+            adbc_core::constants::ADBC_VERSION_1_1_0,
+            &mut driver as *mut FFI_AdbcDriver as *mut c_void,
+            &mut error,
+        );
+        assert_adbc_ok(status, &error, "AdbcDriverExasolInit");
+
+        let status = driver.DatabaseNew.expect("DatabaseNew")(&mut database, &mut error);
+        assert_adbc_ok(status, &error, "DatabaseNew");
+        let status = driver.DatabaseSetOption.expect("DatabaseSetOption")(
+            &mut database,
+            c"uri".as_ptr(),
+            uri.as_ptr(),
+            &mut error,
+        );
+        assert_adbc_ok(status, &error, "DatabaseSetOption");
+        let status = driver.DatabaseInit.expect("DatabaseInit")(&mut database, &mut error);
+        assert_adbc_ok(status, &error, "DatabaseInit");
+
+        let status = driver.ConnectionNew.expect("ConnectionNew")(&mut connection, &mut error);
+        assert_adbc_ok(status, &error, "ConnectionNew");
+        let status = driver.ConnectionInit.expect("ConnectionInit")(
+            &mut connection,
+            &mut database,
+            &mut error,
+        );
+        assert_adbc_ok(status, &error, "ConnectionInit");
+
+        let status =
+            driver.StatementNew.expect("StatementNew")(&mut connection, &mut statement, &mut error);
+        assert_adbc_ok(status, &error, "StatementNew");
+        let status = driver.StatementSetSqlQuery.expect("StatementSetSqlQuery")(
+            &mut statement,
+            sql.as_ptr(),
+            &mut error,
+        );
+        assert_adbc_ok(status, &error, "StatementSetSqlQuery");
+
+        let status = driver.StatementExecuteQuery.expect("StatementExecuteQuery")(
+            &mut statement,
+            &mut stream,
+            &mut rows_affected,
+            &mut error,
+        );
+        assert_adbc_ok(status, &error, "StatementExecuteQuery");
+        assert_eq!(
+            rows_affected, -1,
+            "ExecuteQuery with a result stream must report an unknown count"
+        );
+
+        drop(stream);
+        let status = driver.StatementRelease.expect("StatementRelease")(&mut statement, &mut error);
+        assert_adbc_ok(status, &error, "StatementRelease");
+        let status =
+            driver.ConnectionRelease.expect("ConnectionRelease")(&mut connection, &mut error);
+        assert_adbc_ok(status, &error, "ConnectionRelease");
+        let status = driver.DatabaseRelease.expect("DatabaseRelease")(&mut database, &mut error);
+        assert_adbc_ok(status, &error, "DatabaseRelease");
+        let status = driver.release.expect("release")(&mut driver, &mut error);
+        assert_adbc_ok(status, &error, "driver release");
+    }
+
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: execute_update sends every bound row in one execution
+#[test]
+fn test_bind_execute_update_runs_one_execution_for_any_row_count() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_ONE_EXEC");
+    let mut stmt = prepare_insert(&mut conn, &schema_name, "id INTEGER, name VARCHAR(100)");
+
+    let mut counts = Vec::new();
+    let one_row = statements_during(&mut conn, || {
+        stmt.bind(id_name_batch(0..1, |i| format!("n{i}"))).unwrap();
+        counts.push(stmt.execute_update().expect("one row"));
+    });
+    let many_rows = statements_during(&mut conn, || {
+        stmt.bind(id_name_batch(1..1001, |i| format!("n{i}")))
+            .unwrap();
+        counts.push(stmt.execute_update().expect("1,000 rows"));
+    });
+
+    assert_eq!(counts, vec![Some(1), Some(1000)]);
+    assert_eq!(many_rows, one_row, "1,000 rows must take one execution");
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![1001]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: execute runs a row-count statement once for the whole bound batch
+#[test]
+fn test_bind_execute_writes_every_row_of_a_dml_batch() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_EXEC_DML");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.BIND_TABLE (id INTEGER, name VARCHAR(100))"),
+    );
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!(
+        "INSERT INTO {schema_name}.BIND_TABLE (id, name) VALUES (?, ?)"
+    ))
+    .unwrap();
+    stmt.prepare().unwrap();
+
+    stmt.bind(bind_table_batch()).unwrap();
+    let mut reader = stmt.execute().expect("a DML statement must succeed");
+    assert!(reader.next().is_none(), "a row-count result has no batches");
+    drop(reader);
+
+    let (ids, names) = read_bind_table(&mut conn, &schema_name);
+    assert_eq!(ids, vec![10, 20, 30]);
+    assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+
+    let one_row = statements_during(&mut conn, || {
+        stmt.bind(id_name_batch(100..101, |i| format!("n{i}")))
+            .unwrap();
+        assert!(stmt.execute().unwrap().next().is_none());
+    });
+    let fifty_rows = statements_during(&mut conn, || {
+        stmt.bind(id_name_batch(200..250, |i| format!("n{i}")))
+            .unwrap();
+        assert!(stmt.execute().unwrap().next().is_none());
+    });
+    assert_eq!(fifty_rows, one_row, "50 rows must take one execution");
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: execute runs a result-set statement once per bound row
+#[test]
+fn test_bind_execute_query_runs_once_per_bound_row() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_PER_ROW");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.QUERY_TABLE (id INTEGER, val INTEGER)"),
+    );
+    execute_ddl(
+        &mut conn,
+        format!("INSERT INTO {schema_name}.QUERY_TABLE VALUES (1, 100), (2, 200), (3, 300)"),
+    );
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!(
+        "SELECT val FROM {schema_name}.QUERY_TABLE WHERE id = ?"
+    ))
+    .unwrap();
+    stmt.prepare().unwrap();
+    let ids = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![3, 1]))],
+    )
+    .unwrap();
+    stmt.bind(ids).unwrap();
+
+    let mut values = Vec::new();
+    for batch in stmt.execute().expect("a multi-row SELECT must run per row") {
+        values.extend(integers_in(
+            batch.expect("Failed to read batch").column(0).as_ref(),
+        ));
+    }
+
+    assert_eq!(values, vec![300, 100], "rows come back in bound order");
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: A failed bound batch stores none of its rows
+#[test]
+fn test_bind_failed_batch_stores_no_row() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_FAILED");
+    let mut stmt = prepare_insert(&mut conn, &schema_name, "id INTEGER, name VARCHAR(3)");
+    let failing_batch = || {
+        id_name_batch(1..4, |i| {
+            ["a", "TOOLONG", "c"][(i - 1) as usize].to_string()
+        })
+    };
+
+    stmt.bind(failing_batch()).unwrap();
+    let error = stmt.execute_update().expect_err("the batch must fail");
+    assert!(
+        error.message.contains("right truncation"),
+        "got: {}",
+        error.message
+    );
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![0]
+    );
+
+    stmt.bind(failing_batch()).unwrap();
+    let error = stmt.execute().err().expect("the batch must fail");
+    assert!(
+        error.message.contains("right truncation"),
+        "got: {}",
+        error.message
+    );
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![0]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: A bound value that cannot be converted fails the batch before execution
+#[test]
+fn test_bind_unconvertible_value_stores_no_row() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_UNCONVERTIBLE");
+    let mut stmt = prepare_insert(&mut conn, &schema_name, "id INTEGER, d DATE");
+    let unconvertible_batch = || {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("d", DataType::Date32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(arrow::array::Date32Array::from(vec![0, 2_932_897])),
+            ],
+        )
+        .unwrap()
+    };
+
+    stmt.bind(unconvertible_batch()).unwrap();
+    let error = stmt.execute_update().expect_err("the batch must fail");
+    assert_eq!(error.status, Status::InvalidArguments);
+
+    stmt.bind(unconvertible_batch()).unwrap();
+    let error = stmt.execute().err().expect("the batch must fail");
+    assert_eq!(error.status, Status::InvalidArguments);
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![0]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: A zero-row bound batch runs no execution
+#[test]
+fn test_bind_zero_row_batch_runs_no_execution() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_ZERO_ROWS");
+    let mut stmt = prepare_insert(&mut conn, &schema_name, "id INTEGER, name VARCHAR(10)");
+
+    stmt.bind(id_name_batch(0..0, |i| i.to_string())).unwrap();
+    assert_eq!(stmt.execute_update().expect("zero rows"), Some(0));
+
+    stmt.bind(id_name_batch(0..0, |i| i.to_string())).unwrap();
+    assert!(stmt.execute().expect("zero rows").next().is_none());
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![0]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: execute_update sends every bound row in one execution
+#[test]
+fn test_bind_zero_column_batch_runs_once_per_bound_row() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_NO_PARAMS");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (id INTEGER)"),
+    );
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!("INSERT INTO {schema_name}.T VALUES (1)"))
+        .unwrap();
+    stmt.prepare().unwrap();
+
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(3));
+    let batch =
+        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options).unwrap();
+    stmt.bind(batch).unwrap();
+    assert_eq!(stmt.execute_update().expect("three rows"), Some(3));
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![3]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+const WIDE_VALUE_CHARS: usize = 2000;
+const FAILING_ROW: i32 = 42_000;
+
+/// A batch of `rows` rows with ids from `first_id`, each name `WIDE_VALUE_CHARS` characters.
+fn wide_batch(first_id: i32, rows: i32) -> RecordBatch {
+    id_name_batch(first_id..first_id + rows, |_| "x".repeat(WIDE_VALUE_CHARS))
+}
+
+/// Scenario: A bound batch larger than one data message is stored in full over the native protocol
+/// Scenario: Batch update larger than one data message over the native protocol
+#[test]
+fn test_bind_batch_above_the_data_message_size_is_stored_in_full() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_LARGE");
+    let mut stmt = prepare_insert(
+        &mut conn,
+        &schema_name,
+        &format!("id INTEGER, s VARCHAR({WIDE_VALUE_CHARS})"),
+    );
+
+    let one_row = statements_during(&mut conn, || {
+        stmt.bind(wide_batch(0, 1)).unwrap();
+        assert_eq!(stmt.execute_update().expect("one row"), Some(1));
+    });
+    let mut stored = None;
+    let large = statements_during(&mut conn, || {
+        stmt.bind(wide_batch(1, 40_000)).unwrap();
+        stored = stmt.execute_update().expect("a batch above 64 MiB");
+    });
+    assert_eq!(stored, Some(40_000));
+    assert!(
+        large > one_row,
+        "the batch must run as more than one execution ({large} vs {one_row})"
+    );
+
+    stmt.bind(wide_batch(40_001, 40_000)).unwrap();
+    assert!(stmt
+        .execute()
+        .expect("a batch above 64 MiB")
+        .next()
+        .is_none());
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![80_001]
+    );
+    assert_eq!(integers_from(&mut conn, "SELECT 1".to_string()), vec![1]);
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: A failed execution of a split bound batch keeps the rows of the earlier executions
+/// Scenario: Batch update larger than one data message over the native protocol
+#[test]
+fn test_bind_split_batch_stops_at_the_failing_execution() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_SPLIT_FAIL");
+    let mut stmt = prepare_insert(
+        &mut conn,
+        &schema_name,
+        &format!("id INTEGER, s VARCHAR({WIDE_VALUE_CHARS})"),
+    );
+    let batch = id_name_batch(0..70_000, |i| {
+        let width = if i == FAILING_ROW {
+            WIDE_VALUE_CHARS + 1
+        } else {
+            WIDE_VALUE_CHARS
+        };
+        "x".repeat(width)
+    });
+
+    stmt.bind(batch).unwrap();
+    let error = stmt
+        .execute_update()
+        .expect_err(&format!("row {FAILING_ROW} must fail"));
+    assert!(
+        error.message.contains("right truncation"),
+        "got: {}",
+        error.message
+    );
+
+    let stored = integers_from(
+        &mut conn,
+        format!("SELECT id FROM {schema_name}.T ORDER BY id"),
+    );
+    assert!(!stored.is_empty(), "the first execution stays committed");
+    assert!(
+        stored.iter().copied().eq(0..stored.len() as i64),
+        "the stored ids must form one range from 0"
+    );
+    assert!(
+        stored.iter().all(|id| *id < i64::from(FAILING_ROW)),
+        "no row at or after the failing row may be stored"
+    );
+    assert_eq!(integers_from(&mut conn, "SELECT 1".to_string()), vec![1]);
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: A bound batch with the wrong column count fails before execution
+#[test]
+fn test_bind_wrong_column_count_stores_no_row() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_WRONG_COLUMNS");
+    let mut stmt = prepare_insert(&mut conn, &schema_name, "id INTEGER, name VARCHAR(10)");
+    let three_columns = || {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(Int32Array::from(vec![5, 6])),
+            ],
+        )
+        .unwrap()
+    };
+
+    stmt.bind(three_columns()).unwrap();
+    let error = stmt
+        .execute_update()
+        .expect_err("the arity must be checked");
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("expects 2"),
+        "got: {}",
+        error.message
+    );
+
+    stmt.bind(three_columns()).unwrap();
+    let error = stmt.execute().err().expect("the arity must be checked");
+    assert_eq!(error.status, Status::InvalidArguments);
+    assert!(
+        error.message.contains("expects 2"),
+        "got: {}",
+        error.message
+    );
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![0]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
 }
 
 #[test]
