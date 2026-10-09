@@ -11,7 +11,7 @@
 use crate::adbc::Statement;
 use crate::connection::auth::AuthResponseData;
 use crate::connection::params::ConnectionParams;
-use crate::connection::session::{Session as SessionInfo, SessionConfig, SessionState};
+use crate::connection::session::{Session as SessionInfo, SessionConfig};
 use crate::error::{ConnectionError, ExasolError, QueryError, TransportError};
 use crate::query::prepared::PreparedStatement;
 use crate::query::results::ResultSet;
@@ -35,19 +35,6 @@ use tokio::sync::Mutex;
 /// # Example
 ///
 pub type Session = Connection;
-
-/// Classify a `set_schema` (`OPEN SCHEMA`) failure as a missing-schema error.
-///
-/// A schema named in the connection URI is a *best-effort default*. When that
-/// schema does not yet exist the server reports a "schema ... not found" error,
-/// which we deliberately swallow during connect so the connection stays open
-/// (see [`Connection::connect_with_transport`]). Any other failure is fatal.
-///
-/// Returns `true` only when the error message indicates the schema was not
-/// found; all other errors return `false`.
-fn schema_open_error_is_missing_schema(err: &QueryError) -> bool {
-    err.to_string().to_ascii_lowercase().contains("not found")
-}
 
 /// Round a duration up to whole seconds over its millisecond value.
 ///
@@ -255,36 +242,23 @@ impl Connection {
             params,
         };
 
-        // A schema named in the connection URI is a *best-effort default*: we
-        // OPEN it so unqualified queries resolve against it. A schema that does
-        // not yet exist must NOT fail the connection — tools such as dbt create
-        // their target schema after connecting and fully qualify every relation,
-        // so a not-yet-existing default schema is a normal state, not a corrupt
-        // one. We therefore swallow "schema not found" and leave the session
-        // with no active schema (the schema can be OPENed later, once it exists).
-        //
-        // Any other failure (auth, transport, permissions) still indicates a
-        // genuinely broken connection: we close the transport — we are already
-        // authenticated server-side — and propagate a clear error rather than
-        // return a half-open `Connection`.
+        // The schema must exist: every rejection fails the connect, and the
+        // server's error text is never inspected to decide otherwise.
         if let Some(schema_name) = schema {
-            if let Err(query_err) = connection.set_schema(schema_name.clone()).await {
-                let schema_missing = schema_open_error_is_missing_schema(&query_err);
-                if !schema_missing {
-                    let host = connection.params.host.clone();
-                    let port = connection.params.port;
-                    let _ = connection.shutdown().await;
-                    return Err(ConnectionError::ConnectionFailed {
-                        host,
-                        port,
-                        message: format!(
-                            "failed to activate schema '{}' from connection URI: {}",
-                            schema_name, query_err
-                        ),
-                    });
-                }
-                // Schema does not exist yet: keep the connection open with no
-                // active schema. Fully qualified names continue to work.
+            if let Err(query_err) = connection.set_schema(schema_name.as_str()).await {
+                let host = connection.params.host.clone();
+                let port = connection.params.port;
+                // The rejection is the error worth reporting; the close only
+                // keeps the authenticated session from leaking.
+                let _ = connection.shutdown().await;
+                return Err(ConnectionError::ConnectionFailed {
+                    host,
+                    port,
+                    message: format!(
+                        "failed to set schema '{}' from the connection parameters: {}",
+                        schema_name, query_err
+                    ),
+                });
             }
         }
 
@@ -356,9 +330,6 @@ impl Connection {
             .await
             .map_err(|e| QueryError::InvalidState(e.to_string()))?;
 
-        // Update session state
-        self.session.set_state(SessionState::Executing).await;
-
         // Increment query counter
         self.session.increment_query_count();
 
@@ -403,9 +374,6 @@ impl Connection {
         // that's the value that fired.
         let result =
             exec_result.map_err(|e| map_execution_error(e, target_secs.saturating_mul(1000)))?;
-
-        // Update session state back to ready/in_transaction
-        self.update_session_state_after_query().await;
 
         // Convert transport result to ResultSet
         ResultSet::from_transport_result(result, Arc::clone(&self.transport))
@@ -509,9 +477,6 @@ impl Connection {
             .await
             .map_err(|e| QueryError::InvalidState(e.to_string()))?;
 
-        // Update session state
-        self.session.set_state(SessionState::Executing).await;
-
         // Increment query counter
         self.session.increment_query_count();
 
@@ -525,9 +490,6 @@ impl Connection {
             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
         drop(transport);
-
-        // Update session state back to ready/in_transaction
-        self.update_session_state_after_query().await;
 
         ResultSet::from_transport_result(result, Arc::clone(&self.transport))
     }
@@ -561,9 +523,6 @@ impl Connection {
             .await
             .map_err(|e| QueryError::InvalidState(e.to_string()))?;
 
-        // Update session state
-        self.session.set_state(SessionState::Executing).await;
-
         // Convert parameters to column-major JSON format
         let params_data = stmt.build_parameters_data()?;
 
@@ -574,9 +533,6 @@ impl Connection {
             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
         drop(transport);
-
-        // Update session state back to ready/in_transaction
-        self.update_session_state_after_query().await;
 
         match result {
             QueryResult::RowCount { count } => Ok(count),
@@ -617,9 +573,6 @@ impl Connection {
             .await
             .map_err(|e| QueryError::InvalidState(e.to_string()))?;
 
-        // Update session state
-        self.session.set_state(SessionState::Executing).await;
-
         // Convert batch parameters to column-major JSON format
         let params_data = stmt.build_batch_parameters_data(rows)?;
 
@@ -630,9 +583,6 @@ impl Connection {
             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
         drop(transport);
-
-        // Update session state back to ready/in_transaction
-        self.update_session_state_after_query().await;
 
         match result {
             QueryResult::RowCount { count } => Ok(count),
@@ -671,9 +621,6 @@ impl Connection {
             .await
             .map_err(|e| QueryError::InvalidState(e.to_string()))?;
 
-        // Update session state
-        self.session.set_state(SessionState::Executing).await;
-
         // Increment query counter
         self.session.increment_query_count();
 
@@ -687,9 +634,6 @@ impl Connection {
             .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
 
         drop(transport);
-
-        // Update session state back to ready/in_transaction
-        self.update_session_state_after_query().await;
 
         ResultSet::from_transport_result(result, Arc::clone(&self.transport))
     }
@@ -796,7 +740,24 @@ impl Connection {
     // Transaction Methods
     // ========================================================================
 
+    /// Turns autocommit off on the server and marks the session as in a transaction.
+    ///
+    /// A `Closing` or `Closed` session ("Connection is closed") and an already
+    /// active transaction ("Transaction already active") are rejected before
+    /// any server request, so the server's autocommit setting stays unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QueryError::TransactionError` for both rejections and when the
+    /// autocommit request fails.
     pub async fn begin_transaction(&mut self) -> Result<(), QueryError> {
+        // Reject before any request: autocommit must not change on the server
+        // for a transaction that cannot start.
+        self.session
+            .ensure_can_begin_transaction()
+            .await
+            .map_err(|e| QueryError::TransactionError(e.to_string()))?;
+
         // Disable autocommit on the server so statements don't auto-commit
         self.transport
             .lock()
@@ -856,16 +817,28 @@ impl Connection {
     // Session and Schema Methods
     // ========================================================================
 
-    /// Get the current schema.
+    /// The session's current schema as the server last reported it.
+    ///
+    /// Reads the value the transport recorded from the server's responses,
+    /// without a server request. It follows the URI schema, `set_schema`, and
+    /// `OPEN SCHEMA`, `CREATE SCHEMA`, `CLOSE SCHEMA`, or `DROP SCHEMA` run as
+    /// SQL, and holds the name the server opened, which can differ from the
+    /// requested text (`my_schema` opens `MY_SCHEMA`).
     ///
     /// # Returns
     ///
-    /// The current schema name, or `None` if no schema is set.
+    /// The current schema name, or `None` if the session has no current schema.
     pub async fn current_schema(&self) -> Option<String> {
-        self.session.current_schema().await
+        self.transport.lock().await.current_schema()
     }
 
-    /// Set the current schema.
+    /// Set the session's current schema.
+    ///
+    /// Sends the name as the current-schema session attribute, never as an
+    /// `OPEN SCHEMA` statement, so the name needs no quoting. The server opens
+    /// the schema whose name matches exactly, otherwise the one that matches
+    /// the upper-case form, and [`current_schema`](Self::current_schema) then
+    /// reports the name the server opened.
     ///
     /// # Arguments
     ///
@@ -873,16 +846,43 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` if the operation fails.
-    ///
-    /// # Example
-    ///
+    /// Returns `QueryError::InvalidState` when the session cannot run
+    /// operations, and `QueryError::ExecutionFailed` with the server's message
+    /// when the server rejects the schema, in which case the current schema
+    /// stays unchanged.
     pub async fn set_schema(&mut self, schema: impl Into<String>) -> Result<(), QueryError> {
-        let schema_name = schema.into();
-        self.execute_update(format!("OPEN SCHEMA {}", schema_name))
-            .await?;
-        self.session.set_current_schema(Some(schema_name)).await;
-        Ok(())
+        self.session
+            .validate_ready()
+            .await
+            .map_err(|e| QueryError::InvalidState(e.to_string()))?;
+
+        self.transport
+            .lock()
+            .await
+            .set_current_schema(&schema.into())
+            .await
+            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))
+    }
+
+    /// Ask the server for the session's current schema with a get-attributes
+    /// request.
+    ///
+    /// Serves the ADBC `adbc.connection.db_schema` read, which reports the
+    /// server's value rather than the recorded one, so it also sees a change
+    /// no response of this session reported.
+    #[cfg(any(feature = "ffi", test))]
+    pub(crate) async fn refresh_current_schema(&self) -> Result<Option<String>, QueryError> {
+        self.session
+            .validate_ready()
+            .await
+            .map_err(|e| QueryError::InvalidState(e.to_string()))?;
+
+        self.transport
+            .lock()
+            .await
+            .refresh_current_schema()
+            .await
+            .map_err(|e| QueryError::ExecutionFailed(e.to_string()))
     }
 
     // ========================================================================
@@ -2196,20 +2196,6 @@ impl Connection {
     ) -> Result<u64, crate::export::csv::ExportError> {
         blocking_runtime().block_on(self.export_to_arrow_ipc(source, file_path, options))
     }
-
-    // ========================================================================
-    // Private Helper Methods
-    // ========================================================================
-
-    /// Update session state after query execution.
-    async fn update_session_state_after_query(&self) {
-        if self.session.in_transaction() {
-            self.session.set_state(SessionState::InTransaction).await;
-        } else {
-            self.session.set_state(SessionState::Ready).await;
-        }
-        self.session.update_activity().await;
-    }
 }
 
 impl std::fmt::Debug for Connection {
@@ -2308,35 +2294,6 @@ impl Default for ConnectionBuilder {
 mod tests {
     use super::*;
 
-    /// Regression test for the best-effort URI-schema fix.
-    ///
-    /// A schema named in the connection URI that does not yet exist must NOT
-    /// fail the connection: the server reports a "schema ... not found" error
-    /// (real Exasol message format), which `connect_with_transport` swallows so
-    /// the connection stays open. Every other failure must remain fatal.
-    #[test]
-    fn schema_open_error_missing_schema_is_recognized() {
-        // Real Exasol-style "OPEN SCHEMA" failure for a non-existent schema.
-        let missing = QueryError::ExecutionFailed(
-            "Protocol error: schema FOO not found [line 1, column 13] (SQL state: 42000)"
-                .to_string(),
-        );
-        assert!(
-            schema_open_error_is_missing_schema(&missing),
-            "a 'schema ... not found' error must be classified as missing-schema (swallowed)"
-        );
-    }
-
-    #[test]
-    fn schema_open_error_unrelated_is_fatal() {
-        // An unrelated failure (e.g. permissions) must stay fatal.
-        let unrelated = QueryError::ExecutionFailed("insufficient privileges".to_string());
-        assert!(
-            !schema_open_error_is_missing_schema(&unrelated),
-            "an unrelated error must NOT be classified as missing-schema (stays fatal)"
-        );
-    }
-
     #[test]
     fn secs_ceil_reserves_zero_for_the_unlimited_reset_only() {
         // Zero maps to zero: the "no timeout / reset to unlimited" sentinel.
@@ -2420,6 +2377,7 @@ mod tests {
     // is asserted without a live Exasol or any network I/O.
     // ========================================================================
 
+    use crate::connection::session::SessionState;
     use crate::transport::messages::SessionInfo as TransportSessionInfo;
     use crate::transport::test_support::{transport_session_info, MockTransport};
     use std::sync::Mutex as SyncMutex;
@@ -2992,7 +2950,7 @@ mod tests {
         }
     }
 
-    // --- the two schema-open branches ---
+    // --- the URI schema ---
 
     fn params_with_schema(schema: &str) -> ConnectionParams {
         ConnectionParams::builder()
@@ -3005,89 +2963,99 @@ mod tests {
             .expect("params")
     }
 
+    /// Scenario: Schema in connection params is opened on connect
     #[tokio::test]
-    async fn connect_opens_the_schema_named_in_the_connection_uri() {
+    async fn connect_sets_the_uri_schema_as_a_session_attribute_after_login() {
         let log = new_sql_log();
-        let conn = Connection::connect_with_transport(
-            params_with_schema("SALES"),
-            recording_transport(&log),
-        )
-        .await
-        .expect("connect");
+        let mut login_order = mockall::Sequence::new();
+        let mut transport = MockTransport::new();
+        transport
+            .expect_connect()
+            .times(1)
+            .in_sequence(&mut login_order)
+            .returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .times(1)
+            .in_sequence(&mut login_order)
+            .returning(|_| Ok(transport_session_info()));
+        transport
+            .expect_set_query_timeout()
+            .times(1)
+            .in_sequence(&mut login_order)
+            .returning(|_| Ok(()));
+        transport
+            .expect_set_current_schema()
+            .withf(|schema| schema == "sales")
+            .times(1)
+            .in_sequence(&mut login_order)
+            .returning(|_| Ok(()));
+        transport
+            .expect_current_schema()
+            .returning(|| Some("SALES".to_string()));
+        let sink = Arc::clone(&log);
+        transport.expect_execute_query().returning(move |sql| {
+            sink.lock().expect("SQL log poisoned").push(sql.to_string());
+            Ok(QueryResult::row_count(0))
+        });
+        let params = ConnectionParams::builder()
+            .host("db.example.invalid")
+            .username("tester")
+            .password("s3cr3t-pw")
+            .schema("sales")
+            .query_timeout(Duration::from_secs(30))
+            .build()
+            .expect("params");
 
-        assert_eq!(only_sql(&log), "OPEN SCHEMA SALES");
+        let conn = Connection::connect_with_transport(params, transport)
+            .await
+            .expect("connect");
+
+        assert!(
+            recorded(&log).is_empty(),
+            "connect must not send OPEN SCHEMA"
+        );
         assert_eq!(conn.current_schema().await, Some("SALES".to_string()));
     }
 
-    /// A schema named in the URI is a best-effort default: one that does not
-    /// exist yet must leave the connection open with no active schema.
+    /// Scenario: Schema activation failure surfaces during connect
     #[tokio::test]
-    async fn connect_survives_a_schema_from_the_uri_that_does_not_exist_yet() {
-        let mut transport = MockTransport::new();
-        transport.expect_connect().returning(|_| Ok(()));
-        transport
-            .expect_authenticate()
-            .returning(|_| Ok(transport_session_info()));
-        transport.expect_execute_query().returning(|_| {
-            Err(TransportError::ProtocolError(
-                "schema FOO not found [line 1, column 13] (SQL state: 42000)".to_string(),
-            ))
-        });
-        transport.expect_is_connected().returning(|| true);
+    async fn connect_fails_and_closes_the_transport_for_any_rejected_uri_schema() {
+        let rejections = [
+            "schema ZZ_TYPO not found (SQL state: 42000)",
+            "insufficient privileges for schema ZZ_TYPO (SQL state: 42500)",
+            "connection reset by peer",
+        ];
+        for rejection in rejections {
+            let mut transport = MockTransport::new();
+            transport.expect_connect().returning(|_| Ok(()));
+            transport
+                .expect_authenticate()
+                .returning(|_| Ok(transport_session_info()));
+            transport
+                .expect_set_current_schema()
+                .times(1)
+                .returning(move |_| Err(TransportError::ProtocolError(rejection.to_string())));
+            transport.expect_close().times(1).returning(|| Ok(()));
 
-        let conn = Connection::connect_with_transport(params_with_schema("FOO"), transport)
-            .await
-            .expect("a not-yet-existing URI schema must not fail the connection");
+            let error =
+                Connection::connect_with_transport(params_with_schema("ZZ_TYPO"), transport)
+                    .await
+                    .expect_err("a rejected URI schema must fail the connection");
 
-        assert_eq!(
-            conn.current_schema().await,
-            None,
-            "the session must be left with no active schema"
-        );
-        assert!(!conn.is_closed().await, "the connection must stay open");
-    }
-
-    /// Any schema-open failure other than "not found" means a genuinely broken
-    /// connection: it must close the transport rather than hand back a
-    /// half-open `Connection`.
-    #[tokio::test]
-    async fn connect_closes_the_transport_when_opening_the_uri_schema_fails_fatally() {
-        let mut transport = MockTransport::new();
-        transport.expect_connect().returning(|_| Ok(()));
-        transport
-            .expect_authenticate()
-            .returning(|_| Ok(transport_session_info()));
-        transport.expect_execute_query().returning(|_| {
-            Err(TransportError::ProtocolError(
-                "insufficient privileges for schema SALES".to_string(),
-            ))
-        });
-        transport.expect_close().times(1).returning(|| Ok(()));
-
-        let error = Connection::connect_with_transport(params_with_schema("SALES"), transport)
-            .await
-            .expect_err("a fatal schema-open failure must fail the connection");
-
-        match error {
-            ConnectionError::ConnectionFailed {
-                host,
-                port,
-                message,
-            } => {
-                assert_eq!(host, "db.example.invalid");
-                assert_eq!(port, 8563);
-                assert!(
-                    message.contains("failed to activate schema 'SALES' from connection URI"),
-                    "got: {}",
-                    message
-                );
-                assert!(
-                    message.contains("insufficient privileges"),
-                    "got: {}",
-                    message
-                );
+            match error {
+                ConnectionError::ConnectionFailed {
+                    host,
+                    port,
+                    message,
+                } => {
+                    assert_eq!(host, "db.example.invalid");
+                    assert_eq!(port, 8563);
+                    assert!(message.contains("ZZ_TYPO"), "got: {message}");
+                    assert!(message.contains(rejection), "got: {message}");
+                }
+                other => panic!("expected ConnectionFailed, got {:?}", other),
             }
-            other => panic!("expected ConnectionFailed, got {:?}", other),
         }
     }
 
@@ -3303,6 +3271,7 @@ mod tests {
         }
     }
 
+    /// Scenario: A closed session rejects operations as closed
     #[tokio::test]
     async fn execute_statement_rejects_a_closed_session_as_an_invalid_state() {
         let log = new_sql_log();
@@ -3310,7 +3279,9 @@ mod tests {
         conn.session.set_state(SessionState::Closed).await;
 
         match conn.execute_statement(&Statement::new("SELECT 1")).await {
-            Err(QueryError::InvalidState(_)) => {}
+            Err(QueryError::InvalidState(message)) => {
+                assert!(message.contains("Connection is closed"), "got: {}", message)
+            }
             other => panic!("expected InvalidState, got {:?}", other),
         }
         assert!(
@@ -3574,10 +3545,18 @@ mod tests {
         );
     }
 
+    /// Scenario: Starting a second transaction reports the active transaction
     #[tokio::test]
     async fn begin_transaction_rejects_a_second_overlapping_transaction() {
-        let log = new_sql_log();
-        let mut conn = connected_for_transactions(&log).await;
+        let sql_log = new_sql_log();
+        let mut transport = recording_transport(&sql_log);
+        transport
+            .expect_set_autocommit()
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
         conn.begin_transaction().await.expect("first begin");
 
         match conn.begin_transaction().await {
@@ -3586,7 +3565,8 @@ mod tests {
                     message.contains("Transaction already active"),
                     "got: {}",
                     message
-                )
+                );
+                assert!(!message.contains("closed"), "got: {}", message);
             }
             other => panic!("expected TransactionError, got {:?}", other),
         }
@@ -3676,15 +3656,128 @@ mod tests {
         assert!(!conn.in_transaction());
     }
 
+    /// Scenario: Set the current schema at runtime
     #[tokio::test]
-    async fn set_schema_opens_the_schema_and_records_it_on_the_session() {
+    async fn set_schema_sends_the_schema_attribute_and_reports_the_servers_name() {
         let log = new_sql_log();
-        let mut conn = connected(&log).await;
+        let mut transport = recording_transport(&log);
+        transport
+            .expect_set_current_schema()
+            .withf(|schema| schema == "my_schema")
+            .times(1)
+            .returning(|_| Ok(()));
+        transport
+            .expect_current_schema()
+            .returning(|| Some("MY_SCHEMA".to_string()));
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
 
-        conn.set_schema("SALES").await.expect("set_schema");
+        conn.set_schema("my_schema").await.expect("set_schema");
 
-        assert_eq!(only_sql(&log), "OPEN SCHEMA SALES");
-        assert_eq!(conn.current_schema().await, Some("SALES".to_string()));
+        assert!(
+            recorded(&log).is_empty(),
+            "set_schema must not send OPEN SCHEMA"
+        );
+        assert_eq!(conn.current_schema().await, Some("MY_SCHEMA".to_string()));
+    }
+
+    /// Scenario: Set the current schema at runtime
+    #[tokio::test]
+    async fn set_schema_returns_the_transports_error() {
+        let log = new_sql_log();
+        let mut transport = recording_transport(&log);
+        transport.expect_set_current_schema().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "schema ZZ_TYPO not found (SQL state: 42000)".to_string(),
+            ))
+        });
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let error = conn
+            .set_schema("ZZ_TYPO")
+            .await
+            .expect_err("a rejected schema must fail set_schema");
+
+        assert!(
+            error.to_string().contains("schema ZZ_TYPO not found"),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_schema_rejects_a_closed_session_without_a_request() {
+        let log = new_sql_log();
+        let mut transport = recording_transport(&log);
+        transport.expect_set_current_schema().never();
+        let mut conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+        conn.session.set_state(SessionState::Closed).await;
+
+        match conn.set_schema("SALES").await {
+            Err(QueryError::InvalidState(_)) => {}
+            other => panic!("expected InvalidState, got {:?}", other),
+        }
+    }
+
+    /// Scenario: Current schema follows schema changes made in SQL
+    #[tokio::test]
+    async fn current_schema_reports_the_transports_value_without_a_request() {
+        let log = new_sql_log();
+        let mut transport = recording_transport(&log);
+        transport
+            .expect_current_schema()
+            .returning(|| Some("OPENED_IN_SQL".to_string()));
+        transport.expect_refresh_current_schema().never();
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(
+            conn.current_schema().await,
+            Some("OPENED_IN_SQL".to_string())
+        );
+        assert!(recorded(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_current_schema_returns_the_servers_answer() {
+        let log = new_sql_log();
+        let mut transport = recording_transport(&log);
+        transport
+            .expect_refresh_current_schema()
+            .times(1)
+            .returning(|| Ok(Some("SYS".to_string())));
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        assert_eq!(
+            conn.refresh_current_schema().await.expect("refresh"),
+            Some("SYS".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_current_schema_surfaces_a_transport_failure() {
+        let log = new_sql_log();
+        let mut transport = recording_transport(&log);
+        transport
+            .expect_refresh_current_schema()
+            .returning(|| Err(TransportError::ProtocolError("socket closed".to_string())));
+        let conn = Connection::connect_with_transport(test_params(), transport)
+            .await
+            .expect("connect");
+
+        let error = conn
+            .refresh_current_schema()
+            .await
+            .expect_err("a failed request must surface");
+
+        assert!(error.to_string().contains("socket closed"), "got: {error}");
     }
 
     // ------------------------------------------------------------------------
@@ -4558,6 +4651,208 @@ mod tests {
                 assert!(message.contains("socket closed"), "got: {}", message)
             }
             other => panic!("expected ExecutionFailed, got {:?}", other),
+        }
+    }
+
+    /// A transport on which every query except `COMMIT` and `ROLLBACK`, every
+    /// prepared execution, and every `queryTimeout` push fails, so a test can
+    /// fail a statement and still end its transaction.
+    fn failing_statement_transport() -> MockTransport {
+        let mut transport = MockTransport::new();
+        transport.expect_connect().returning(|_| Ok(()));
+        transport
+            .expect_authenticate()
+            .returning(|_| Ok(transport_session_info()));
+        transport.expect_execute_query().returning(|sql| {
+            if sql == "COMMIT" || sql == "ROLLBACK" {
+                Ok(QueryResult::row_count(0))
+            } else {
+                Err(TransportError::ProtocolError(
+                    "object ZZ_NO_SUCH_TABLE not found".to_string(),
+                ))
+            }
+        });
+        transport.expect_set_query_timeout().returning(|_| {
+            Err(TransportError::ProtocolError(
+                "queryTimeout rejected".to_string(),
+            ))
+        });
+        transport
+            .expect_create_prepared_statement()
+            .returning(|_| Ok(handle_with(0)));
+        transport
+            .expect_execute_prepared_statement()
+            .returning(|_, _| {
+                Err(TransportError::ProtocolError(
+                    "object ZZ_NO_SUCH_TABLE not found".to_string(),
+                ))
+            });
+        transport.expect_set_autocommit().returning(|_| Ok(()));
+        transport
+    }
+
+    async fn connected_with_failing_statements() -> Connection {
+        Connection::connect_with_transport(test_params(), failing_statement_transport())
+            .await
+            .expect("connect")
+    }
+
+    /// Scenario: A failed statement leaves the session usable
+    #[tokio::test]
+    async fn failed_execute_statement_leaves_the_session_ready() {
+        let mut conn = connected_with_failing_statements().await;
+
+        let server_error = conn.execute_statement(&Statement::new("SELECT 1")).await;
+        assert!(server_error.is_err(), "the server rejects the statement");
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+
+        let unbound = conn.execute_statement(&Statement::new("SELECT ?")).await;
+        assert!(matches!(
+            unbound,
+            Err(QueryError::ParameterBindingError { .. })
+        ));
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+
+        let mut timed = Statement::new("SELECT 1");
+        timed.set_timeout(5_000);
+        let rejected_timeout = conn.execute_statement(&timed).await;
+        assert!(
+            rejected_timeout.is_err(),
+            "the server rejects the queryTimeout push"
+        );
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+    }
+
+    /// Scenario: A failed statement leaves the session usable
+    #[tokio::test]
+    async fn failed_prepared_executions_leave_the_session_ready() {
+        let mut conn = connected_with_failing_statements().await;
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+
+        assert!(conn.execute_prepared(&stmt).await.is_err());
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+
+        assert!(conn.execute_prepared_update(&stmt).await.is_err());
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+
+        assert!(conn.execute_batch_update(&stmt, &[]).await.is_err());
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+
+        assert!(conn.execute_batch(&stmt, &[]).await.is_err());
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+    }
+
+    /// Scenario: A failed statement leaves the session usable
+    #[tokio::test]
+    async fn begin_transaction_succeeds_after_a_failed_statement() {
+        let mut conn = connected_with_failing_statements().await;
+        assert!(conn
+            .execute_statement(&Statement::new("SELECT 1"))
+            .await
+            .is_err());
+
+        conn.begin_transaction()
+            .await
+            .expect("a failed statement must not block the transaction start");
+
+        assert!(conn.in_transaction());
+        assert_eq!(conn.session.state().await, SessionState::InTransaction);
+    }
+
+    /// Scenario: A failed statement inside a transaction keeps the transaction
+    #[tokio::test]
+    async fn failed_statement_inside_a_transaction_keeps_the_transaction() {
+        let mut conn = connected_with_failing_statements().await;
+        let stmt = conn.prepare("SELECT 1").await.expect("prepare");
+        conn.begin_transaction().await.expect("begin");
+
+        assert!(conn
+            .execute_statement(&Statement::new("SELECT 1"))
+            .await
+            .is_err());
+        assert_eq!(conn.session.state().await, SessionState::InTransaction);
+
+        assert!(conn.execute_prepared(&stmt).await.is_err());
+        assert_eq!(conn.session.state().await, SessionState::InTransaction);
+
+        conn.commit().await.expect("commit");
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+
+        conn.begin_transaction().await.expect("second begin");
+        assert!(conn
+            .execute_statement(&Statement::new("SELECT 1"))
+            .await
+            .is_err());
+        conn.rollback().await.expect("rollback");
+        assert_eq!(conn.session.state().await, SessionState::Ready);
+    }
+
+    /// Scenario: An abandoned execution leaves the session state unchanged
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_execution_leaves_the_session_state_unchanged() {
+        use crate::transport::test_support::StalledQueryTransport;
+
+        for in_transaction in [false, true] {
+            let mut mock = MockTransport::new();
+            mock.expect_connect().returning(|_| Ok(()));
+            mock.expect_authenticate()
+                .returning(|_| Ok(transport_session_info()));
+            mock.expect_set_autocommit().returning(|_| Ok(()));
+            let mut conn =
+                Connection::connect_with_transport(test_params(), StalledQueryTransport::new(mock))
+                    .await
+                    .expect("connect");
+            if in_transaction {
+                conn.begin_transaction().await.expect("begin");
+            }
+            let before = conn.session.state().await;
+
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(50),
+                conn.execute_statement(&Statement::new("SELECT 1")),
+            )
+            .await;
+
+            assert!(outcome.is_err(), "the stalled execution never completes");
+            assert_eq!(conn.session.state().await, before);
+        }
+    }
+
+    /// Scenario: A closed session rejects operations as closed
+    #[tokio::test]
+    async fn closed_session_rejects_operations_as_closed() {
+        for state in [SessionState::Closing, SessionState::Closed] {
+            let mut transport = MockTransport::new();
+            transport.expect_connect().returning(|_| Ok(()));
+            transport
+                .expect_authenticate()
+                .returning(|_| Ok(transport_session_info()));
+            let mut conn = Connection::connect_with_transport(test_params(), transport)
+                .await
+                .expect("connect");
+            let prepared = PreparedStatement::new(handle_with(0));
+            conn.session.set_state(state).await;
+
+            let rejections = [
+                conn.execute_statement(&Statement::new("SELECT 1"))
+                    .await
+                    .err(),
+                conn.prepare("SELECT 1").await.err(),
+                conn.execute_prepared(&prepared).await.err(),
+                conn.begin_transaction().await.err(),
+            ];
+
+            // The transport mock has no expectation for any request, so a
+            // request sent for these operations would have panicked.
+            for rejection in rejections {
+                let error = rejection.unwrap_or_else(|| panic!("{:?} must reject", state));
+                assert!(
+                    error.to_string().contains("Connection is closed"),
+                    "{:?}: got {}",
+                    state,
+                    error
+                );
+            }
         }
     }
 }

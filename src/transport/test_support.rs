@@ -51,6 +51,9 @@ mock! {
         fn is_connected(&self) -> bool;
         async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError>;
         async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError>;
+        async fn set_current_schema(&mut self, schema: &str) -> Result<(), TransportError>;
+        async fn refresh_current_schema(&mut self) -> Result<Option<String>, TransportError>;
+        fn current_schema(&self) -> Option<String>;
     }
 }
 
@@ -164,6 +167,18 @@ impl TransportProtocol for StalledQueryTransport {
 
     async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
         self.inner.set_query_timeout(timeout_secs).await
+    }
+
+    async fn set_current_schema(&mut self, schema: &str) -> Result<(), TransportError> {
+        self.inner.set_current_schema(schema).await
+    }
+
+    async fn refresh_current_schema(&mut self) -> Result<Option<String>, TransportError> {
+        self.inner.refresh_current_schema().await
+    }
+
+    fn current_schema(&self) -> Option<String> {
+        self.inner.current_schema()
     }
 }
 

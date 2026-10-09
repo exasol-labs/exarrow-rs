@@ -37,8 +37,8 @@ use exarrow_rs::adbc::Driver;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let driver = Driver::new();
     let database = driver.open("exasol://user:pwd@localhost:8563/my_schema")?;
-    // The URI schema (/my_schema) is applied server-side automatically during connect().
-    // No manual set_schema() call is needed.
+    // The URI schema (/my_schema) must exist; connect() makes it the current schema
+    // and fails if the server rejects it. No manual set_schema() call is needed.
     let mut connection = database.connect().await?;
 
     let results = connection.query("SELECT * FROM customers").await?;

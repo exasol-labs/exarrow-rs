@@ -27,11 +27,11 @@ use super::tls;
 
 use self::attributes::{AttributeSet, AttributeValue};
 use self::constants::{
-    ATTR_AUTOCOMMIT, ATTR_DATABASE_NAME, ATTR_DATA_MESSAGE_SIZE, ATTR_PRODUCT_NAME,
-    ATTR_PROTOCOL_VERSION, ATTR_PUBLIC_KEY, ATTR_QUERY_TIMEOUT, ATTR_RANDOM_PHRASE,
-    ATTR_RELEASE_VERSION, ATTR_SESSIONID, ATTR_TIMEZONE, CMD_CLOSE_PREPARED, CMD_CLOSE_RESULTSET,
-    CMD_CREATE_PREPARED, CMD_DISCONNECT, CMD_EXECUTE, CMD_EXECUTE_PREPARED, CMD_FETCH2,
-    CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
+    ATTR_AUTOCOMMIT, ATTR_CURRENT_SCHEMA, ATTR_DATABASE_NAME, ATTR_DATA_MESSAGE_SIZE,
+    ATTR_PRODUCT_NAME, ATTR_PROTOCOL_VERSION, ATTR_PUBLIC_KEY, ATTR_QUERY_TIMEOUT,
+    ATTR_RANDOM_PHRASE, ATTR_RELEASE_VERSION, ATTR_SESSIONID, ATTR_TIMEZONE, CMD_CLOSE_PREPARED,
+    CMD_CLOSE_RESULTSET, CMD_CREATE_PREPARED, CMD_DISCONNECT, CMD_EXECUTE, CMD_EXECUTE_PREPARED,
+    CMD_FETCH2, CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
     MAX_DATA_MESSAGE_SIZE, PROTOCOL_VERSION, SMALL_RESULTSET, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL,
     T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_TIMESTAMP,
     T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
@@ -129,6 +129,7 @@ pub struct NativeTcpTransport {
     fetch_positions: HashMap<i32, i64>,
     result_columns: HashMap<i32, Arc<Vec<NativeColumnMeta>>>,
     recv_buf: Vec<u8>,
+    current_schema: Option<String>,
 }
 
 impl NativeTcpTransport {
@@ -143,6 +144,7 @@ impl NativeTcpTransport {
             fetch_positions: HashMap::new(),
             result_columns: HashMap::new(),
             recv_buf: Vec::with_capacity(1 << 20),
+            current_schema: None,
         }
     }
 
@@ -210,6 +212,8 @@ impl NativeTcpTransport {
     ///
     /// After this call, `self.recv_buf` contains the decrypted payload bytes.
     /// The buffer grows on demand but never shrinks, amortising allocation cost across fetches.
+    /// Every response passes through here, so this also records attribute 22 when the
+    /// response carries it.
     async fn receive_into_buf(&mut self) -> Result<MessageHeader, TransportError> {
         let mut hdr = [0u8; HEADER_SIZE];
         self.stream_mut()?.read_exact(&mut hdr).await?;
@@ -228,6 +232,10 @@ impl NativeTcpTransport {
             if self.encryptor.is_active() {
                 self.encryptor.decrypt(&mut self.recv_buf);
             }
+        }
+        let attrs = Self::response_attributes(&header, &self.recv_buf)?;
+        if let Some(schema) = current_schema_change(&attrs) {
+            self.current_schema = schema;
         }
         Ok(header)
     }
@@ -293,6 +301,20 @@ impl NativeTcpTransport {
         } else {
             &[]
         }
+    }
+
+    /// Parse the attribute block at the start of a response payload.
+    ///
+    /// A header that declares no attributes or no attribute bytes carries no block.
+    fn response_attributes(
+        header: &MessageHeader,
+        payload: &[u8],
+    ) -> Result<AttributeSet, TransportError> {
+        if header.num_attributes == 0 || header.attribute_data_len == 0 {
+            return Ok(AttributeSet::new());
+        }
+        let attr_len = (header.attribute_data_len as usize).min(payload.len());
+        attributes::parse_attributes(&payload[..attr_len], header.num_attributes)
     }
 
     /// Parse the result-part of a response payload and check for exceptions.
@@ -792,6 +814,20 @@ impl NativeTcpTransport {
             .unwrap_or(MAX_DATA_MESSAGE_SIZE as i64)
     }
 
+    /// Send CMD_SET_ATTRIBUTES and fail with the server's message when it rejects a value.
+    async fn set_attributes(&mut self, attrs: &AttributeSet) -> Result<(), TransportError> {
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before setting attributes",
+        )?;
+
+        let header = self
+            .send_and_fill_buf(CMD_SET_ATTRIBUTES, attrs, None)
+            .await?;
+        Self::check_response(&header, &self.recv_buf)?;
+        Ok(())
+    }
+
     /// Every CMD_EXECUTE_PREPARED message carries these attributes, and `split_parameter_rows` counts their size.
     fn execute_prepared_attributes() -> AttributeSet {
         AttributeSet::new()
@@ -870,6 +906,23 @@ fn attribute_integer(attrs: &AttributeSet, id: u16) -> Option<i64> {
         AttributeValue::Int32(value) => Some(*value as i64),
         _ => None,
     }
+}
+
+/// The change a response's attributes make to the recorded current schema.
+///
+/// `None` leaves the recorded value unchanged: a response to any command other
+/// than CMD_GET_ATTRIBUTES carries attribute 22 only when the statement changed
+/// it. `Some(None)` clears it, because an empty attribute 22 means no schema.
+fn current_schema_change(attrs: &AttributeSet) -> Option<Option<String>> {
+    attribute_text(attrs, ATTR_CURRENT_SCHEMA).map(|name| Some(name).filter(|n| !n.is_empty()))
+}
+
+/// The current schema a CMD_GET_ATTRIBUTES response reports.
+///
+/// That response lists every session attribute, so there an absent attribute 22
+/// means the session has no current schema.
+fn current_schema_from_get_attributes(attrs: &AttributeSet) -> Option<String> {
+    current_schema_change(attrs).flatten()
 }
 
 /// Fail when a response payload carries a server exception, describing it with `context`.
@@ -975,14 +1028,8 @@ impl LifecycleSteps for NativeTcpTransport {
         let ga_result_data = Self::extract_result_data(&ga_header, &ga_payload);
         reject_exception("GET_ATTRIBUTES failed", &ga_result_data)?;
 
-        // The GET_ATTRIBUTES response header has attributes
-        let ga_attrs = if ga_header.num_attributes > 0 && ga_header.attribute_data_len > 0 {
-            let attr_data =
-                &ga_payload[..(ga_header.attribute_data_len as usize).min(ga_payload.len())];
-            super::native::attributes::parse_attributes(attr_data, ga_header.num_attributes)?
-        } else {
-            AttributeSet::new()
-        };
+        let ga_attrs = Self::response_attributes(&ga_header, &ga_payload)?;
+        self.current_schema = current_schema_from_get_attributes(&ga_attrs);
 
         let session_id = attribute_integer(&ga_attrs, ATTR_SESSIONID)
             .map(|id| id.to_string())
@@ -1023,6 +1070,7 @@ impl LifecycleSteps for NativeTcpTransport {
     fn release_connection(&mut self) {
         self.stream = None;
         self.session = None;
+        self.current_schema = None;
     }
 }
 
@@ -1326,30 +1374,12 @@ impl TransportProtocol for NativeTcpTransport {
     }
 
     async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError> {
-        self.lifecycle.require(
-            ConnectionState::Authenticated,
-            "Must authenticate before setting attributes",
-        )?;
-
         let mut attrs = AttributeSet::new();
         attrs.add(ATTR_AUTOCOMMIT, AttributeValue::Bool(enabled));
-
-        let (header, payload) = self
-            .send_and_receive(CMD_SET_ATTRIBUTES, &attrs, None)
-            .await?;
-
-        if !payload.is_empty() {
-            let _ = Self::check_response(&header, &payload)?;
-        }
-        Ok(())
+        self.set_attributes(&attrs).await
     }
 
     async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
-        self.lifecycle.require(
-            ConnectionState::Authenticated,
-            "Must authenticate before setting attributes",
-        )?;
-
         let timeout_secs_i32 = i32::try_from(timeout_secs).map_err(|_| {
             TransportError::ProtocolError(format!(
                 "query_timeout of {timeout_secs}s exceeds the native protocol's i32 range"
@@ -1358,15 +1388,37 @@ impl TransportProtocol for NativeTcpTransport {
 
         let mut attrs = AttributeSet::new();
         attrs.add(ATTR_QUERY_TIMEOUT, AttributeValue::Int32(timeout_secs_i32));
+        self.set_attributes(&attrs).await
+    }
 
-        let (header, payload) = self
-            .send_and_receive(CMD_SET_ATTRIBUTES, &attrs, None)
-            .await?;
-
-        if !payload.is_empty() {
-            let _ = Self::check_response(&header, &payload)?;
-        }
+    async fn set_current_schema(&mut self, schema: &str) -> Result<(), TransportError> {
+        let mut attrs = AttributeSet::new();
+        attrs.add(
+            ATTR_CURRENT_SCHEMA,
+            AttributeValue::String(schema.to_owned()),
+        );
+        self.set_attributes(&attrs).await?;
+        self.refresh_current_schema().await?;
         Ok(())
+    }
+
+    async fn refresh_current_schema(&mut self) -> Result<Option<String>, TransportError> {
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before reading attributes",
+        )?;
+
+        let header = self
+            .send_and_fill_buf(CMD_GET_ATTRIBUTES, &AttributeSet::new(), None)
+            .await?;
+        Self::check_response(&header, &self.recv_buf)?;
+        let attrs = Self::response_attributes(&header, &self.recv_buf)?;
+        self.current_schema = current_schema_from_get_attributes(&attrs);
+        Ok(self.current_schema.clone())
+    }
+
+    fn current_schema(&self) -> Option<String> {
+        self.current_schema.clone()
     }
 }
 
@@ -1705,6 +1757,93 @@ mod tests {
 
         assert!(NativeTcpTransport::extract_result_data(&header, &payload).is_empty());
         assert!(NativeTcpTransport::result_data_slice(&header, &payload).is_empty());
+    }
+
+    fn response_with_attributes(attrs: &AttributeSet) -> (MessageHeader, Vec<u8>) {
+        let mut payload = attrs.serialize();
+        let header = MessageHeader::new(
+            CMD_EXECUTE,
+            1,
+            attrs.num_attributes(),
+            payload.len() as u32,
+            1,
+        );
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        (header, payload)
+    }
+
+    fn reported_change(attrs: &AttributeSet) -> Option<Option<String>> {
+        let (header, payload) = response_with_attributes(attrs);
+        let parsed = NativeTcpTransport::response_attributes(&header, &payload).unwrap();
+        current_schema_change(&parsed)
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[test]
+    fn current_schema_change_reads_attribute_22_from_a_response() {
+        let attrs = attribute_set(&[
+            (ATTR_AUTOCOMMIT, AttributeValue::Bool(true)),
+            (
+                ATTR_CURRENT_SCHEMA,
+                AttributeValue::String("ZZ_MixedCase".to_owned()),
+            ),
+        ]);
+
+        assert_eq!(
+            reported_change(&attrs),
+            Some(Some("ZZ_MixedCase".to_owned()))
+        );
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[test]
+    fn current_schema_change_reports_an_empty_attribute_22_as_no_schema() {
+        let attrs = attribute_set(&[(ATTR_CURRENT_SCHEMA, AttributeValue::String(String::new()))]);
+
+        assert_eq!(reported_change(&attrs), Some(None));
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[test]
+    fn response_without_attribute_22_leaves_the_current_schema_unchanged() {
+        let other_attribute = attribute_set(&[(ATTR_AUTOCOMMIT, AttributeValue::Bool(false))]);
+
+        assert_eq!(reported_change(&other_attribute), None);
+        assert_eq!(reported_change(&AttributeSet::new()), None);
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[test]
+    fn get_attributes_response_without_attribute_22_means_no_current_schema() {
+        let without_schema = attribute_set(&[(ATTR_AUTOCOMMIT, AttributeValue::Bool(true))]);
+        let with_schema = attribute_set(&[(
+            ATTR_CURRENT_SCHEMA,
+            AttributeValue::String("SYS".to_owned()),
+        )]);
+
+        assert_eq!(current_schema_from_get_attributes(&without_schema), None);
+        assert_eq!(
+            current_schema_from_get_attributes(&with_schema),
+            Some("SYS".to_owned())
+        );
+    }
+
+    #[test]
+    fn response_attributes_are_empty_when_the_header_declares_no_attribute_block() {
+        let header = MessageHeader::new(CMD_EXECUTE, 1, 2, 0, 1);
+
+        let attrs = NativeTcpTransport::response_attributes(&header, &[0, 0, 0, 0]).unwrap();
+
+        assert_eq!(attrs.num_attributes(), 0);
+    }
+
+    #[test]
+    fn response_attributes_report_a_truncated_attribute_block() {
+        let header = MessageHeader::new(CMD_EXECUTE, 1, 1, 6, 0);
+        let mut payload = ATTR_CURRENT_SCHEMA.to_le_bytes().to_vec();
+        payload.extend_from_slice(&10u32.to_le_bytes());
+
+        assert!(NativeTcpTransport::response_attributes(&header, &payload).is_err());
     }
 
     #[test]

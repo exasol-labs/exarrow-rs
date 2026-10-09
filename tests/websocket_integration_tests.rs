@@ -13,6 +13,8 @@
 #![cfg(feature = "websocket")]
 
 mod common;
+#[path = "common/schema_activation.rs"]
+mod schema_activation;
 
 use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
@@ -2178,4 +2180,42 @@ async fn test_ws_pre_1970_dates_and_timestamps_keep_their_calendar_day() {
     );
 
     conn.close().await.expect("Failed to close connection");
+}
+
+// Schema activation over WebSocket: the same checks as the native suite, from
+// `schema_activation`.
+
+/// Scenario: Schema in connection params is opened on connect
+#[tokio::test]
+async fn test_websocket_uri_schema_is_opened_on_connect() {
+    skip_if_no_exasol!();
+    schema_activation::check_uri_schema_is_opened_on_connect("websocket").await;
+}
+
+/// Scenario: Schema activation failure surfaces during connect
+#[tokio::test]
+async fn test_websocket_connect_with_missing_uri_schema_fails() {
+    skip_if_no_exasol!();
+    schema_activation::check_missing_uri_schema_fails_the_connect("websocket").await;
+}
+
+/// Scenario: URI schema name follows the server's case rule
+#[tokio::test]
+async fn test_websocket_uri_schema_name_follows_the_server_case_rule() {
+    skip_if_no_exasol!();
+    schema_activation::check_uri_schema_case_rule("websocket").await;
+}
+
+/// Scenario: Set the current schema at runtime
+#[tokio::test]
+async fn test_websocket_set_schema_sets_the_server_current_schema() {
+    skip_if_no_exasol!();
+    schema_activation::check_set_schema("websocket").await;
+}
+
+/// Scenario: Current schema follows schema changes made in SQL
+#[tokio::test]
+async fn test_websocket_current_schema_follows_schema_changes_in_sql() {
+    skip_if_no_exasol!();
+    schema_activation::check_current_schema_follows_sql("websocket").await;
 }

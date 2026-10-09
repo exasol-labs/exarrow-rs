@@ -8,6 +8,10 @@ mod common;
 #[cfg(feature = "websocket")]
 use common::get_test_connection_with_transport;
 use common::{generate_test_schema_name, get_test_connection};
+#[cfg(feature = "native")]
+use common::{get_host, get_password, get_port, get_user};
+#[cfg(feature = "native")]
+use exarrow_rs::transport::{ConnectionParams, Credentials, NativeTcpTransport, TransportProtocol};
 
 #[tokio::test]
 async fn test_native_connection() {
@@ -126,6 +130,85 @@ async fn test_native_set_autocommit() {
     conn.rollback().await.expect("Rollback should succeed");
 
     conn.close().await.expect("Failed to close");
+}
+
+#[cfg(feature = "native")]
+async fn authenticated_native_transport() -> NativeTcpTransport {
+    let params = ConnectionParams::new(get_host(), get_port())
+        .with_tls(true)
+        .with_validate_server_certificate(false);
+    let mut transport = NativeTcpTransport::new();
+    transport.connect(&params).await.expect("connect");
+    transport
+        .authenticate(&Credentials::new(get_user(), get_password()))
+        .await
+        .expect("authenticate");
+    transport
+}
+
+/// Scenario: Set the current schema attribute
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn native_set_current_schema_records_the_servers_name() {
+    skip_if_no_exasol!();
+    let schema = generate_test_schema_name();
+    let mut admin = get_test_connection().await.expect("admin connection");
+    admin
+        .execute_update(format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    let mut transport = authenticated_native_transport().await;
+    let after_login = transport.current_schema();
+    let set = transport.set_current_schema(&schema.to_lowercase()).await;
+    let recorded = transport.current_schema();
+    transport.close().await.expect("close");
+
+    let _ = admin
+        .execute_update(format!("DROP SCHEMA {schema} CASCADE"))
+        .await;
+    admin.close().await.expect("admin close");
+
+    assert_eq!(after_login, None, "a fresh session has no current schema");
+    set.expect("an existing schema must be accepted");
+    assert_eq!(recorded, Some(schema));
+}
+
+/// Scenario: Set the current schema attribute
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn native_set_current_schema_reports_a_rejected_schema() {
+    skip_if_no_exasol!();
+    let schema = generate_test_schema_name();
+    let missing = format!("{schema}_MISSING");
+    let mut admin = get_test_connection().await.expect("admin connection");
+    admin
+        .execute_update(format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+
+    let mut transport = authenticated_native_transport().await;
+    transport
+        .set_current_schema(&schema)
+        .await
+        .expect("an existing schema must be accepted");
+    let rejected = transport.set_current_schema(&missing).await;
+    let recorded = transport.current_schema();
+    let on_server = transport.refresh_current_schema().await;
+    transport.close().await.expect("close");
+
+    let _ = admin
+        .execute_update(format!("DROP SCHEMA {schema} CASCADE"))
+        .await;
+    admin.close().await.expect("admin close");
+
+    let error = rejected
+        .expect_err("a missing schema must be rejected")
+        .to_string();
+    assert!(error.contains(&missing), "got: {error}");
+    assert!(error.contains("not found"), "got: {error}");
+    assert_eq!(recorded, Some(schema.clone()));
+    assert_eq!(on_server.expect("get attributes"), Some(schema));
 }
 
 /// Verify that the default connection (no transport= param) uses the native transport.

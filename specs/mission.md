@@ -24,7 +24,7 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 6. **Metadata lookup** — ADBC catalog, schema, and column discovery through GetObjects, table schema lookup, and parameter schema lookup after prepare
 7. **Transaction control** — autocommit on or off, commit, and rollback on a Connection
 8. **ADBC bulk ingestion** — ingest Arrow data into a target table through the standard Statement with IngestMode Append, Create, CreateAppend, or Replace, generating table DDL from the Arrow schema
-9. **Authentication and session setup** — username and password login (RSA-encrypted password on the native protocol), no credential logging, and a best-effort default schema opened on connect from the URI or connection parameters
+9. **Authentication and session setup** — username and password login (RSA-encrypted password on the native protocol), no credential logging, and a default schema from the URI or connection parameters that must exist, set as a session attribute on connect
 10. **Query execution and server version gating** — SQL execution with placeholder parsing that skips literals, comments, and quoted identifiers, and feature gating on the server release version
 
 ## Out of Scope

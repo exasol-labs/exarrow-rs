@@ -53,6 +53,8 @@ pub struct PublicKeyResponse {
     pub response_data: Option<PublicKeyData>,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 /// Public key data returned by the server.
@@ -197,6 +199,8 @@ pub struct LoginResponse {
     pub response_data: Option<LoginResponseData>,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 /// Login response data.
@@ -283,6 +287,8 @@ pub struct ExecuteResponse {
     pub response_data: Option<ExecuteResponseData>,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 /// Execute response data.
@@ -508,6 +514,8 @@ pub struct FetchResponse {
     pub response_data: Option<FetchResponseData>,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 /// Fetch response data.
@@ -557,6 +565,8 @@ pub struct CloseResultSetResponse {
     pub status: String,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 // ============================================================================
@@ -630,6 +640,8 @@ pub struct CreatePreparedStatementResponse {
     pub response_data: Option<PreparedStatementResponseData>,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 /// Response data containing statement handle and metadata.
@@ -769,6 +781,8 @@ pub struct ClosePreparedStatementResponse {
     pub status: String,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 // ============================================================================
@@ -806,6 +820,8 @@ pub struct DisconnectResponse {
     pub status: String,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
 
 /// Set attributes request (e.g., to toggle autocommit mid-session).
@@ -840,6 +856,16 @@ impl SetAttributesRequest {
         attributes.insert("queryTimeout".to_string(), serde_json::Value::from(seconds));
         Self::new(attributes)
     }
+
+    /// Create a request to set the session's current schema.
+    ///
+    /// The name is sent as given, without quoting: the server resolves it by
+    /// exact name first and by its upper-case form second.
+    pub fn current_schema(schema: &str) -> Self {
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert("currentSchema".to_string(), serde_json::Value::from(schema));
+        Self::new(attributes)
+    }
 }
 
 /// Set attributes response.
@@ -850,7 +876,90 @@ pub struct SetAttributesResponse {
     pub status: String,
     /// Exception information if failed
     pub exception: Option<ExceptionInfo>,
+    /// Session attributes the server reports with this response
+    pub attributes: Option<ResponseAttributes>,
 }
+
+/// Request for every session attribute.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAttributesRequest {
+    /// Command name (always "getAttributes")
+    pub command: String,
+}
+
+impl GetAttributesRequest {
+    /// Create a new get attributes request.
+    pub fn new() -> Self {
+        Self {
+            command: "getAttributes".to_string(),
+        }
+    }
+}
+
+impl Default for GetAttributesRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Response to `getAttributes`, which reports every session attribute.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAttributesResponse {
+    /// Status of the response
+    pub status: String,
+    /// Exception information if failed
+    pub exception: Option<ExceptionInfo>,
+    /// The session attributes
+    pub attributes: Option<ResponseAttributes>,
+}
+
+/// The session attributes the driver reads from a response's top-level
+/// `attributes` object.
+///
+/// Only `currentSchema` is declared. The object mixes value types (for example
+/// `autocommit: true`, `queryTimeout: 0`), and serde skips undeclared members,
+/// so a string map would reject it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseAttributes {
+    /// The session's current schema, empty when no schema is open; absent when
+    /// the response does not report it
+    pub current_schema: Option<String>,
+}
+
+/// A response that may carry a top-level `attributes` object.
+///
+/// The WebSocket transport reads every response through this trait, so it can
+/// track the session attributes the server reports with any command.
+pub trait AttributedResponse {
+    /// The response's top-level `attributes` object, if the server sent one.
+    fn attributes(&self) -> Option<&ResponseAttributes>;
+}
+
+macro_rules! impl_attributed_response {
+    ($($response:ty),+ $(,)?) => {
+        $(impl AttributedResponse for $response {
+            fn attributes(&self) -> Option<&ResponseAttributes> {
+                self.attributes.as_ref()
+            }
+        })+
+    };
+}
+
+impl_attributed_response!(
+    PublicKeyResponse,
+    LoginResponse,
+    DisconnectResponse,
+    ExecuteResponse,
+    FetchResponse,
+    CloseResultSetResponse,
+    CreatePreparedStatementResponse,
+    ClosePreparedStatementResponse,
+    SetAttributesResponse,
+    GetAttributesResponse,
+);
 
 // ============================================================================
 // Common Types
@@ -1795,6 +1904,76 @@ mod tests {
         let json = serde_json::to_string(&disabled).unwrap();
         assert!(json.contains("\"command\":\"setAttributes\""));
         assert!(json.contains("\"autocommit\":false"));
+    }
+
+    #[test]
+    fn test_set_attributes_request_current_schema_sends_the_name_as_given() {
+        let request = SetAttributesRequest::current_schema("zz-hyphen");
+
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "command": "setAttributes",
+                "attributes": {"currentSchema": "zz-hyphen"}
+            })
+        );
+    }
+
+    #[test]
+    fn test_get_attributes_request_serialization() {
+        assert_eq!(
+            serde_json::to_value(GetAttributesRequest::new()).unwrap(),
+            serde_json::json!({"command": "getAttributes"})
+        );
+    }
+
+    #[test]
+    fn test_get_attributes_response_reads_the_current_schema_among_mixed_value_types() {
+        let response: GetAttributesResponse = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "attributes": {
+                "autocommit": true,
+                "queryTimeout": 0,
+                "currentSchema": "SYS",
+                "snapshotTransactionsEnabled": false
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response
+                .attributes()
+                .and_then(|attributes| attributes.current_schema.as_deref()),
+            Some("SYS")
+        );
+    }
+
+    #[test]
+    fn test_response_without_top_level_attributes_reports_none() {
+        let response: SetAttributesResponse =
+            serde_json::from_value(serde_json::json!({"status": "ok"})).unwrap();
+
+        assert!(response.attributes().is_none());
+    }
+
+    #[test]
+    fn test_execute_response_reads_top_level_attributes_apart_from_response_data() {
+        let response: ExecuteResponse = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "responseData": {
+                "numResults": 1,
+                "results": [{"resultType": "rowCount", "rowCount": 0}]
+            },
+            "attributes": {"currentSchema": ""}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response
+                .attributes()
+                .and_then(|attributes| attributes.current_schema.as_deref()),
+            Some("")
+        );
     }
 
     // ========================================================================

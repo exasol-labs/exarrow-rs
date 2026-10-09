@@ -330,6 +330,45 @@ pub trait TransportProtocol: Send + Sync {
     ///
     /// Returns `TransportError` if the operation fails.
     async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError>;
+
+    /// Set the session's current schema with the protocol's set-attributes
+    /// command, then record the schema the server opened through
+    /// [`refresh_current_schema`](Self::refresh_current_schema).
+    ///
+    /// The name travels as a plain attribute value, never as an `OPEN SCHEMA`
+    /// statement, so the server resolves it by exact name first and by its
+    /// upper-case form second. The set-attributes response does not echo the
+    /// schema, which is why the get-attributes request follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` with the server's message when the server
+    /// rejects the schema. The rejection returns before the get-attributes
+    /// request, so the recorded current schema stays unchanged.
+    async fn set_current_schema(&mut self, schema: &str) -> Result<(), TransportError>;
+
+    /// Ask the server for the session's current schema with one get-attributes
+    /// request, record the answer, and return it.
+    ///
+    /// Returns `None` when the session has no current schema. Unlike
+    /// [`current_schema`](Self::current_schema), this also sees a change that
+    /// no response of this session reported, such as another session dropping
+    /// the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if the request fails.
+    async fn refresh_current_schema(&mut self) -> Result<Option<String>, TransportError>;
+
+    /// The session's current schema as the server last reported it, read
+    /// without a server request; `None` means no current schema.
+    ///
+    /// The transport is the single owner of this value because it is the only
+    /// module that sees every response: it records the current schema from
+    /// each response that carries the attribute, including the responses to
+    /// `OPEN SCHEMA`, `CREATE SCHEMA`, `CLOSE SCHEMA`, and `DROP SCHEMA` run as
+    /// SQL, and from every get-attributes response.
+    fn current_schema(&self) -> Option<String>;
 }
 
 /// Result of a query execution.

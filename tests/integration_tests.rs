@@ -71,6 +71,8 @@
 
 // Declare the common module for shared test utilities
 mod common;
+#[path = "common/schema_activation.rs"]
+mod schema_activation;
 
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
@@ -486,22 +488,18 @@ async fn test_create_schema() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Best-effort URI-schema regression (live behavior).
+/// A schema named in the connection parameters must exist: connecting with a
+/// missing one through the builder fails with an error that names the schema.
 ///
-/// Connecting with a URI schema that does NOT yet exist must succeed: the
-/// "schema ... not found" failure from the implicit `OPEN SCHEMA` is swallowed
-/// and the connection stays open with no active schema. Tools such as dbt rely
-/// on this so they can create their target schema after connecting.
-///
-/// Documents the live behavior against a real Exasol.
+/// Scenario: Schema activation failure surfaces during connect
+/// Scenario: Session attributes
 #[tokio::test]
-async fn test_connect_with_nonexistent_uri_schema_succeeds() {
+async fn test_connect_with_missing_uri_schema_fails() {
     skip_if_no_exasol!();
 
     let schema_name = generate_test_schema_name();
 
-    // Connect requesting a default schema that does not exist yet.
-    let conn = Connection::builder()
+    let result = Connection::builder()
         .host(&get_host())
         .port(get_port())
         .username(&get_user())
@@ -511,19 +509,12 @@ async fn test_connect_with_nonexistent_uri_schema_succeeds() {
         .connect()
         .await;
 
-    assert!(
-        conn.is_ok(),
-        "Connecting with a non-existent URI schema should succeed (best-effort default), got: {:?}",
-        conn.err()
-    );
-
-    let conn = conn.unwrap();
-    assert!(
-        !conn.is_closed().await,
-        "Connection should stay open even though the URI schema does not exist"
-    );
-
-    conn.close().await.expect("Failed to close connection");
+    let error = match result {
+        Ok(_) => panic!("a missing schema must fail the connect"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains(&schema_name), "got: {error}");
+    assert!(error.contains("not found"), "got: {error}");
 }
 
 /// 4.2 Test CREATE TABLE with various column types
@@ -1042,6 +1033,62 @@ async fn test_transaction_begin() {
     // Rollback to clean up (don't leave open transaction)
     conn.rollback().await.expect("ROLLBACK should succeed");
 
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: A failed statement leaves the session usable
+#[tokio::test]
+async fn test_failed_statement_leaves_the_session_usable() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let failure = conn
+        .query("SELECT * FROM ZZ_NO_SUCH_SCHEMA.ZZ_NO_SUCH_TABLE")
+        .await;
+    assert!(failure.is_err(), "selecting a missing table must fail");
+
+    let batches = conn
+        .query("SELECT 1")
+        .await
+        .expect("the next statement must execute after a failed one");
+    assert!(!batches.is_empty(), "SELECT 1 should return a batch");
+
+    conn.begin_transaction()
+        .await
+        .expect("begin_transaction must succeed after a failed statement");
+    assert!(conn.in_transaction());
+
+    conn.rollback().await.expect("ROLLBACK should succeed");
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: A failed statement inside a transaction keeps the transaction
+#[tokio::test]
+async fn test_failed_statement_inside_a_transaction_keeps_the_transaction() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    conn.begin_transaction()
+        .await
+        .expect("BEGIN should succeed");
+
+    let failure = conn
+        .query("SELECT * FROM ZZ_NO_SUCH_SCHEMA.ZZ_NO_SUCH_TABLE")
+        .await;
+    assert!(failure.is_err(), "selecting a missing table must fail");
+    assert!(
+        conn.in_transaction(),
+        "a failed statement must not end the transaction"
+    );
+
+    conn.rollback().await.expect("ROLLBACK should succeed");
+    assert!(!conn.in_transaction());
+
+    conn.begin_transaction()
+        .await
+        .expect("a new transaction must start once the first one ended");
+    conn.rollback().await.expect("ROLLBACK should succeed");
     conn.close().await.expect("Failed to close connection");
 }
 
@@ -2475,128 +2522,53 @@ async fn test_connect_with_certificate_fingerprint() {
     conn.close().await.expect("Failed to close connection");
 }
 
-// Auto-OPEN-SCHEMA on connect (Task 1: change-integrator-experience)
+// Schema activation
 //
-// `Database::connect()` MUST issue `OPEN SCHEMA <name>` server-side when the
-// connection URI carries a schema. Without this, unqualified queries fail
-// even though `current_schema()` reports the URI schema. These two tests
-// pin both the happy path and the cleanup-on-failure invariant.
+// A schema from the connection URI or `ConnectionParams` becomes the session's
+// current schema through the protocol's set-attributes command right after the
+// login, and `current_schema()` reports the name the server opened. The checks
+// live in `schema_activation`, shared with the WebSocket suite.
 
-/// Connecting with a URI that names a schema activates that schema server-side
-/// without the caller having to invoke `set_schema()` explicitly.
+/// Connecting with a URI that names a schema sets it as the session's current
+/// schema with the set-attributes command, so unqualified queries resolve
+/// against it without the caller invoking `set_schema()`.
+///
+/// Scenario: Schema in connection params is opened on connect
+/// Scenario: Session attributes
 #[tokio::test]
 async fn test_uri_schema_is_opened_on_connect() {
     skip_if_no_exasol!();
-
-    // Arrange: create a schema and a table inside it via an admin connection.
-    let mut admin = get_test_connection()
-        .await
-        .expect("admin connection should succeed");
-    let schema_name = generate_test_schema_name();
-    admin
-        .execute_update(&format!("CREATE SCHEMA {}", schema_name))
-        .await
-        .expect("CREATE SCHEMA should succeed");
-    admin
-        .execute_update(&format!(
-            "CREATE TABLE {}.auto_open_probe (id INTEGER, label VARCHAR(16))",
-            schema_name
-        ))
-        .await
-        .expect("CREATE TABLE should succeed");
-    admin
-        .execute_update(&format!(
-            "INSERT INTO {}.auto_open_probe VALUES (1, 'one'), (2, 'two')",
-            schema_name
-        ))
-        .await
-        .expect("INSERT should succeed");
-
-    // Act: open a fresh connection whose URI carries the schema; do NOT call
-    // `set_schema()` — the auto-OPEN-SCHEMA behavior under test must do it.
-    let driver = exarrow_rs::adbc::Driver::new();
-    let conn_str_with_schema = format!(
-        "exasol://{}:{}@{}:{}/{}?tls=true&validateservercertificate=0",
-        common::get_user(),
-        common::get_password(),
-        common::get_host(),
-        common::get_port(),
-        schema_name,
-    );
-    let database = driver
-        .open(&conn_str_with_schema)
-        .expect("URI parse with schema should succeed");
-
-    let mut conn = database
-        .connect()
-        .await
-        .expect("connect with URI schema should succeed");
-
-    let cached_schema = conn.current_schema().await;
-    let unqualified_result = conn
-        .query("SELECT id FROM auto_open_probe ORDER BY id")
-        .await;
-    let close_result = conn.close().await;
-
-    // Drop the schema before asserting so a failed assertion does not leak
-    // server-side state across test runs.
-    cleanup_schema(&mut admin, &schema_name).await;
-    admin.close().await.expect("admin close should succeed");
-
-    assert_eq!(
-        cached_schema,
-        Some(schema_name.clone()),
-        "current_schema() should reflect URI schema after auto-OPEN-SCHEMA"
-    );
-
-    let batches =
-        unqualified_result.expect("unqualified SELECT should succeed when schema is auto-opened");
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2, "should see two inserted rows");
-
-    close_result.expect("close should succeed");
+    schema_activation::check_uri_schema_is_opened_on_connect("native").await;
 }
 
-/// Connecting with a URI that names a schema which does NOT exist must SUCCEED:
-/// per ADR-006 the implicit `OPEN SCHEMA` "schema ... not found" failure is
-/// swallowed and the session stays open with no active schema. This exercises
-/// the ADBC URI path (the one dbt uses); the builder path is covered by
-/// `test_connect_with_nonexistent_uri_schema_succeeds`.
+/// The ADBC URI path, which dbt uses, fails the connect for a missing schema.
+///
+/// Scenario: Schema activation failure surfaces during connect
 #[tokio::test]
-async fn test_uri_schema_missing_is_best_effort_via_adbc() {
+async fn test_uri_schema_missing_fails_via_adbc() {
     skip_if_no_exasol!();
+    schema_activation::check_missing_uri_schema_fails_the_connect("native").await;
+}
 
-    let driver = exarrow_rs::adbc::Driver::new();
-    let bogus_schema = "SCHEMA_THAT_DOES_NOT_EXIST_XYZ_AUTOOPEN";
-    let conn_str = format!(
-        "exasol://{}:{}@{}:{}/{}?tls=true&validateservercertificate=0",
-        common::get_user(),
-        common::get_password(),
-        common::get_host(),
-        common::get_port(),
-        bogus_schema,
-    );
-    let database = driver
-        .open(&conn_str)
-        .expect("URI parse with schema should succeed");
+/// Scenario: URI schema name follows the server's case rule
+#[tokio::test]
+async fn test_uri_schema_name_follows_the_server_case_rule() {
+    skip_if_no_exasol!();
+    schema_activation::check_uri_schema_case_rule("native").await;
+}
 
-    let conn = database.connect().await;
+/// Scenario: Set the current schema at runtime
+#[tokio::test]
+async fn test_set_schema_sets_the_server_current_schema() {
+    skip_if_no_exasol!();
+    schema_activation::check_set_schema("native").await;
+}
 
-    assert!(
-        conn.is_ok(),
-        "connect() with a non-existent URI schema must succeed (best-effort default, ADR-006), got: {:?}",
-        conn.err()
-    );
-    let conn = conn.unwrap();
-
-    // The missing schema was swallowed, so no schema is active.
-    assert_eq!(
-        conn.current_schema().await,
-        None,
-        "a swallowed missing URI schema must leave the session with no active schema"
-    );
-
-    conn.close().await.expect("close should succeed");
+/// Scenario: Current schema follows schema changes made in SQL
+#[tokio::test]
+async fn test_current_schema_follows_schema_changes_in_sql() {
+    skip_if_no_exasol!();
+    schema_activation::check_current_schema_follows_sql("native").await;
 }
 
 // Section 10: Placeholder scanning and IN-clause integration tests
