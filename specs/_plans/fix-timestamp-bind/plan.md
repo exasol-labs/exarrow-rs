@@ -6,22 +6,27 @@ Make a prepared statement with a bound TIMESTAMP parameter work over the native 
 
 ## Context
 
-- Reproduced on `main` (b7897d1, 0.20.1) against `exasol/docker-db:latest` through the driver manager with `CREATE TABLE T (C TIMESTAMP)`, `INSERT INTO T VALUES (?)`, one bound `TimestampMicrosecondArray` `[1_704_096_000_000_000]`, and `execute_update`. Over the native transport the call fails with `Query execution failed: Failed to receive message: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof`.
-- The same native failure occurs for every Timestamp unit (Second, Millisecond, Microsecond, Nanosecond), with no time zone, `UTC`, or `Europe/Berlin`, for `TIMESTAMP`, `TIMESTAMP(0)`, `TIMESTAMP(3)`, `TIMESTAMP(6)`, `TIMESTAMP(9)`, and `TIMESTAMP WITH LOCAL TIME ZONE` columns, for a Utf8 value bound to a TIMESTAMP column, and through Python `adbc_driver_manager.dbapi` with a `datetime` parameter. A Date32 value bound to a DATE column succeeds.
-- Over the WebSocket transport every bound Arrow Timestamp case above succeeds and reads back unchanged.
-- Root cause: `parse_column_meta` (`src/transport/native/result_parser.rs`) reads a 4-byte precision after the type ID of a TIMESTAMP column description (protocol version 19 and later), but `write_column_metadata` (`src/transport/native/mod.rs`) writes no metadata for a TIMESTAMP parameter column. Exasol then reads the row data at the wrong offset and closes the connection.
-- A temporary patch that writes a 4-byte precision for the three TIMESTAMP wire types made every native case above succeed. Precision 3 and precision 9 stored identical values in `TIMESTAMP(0)`, `TIMESTAMP(3)`, `TIMESTAMP(6)`, and `TIMESTAMP(9)` columns. Exasol reports precisions 0, 3, 6, and 9 in the parameter description, and describes a `TIMESTAMP WITH LOCAL TIME ZONE` parameter as wire type 21.
-- `arrow_value_to_parameter` (`src/adbc_ffi.rs`) formats every Timestamp unit as `YYYY-MM-DD HH:MM:SS.ffffff` in UTC, with a space separator, and floors nanoseconds to microseconds. It has used a space separator since v0.7.0, including 0.12.0, the version in #38. The WebSocket transport reproduces the #38 error text only for a caller-supplied Utf8 value: `[22018] invalid character value for cast, SPACE expected; Value: '2024-01-01T08:00:00' Format: 'YYYY-MM-DD HH24:MI:SS.FF6'`.
-- With the precision field in place, the native encoder's text parsing becomes reachable for TIMESTAMP values. It stores `2000-01-01 00:00:00` for the text `garbage` and `2024-01-01 00:00:00` for `2024-1-1 8:0:0`, while the WebSocket transport rejects `garbage` and stores `2024-01-01 08:00:00` for `2024-1-1 8:0:0`. On `main` the native encoder already stores `2000-01-01` for the DATE text `2024/01/02`.
-- Over the WebSocket transport, Exasol's text cast gave these results for prepared inserts into `TIMESTAMP(6)` and `DATE` columns on `exasol-test` (`exasol/docker-db:latest`, session time zone `EUROPE/BERLIN`):
+- Reproduction on `main` (b7897d1, 0.20.1, `exasol/docker-db:latest`, native transport, driver manager): `CREATE TABLE T (C TIMESTAMP)`, `INSERT INTO T VALUES (?)`, one bound `TimestampMicrosecondArray` `[1_704_096_000_000_000]`, and `execute_update` fail with `Query execution failed: Failed to receive message: peer closed connection without sending TLS close_notify: ...`.
+- The same native failure occurs for every Timestamp unit and time zone, every TIMESTAMP precision, `TIMESTAMP WITH LOCAL TIME ZONE`, a Utf8 value bound to a TIMESTAMP column, and a Python `datetime` parameter through `adbc_driver_manager.dbapi`.
+- A Date32 value bound to a DATE column succeeds over the native transport.
+- Over the WebSocket transport, every bound Arrow Timestamp case above succeeds and reads back unchanged.
+- Root cause: `parse_column_meta` (`src/transport/native/result_parser.rs`) reads a 4-byte precision after the type ID of a TIMESTAMP column description (protocol version 19 and later), but `write_column_metadata` (`src/transport/native/mod.rs`) writes none for a TIMESTAMP parameter column, so Exasol reads the row data at the wrong offset and closes the connection.
+- A temporary patch that writes the precision field made every native case above succeed.
+- Over the native protocol, Exasol describes both `TIMESTAMP` and `TIMESTAMP WITH LOCAL TIME ZONE` parameters as wire type 21.
+- `arrow_value_to_parameter` (`src/adbc_ffi.rs`) formats every Timestamp unit as `YYYY-MM-DD HH:MM:SS.ffffff` in UTC with nanoseconds floored, and has used a space separator since v0.7.0.
+- Over the WebSocket transport, only caller-supplied Utf8 text reproduces the #38 error: `[22018] invalid character value for cast, SPACE expected; Value: '2024-01-01T08:00:00' Format: 'YYYY-MM-DD HH24:MI:SS.FF6'`.
+- With the precision field in place, the native TIMESTAMP text parser stores `2000-01-01 00:00:00` for `garbage` and `2024-01-01 00:00:00` for `2024-1-1 8:0:0`.
+- On `main`, the native DATE text parser stores `2000-01-01` for `2024/01/02`.
+- Exasol's text cast over the WebSocket transport gave these results for prepared inserts into `TIMESTAMP(6)` and `DATE` columns on `exasol-test` (session time zone `EUROPE/BERLIN`):
+  - It rejects `garbage` and stores `2024-01-01 08:00:00` for `2024-1-1 8:0:0`.
   - Empty text stores NULL. Text of only spaces fails with SQL state 22018.
-  - Leading and trailing spaces are ignored, and so are extra spaces between the date and the time. A tab fails with SQL state 22018.
+  - Leading spaces, trailing spaces, and extra spaces between the date and the time are ignored. A tab fails with SQL state 22018.
   - `2024-01-01 08` and `2024-01-01 08:00:00.` both store `2024-01-01 08:00:00`.
-  - A DATE column stores only the date of date-and-time text such as `2024-01-02 08:30`. It rejects an hour above 23 and a minute or second above 60 with SQL state 22018, and it accepts minute 60 and second 60.
-  - The cast also accepts forms outside the native grammar of `decision-log.md` entry [3], such as the trailing colon in `2024-01-01 08:00:`.
-- Exasol validates the field values of a binary DATE or TIMESTAMP: month 13 and February 30 fail with SQL state 22008, hour 25 fails with SQL state 22009, and the connection stays open.
-- CI builds the driver manager cdylib with `--features ffi` only, so `tests/driver_manager_tests.rs` reaches only the native transport. `tests/integration_tests.rs` runs under `cargo llvm-cov` with the `ffi` feature, where the FFI runtime deadlocks, and `tests/websocket_integration_tests.rs` runs with `--features 'ffi websocket'` outside coverage.
-- The plan changes no architecture. See `decision-log.md` entry [9].
+  - A DATE column stores only the date of `2024-01-02 08:30`. It accepts minute 60 and second 60, and rejects an hour above 23 and a minute or second above 60 with SQL state 22018.
+  - It accepts a trailing colon, as in `2024-01-01 08:00:`.
+- Exasol rejects out-of-range fields of a binary DATE or TIMESTAMP value with SQL state 22008 (month 13, February 30) or 22009 (hour 25), and keeps the connection open.
+- CI builds the driver manager cdylib with `--features ffi` only, so `tests/driver_manager_tests.rs` reaches only the native transport.
+- No architecture delta: the change stays inside the native transport's parameter encoding.
 
 ## Features
 
