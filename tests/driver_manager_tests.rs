@@ -2891,6 +2891,66 @@ fn test_bind_unconvertible_value_stores_no_row() {
     drop_test_schema(&mut conn, &schema_name);
 }
 
+/// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
+///
+/// Compares date and time values, not instants: Exasol reads a value bound to a
+/// `TIMESTAMP WITH LOCAL TIME ZONE` column in the session time zone.
+#[test]
+fn test_bind_arrow_temporal_values_round_trip() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    setup_driver_manager_conn!(_driver, _db, conn);
+    let schema_name = generate_unique_test_name("TEST_BIND_TEMPORAL");
+    let mut stmt = prepare_insert(&mut conn, &schema_name, "TS TIMESTAMP(6), D DATE");
+    // 2024-01-01 08:00:00.123456 and 1969-12-31 23:59:59.000001; 2024-01-02 and 1969-12-31.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("d", DataType::Date32, false),
+        ])),
+        vec![
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                1_704_096_000_123_456,
+                -999_999,
+            ])),
+            Arc::new(arrow::array::Date32Array::from(vec![19_724, -1])),
+        ],
+    )
+    .unwrap();
+
+    stmt.bind(batch).unwrap();
+    assert_eq!(stmt.execute_update().expect("bound insert"), Some(2));
+
+    let mut read = conn.new_statement().unwrap();
+    read.set_sql_query(format!(
+        "SELECT TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6') || ' ' || TO_CHAR(D) FROM {schema_name}.T ORDER BY D"
+    ))
+    .unwrap();
+    let mut rows = Vec::new();
+    for batch in read.execute().unwrap() {
+        rows.extend(strings_in(batch.unwrap().column(0).as_ref()));
+    }
+    assert_eq!(
+        rows,
+        vec![
+            "1969-12-31 23:59:59.000001 1969-12-31",
+            "2024-01-01 08:00:00.123456 2024-01-02"
+        ]
+    );
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![2]
+    );
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
 /// Scenario: A zero-row bound batch runs no execution
 #[test]
 fn test_bind_zero_row_batch_runs_no_execution() {

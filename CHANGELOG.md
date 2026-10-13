@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.1
+
+- Fix: over the native protocol, a prepared statement with a bound TIMESTAMP parameter no longer breaks the connection. This covers a bound Arrow Timestamp column, a Python `datetime` parameter, and TIMESTAMP text. TIMESTAMP text outside the form `YYYY-MM-DD[ HH[:MI[:SS[.FFFFFFFFF]]]]` fails before execution. ISO 8601 text with a `T` separator bound to a TIMESTAMP parameter still fails on both transports, and a bound Arrow Timestamp column never produces such text. Fixes #38.
+- Fix: over the native protocol, DATE parameter text outside the accepted form fails before execution instead of storing `2000-01-01` or a partly wrong date. Empty text stores NULL, and date-and-time text stores its date.
+
 ## 0.21.0
 
 - Breaking: a schema in the connection URI or in `ConnectionParams` must exist. When the server rejects it, `connect()` closes the session and fails with `ConnectionError::ConnectionFailed`, whose message names the schema and contains the server's message. Before, a missing schema connected with no current schema and no warning. A dbt run whose target schema does not exist yet fails at connect until the dbt Exasol adapter connects without the schema and runs `CREATE SCHEMA IF NOT EXISTS`.
