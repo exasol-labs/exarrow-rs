@@ -2,7 +2,12 @@
 
 ## Summary
 
-Make a prepared statement with a bound TIMESTAMP parameter work over the native protocol by writing the fractional-seconds precision field that Exasol expects in a TIMESTAMP parameter column header, and make the native encoder reject DATE and TIMESTAMP text it cannot read instead of storing a substitute value. Integration tests pin the behavior on both transports, and the fix for #38 ships as 0.20.2.
+This plan makes two fixes to native DATE and TIMESTAMP parameter binding. Each fix has its own CHANGELOG `Fix:` entry, so the PR reviewer can accept or remove the second fix on its own.
+
+1. TIMESTAMP (#38): a prepared statement with a bound TIMESTAMP parameter works over the native protocol, because the encoder writes the fractional-seconds precision field that Exasol expects in a TIMESTAMP parameter column header. TIMESTAMP text that the encoder cannot read fails before execution instead of storing a substitute value.
+2. DATE: DATE parameter text that the native encoder cannot read fails before execution instead of storing `2000-01-01` or a partly wrong date. This defect exists on `main` and is not part of #38. Removing this fix means keeping `parse_date_to_packed` as on `main` and dropping the DATE text cases from the deltas and from tasks 1.2, 1.4, 1.6, 1.7, and 2.3.
+
+Integration tests pin the behavior on both transports. The release is 0.20.2, or 0.21.1 if PR #91 merges first (see Dependencies).
 
 ## Context
 
@@ -13,7 +18,8 @@ Make a prepared statement with a bound TIMESTAMP parameter work over the native 
 - Root cause: `parse_column_meta` (`src/transport/native/result_parser.rs`) reads a 4-byte precision after the type ID of a TIMESTAMP column description (protocol version 19 and later), but `write_column_metadata` (`src/transport/native/mod.rs`) writes none for a TIMESTAMP parameter column, so Exasol reads the row data at the wrong offset and closes the connection.
 - A temporary patch that writes the precision field made every native case above succeed.
 - Over the native protocol, Exasol describes both `TIMESTAMP` and `TIMESTAMP WITH LOCAL TIME ZONE` parameters as wire type 21.
-- `arrow_value_to_parameter` (`src/adbc_ffi.rs`) formats every Timestamp unit as `YYYY-MM-DD HH:MM:SS.ffffff` in UTC with nanoseconds floored, and has used a space separator since v0.7.0.
+- `arrow_value_to_parameter` (`src/adbc_ffi.rs`) builds Date32 and Timestamp parameter text with `format_date32` and `format_timestamp` from `src/types/conversion.rs`.
+- `arrow_value_to_parameter` formats every Timestamp unit as `YYYY-MM-DD HH:MM:SS.ffffff` in UTC with nanoseconds floored, and has used a space separator since v0.7.0.
 - Over the WebSocket transport, only caller-supplied Utf8 text reproduces the #38 error: `[22018] invalid character value for cast, SPACE expected; Value: '2024-01-01T08:00:00' Format: 'YYYY-MM-DD HH24:MI:SS.FF6'`.
 - With the precision field in place, the native TIMESTAMP text parser stores `2000-01-01 00:00:00` for `garbage` and `2024-01-01 00:00:00` for `2024-1-1 8:0:0`.
 - On `main`, the native DATE text parser stores `2000-01-01` for `2024/01/02`.
@@ -45,25 +51,37 @@ Make a prepared statement with a bound TIMESTAMP parameter work over the native 
   - `2024-01-01T08:00:00`, `2024/01/02`, `garbage`, and text of only spaces fail on both transports.
   - Divergence: the accepted forms are a subset of the text that Exasol's cast accepts over the WebSocket transport. Some forms, such as the trailing colon in `2024-01-01 08:00:`, fail only over the native transport.
 - No change to the WebSocket transport, the FFI Arrow-to-parameter conversion, time zone handling, or the batch splitting of #90.
-- No breaking API change. Release 0.20.2.
+- No breaking API change. Release 0.20.2, or 0.21.1 if PR #91 merges first.
 
 ## Dependencies
 
-- Draft PR #91 (plan fix-session-schema) touches `src/adbc/connection.rs` and session state. This plan changes neither. If #91 merges first with its own version bump, this plan's version and changelog header move to the next patch version.
+- PR #91 (plan fix-session-schema, branch `plan/fix-session-schema`) sets the version to 0.21.0.
+- Both PRs edit `src/transport/native/mod.rs`, `src/transport/native/constants.rs`, `tests/integration_tests.rs`, `tests/websocket_integration_tests.rs`, `tests/driver_manager_tests.rs`, `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+- In `src/transport/native/mod.rs`, PR #91 changes none of the functions that this plan changes. Both PRs change the `use self::constants::{...}` import list and add unit tests to `mod tests`.
+- If PR #91 merges first, rebase this branch onto `main`, set `version = "0.21.1"`, and put this plan's CHANGELOG section `## 0.21.1` above `## 0.21.0`. If this PR merges first, it releases 0.20.2.
 
 ## Implementation Tasks
 
 1. Temporal parameter binding (group A)
-   - [ ] 1.1 Add failing unit tests in `src/transport/native/mod.rs` for the TIMESTAMP header: a `build_execute_prepared_payload` payload for a parameter described as `TIMESTAMP` (wire type 21) or `TIMESTAMP WITH LOCAL TIME ZONE` (wire type 125) carries the type ID followed by the literal bytes of precision 9 and an 11-byte value; `write_column_metadata` writes the same precision for wire type 124, which no parameter description maps to today; and `split_parameter_rows` plus `build_range_payload` repeat that header in every range.
-   - [ ] 1.2 Add failing unit tests in `src/transport/native/mod.rs` for temporal values:
-     - The accepted forms encode field by field: `2024-03-09 14:25:36.123456`, `2024-1-1 8:0:0`, `2024-03-09` as midnight, `2024-03-09 14` as 14:00:00, `2024-03-09 14:25`, `2024-03-09 14:25:36.` with 0 fraction digits, 1 and 9 fraction digits, `2024-03-09 14:25` with one leading and one trailing space, `2024-03-09   14:25` with three spaces before the time, and `1500-02-29` kept as written.
-     - Empty text in a `T_DATE` column and in a timestamp column is written as the null marker 0 with no value bytes.
-     - A `T_DATE` value with a time part encodes only its date: `2024-01-02 08:30`, `2024-01-02 23:59:59`, and `2024-01-02 08:60:60` each encode 2024-01-02.
-     - Out-of-range fields are sent as written: `2024-13-01`, `2024-02-30`, and `2024-01-01 25:00:00` in a timestamp column.
-     - The rejected forms return an error whose message contains the value and the accepted form: `2024-01-01T08:00:00`, `2024/01/02`, `garbage`, text of only spaces, a tab before the date, the trailing colon in `2024-01-01 08:00:`, 10 fraction digits, a 5-digit year, `2024-01-02 24:00`, `2024-01-02 08:61`, and `2024-01-02 08:30:61` in a `T_DATE` column, a JSON number, and a JSON boolean.
-     - `build_execute_prepared_payload` and `split_parameter_rows` fail for a parameter set that contains a rejected value.
+   - [ ] 1.1 Add failing unit tests in `src/transport/native/mod.rs` for the TIMESTAMP parameter column header:
+     - `prepared_payload_writes_timestamp_precision_for_each_timestamp_wire_type`: a `build_execute_prepared_payload` payload for a parameter described as `TIMESTAMP` (wire type 21) and one for a parameter described as `TIMESTAMP WITH LOCAL TIME ZONE` (wire type 125) each carry the type ID, the literal bytes of precision 9, and an 11-byte value. `write_column_metadata` writes the same precision for wire type 124, which no parameter description maps to today.
+     - `prepared_payload_ranges_repeat_the_timestamp_precision`: `split_parameter_rows` plus `build_range_payload` repeat the type ID and precision 9 in the column header of every range.
+   - [ ] 1.2 Add failing unit tests for temporal values, one function per sub-bullet. A `T_DATE` case uses wire type 14, and a timestamp case uses wire type 21.
+     - `temporal_text_in_the_accepted_forms_encodes_field_by_field` in `src/transport/native/mod.rs`, checking the value bytes:
+       - Timestamp cases: `2024-03-09 14:25:36.123456`, `2024-1-1 8:0:0`, `2024-03-09` as midnight, `2024-03-09 14` as 14:00:00, `2024-03-09 14:25`, `2024-03-09 14:25:36.` with 0 fraction digits, 1 and 9 fraction digits, `2024-03-09 14:25` with one leading and one trailing space, `2024-03-09   14:25` with three spaces before the time, and `1500-02-29` kept as written.
+       - Empty text in a `T_DATE` column and in a timestamp column is written as the null marker 0 with no value bytes.
+       - `T_DATE` cases: `2024-03-09`, and `2024-01-02 08:30`, `2024-01-02 23:59:59`, and `2024-01-02 08:60:60`, which each encode only 2024-01-02.
+     - `out_of_range_temporal_fields_are_sent_as_written` in `src/transport/native/mod.rs`: `2024-13-01` and `2024-02-30` in a `T_DATE` column and in a timestamp column, and `2024-01-01 25:00:00` in a timestamp column, each encoded with the fields as written.
+     - `temporal_values_in_other_forms_are_rejected` in `src/transport/native/mod.rs`: each case returns `TransportError::SerializationError` whose message contains the value and the accepted form, `YYYY-MM-DD` for a `T_DATE` column and `YYYY-MM-DD HH:MI:SS.FFFFFFFFF` for a timestamp column.
+       - Timestamp cases: `2024-01-01T08:00:00`, `garbage`, text of only spaces, a tab before the date, the trailing colon in `2024-01-01 08:00:`, 10 fraction digits, a 5-digit year, and a JSON boolean.
+       - `T_DATE` cases: `2024/01/02`, `2024-01-02 24:00`, `2024-01-02 08:61`, `2024-01-02 08:30:61`, and a JSON number.
+     - `prepared_payload_with_a_rejected_temporal_value_fails` in `src/transport/native/mod.rs`: `build_execute_prepared_payload` and `split_parameter_rows` return that error for a parameter set whose second row holds `garbage` in a timestamp column.
+     - `formatter_output_parses_back_to_its_fields` in `src/types/conversion.rs`: `parse_date_text` reads the output of `format_date32` for 0001-01-01, 9999-12-31, and 1969-12-31, and `parse_timestamp_text` reads the output of `format_timestamp` with unit Microsecond for 0001-01-01 00:00:00, 9999-12-31 23:59:59.999999, and 1969-12-31 23:59:59.000001. Each result holds the fields of that date or timestamp, with nanoseconds 999999000 and 1000 for the two fractional values.
    - [ ] 1.3 In `write_column_metadata`, write a 4-byte little-endian precision of 9 for `T_TIMESTAMP`, `T_TIMESTAMP_LOCAL_TZ`, and `T_TIMESTAMP_UTC`, taken from a named constant in `src/transport/native/constants.rs` whose comment states that the encoder sends a nanosecond field.
-   - [ ] 1.4 Replace the bodies of `parse_date_to_packed` and `write_timestamp_bytes` with fallible field-by-field parsers for the grammar of the scenario "DATE and TIMESTAMP parameter text is encoded field by field". Both share one parser for the date and the optional time part, do no calendar conversion, and check ranges only for the time part of a `T_DATE` value. `write_param_value` writes the null marker 0 for empty text in a `T_DATE` or timestamp column, as it does for a JSON null, and returns `TransportError::SerializationError` for rejected text and for non-text `T_DATE` or timestamp values. Delete the unit tests `packed_dates_fall_back_field_by_field` and `unparsable_timestamp_fields_fall_back_to_their_defaults`, and adapt `timestamps_encode_their_fractional_seconds_as_nanoseconds` and `timestamps_without_a_time_part_default_to_midnight` to the fallible signature.
+   - [ ] 1.4 Parse DATE and TIMESTAMP text in `src/types/conversion.rs` and write the parsed fields in the native encoder:
+     - In `src/types/conversion.rs`, next to `format_date32` and `format_timestamp_micros`, add the fallible parsers `parse_date_text` and `parse_timestamp_text` for the grammar of the scenario "DATE and TIMESTAMP parameter text is encoded field by field". Both share one parser for the date and the optional time part and return the field values as written, with no calendar conversion. `parse_date_text` returns the date fields and checks the time bounds of a DATE value. A rejection message contains the text and the accepted form, `YYYY-MM-DD` or `YYYY-MM-DD HH:MI:SS.FFFFFFFFF`, held as two constants next to the parsers.
+     - In `src/transport/native/mod.rs`, replace `parse_date_to_packed` and `write_timestamp_bytes` with byte writers that take the parsed fields and keep the wire layout. `write_param_value` writes the null marker 0 for empty text in a `T_DATE` or timestamp column, as it does for a JSON null. For other text, it calls the parser for the column's wire type and writes the returned fields. It returns `TransportError::SerializationError` for rejected text, and for a non-text value with the matching accepted-form constant in the message.
+     - Delete the unit tests `packed_dates_fall_back_field_by_field` and `unparsable_timestamp_fields_fall_back_to_their_defaults`, and adapt `timestamps_encode_their_fractional_seconds_as_nanoseconds` and `timestamps_without_a_time_part_default_to_midnight` to the new encoder.
    - [ ] 1.5 Add a fixture to `tests/common/mod.rs` that builds the RecordBatch of the scenario "Bound Arrow Timestamp and Date32 values are stored on both transports", the matching `CREATE TABLE` column list, and the expected microsecond and day values per column, so that the native and WebSocket tests share one definition. Nanosecond values are whole microseconds (see `decision-log.md` entry [5]).
    - [ ] 1.6 Add `test_prepared_temporal_text_parameters` to `tests/integration_tests.rs` with the cases of the scenario "DATE and TIMESTAMP text parameters are stored or rejected on both transports", emptying the table before each case: the valid text round trip; `2024-01-01 08:00:00` with one leading and one trailing space bound to `TS` and `2024-01-02 08:30` bound to `D`, stored as `2024-01-01 08:00:00` and `2024-01-02`; empty text bound to `TS` and `D`, stored as NULL; then each rejected value fails, stores no row, and a later `SELECT` on the same connection succeeds.
    - [ ] 1.7 Add `test_ws_prepared_temporal_text_parameters` to `tests/websocket_integration_tests.rs` with the same cases and steps over `transport=websocket`.
@@ -71,15 +89,18 @@ Make a prepared statement with a bound TIMESTAMP parameter work over the native 
    - [ ] 1.9 Add `test_ws_ffi_bind_arrow_temporal_values_round_trip` to `tests/websocket_integration_tests.rs` under `#[cfg(feature = "ffi")]` as a plain `#[test]`: the same steps as 1.8 through an in-process `exarrow_rs::FfiDriver` with `transport=websocket` in the URI.
 2. Documentation and release (group B)
    - [ ] 2.1 In `docs/prepared-statements.md`, replace the `chrono::NaiveDate` and `chrono::NaiveDateTime` rows of "Supported Parameter Types", which name `From` conversions that do not exist, with rows for DATE and TIMESTAMP text in the accepted forms. In `docs/type-mapping.md`, add a parameter binding note: an Arrow Timestamp of any unit binds as its UTC date and time at microsecond precision with nanoseconds rounded down, and Date32 binds as DATE.
-   - [ ] 2.2 Set `version = "0.20.2"` in `Cargo.toml` and run `cargo build` so that `Cargo.lock` records it.
-   - [ ] 2.3 Add a `## 0.20.2` section to `CHANGELOG.md` above `## 0.20.1`, with a Fix entry for the native TIMESTAMP parameter failure that ends with `Fixes #38.` and a Changed entry for DATE and TIMESTAMP parameter text over the native transport: text outside the accepted forms fails before execution, and empty text stores NULL.
+   - [ ] 2.2 Set `version = "0.20.2"` in `Cargo.toml`, or `0.21.1` under the rule in Dependencies, and run `cargo build` so that `Cargo.lock` records it.
+   - [ ] 2.3 Add a `## 0.20.2` section to `CHANGELOG.md` above `## 0.20.1`, or the section that the rule in Dependencies names, with two entries:
+     - A `Fix:` entry for the native TIMESTAMP parameter failure, covering a bound Arrow Timestamp column, a Python `datetime` parameter, and TIMESTAMP text, and stating that TIMESTAMP text outside the accepted forms fails before execution. It contains the sentence "ISO 8601 text with a `T` separator bound to a TIMESTAMP parameter still fails on both transports, and a bound Arrow Timestamp column never produces such text." and ends with `Fixes #38.`
+     - A separate `Fix:` entry for DATE parameter text over the native transport: text outside the accepted forms fails before execution instead of storing `2000-01-01` or a partly wrong date, empty text stores NULL, and date-and-time text stores its date. It does not cite #38.
+   - [ ] 2.4 At implementation time, add the sentence of task 2.3 to the PR #92 description: "ISO 8601 text with a `T` separator bound to a TIMESTAMP parameter still fails on both transports, and a bound Arrow Timestamp column never produces such text."
 
 ## Parallelization
 
 | Group | Tasks | Depends on | Knowledge |
 |-------|-------|------------|-----------|
-| A: temporal parameter binding | 1.1-1.9 | none | spec deltas `native-client/prepared-statement-protocol`, `prepared-statements/parameter-binding`, `type-mapping/arrow-to-exasol`; `src/transport/native/mod.rs`, `src/transport/native/constants.rs`, `src/transport/native/result_parser.rs` (read only), `src/adbc_ffi.rs` (read only), `tests/common/mod.rs`, `tests/integration_tests.rs`, `tests/websocket_integration_tests.rs`, `tests/driver_manager_tests.rs` |
-| B: documentation and release | 2.1-2.3 | A (documents A's accepted forms) | `docs/prepared-statements.md`, `docs/type-mapping.md`, `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, `CONTRIBUTING.md` (Releasing) |
+| A: temporal parameter binding | 1.1-1.9 | none | spec deltas `native-client/prepared-statement-protocol`, `prepared-statements/parameter-binding`, `type-mapping/arrow-to-exasol`; `src/types/conversion.rs`, `src/transport/native/mod.rs`, `src/transport/native/constants.rs`, `src/transport/native/result_parser.rs` (read only), `src/adbc_ffi.rs` (read only), `tests/common/mod.rs`, `tests/integration_tests.rs`, `tests/websocket_integration_tests.rs`, `tests/driver_manager_tests.rs` |
+| B: documentation and release | 2.1-2.4 | A (documents A's accepted forms) | `docs/prepared-statements.md`, `docs/type-mapping.md`, `CHANGELOG.md`, `Cargo.toml`, `Cargo.lock`, `CONTRIBUTING.md` (Releasing), plan.md § Dependencies, PR #92 description |
 
 ## Dead Code Removal
 
@@ -87,7 +108,7 @@ Make a prepared statement with a bound TIMESTAMP parameter work over the native 
 |------|----------|--------|
 | Test | `src/transport/native/mod.rs` `packed_dates_fall_back_field_by_field` | Pins the default-value fallback that task 1.4 removes |
 | Test | `src/transport/native/mod.rs` `unparsable_timestamp_fields_fall_back_to_their_defaults` | Pins the default-value fallback that task 1.4 removes |
-| Function body | `src/transport/native/mod.rs` `parse_date_to_packed`, `write_timestamp_bytes` | Lenient fixed-offset parsing replaced by fallible field-by-field parsing |
+| Function | `src/transport/native/mod.rs` `parse_date_to_packed`, `write_timestamp_bytes` | Lenient fixed-offset parsing replaced by `parse_date_text` and `parse_timestamp_text` in `src/types/conversion.rs` and byte writers that take the parsed fields |
 | Docs rows | `docs/prepared-statements.md` "Supported Parameter Types" | `chrono::NaiveDate` and `chrono::NaiveDateTime` have no `From` conversion into `Parameter` |
 
 ## Verification
@@ -104,6 +125,7 @@ Make a prepared statement with a bound TIMESTAMP parameter work over the native 
 | DATE and TIMESTAMP parameter values in another form are rejected before execution | Integration | `tests/integration_tests.rs` | `test_prepared_temporal_text_parameters` |
 | DATE and TIMESTAMP text parameters are stored or rejected on both transports | Integration (native) | `tests/integration_tests.rs` | `test_prepared_temporal_text_parameters` |
 | DATE and TIMESTAMP text parameters are stored or rejected on both transports | Integration (WebSocket) | `tests/websocket_integration_tests.rs` | `test_ws_prepared_temporal_text_parameters` |
+| Bound Arrow Timestamp and Date32 values are stored on both transports | Unit (formatter output parses back to its fields) | `src/types/conversion.rs` | `formatter_output_parses_back_to_its_fields` |
 | Bound Arrow Timestamp and Date32 values are stored on both transports | Integration (native) | `tests/driver_manager_tests.rs` | `test_bind_arrow_temporal_values_round_trip` |
 | Bound Arrow Timestamp and Date32 values are stored on both transports | Integration (WebSocket) | `tests/websocket_integration_tests.rs` | `test_ws_ffi_bind_arrow_temporal_values_round_trip` |
 

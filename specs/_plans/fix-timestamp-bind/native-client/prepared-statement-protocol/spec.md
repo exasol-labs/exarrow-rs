@@ -41,7 +41,7 @@ A `CMD_CREATE_PREPARED` reply carries an `R_HANDLE` (2) part followed by zero or
 * *GIVEN* an authenticated native TCP session exists
 * *AND* a parameter set with a column encoded with wire type `T_DATE` (14), `T_TIMESTAMP` (21), `T_TIMESTAMP_LOCAL_TZ` (124), or `T_TIMESTAMP_UTC` (125) whose value the scenario "DATE and TIMESTAMP parameter text is encoded field by field" does not encode, such as `2024-01-01T08:00:00`, `2024/01/02`, `garbage`, text of only spaces, the trailing colon in `2024-01-01 08:00:`, a `T_DATE` value whose time part has an hour above 23 or a minute or second above 60, or a value that is not text
 * *WHEN* building the `CMD_EXECUTE_PREPARED` (11) payload
-* *THEN* the system SHALL return an error whose message contains the value and the accepted form
+* *THEN* the system SHALL return an error whose message contains the rejected value and the accepted form, `YYYY-MM-DD` for a `T_DATE` (14) column or `YYYY-MM-DD HH:MI:SS.FFFFFFFFF` for a `T_TIMESTAMP` (21), `T_TIMESTAMP_LOCAL_TZ` (124), or `T_TIMESTAMP_UTC` (125) column
 * *AND* the system MUST NOT substitute a default value, such as `2000-01-01`, for the rejected value
 * *AND* the system MUST NOT send a `CMD_EXECUTE_PREPARED` (11) request for that parameter set
 <!-- /DELTA:NEW -->

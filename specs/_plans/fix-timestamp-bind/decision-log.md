@@ -18,9 +18,9 @@
 
 ### [3] Reject DATE and TIMESTAMP text that the native encoder cannot read
 
-- **Decision:** The native encoder parses DATE and TIMESTAMP text field by field with the grammar of the scenario "DATE and TIMESTAMP parameter text is encoded field by field". It returns `TransportError::SerializationError` for any other text and for a non-text value, before any execution request. It checks syntax only, plus the time bounds of a `T_DATE` value. Exasol checks every other field range.
-- **Rationale:** The header fix makes the lenient TIMESTAMP parser reachable, so its substitute values would reach the database. The DATE parser has the same defect on `main`, and the brief asks to check DATE the same way, so one parser serves both. Each grammar rule reproduces a result of Exasol's text cast over the WebSocket transport on `exasol-test`. The driver checks the `T_DATE` time bounds because a binary DATE value carries no time, so Exasol never sees it. Field-by-field encoding conforms to ADR `date-timestamp-convert-by-calendar-label`. Rejection before any I/O follows ADR `fail-fast-per-row-arity-check-in-batch-execution`, and `split_parameter_rows` encodes every row before the first request, so the #90 batch splitting is unchanged.
-- **Alternatives:** Keep the lenient fixed-offset parser: rejected, because it stores `2000-01-01 00:00:00` for `garbage`. Validate ranges with chrono: rejected, because chrono rejects Julian-only leap days such as `1500-02-29`, which Exasol accepts, and Exasol already rejects out-of-range fields with SQL state 22008 or 22009. Send the values as CHAR text: rejected, because native binding would then depend on the session's `NLS_TIMESTAMP_FORMAT`.
+- **Decision:** DATE and TIMESTAMP text is parsed field by field with the grammar of the scenario "DATE and TIMESTAMP parameter text is encoded field by field". The parsers live in `src/types/conversion.rs` next to `format_date32` and `format_timestamp_micros` and return field values. The native encoder writes those fields in the wire layout. It returns `TransportError::SerializationError` for any other text and for a non-text value, before any execution request. The parsers check syntax only, plus the time bounds of a DATE value. Exasol checks every other field range.
+- **Rationale:** The header fix makes the lenient TIMESTAMP parser reachable, so its substitute values would reach the database. The DATE parser has the same defect on `main`, and the brief asks to check DATE the same way, so one parser serves both. One module owns the Exasol date and timestamp text form: the formatters that the FFI layer binds through and the parsers sit together, and a unit test parses the formatter output back. The native transport already depends on `src/types/conversion.rs` for result decoding. Each grammar rule reproduces a result of Exasol's text cast over the WebSocket transport on `exasol-test`. The driver checks the `T_DATE` time bounds because a binary DATE value carries no time, so Exasol never sees it. Field-by-field encoding conforms to ADR `date-timestamp-convert-by-calendar-label`. Rejection before any I/O follows ADR `fail-fast-per-row-arity-check-in-batch-execution`, and `split_parameter_rows` encodes every row before the first request, so the #90 batch splitting is unchanged.
+- **Alternatives:** Keep the lenient fixed-offset parser: rejected, because it stores `2000-01-01 00:00:00` for `garbage`. Parse inside `src/transport/native/mod.rs`: rejected, because two modules would then own one text form, and a formatter change, such as 9 fraction digits for a Nanosecond value, could fall outside the grammar. Validate ranges with chrono: rejected, because chrono rejects Julian-only leap days such as `1500-02-29`, which Exasol accepts, and Exasol already rejects out-of-range fields with SQL state 22008 or 22009. Send the values as CHAR text: rejected, because native binding would then depend on the session's `NLS_TIMESTAMP_FORMAT`.
 - **Promotes to ADR:** no
 
 ### [4] Reject the ISO 8601 `T` separator over the native transport
@@ -58,4 +58,22 @@
 
 - **Finding:** `plan-reviewer` round 1, `[REQUIREMENT_CONFLICT]`. The native grammar rejected empty text, surrounding spaces, an hour-only time, a 0-digit fraction, and date-and-time text in a DATE column. Exasol's cast accepts all of them over the WebSocket transport, which contradicted decision [4].
 - **Direction change:** Decision [3] and its scenario accept those forms. Probes on `exasol-test` kept text of only spaces and an out-of-range `T_DATE` time part rejected. The parity scenario is renamed "DATE and TIMESTAMP text parameters are stored or rejected on both transports". Forms such as a trailing colon still fail only over the native transport, as decision [4] states.
+- **Promotes to ADR:** no
+
+### [2] [plan-review] The DATE text fix is not part of #38
+
+- **Finding:** `plan-reviewer` round 1, `[SCOPE_CREEP]`. The DATE text defect exists on `main` and is unrelated to #38, but the plan listed it under the #38 changelog entry.
+- **Direction change:** The requester kept the DATE fix in this PR as a second fix. `plan.md` Summary names it, and task 2.3 gives it its own CHANGELOG `Fix:` entry that does not cite #38.
+- **Promotes to ADR:** no
+
+### [3] [plan-review] ISO 8601 `T` text still fails after `Fixes #38`
+
+- **Finding:** `plan-reviewer` round 1, `[SCOPE_REDUCTION]`. The #38 reporter binds text with a `T` separator, which still fails on both transports after this plan.
+- **Direction change:** The requester kept `Fixes #38`. Tasks 2.3 and 2.4 state in the CHANGELOG entry and in the PR description that such text still fails on both transports and that a bound Arrow Timestamp column never produces it.
+- **Promotes to ADR:** no
+
+### [4] [plan-review] The temporal text grammar lived apart from its formatters
+
+- **Finding:** `plan-reviewer` round 1, `[INFORMATION_LEAKAGE]`. The native encoder held its own grammar for the text form that `src/types/conversion.rs` formats.
+- **Direction change:** Decision [3] moves the parsers to `src/types/conversion.rs`, and task 1.2 adds a unit test that parses the formatter output back.
 - **Promotes to ADR:** no
