@@ -24,7 +24,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let driver = Driver::new();
-//!     // Schema in the URI is automatically opened with OPEN SCHEMA after login.
+//!     // The URI schema must exist; connect() sets it as a session attribute and fails if the server rejects it.
 //!     let database = driver.open(
 //!         "exasol://sys:exasol@localhost:8563/my_schema?validateservercertificate=0"
 //!     )?;
