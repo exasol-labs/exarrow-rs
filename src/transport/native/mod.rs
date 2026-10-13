@@ -2566,4 +2566,112 @@ mod tests {
             other => panic!("expected ProtocolError, got {other:?}"),
         }
     }
+
+    fn row_count_response(attrs: &AttributeSet) -> Vec<u8> {
+        let mut payload = attrs.serialize();
+        let mut header = MessageHeader::new(
+            CMD_EXECUTE,
+            1,
+            attrs.num_attributes(),
+            payload.len() as u32,
+            1,
+        );
+        payload.extend_from_slice(&1i32.to_le_bytes());
+        payload.push(constants::R_ROW_COUNT as u8);
+        payload.extend_from_slice(&0i64.to_le_bytes());
+        header.message_length = payload.len() as u32;
+        let mut wire = header.serialize().to_vec();
+        wire.extend_from_slice(&payload);
+        wire
+    }
+
+    /// Serve one scripted response per request on a loopback socket and return a
+    /// transport that is logged in against it.
+    async fn transport_answering(responses: Vec<Vec<u8>>) -> NativeTcpTransport {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            for response in responses {
+                let mut hdr = [0u8; HEADER_SIZE];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let len = MessageHeader::parse(&hdr).unwrap().message_length as usize;
+                let mut body = vec![0u8; len];
+                sock.read_exact(&mut body).await.unwrap();
+                sock.write_all(&response).await.unwrap();
+            }
+        });
+        let mut transport = NativeTcpTransport::new();
+        transport.stream = Some(NativeStream::Plain(TcpStream::connect(addr).await.unwrap()));
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
+        transport
+    }
+
+    fn schema_attrs(schema: &str) -> AttributeSet {
+        attribute_set(&[(
+            ATTR_CURRENT_SCHEMA,
+            AttributeValue::String(schema.to_owned()),
+        )])
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[tokio::test]
+    async fn set_current_schema_sets_then_reads_back_the_session_schema() {
+        let mut transport = transport_answering(vec![
+            row_count_response(&AttributeSet::new()),
+            row_count_response(&schema_attrs("ZZ_MixedCase")),
+        ])
+        .await;
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            transport.set_current_schema("ZZ_MixedCase"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.current_schema(), Some("ZZ_MixedCase".to_owned()));
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[tokio::test]
+    async fn any_response_carrying_attribute_22_updates_the_tracked_schema() {
+        let mut transport =
+            transport_answering(vec![row_count_response(&schema_attrs("OTHER"))]).await;
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            transport.send_and_fill_buf(CMD_EXECUTE, &AttributeSet::new(), None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.current_schema(), Some("OTHER".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn refresh_current_schema_clears_the_schema_when_the_server_reports_none() {
+        let mut transport =
+            transport_answering(vec![row_count_response(&AttributeSet::new())]).await;
+        transport.current_schema = Some("STALE".to_owned());
+
+        let schema = finish_within(LOOPBACK_TEST_BOUND, transport.refresh_current_schema())
+            .await
+            .unwrap();
+
+        assert_eq!(schema, None);
+        assert_eq!(transport.current_schema(), None);
+    }
+
+    #[tokio::test]
+    async fn set_attributes_and_refresh_require_an_authenticated_session() {
+        let mut transport = NativeTcpTransport::new();
+
+        assert!(transport
+            .set_attributes(&AttributeSet::new())
+            .await
+            .is_err());
+        assert!(transport.refresh_current_schema().await.is_err());
+    }
 }

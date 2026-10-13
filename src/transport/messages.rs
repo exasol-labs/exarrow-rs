@@ -2055,4 +2055,12 @@ mod tests {
         assert_eq!(data.total_rows, 2);
         assert_eq!(data.data.num_rows(), 2);
     }
+
+    #[test]
+    fn get_attributes_request_default_matches_new() {
+        let request = GetAttributesRequest::default();
+
+        assert_eq!(request.command, "getAttributes");
+        assert_eq!(request.command, GetAttributesRequest::new().command);
+    }
 }
