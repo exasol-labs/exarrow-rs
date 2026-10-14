@@ -1594,6 +1594,16 @@ async fn test_ws_prepared_statement_lifecycle() {
     conn.close().await.expect("Failed to close connection");
 }
 
+async fn single_string(conn: &mut Connection, sql: &str) -> String {
+    let batches = conn.execute(sql).await.unwrap().fetch_all().await.unwrap();
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    col.value(0).to_string()
+}
+
 /// Scenario: DATE and TIMESTAMP text parameters are stored or rejected on both transports
 #[tokio::test]
 async fn test_ws_prepared_temporal_text_parameters() {
@@ -1652,25 +1662,43 @@ async fn test_ws_prepared_temporal_text_parameters() {
         assert_eq!(col.value(0), expected);
     }
 
-    // Rejected text fails before execution, stores no row, and keeps the connection usable.
+    let row_summary = format!(
+        "SELECT TO_CHAR(COUNT(*)) || ':' || TO_CHAR(COUNT(TS)) || ':' || TO_CHAR(COUNT(D)) FROM {schema}.T"
+    );
+
+    // Empty text binds as NULL for both column types.
     conn.execute_update(&format!("DELETE FROM {schema}.T"))
         .await
         .unwrap();
-    for bad in ["2024-01-01T08:00:00", "garbage"] {
+    prepared.clear_parameters();
+    prepared.bind(0, "").unwrap();
+    prepared.bind(1, "").unwrap();
+    conn.execute_prepared_update(&prepared)
+        .await
+        .expect("empty text must store NULL");
+    assert_eq!(single_string(&mut conn, &row_summary).await, "1:0:0");
+
+    // Exasol casts the text and rejects it at execution; it accepts the cut-off "08:00:", so that case is native-only.
+    conn.execute_update(&format!("DELETE FROM {schema}.T"))
+        .await
+        .unwrap();
+    let rejected = [
+        ("2024-01-01T08:00:00", "2024-01-02"),
+        ("garbage", "2024-01-02"),
+        ("   ", "2024-01-02"),
+        ("2024-01-01 08:00:00", "2024/01/02"),
+        ("2024-01-01 08:00:00", "2024-01-02 25:00:00"),
+    ];
+    for (ts, d) in rejected {
         prepared.clear_parameters();
-        prepared.bind(0, bad).unwrap();
-        prepared.bind(1, "2024-01-02").unwrap();
+        prepared.bind(0, ts).unwrap();
+        prepared.bind(1, d).unwrap();
         assert!(
             conn.execute_prepared_update(&prepared).await.is_err(),
-            "{bad:?} must be rejected"
+            "{ts:?}/{d:?} must be rejected"
         );
     }
-    let rs = conn
-        .execute(&format!("SELECT COUNT(*) FROM {schema}.T"))
-        .await
-        .expect("connection must stay usable");
-    let batches = rs.fetch_all().await.unwrap();
-    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(single_string(&mut conn, &row_summary).await, "0:0:0");
 
     let _ = conn
         .execute_update(&format!("DROP SCHEMA {schema} CASCADE"))

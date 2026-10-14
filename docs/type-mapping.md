@@ -54,7 +54,7 @@ Import and parameter binding convert Arrow values to Exasol text with the same c
 
 ### Parameter binding of dates and timestamps
 
-An Arrow Timestamp of any unit binds as its UTC date and time at microsecond precision, with nanoseconds rounded down. Date32 binds as DATE. Text bound to a DATE or TIMESTAMP parameter must use the form `YYYY-MM-DD` or `YYYY-MM-DD HH:MI:SS.FFFFFFFFF`, with the time part optional. Other text, such as ISO 8601 with a `T` separator, fails before execution.
+An Arrow Timestamp of any unit binds as its UTC date and time at microsecond precision, with nanoseconds rounded down. Date32 binds as DATE. On the native transport, text bound to a DATE or TIMESTAMP parameter must use the form `YYYY-MM-DD` or `YYYY-MM-DD HH:MI:SS.FFFFFFFFF`, with the time part optional. Other text, such as ISO 8601 with a `T` separator, fails before execution. On the WebSocket transport, the driver sends the text to Exasol, which casts it. Exasol may accept forms the native transport rejects, and it rejects invalid text at execution.
 
 ### INTERVAL
 
