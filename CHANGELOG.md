@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.21.0
+
+- Breaking: a schema in the connection URI or in `ConnectionParams` must exist. When the server rejects it, `connect()` closes the session and fails with `ConnectionError::ConnectionFailed`, whose message names the schema and contains the server's message. Before, a missing schema connected with no current schema and no warning. A dbt run whose target schema does not exist yet fails at connect until the dbt Exasol adapter connects without the schema and runs `CREATE SCHEMA IF NOT EXISTS`.
+- Breaking: `TransportProtocol` gains `set_current_schema`, `refresh_current_schema`, and `current_schema`, so an implementation outside the crate must add them.
+- Breaking: `Session::current_schema`, `Session::set_current_schema`, and `Session::update_activity` are removed. Use `Connection::current_schema`.
+- Breaking: `SessionState` loses the variants `Initializing`, `Executing`, `Idle`, and `Error`, and `SessionState::is_active` is removed. The session is `Ready`, `InTransaction`, `Closing`, or `Closed`, and running a statement never changes it.
+- Changed: the driver sets the current schema with the protocol's set-attributes command instead of `OPEN SCHEMA`, so the server's case rule decides which schema a name opens: the exact name first, then its upper-case form. `/myschema` still opens `MYSCHEMA`, but when both `myschema` and `MYSCHEMA` exist, it now opens `myschema`.
+- Changed: `Connection::current_schema()` reports the name of the schema the server opened, such as `MY_SCHEMA` for the URI schema `my_schema`, instead of the name as given.
+- Fix: a mixed-case or special-character URI schema, such as `ZZ_MixedCase` or `zz-hyphen`, becomes the current schema. `ZZ_MixedCase` used to leave the session with no current schema, and `zz-hyphen` failed with a syntax error.
+- Fix: setting the ADBC `adbc.connection.db_schema` option sets the server's current schema, and reading it returns the server's value. A URI schema no longer reads back as `NOT_FOUND`.
+- Fix: `Connection::current_schema()` follows `OPEN SCHEMA`, `CREATE SCHEMA`, `CLOSE SCHEMA`, and `DROP SCHEMA` run as SQL. Fixes #77.
+- Fix: a failed statement no longer makes `begin_transaction()` or ADBC `AutoCommit=false` fail with `Connection is closed`. A second `begin_transaction()` during a transaction reports `Transaction already active` and no longer sends a request to the server. Fixes #72.
+
 ## 0.20.1
 
 - Fix: a prepared INSERT, UPDATE, DELETE, or MERGE run through ADBC `execute` with bound parameters, such as Python `cursor.execute(sql, params)`, no longer fails with `Cannot fetch batches from row count result` after it wrote data, and it writes every row of a bound batch. Fixes #78.

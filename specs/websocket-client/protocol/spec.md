@@ -67,3 +67,18 @@ The system implements the Exasol WebSocket API protocol as defined in https://gi
 * *THEN* the system SHALL send a `setAttributes` command with the attributes to modify
 * *AND* the system SHALL validate the server response status
 * *AND* the system SHALL return an error if the server rejects the attribute change
+
+### Scenario: Set the current schema attribute
+
+* *GIVEN* an authenticated WebSocket session exists
+* *WHEN* the driver sets the session's current schema to a name
+* *THEN* the system SHALL send a `setAttributes` command whose `attributes` object holds `currentSchema` with the name
+* *AND* when the server rejects the change, the system SHALL return an error that contains the server's error message and MUST leave the recorded current schema unchanged
+* *AND* after the server accepts the change, the system SHALL send a `getAttributes` command and SHALL record the `currentSchema` member of that response's `attributes` object as the session's current schema, where an empty value means the session has no current schema
+
+### Scenario: Track the current schema attribute from responses
+
+* *GIVEN* an authenticated WebSocket session exists
+* *WHEN* a server response holds a top-level `attributes` object with a `currentSchema` member
+* *THEN* the system SHALL record the member's value as the session's current schema, where an empty value means the session has no current schema
+* *AND* a response without a `currentSchema` member MUST leave the recorded current schema unchanged

@@ -22,11 +22,12 @@ use crate::error::TransportError;
 use super::deadline::SetupStep;
 use super::lifecycle::{self, ConnectionLifecycle, ConnectionState, LifecycleSteps};
 use super::messages::{
-    AuthRequest, ClosePreparedStatementRequest, ClosePreparedStatementResponse,
+    AttributedResponse, AuthRequest, ClosePreparedStatementRequest, ClosePreparedStatementResponse,
     CloseResultSetRequest, CloseResultSetResponse, CreatePreparedStatementRequest,
     CreatePreparedStatementResponse, DisconnectRequest, DisconnectResponse,
     ExecutePreparedStatementRequest, ExecuteRequest, ExecuteResponse, FetchRequest, FetchResponse,
-    LoginInitRequest, LoginResponse, PublicKeyResponse, ResultData, ResultEntryKind, ResultPayload,
+    GetAttributesRequest, GetAttributesResponse, LoginInitRequest, LoginResponse,
+    PublicKeyResponse, ResponseAttributes, ResultData, ResultEntryKind, ResultPayload,
     ResultSetHandle, SessionInfo, SetAttributesRequest, SetAttributesResponse,
 };
 use super::protocol::{
@@ -45,6 +46,7 @@ pub struct WebSocketTransport {
     lifecycle: ConnectionLifecycle,
     /// Next fetch start position per open result set handle
     fetch_positions: HashMap<i32, i64>,
+    current_schema: Option<String>,
 }
 
 impl WebSocketTransport {
@@ -55,6 +57,7 @@ impl WebSocketTransport {
             session_info: None,
             lifecycle: ConnectionLifecycle::new(),
             fetch_positions: HashMap::new(),
+            current_schema: None,
         }
     }
 
@@ -62,11 +65,12 @@ impl WebSocketTransport {
     ///
     /// Exasol may send intermediate status messages (like "EXECUTING") before
     /// the actual JSON response. This method skips those messages and returns
-    /// only the final JSON response.
+    /// only the final JSON response. Every response passes through here, so this
+    /// also records the current schema when the response reports it.
     async fn send_receive<T, R>(&mut self, request: &T) -> Result<R, TransportError>
     where
         T: serde::Serialize,
-        R: serde::de::DeserializeOwned,
+        R: serde::de::DeserializeOwned + AttributedResponse,
     {
         // Serialize request
         let request_json = serde_json::to_string(request)?;
@@ -111,8 +115,31 @@ impl WebSocketTransport {
                 ))
             })?;
 
+            self.record_current_schema(response.attributes());
             return Ok(response);
         }
+    }
+
+    /// Record a reported current schema, where an empty value means none; a
+    /// response that does not report it leaves the recorded value unchanged.
+    fn record_current_schema(&mut self, attributes: Option<&ResponseAttributes>) {
+        if let Some(schema) = attributes.and_then(|a| a.current_schema.as_deref()) {
+            self.current_schema = Some(schema.to_owned()).filter(|name| !name.is_empty());
+        }
+    }
+
+    /// Send `setAttributes` and fail with the server's message when it rejects a value.
+    async fn set_attributes(
+        &mut self,
+        request: &SetAttributesRequest,
+    ) -> Result<(), TransportError> {
+        self.lifecycle.require(
+            ConnectionState::Authenticated,
+            "Must authenticate before setting attributes",
+        )?;
+
+        let response: SetAttributesResponse = self.send_receive(request).await?;
+        self.check_status(&response.status, &response.exception)
     }
 
     /// Check response status and return error if not ok.
@@ -468,6 +495,7 @@ impl LifecycleSteps for WebSocketTransport {
     fn release_connection(&mut self) {
         self.ws_stream = None;
         self.session_info = None;
+        self.current_schema = None;
     }
 }
 
@@ -737,27 +765,36 @@ impl TransportProtocol for WebSocketTransport {
     }
 
     async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError> {
-        self.lifecycle.require(
-            ConnectionState::Authenticated,
-            "Must authenticate before setting attributes",
-        )?;
-
-        let request = SetAttributesRequest::autocommit(enabled);
-        let response: SetAttributesResponse = self.send_receive(&request).await?;
-        self.check_status(&response.status, &response.exception)?;
-        Ok(())
+        self.set_attributes(&SetAttributesRequest::autocommit(enabled))
+            .await
     }
 
     async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
+        self.set_attributes(&SetAttributesRequest::query_timeout(timeout_secs))
+            .await
+    }
+
+    async fn set_current_schema(&mut self, schema: &str) -> Result<(), TransportError> {
+        self.set_attributes(&SetAttributesRequest::current_schema(schema))
+            .await?;
+        self.refresh_current_schema().await?;
+        Ok(())
+    }
+
+    async fn refresh_current_schema(&mut self) -> Result<Option<String>, TransportError> {
         self.lifecycle.require(
             ConnectionState::Authenticated,
-            "Must authenticate before setting attributes",
+            "Must authenticate before reading attributes",
         )?;
 
-        let request = SetAttributesRequest::query_timeout(timeout_secs);
-        let response: SetAttributesResponse = self.send_receive(&request).await?;
+        let response: GetAttributesResponse =
+            self.send_receive(&GetAttributesRequest::new()).await?;
         self.check_status(&response.status, &response.exception)?;
-        Ok(())
+        Ok(self.current_schema.clone())
+    }
+
+    fn current_schema(&self) -> Option<String> {
+        self.current_schema.clone()
     }
 }
 
@@ -1678,5 +1715,188 @@ El6NrMeFybqeqwjPHPG1oCwg4YIeaT8ZB2qUW143brUB
             .unwrap();
 
         assert_eq!(fetch_start_positions(&server), vec![0]);
+    }
+
+    fn row_count_response(attributes: Option<Value>) -> Value {
+        let mut response = json!({
+            "status": "ok",
+            "responseData": {
+                "numResults": 1,
+                "results": [{"resultType": "rowCount", "rowCount": 0}]
+            }
+        });
+        if let Some(attributes) = attributes {
+            response["attributes"] = attributes;
+        }
+        response
+    }
+
+    /// A `getAttributes` answer with the mixed value types the server sends.
+    fn get_attributes_response(current_schema: &str) -> Value {
+        json!({
+            "status": "ok",
+            "attributes": {
+                "autocommit": true,
+                "queryTimeout": 0,
+                "currentSchema": current_schema,
+                "snapshotTransactionsEnabled": false
+            }
+        })
+    }
+
+    async fn execute_each(transport: &mut WebSocketTransport, statements: &[&str]) {
+        for sql in statements {
+            transport.execute_query(sql).await.expect("execute");
+        }
+    }
+
+    /// Scenario: Set the current schema attribute
+    #[tokio::test]
+    async fn set_current_schema_sends_set_attributes_then_records_the_servers_name() {
+        let server = FakeWebSocketServer::scripted(vec![
+            json!({"status": "ok"}),
+            get_attributes_response("MY_SCHEMA"),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+
+        transport.set_current_schema("my_schema").await.unwrap();
+
+        assert_eq!(
+            server.requests(),
+            vec![
+                json!({"command": "setAttributes", "attributes": {"currentSchema": "my_schema"}}),
+                json!({"command": "getAttributes"}),
+            ]
+        );
+        assert_eq!(transport.current_schema(), Some("MY_SCHEMA".to_string()));
+    }
+
+    /// Scenario: Set the current schema attribute
+    #[tokio::test]
+    async fn set_current_schema_returns_the_servers_rejection() {
+        let server = FakeWebSocketServer::scripted(vec![
+            json!({"status": "ok"}),
+            get_attributes_response("SALES"),
+            json!({
+                "status": "error",
+                "exception": {"sqlCode": "42000", "text": "schema ZZ_TYPO not found"}
+            }),
+            get_attributes_response("ZZ_TYPO"),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+        transport.set_current_schema("SALES").await.unwrap();
+
+        let error = transport.set_current_schema("ZZ_TYPO").await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("schema ZZ_TYPO not found"),
+            "{error}"
+        );
+        assert_eq!(transport.current_schema(), Some("SALES".to_string()));
+        assert_eq!(
+            server.requests().len(),
+            3,
+            "a rejected set must not send getAttributes"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_current_schema_reports_an_empty_value_as_no_schema() {
+        let server = FakeWebSocketServer::scripted(vec![
+            row_count_response(Some(json!({"currentSchema": "S1"}))),
+            get_attributes_response(""),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+        execute_each(&mut transport, &["OPEN SCHEMA S1"]).await;
+
+        let refreshed = transport.refresh_current_schema().await.unwrap();
+
+        assert_eq!(refreshed, None);
+        assert_eq!(transport.current_schema(), None);
+    }
+
+    #[tokio::test]
+    async fn refresh_current_schema_returns_the_servers_error() {
+        let server = FakeWebSocketServer::scripted(vec![
+            row_count_response(Some(json!({"currentSchema": "S1"}))),
+            json!({
+                "status": "error",
+                "exception": {"sqlCode": "42000", "text": "getAttributes rejected"}
+            }),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+        execute_each(&mut transport, &["OPEN SCHEMA S1"]).await;
+
+        let error = transport.refresh_current_schema().await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("getAttributes rejected"),
+            "{error}"
+        );
+        assert_eq!(transport.current_schema(), Some("S1".to_string()));
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[tokio::test]
+    async fn response_attributes_update_the_current_schema() {
+        let server = FakeWebSocketServer::scripted(vec![row_count_response(Some(
+            json!({"currentSchema": "S1"}),
+        ))])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+
+        execute_each(&mut transport, &["OPEN SCHEMA S1"]).await;
+
+        assert_eq!(transport.current_schema(), Some("S1".to_string()));
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[tokio::test]
+    async fn response_without_current_schema_leaves_the_current_schema_unchanged() {
+        let server = FakeWebSocketServer::scripted(vec![
+            row_count_response(Some(json!({"currentSchema": "S1"}))),
+            row_count_response(None),
+            row_count_response(Some(json!({"autocommit": true}))),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+
+        execute_each(&mut transport, &["OPEN SCHEMA S1", "SELECT 1", "COMMIT"]).await;
+
+        assert_eq!(transport.current_schema(), Some("S1".to_string()));
+    }
+
+    /// Scenario: Track the current schema attribute from responses
+    #[tokio::test]
+    async fn empty_current_schema_in_a_response_means_no_current_schema() {
+        let server = FakeWebSocketServer::scripted(vec![
+            row_count_response(Some(json!({"currentSchema": "S1"}))),
+            row_count_response(Some(json!({"currentSchema": ""}))),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+
+        execute_each(&mut transport, &["OPEN SCHEMA S1", "CLOSE SCHEMA"]).await;
+
+        assert_eq!(transport.current_schema(), None);
+    }
+
+    #[tokio::test]
+    async fn closing_the_transport_forgets_the_current_schema() {
+        let server = FakeWebSocketServer::scripted(vec![
+            row_count_response(Some(json!({"currentSchema": "S1"}))),
+            json!({"status": "ok"}),
+        ])
+        .await;
+        let mut transport = authenticated_transport(&server).await;
+        execute_each(&mut transport, &["OPEN SCHEMA S1"]).await;
+
+        transport.close().await.unwrap();
+
+        assert_eq!(transport.current_schema(), None);
     }
 }

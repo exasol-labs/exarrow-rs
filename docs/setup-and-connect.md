@@ -61,8 +61,8 @@ use exarrow_rs::adbc::Driver;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let driver = Driver::new();
     let database = driver.open("exasol://user:password@localhost:8563/my_schema")?;
-    // The schema in the URI (/my_schema) is opened server-side automatically during connect().
-    // Unqualified queries can reference tables in my_schema without any additional setup.
+    // The URI schema (/my_schema) must exist. connect() makes it the session's current schema,
+    // so unqualified queries resolve against my_schema without any additional setup.
     let mut connection = database.connect().await?;
 
     // Use the connection...
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-If you need to switch schemas after connecting, call `connection.set_schema("other_schema").await?`. The `set_schema()` method is also available for connections opened without a URI schema.
+To change the current schema after connecting, call `connection.set_schema("other_schema").await?`. The `set_schema()` method also works for connections opened without a URI schema. See [Schema and Session Behavior](#schema-and-session-behavior).
 
 ## Parameters
 
@@ -118,11 +118,21 @@ exasol://user@[2001:db8::1]:9000/schema
 
 ## Schema and Session Behavior
 
-When the connection URI includes a schema path (e.g., `/my_schema`), `connect()` automatically issues `OPEN SCHEMA my_schema` server-side before returning the connection. Unqualified queries — `SELECT * FROM my_table` rather than `SELECT * FROM my_schema.my_table` — will resolve against that schema immediately, without any manual setup step.
+A schema in the connection URI (for example `/my_schema`) or in `ConnectionParams` must exist on the server. Right after the login, `connect()` sets it as the session's current schema with the protocol's set-attributes command. Unqualified queries such as `SELECT * FROM my_table` then resolve against that schema without a setup step.
 
-- **Auto-apply on connect**: `database.connect().await?` opens the schema stated in the URI. If the schema does not exist, `connect()` returns a `ConnectionError` rather than returning a connection whose schema state silently differs from the URI.
-- **Switch schemas at runtime**: Call `connection.set_schema("other_schema").await?` at any point after connecting to change the active schema. This is useful when you need to access multiple schemas within the same session.
-- **Session state accessors**: Use `connection.current_schema()` to read the currently open schema name, and `connection.session_id()` to retrieve the numeric session identifier assigned by the server.
+- **A rejected schema fails the connect**: when the server rejects the schema, for example because it does not exist or the user lacks privileges, `connect()` closes the session and returns `ConnectionError::ConnectionFailed`. The message names the schema and contains the server's message. To create a schema on first use, connect without a schema and run `CREATE SCHEMA IF NOT EXISTS my_schema`, which also makes it the current schema.
+- **The server's case rule**: the driver sends the schema name as written, without quotes. The server opens the schema whose name matches exactly, and otherwise the schema whose name matches the upper-case form of the name. The table shows the result for some URI schemas.
+- **Switch schemas at runtime**: `connection.set_schema("other_schema").await?` sets the current schema with the same command and the same case rule. When the server rejects the name, `set_schema()` returns an error that contains the server's message, and the current schema stays unchanged.
+- **Read the current schema**: `connection.current_schema().await` returns the name of the schema the server opened, for example `MYSCHEMA` for the URI schema `/myschema`, or `None` when the session has no current schema. The value follows schema changes made in SQL (`OPEN SCHEMA`, `CREATE SCHEMA`, `CLOSE SCHEMA`, and `DROP SCHEMA` of the current schema), and reading it sends no request to the server. `connection.session_id()` returns the session identifier the server assigned.
+- **ADBC driver managers**: setting the `adbc.connection.db_schema` connection option, at connection creation or later, sets the server's current schema and fails for a schema the server rejects. Reading the option asks the server for its current schema and reports `NOT_FOUND` when the session has none. Before the driver has opened the session, the read returns the URI schema as written, without connecting.
+
+| URI schema | Schemas on the server | Current schema after connect |
+|---|---|---|
+| `/ZZ_MixedCase` | `"ZZ_MixedCase"` | `ZZ_MixedCase` |
+| `/zz-hyphen` | `"zz-hyphen"` | `zz-hyphen` |
+| `/myschema` | `MYSCHEMA` | `MYSCHEMA` |
+| `/myschema` | `"myschema"` and `MYSCHEMA` | `myschema` |
+| `/zz_mixedcase` | `"ZZ_MixedCase"` only | none: the connect fails |
 
 ## Session Attributes
 
@@ -131,7 +141,6 @@ Any unrecognized query parameter is forwarded as a session attribute to the Exas
 | Attribute | Type | Description |
 |---|---|---|
 | `autocommit` | boolean | Auto-commit after each statement |
-| `currentSchema` | string | Current schema name |
 | `feedbackInterval` | number | Heartbeat interval during query execution (seconds) |
 | `queryTimeout` | number | Server-side query timeout (seconds). This is the same attribute the `query_timeout` connection parameter forwards — see [Parameters](#parameters); they are not independent knobs. |
 | `resultSetMaxRows` | number | Max result set rows (0 = unlimited) |
@@ -177,7 +186,7 @@ When a server accepts the TCP connection and then stops answering, opening the c
 
 A timeout in the TCP connect, the TLS handshake, or the WebSocket upgrade is reported as `ConnectionError::ConnectionFailed`. A login that runs out of time is reported as `ConnectionError::AuthenticationFailed`.
 
-The connection timeout does not bound query execution, including the `OPEN SCHEMA` statement that `connect()` runs after the login for a schema in the URI. Exasol enforces `query_timeout` on the server, as [Parameters](#parameters) describes.
+The connection timeout does not bound query execution. It also does not bound the set-attributes command that `connect()` sends after the login for a schema in the URI. Exasol enforces `query_timeout` on the server, as [Parameters](#parameters) describes.
 
 HTTP tunnel setup for imports and exports has its own 30-second bound, which the connection timeout does not change. See [Tunnel Setup Timeout](import-export.md#tunnel-setup-timeout).
 

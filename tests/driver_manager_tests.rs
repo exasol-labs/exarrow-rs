@@ -1768,6 +1768,49 @@ fn test_autocommit_toggle() {
     assert_eq!(auto_commit, "true");
 }
 
+/// Scenario: A failed statement leaves the session usable
+#[test]
+fn test_ffi_autocommit_off_after_a_failed_statement() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        get_library_path(),
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+    let opts = vec![(OptionDatabase::Uri, OptionValue::String(get_test_uri()))];
+    let db = driver
+        .new_database_with_opts(opts)
+        .expect("Failed to create database");
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let mut failing = conn.new_statement().expect("Failed to create statement");
+    failing
+        .set_sql_query("SELECT * FROM ZZ_NO_SUCH_SCHEMA.ZZ_NO_SUCH_TABLE")
+        .expect("Failed to set SQL query");
+    assert!(
+        failing.execute().is_err(),
+        "selecting a missing table must fail"
+    );
+    drop(failing);
+
+    conn.set_option(OptionConnection::AutoCommit, "false".into())
+        .expect("AutoCommit=false must succeed after a failed statement");
+
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT 1")
+        .expect("Failed to set SQL query");
+    stmt.execute()
+        .expect("SELECT 1 must execute in the transaction");
+    drop(stmt);
+    conn.commit().expect("commit must succeed");
+
+    conn.set_option(OptionConnection::AutoCommit, "true".into())
+        .expect("AutoCommit=true must succeed");
+}
+
 // GetObjects Tests
 
 /// Helper macro to set up a driver manager connection.
@@ -3207,25 +3250,19 @@ fn test_autocommit_toggle_with_dml() {
     }
 }
 
-/// Auto-OPEN-SCHEMA on connect via the FFI / driver-manager path
-/// (Task 1.2: change-integrator-experience).
+/// A URI schema becomes the current schema on connect through the FFI path.
 ///
-/// FFI Audit: `FfiConnection::ensure_connected` (`src/adbc_ffi.rs`) parses the
-/// URI into `ConnectionParams` and calls `ExaConnection::from_params(params).await`.
-/// That is exactly the same code path the direct API uses, so the auto-OPEN
-/// behavior implemented in `Connection::connect_with_transport` applies here
-/// without any FFI-specific change.
+/// `FfiConnection::ensure_connected` (`src/adbc_ffi.rs`) builds the connection
+/// with `ExaConnection::from_params`, the path the direct API uses, so the
+/// set-attributes command that `Connection::connect_with_transport` sends after
+/// the login applies here too. This test observes the outcome across the
+/// dynamic-library boundary: an unqualified SELECT resolves against the schema.
 ///
-/// This test confirms the behavior across the dynamic-library boundary. The
-/// FFI runtime is `multi_thread(2)` (see `src/adbc_ffi.rs`), so the inner
-/// `OPEN SCHEMA` await runs on a multi-threaded scheduler — we only need to
-/// observe the user-facing outcome.
+/// The test loads `target/release/libexarrow_rs.so` (or `.dylib`); run
+/// `cargo build --release --features ffi` first.
 ///
-/// Per CLAUDE.md: this test loads `target/release/libexarrow_rs.so` (or
-/// `.dylib`); run `cargo build --release --features ffi` before
-/// `cargo test --test driver_manager_tests -- --include-ignored`.
+/// Scenario: Schema in connection params is opened on connect
 #[test]
-#[ignore = "loads the release cdylib, so it needs `cargo build --release --features ffi` first"]
 fn test_ffi_uri_schema_is_opened_on_connect() {
     skip_if_no_library!();
     skip_if_no_exasol!();
@@ -3337,6 +3374,175 @@ fn test_ffi_uri_schema_is_opened_on_connect() {
     stmt.set_sql_query(format!("DROP SCHEMA {} CASCADE", schema_name))
         .unwrap();
     let _ = stmt.execute_update();
+}
+
+fn get_test_uri_with_schema(schema: &str) -> String {
+    format!(
+        "exasol://{}:{}@{}:{}/{}?tls=true&validateservercertificate=0",
+        get_user(),
+        get_password(),
+        get_host(),
+        get_port(),
+        schema
+    )
+}
+
+/// The current schema the server reports for the session of `conn`.
+fn server_current_schema<C: AdbcConnection>(conn: &mut C) -> Option<String> {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query("SELECT CURRENT_SCHEMA")
+        .expect("Failed to set query");
+    let schemas: Vec<String> = stmt
+        .execute()
+        .expect("SELECT CURRENT_SCHEMA should succeed")
+        .flat_map(|batch| strings_in(batch.expect("batch read should succeed").column(0)))
+        .collect();
+    schemas.into_iter().next()
+}
+
+/// Scenario: Schema activation failure surfaces during connect
+#[test]
+fn test_ffi_missing_uri_schema_fails_the_connection() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+    let missing = generate_unique_test_name("TEST_FFI_MISSING");
+    let database = open_database(&get_test_uri_with_schema(&missing), None, None);
+    let mut conn = database
+        .new_connection()
+        .expect("the session is established on first use");
+
+    let error = match conn.new_statement() {
+        Ok(_) => panic!("a missing URI schema must fail the connection"),
+        Err(error) => error,
+    };
+
+    assert!(error.message.contains(&missing), "got: {}", error.message);
+    assert!(
+        error.message.contains("not found"),
+        "got: {}",
+        error.message
+    );
+}
+
+/// Scenario: ADBC db_schema option sets the server's current schema
+#[test]
+fn test_ffi_db_schema_option_sets_the_server_current_schema() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+    let at_creation = generate_unique_test_name("TEST_FFI_DB_SCHEMA_CREATION");
+    let later = generate_unique_test_name("TEST_FFI_DB_SCHEMA_LATER");
+    let database = open_database(&get_test_uri(), None, None);
+    let mut admin = database
+        .new_connection()
+        .expect("Failed to create admin connection");
+    execute_ddl(&mut admin, format!("CREATE SCHEMA {at_creation}"));
+    execute_ddl(&mut admin, format!("CREATE SCHEMA {later}"));
+
+    let mut conn = database
+        .new_connection_with_opts(vec![(
+            OptionConnection::CurrentSchema,
+            OptionValue::String(at_creation.to_lowercase()),
+        )])
+        .expect("db_schema at connection creation must succeed");
+    let opened_at_creation = server_current_schema(&mut conn);
+    conn.set_option(
+        OptionConnection::CurrentSchema,
+        later.to_lowercase().as_str().into(),
+    )
+    .expect("db_schema after connection creation must succeed");
+    let opened_later = server_current_schema(&mut conn);
+    drop(conn);
+
+    drop_test_schema(&mut admin, &at_creation);
+    drop_test_schema(&mut admin, &later);
+
+    assert_eq!(opened_at_creation, Some(at_creation));
+    assert_eq!(opened_later, Some(later));
+}
+
+/// Scenario: ADBC db_schema option sets the server's current schema
+#[test]
+fn test_ffi_db_schema_option_rejects_a_missing_schema() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+    let schema = generate_unique_test_name("TEST_FFI_DB_SCHEMA_KEPT");
+    let missing = format!("{schema}_MISSING");
+    let database = open_database(&get_test_uri(), None, None);
+    let mut admin = database
+        .new_connection()
+        .expect("Failed to create admin connection");
+    execute_ddl(&mut admin, format!("CREATE SCHEMA {schema}"));
+
+    let mut conn = database
+        .new_connection()
+        .expect("Failed to create connection");
+    conn.set_option(OptionConnection::CurrentSchema, schema.as_str().into())
+        .expect("an existing schema must be accepted");
+    let rejected = conn.set_option(OptionConnection::CurrentSchema, missing.as_str().into());
+    let after_rejection = server_current_schema(&mut conn);
+    drop(conn);
+
+    drop_test_schema(&mut admin, &schema);
+
+    let error = rejected.expect_err("a missing schema must fail the option call");
+    assert!(error.message.contains(&missing), "got: {}", error.message);
+    assert!(
+        error.message.contains("not found"),
+        "got: {}",
+        error.message
+    );
+    assert_eq!(after_rejection, Some(schema));
+}
+
+/// Scenario: ADBC db_schema option reads the server's current schema
+#[test]
+fn test_ffi_db_schema_option_reads_the_server_current_schema() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+    let from_uri = generate_unique_test_name("TEST_FFI_READ_URI");
+    let opened = generate_unique_test_name("TEST_FFI_READ_OPENED");
+    let created = generate_unique_test_name("TEST_FFI_READ_CREATED");
+    let admin_database = open_database(&get_test_uri(), None, None);
+    let mut admin = admin_database
+        .new_connection()
+        .expect("Failed to create admin connection");
+    execute_ddl(&mut admin, format!("CREATE SCHEMA {from_uri}"));
+    execute_ddl(&mut admin, format!("CREATE SCHEMA {opened}"));
+
+    let database = open_database(
+        &get_test_uri_with_schema(&from_uri.to_lowercase()),
+        None,
+        None,
+    );
+    let mut conn = database
+        .new_connection()
+        .expect("Failed to create connection");
+    let before_session = conn.get_option_string(OptionConnection::CurrentSchema);
+    let on_server = server_current_schema(&mut conn);
+    let after_uri = conn.get_option_string(OptionConnection::CurrentSchema);
+    execute_ddl(&mut conn, format!("OPEN SCHEMA {opened}"));
+    let after_open = conn.get_option_string(OptionConnection::CurrentSchema);
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {created}"));
+    let after_create = conn.get_option_string(OptionConnection::CurrentSchema);
+    conn.set_option(OptionConnection::CurrentSchema, opened.as_str().into())
+        .expect("an existing schema must be accepted");
+    let after_option = conn.get_option_string(OptionConnection::CurrentSchema);
+    execute_ddl(&mut conn, "CLOSE SCHEMA".to_string());
+    let after_close = conn.get_option_string(OptionConnection::CurrentSchema);
+    drop(conn);
+
+    for schema in [&from_uri, &opened, &created] {
+        drop_test_schema(&mut admin, schema);
+    }
+
+    let reported = |read: Result<String, adbc_core::error::Error>| read.map_err(|e| e.status);
+    assert_eq!(reported(before_session), Ok(from_uri.to_lowercase()));
+    assert_eq!(on_server, Some(from_uri.clone()));
+    assert_eq!(reported(after_uri), Ok(from_uri));
+    assert_eq!(reported(after_open), Ok(opened.clone()));
+    assert_eq!(reported(after_create), Ok(created));
+    assert_eq!(reported(after_option), Ok(opened));
+    assert_eq!(reported(after_close), Err(Status::NotFound));
 }
 
 // Credential Option Tests
