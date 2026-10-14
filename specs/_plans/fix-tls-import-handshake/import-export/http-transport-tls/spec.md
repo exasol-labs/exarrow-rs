@@ -27,6 +27,7 @@ The HTTP transport encrypts the tunnel with ad-hoc certificates, independently o
 * *WHEN* the client sends that statement
 * *THEN* the client MUST NOT send TLS data on the tunnel before Exasol starts the TLS handshake
 * *AND* the client MUST NOT wait for the TLS handshake before it sends the statement
+* *AND* the client MAY begin its first tunnel read before it dispatches the statement, because as the TLS server it sends no TLS byte until Exasol's first TLS handshake message arrives
 * *AND* the client SHALL complete the TLS handshake when Exasol starts it and SHALL serve Exasol's HTTP requests over the TLS connection
 * *AND* when the TLS handshake fails during an import, the system SHALL return the tunnel error to the caller only after the IMPORT statement has returned
 <!-- /DELTA:NEW -->

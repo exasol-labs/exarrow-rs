@@ -19,14 +19,35 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *THEN* the client SHALL fail with an error message that contains `HTTP tunnel setup timeout after <N>ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`
 * *AND* a stall in the TCP connect or the EXA handshake SHALL fail `connect_with_timeout`, a stall in the TLS handshake SHALL fail the first tunnel operation that reads or writes data, and in both cases the client SHALL close the tunnel connection
 * *AND* one deadline of N milliseconds SHALL bound the TCP connect and the EXA handshake together, so time spent in one step SHALL NOT be granted again to the next
-* *AND* a separate bound of N milliseconds SHALL apply to the TLS handshake, SHALL start when the first tunnel read or write begins, and SHALL include the wait for the first TLS byte from the peer
+* *AND* a separate bound of N milliseconds SHALL apply to the TLS handshake, SHALL start when the first tunnel read or write begins, whether before or after the IMPORT or EXPORT statement is dispatched, and SHALL include the wait for the first TLS byte from the peer
+* *AND* the TLS handshake bound SHALL be a full N milliseconds, whatever time the TCP connect and the EXA handshake used
+<!-- /DELTA:CHANGED -->
+
+<!-- DELTA:NEW -->
+### Scenario: A TLS tunnel stays failed after a failed TLS handshake
+
+* *GIVEN* an HTTP tunnel with TLS enabled whose first read or write failed in the TLS handshake
+* *WHEN* the caller starts another read or write on the same client
+* *THEN* that read or write SHALL fail without waiting for a bound
+* *AND* the client SHALL NOT attempt a new TLS handshake, SHALL send no byte to the peer, and SHALL NOT open a new connection
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:CHANGED -->
+### Scenario: Tunnel setup is bounded by 30 seconds by default
+
+* *GIVEN* an import or an export that opens its HTTP tunnel
+* *AND* the tunnel peer accepts the TCP connection and never sends the EXA handshake response
+* *WHEN* 30 seconds pass after the tunnel setup started
+* *THEN* the import or export SHALL fail with an error message that contains `HTTP tunnel setup timeout after 30000ms (EXA handshake)`
+* *AND* the driver MUST NOT send the IMPORT or EXPORT statement
+* *AND* the bound SHALL apply whether or not `CsvExportOptions::timeout_ms` is set, because that export timeout starts only after the TCP connect and the EXA handshake
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:NEW -->
 ### Scenario: TLS tunnel fails with the step named when Exasol does not start the TLS handshake
 
 * *GIVEN* an HTTP tunnel opened with TLS enabled and a setup bound of N milliseconds
-* *AND* the IMPORT or EXPORT statement that names the tunnel has been sent, and the first tunnel read or write has begun
+* *AND* the first tunnel read or write has begun, before or after the IMPORT or EXPORT statement that names the tunnel is dispatched
 * *WHEN* Exasol sends no TLS byte on the tunnel within N milliseconds after that read or write began
 * *THEN* that read or write SHALL fail with an error message that contains `HTTP tunnel setup timeout after <N>ms (TLS handshake)`
 * *AND* the client SHALL close the tunnel connection
