@@ -55,7 +55,9 @@ pub struct CsvImportOptions {
     /// Maximum number of invalid rows before failure (default: None = fail on first error).
     pub reject_limit: Option<u32>,
 
-    /// Use TLS encryption for HTTP transport (default: true).
+    /// Whether to encrypt the HTTP transport tunnel with TLS (default: `false`).
+    /// `true` encrypts the tunnel, including against Exasol Docker. The control
+    /// connection's TLS does not cover the tunnel data.
     pub use_tls: bool,
 
     /// Target schema (optional).
@@ -809,18 +811,16 @@ where
 
     // Run SQL execution and data streaming concurrently on the same task.
     // The stream normally completes before SQL for small batches — that's expected.
-    // If the stream errors, abort immediately without waiting for SQL.
+    // A failed stream has dropped its tunnel socket, so Exasol fails the IMPORT; awaiting it
+    // first keeps its response from reaching the next statement on the Connection.
     let (sql_result, stream_done) = tokio::select! {
         result = &mut sql_future => {
             (result, false)
         },
         stream_result = &mut stream_future => {
-            match stream_result {
-                Err(e) => return Err(e),
-                Ok(()) => {
-                    (sql_future.await, true)
-                },
-            }
+            let sql_result = sql_future.await;
+            stream_result?;
+            (sql_result, true)
         }
     };
 
@@ -1621,6 +1621,44 @@ mod tests {
         assert!(
             !statement_sent.load(Ordering::SeqCst),
             "the IMPORT statement must not be sent before the tunnel is set up"
+        );
+    }
+
+    /// Scenario: TLS handshake starts after the IMPORT or EXPORT statement is sent
+    #[tokio::test]
+    async fn test_import_returns_a_tunnel_error_only_after_the_statement_returns() {
+        use crate::transport::test_support::FakeExasolServer;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const STATEMENT_RUNTIME: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let server = FakeExasolServer::silent_after_handshake().await;
+        let statement_returned = AtomicBool::new(false);
+        let execute_sql = |_sql: String| async {
+            tokio::time::sleep(STATEMENT_RUNTIME).await;
+            statement_returned.store(true, Ordering::SeqCst);
+            Err::<u64, String>("the tunnel closed before the IMPORT read any data".to_string())
+        };
+        let options = CsvImportOptions::default()
+            .exasol_host(&server.host)
+            .exasol_port(server.port)
+            .use_tls(true);
+
+        let error = import_csv_internal(execute_sql, "t", options, |_client, _compression| async {
+            Err(ImportError::HttpTransportError(
+                "TLS handshake failed".to_string(),
+            ))
+        })
+        .await
+        .expect_err("a failed tunnel must fail the import");
+
+        assert!(
+            matches!(&error, ImportError::HttpTransportError(m) if m == "TLS handshake failed"),
+            "the tunnel error must reach the caller: {error:?}"
+        );
+        assert!(
+            statement_returned.load(Ordering::SeqCst),
+            "the import must not return while the IMPORT statement is still running"
         );
     }
 }

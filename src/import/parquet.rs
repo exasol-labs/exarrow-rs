@@ -51,7 +51,9 @@ pub struct ParquetImportOptions {
     pub column_separator: char,
     /// Column delimiter for CSV output (default: '"')
     pub column_delimiter: char,
-    /// Whether to use TLS for the HTTP transport tunnel
+    /// Whether to encrypt the HTTP transport tunnel with TLS (default: `false`).
+    /// `true` encrypts the tunnel, including against Exasol Docker. The control
+    /// connection's TLS does not cover the tunnel data.
     pub use_tls: bool,
 
     /// Exasol host for HTTP transport connection.
@@ -1173,6 +1175,7 @@ mod tests {
         assert_eq!(options.port, 8563);
     }
 
+    /// Scenario: TLS for HTTP transport is configured uniformly via use_tls
     #[test]
     fn test_parquet_import_options_use_tls_builder() {
         assert!(ParquetImportOptions::default().use_tls(true).use_tls);

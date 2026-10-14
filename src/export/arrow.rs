@@ -108,9 +108,9 @@ pub struct ArrowExportOptions {
     /// Exasol port for HTTP transport connection.
     /// This is typically the same port as the WebSocket connection.
     pub port: u16,
-    /// Whether to use TLS for the HTTP transport tunnel.
-    /// Default is `false` because the main WebSocket connection typically
-    /// already handles TLS encryption.
+    /// Whether to encrypt the HTTP transport tunnel with TLS (default: `false`).
+    /// `true` encrypts the tunnel, including against Exasol Docker. The control
+    /// connection's TLS does not cover the tunnel data.
     pub use_tls: bool,
 }
 
@@ -864,6 +864,7 @@ mod tests {
     // Tests for ArrowExportOptions
     // ==========================================================================
 
+    /// Scenario: TLS for HTTP transport is configured uniformly via use_tls
     #[test]
     fn test_arrow_export_options_default() {
         let options = ArrowExportOptions::default();

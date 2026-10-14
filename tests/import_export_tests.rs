@@ -122,7 +122,6 @@ async fn test_csv_import_into_table() {
         .expect("Failed to write CSV file");
 
     // Import the CSV file
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_imported = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -185,7 +184,6 @@ async fn test_csv_import_with_column_mapping() {
     std::fs::write(&csv_path, "1,John,95.5\n2,Jane,88.0\n").expect("Failed to write CSV file");
 
     // Import with specific column mapping
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let options = CsvImportOptions::default().use_tls(false).columns(vec![
         "id".to_string(),
         "first_name".to_string(),
@@ -235,7 +233,6 @@ async fn test_csv_import_error_handling() {
         .expect("Failed to write CSV file");
 
     // Import should fail due to data type mismatch
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let result = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -280,7 +277,6 @@ async fn test_csv_import_compressed_gzip() {
     encoder.finish().expect("Failed to finish compression");
 
     // Import with gzip compression
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let options = CsvImportOptions::default()
         .use_tls(false)
         .compression(exarrow_rs::query::import::Compression::Gzip);
@@ -326,7 +322,6 @@ async fn test_csv_import_from_stream() {
     let reader = std::io::Cursor::new(csv_data.to_vec());
 
     // Import from stream
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_imported = conn
         .import_csv_from_stream(
             &format!("{}.test_data", schema_name),
@@ -374,7 +369,6 @@ async fn test_csv_export_table_to_file() {
     let csv_path = temp_dir.path().join("export.csv");
 
     // Export to CSV
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_exported = conn
         .export_csv_to_file(
             ExportSource::Table {
@@ -420,7 +414,6 @@ async fn test_csv_export_query_to_file() {
     let csv_path = temp_dir.path().join("query_export.csv");
 
     // Export query result (only first 5 rows)
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_exported = conn
         .export_csv_to_file(
             ExportSource::Query {
@@ -464,7 +457,6 @@ async fn test_csv_export_with_headers() {
     let csv_path = temp_dir.path().join("with_headers.csv");
 
     // Export with column names
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let options = CsvExportOptions::default()
         .use_tls(false)
         .with_column_names(true);
@@ -527,7 +519,6 @@ async fn test_csv_export_with_gzip_transfer() {
     let csv_path = temp_dir.path().join("gzip_transfer_export.csv");
 
     // Export with gzip transfer encoding
-    // Note: use_tls(false) for HTTP transport as Docker Exasol doesn't expect TLS there
     // The compression option enables gzip transfer from Exasol to client,
     // but the library decompresses before writing to file
     let options = CsvExportOptions::default()
@@ -572,7 +563,6 @@ async fn test_csv_export_to_list() {
     populate_test_data(&mut conn, &schema_name, 5).await;
 
     // Export to in-memory list
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows = conn
         .export_csv_to_list(
             ExportSource::Table {
@@ -615,7 +605,6 @@ async fn test_csv_export_to_stream() {
     let writer = std::io::Cursor::new(buffer);
 
     // Export to stream
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_exported = conn
         .export_csv_to_stream(
             ExportSource::Table {
@@ -1204,7 +1193,6 @@ async fn test_csv_import_empty_file() {
     std::fs::write(&csv_path, "").expect("Failed to create empty file");
 
     // Import should succeed with 0 rows
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_imported = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -1237,7 +1225,6 @@ async fn test_csv_export_empty_table() {
     let csv_path = temp_dir.path().join("empty_export.csv");
 
     // Export should succeed with 0 rows
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_exported = conn
         .export_csv_to_file(
             ExportSource::Table {
@@ -1279,7 +1266,6 @@ async fn test_csv_import_special_characters() {
 "#;
     std::fs::write(&csv_path, csv_content).expect("Failed to write CSV file");
 
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_imported = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -1330,7 +1316,6 @@ async fn test_large_dataset_import_export() {
     std::fs::write(&csv_path, &csv_content).expect("Failed to write large CSV");
 
     // Import
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let rows_imported = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -1343,7 +1328,6 @@ async fn test_large_dataset_import_export() {
     assert_eq!(rows_imported, 1000, "Should import 1000 rows");
 
     // Export
-    // Note: use_tls(false) for HTTP transport as the main WebSocket connection already handles TLS
     let export_path = temp_dir.path().join("large_export.csv");
     let rows_exported = conn
         .export_csv_to_file(
@@ -1369,10 +1353,9 @@ async fn test_large_dataset_import_export() {
 //
 // Note: These tests verify that import/export operations work correctly when
 // the main WebSocket connection uses TLS. The HTTP transport layer for
-// import/export runs on the same port but handles TLS separately.
-// For Docker Exasol (local testing), the HTTP transport doesn't use TLS,
-// so we use use_tls(false) for the HTTP transport options.
-// For Exasol SaaS (cloud), TLS might be required for HTTP transport as well.
+// import/export runs on the same port but handles TLS separately, through
+// use_tls on the import/export options. These tests keep the HTTP tunnel plain;
+// the HTTP tunnel TLS section covers use_tls(true).
 
 /// Test import/export with TLS WebSocket connection
 ///
@@ -1397,7 +1380,6 @@ async fn test_tls_connection_csv_import() {
         .expect("Failed to write CSV file");
 
     // Import the CSV file (WebSocket connection uses TLS by default)
-    // Note: use_tls(false) for HTTP transport as Docker Exasol doesn't expect TLS there
     let rows_imported = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -1446,7 +1428,6 @@ async fn test_tls_connection_csv_export() {
     let csv_path = temp_dir.path().join("tls_export.csv");
 
     // Export to CSV (WebSocket connection uses TLS by default)
-    // Note: use_tls(false) for HTTP transport as Docker Exasol doesn't expect TLS there
     let rows_exported = conn
         .export_csv_to_file(
             ExportSource::Table {
@@ -1501,7 +1482,6 @@ async fn test_tls_connection_round_trip() {
     )
     .expect("Failed to write CSV file");
 
-    // Note: use_tls(false) for HTTP transport as Docker Exasol doesn't expect TLS there
     let rows_imported = conn
         .import_csv_from_file(
             &format!("{}.test_data", schema_name),
@@ -1515,7 +1495,6 @@ async fn test_tls_connection_round_trip() {
 
     // Step 2: Export data
     let export_path = temp_dir.path().join("tls_export.csv");
-    // Note: use_tls(false) for HTTP transport as Docker Exasol doesn't expect TLS there
     let rows_exported = conn
         .export_csv_to_file(
             ExportSource::Table {
@@ -3715,6 +3694,175 @@ async fn test_parquet_import_csv_path_keeps_pre_epoch_fractional_timestamps() {
         stored,
         ["1969-12-31 23:59:59.500000", "1969-12-31 23:59:59.999999"]
     );
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section: HTTP tunnel TLS
+//
+// These tests fail instead of skipping when Exasol is unavailable (AGENTS.md).
+
+/// Twice the 30-second TLS handshake bound, so a hang fails the test with its
+/// own message instead of blocking the suite.
+const TLS_HANG_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn within_tls_hang_limit<T>(operation: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(TLS_HANG_LIMIT, operation)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("an import or export with use_tls(true) must finish within {TLS_HANG_LIMIT:?}")
+        })
+}
+
+async fn tls_test_connection() -> Connection {
+    get_test_connection()
+        .await
+        .expect("Exasol must be running for the TLS tests")
+}
+
+fn id_name_rows(count: usize, name_of: impl Fn(usize) -> String) -> Vec<Vec<String>> {
+    (1..=count)
+        .map(|id| vec![id.to_string(), name_of(id)])
+        .collect()
+}
+
+/// Reads back the three rows that the TLS import tests load.
+async fn assert_alice_bob_charlie_imported(conn: &mut Connection, schema_name: &str) {
+    let rows = text_rows(
+        conn,
+        &format!("SELECT id, name FROM {schema_name}.test_data ORDER BY id"),
+    )
+    .await;
+    let expected: Vec<Vec<String>> = [["1", "Alice"], ["2", "Bob"], ["3", "Charlie"]]
+        .iter()
+        .map(|row| row.iter().map(ToString::to_string).collect())
+        .collect();
+    assert_eq!(rows, expected);
+}
+
+/// Scenario: TLS encryption with ad-hoc certificates
+/// Scenario: TLS handshake starts after the IMPORT or EXPORT statement is sent
+/// Scenario: WebSocket TLS and HTTP transport TLS are independent
+/// Scenario: HTTP transport TLS against Exasol Docker (self-signed certificate)
+#[tokio::test]
+async fn test_csv_import_with_tls_completes() {
+    let mut conn = tls_test_connection().await;
+    let schema_name = generate_test_schema_name();
+    setup_import_export_table(&mut conn, &schema_name).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path = temp_dir.path().join("tls_import.csv");
+    std::fs::write(&csv_path, "1,Alice,10.5\n2,Bob,20.5\n3,Charlie,30.5\n")
+        .expect("Failed to write CSV file");
+
+    let rows_imported = within_tls_hang_limit(conn.import_csv_from_file(
+        &format!("{schema_name}.test_data"),
+        &csv_path,
+        CsvImportOptions::default().use_tls(true),
+    ))
+    .await
+    .expect("a CSV import with use_tls(true) must succeed");
+
+    assert_eq!(rows_imported, 3);
+    assert_alice_bob_charlie_imported(&mut conn, &schema_name).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: TLS handshake starts after the IMPORT or EXPORT statement is sent
+/// Scenario: HTTP transport TLS against Exasol Docker (self-signed certificate)
+#[tokio::test]
+async fn test_csv_export_with_tls_completes() {
+    let mut conn = tls_test_connection().await;
+    let schema_name = generate_test_schema_name();
+    setup_import_export_table(&mut conn, &schema_name).await;
+    populate_test_data(&mut conn, &schema_name, 5).await;
+
+    let rows = within_tls_hang_limit(conn.export_csv_to_list(
+        ExportSource::Query {
+            sql: format!("SELECT id, name FROM {schema_name}.test_data ORDER BY id"),
+        },
+        CsvExportOptions::default().use_tls(true),
+    ))
+    .await
+    .expect("a CSV export with use_tls(true) must succeed");
+
+    assert_eq!(rows, id_name_rows(5, |id| format!("name_{id}")));
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: HTTP transport TLS against Exasol Docker (self-signed certificate)
+#[tokio::test]
+async fn test_parallel_csv_import_with_tls_completes() {
+    let mut conn = tls_test_connection().await;
+    let schema_name = generate_test_schema_name();
+    setup_import_export_table(&mut conn, &schema_name).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path1 = temp_dir.path().join("tls_part1.csv");
+    let csv_path2 = temp_dir.path().join("tls_part2.csv");
+    std::fs::write(&csv_path1, "1,Alice,10.5\n2,Bob,20.5\n").expect("Failed to write CSV file 1");
+    std::fs::write(&csv_path2, "3,Charlie,30.5\n").expect("Failed to write CSV file 2");
+
+    let rows_imported = within_tls_hang_limit(conn.import_csv_from_files(
+        &format!("{schema_name}.test_data"),
+        vec![csv_path1, csv_path2],
+        CsvImportOptions::default().use_tls(true),
+    ))
+    .await
+    .expect("a multi-file CSV import with use_tls(true) must succeed");
+
+    assert_eq!(rows_imported, 3);
+    assert_alice_bob_charlie_imported(&mut conn, &schema_name).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: HTTP transport TLS against Exasol Docker (self-signed certificate)
+#[tokio::test]
+async fn test_parquet_import_with_tls_completes() {
+    let mut conn = tls_test_connection().await;
+    let schema_name = generate_test_schema_name();
+    setup_id_name_table(&mut conn, &schema_name).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = write_small_parquet(temp_dir.path(), "tls.parquet");
+
+    let rows_imported = within_tls_hang_limit(
+        conn.import_from_parquet(
+            &format!("{schema_name}.test_data"),
+            &parquet_path,
+            ParquetImportOptions::default()
+                .with_native_parquet(Some(true))
+                .use_tls(true),
+        ),
+    )
+    .await
+    .expect("a native Parquet import with use_tls(true) must succeed");
+
+    assert_eq!(rows_imported, 3);
+    assert_alice_bob_charlie_imported(&mut conn, &schema_name).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: TLS tunnel fails with the step named when Exasol does not start the TLS handshake
+#[tokio::test]
+async fn test_csv_import_with_tls_into_missing_table_returns_error() {
+    let mut conn = tls_test_connection().await;
+    let (schema_name, table) = missing_table_in_new_schema(&mut conn).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let csv_path = temp_dir.path().join("tls_missing.csv");
+    std::fs::write(&csv_path, "1,Alice,10.5\n").expect("Failed to write CSV file");
+
+    assert_import_reports_missing_table(
+        conn.import_csv_from_file(&table, &csv_path, CsvImportOptions::default().use_tls(true)),
+        &table,
+    )
+    .await;
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");

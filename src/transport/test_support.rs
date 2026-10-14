@@ -10,7 +10,8 @@
 //! Doubles here: `MockTransport` and `StalledQueryTransport` for the
 //! `TransportProtocol` trait with `transport_session_info` as the session a
 //! mocked login reports, `FakeExasolServer` for the HTTP-tunnel wire
-//! format (answering, or silent before or after its handshake),
+//! format (answering, silent before or after its handshake, or starting,
+//! stalling, or refusing the TLS handshake that Exasol runs as the client),
 //! `SilentServer` for a peer that accepts and then never answers (plain,
 //! after TLS, or after the WebSocket upgrade), and `FakeWebSocketServer`
 //! (`websocket` feature) for scripted WebSocket API exchanges.
@@ -23,10 +24,12 @@ use crate::transport::messages::{ResultData, ResultSetHandle, SessionInfo};
 use crate::transport::protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult,
 };
+use crate::transport::tls::{client_config, client_handshake};
 use crate::transport::TransportProtocol;
 use async_trait::async_trait;
 use mockall::mock;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -188,15 +191,26 @@ impl TransportProtocol for StalledQueryTransport {
 const INTERNAL_IP: &str = "10.0.0.5";
 const INTERNAL_PORT: i32 = 8563;
 
-/// A loopback peer that plays Exasol's side of an HTTP-tunnel export.
+/// The header of a TLS handshake record that announces a 512-byte body, as a
+/// ClientHello from Exasol starts.
+const TLS_HANDSHAKE_RECORD_HEADER: [u8; 5] = [0x16, 0x03, 0x01, 0x02, 0x00];
+
+/// How long [`FakeExasolServer::accepts_another_connection`] waits. A connect
+/// the driver already made sits in the listener backlog, so this only has to
+/// cover the accept itself.
+const RECONNECT_WINDOW: Duration = Duration::from_millis(100);
+
+/// A loopback peer that plays Exasol's side of an HTTP tunnel.
 ///
-/// The export path opens a real TCP connection and completes the binary tunnel
-/// handshake before any HTTP traffic, so none of its runtime behaviour is
-/// reachable from a unit test without a peer that speaks that wire format.
+/// The import and export paths open a real TCP connection and complete the
+/// binary tunnel handshake before any HTTP traffic, so none of their runtime
+/// behaviour is reachable from a unit test without a peer that speaks that
+/// wire format.
 pub(crate) struct FakeExasolServer {
     pub(crate) host: String,
     pub(crate) port: u16,
-    peer: JoinHandle<()>,
+    listener: Arc<TcpListener>,
+    peer: JoinHandle<Vec<u8>>,
     magic_packet_received: Option<oneshot::Receiver<()>>,
 }
 
@@ -205,8 +219,7 @@ impl FakeExasolServer {
     /// `PUT`, the shape Exasol uses to push EXPORT results at the driver.
     pub(crate) async fn serving_csv(csv: &str) -> Self {
         let body = csv.as_bytes().to_vec();
-        let (listener, host, port) = bind_loopback().await;
-        let peer = tokio::spawn(async move {
+        Self::spawn(|listener| async move {
             let mut stream = accept_and_handshake(&listener).await;
             let head = format!(
                 "PUT /000.csv HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
@@ -215,53 +228,109 @@ impl FakeExasolServer {
             stream.write_all(head.as_bytes()).await.expect("write head");
             stream.write_all(&body).await.expect("write body");
             stream.flush().await.expect("flush the PUT");
-            let mut acknowledgement = Vec::new();
-            let _ = stream.read_to_end(&mut acknowledgement).await;
-        });
-        Self {
-            host,
-            port,
-            peer,
-            magic_packet_received: None,
-        }
+            read_until_end_of_stream(&mut stream).await
+        })
+        .await
     }
 
     /// Answers the handshake and then sends nothing, leaving the export's
     /// tunnel task blocked for as long as the connection stays open.
     pub(crate) async fn silent_after_handshake() -> Self {
-        let (listener, host, port) = bind_loopback().await;
-        let peer = tokio::spawn(async move {
+        Self::spawn(|listener| async move {
             let mut stream = accept_and_handshake(&listener).await;
-            discard_until_end_of_stream(&mut stream).await;
-        });
-        Self {
-            host,
-            port,
-            peer,
-            magic_packet_received: None,
-        }
+            read_until_end_of_stream(&mut stream).await
+        })
+        .await
     }
 
     /// Reads the magic packet and then never answers it, so a client stays in
     /// its EXA handshake. Await [`wait_for_magic_packet`](Self::wait_for_magic_packet)
     /// to know that the client reached that step.
     pub(crate) async fn silent_before_handshake() -> Self {
-        let (listener, host, port) = bind_loopback().await;
         let (received, magic_packet_received) = oneshot::channel();
-        let peer = tokio::spawn(async move {
+        let mut server = Self::spawn(|listener| async move {
             let (mut stream, _) = listener
                 .accept()
                 .await
                 .expect("accept the tunnel connection");
             read_magic_packet(&mut stream).await;
             let _ = received.send(());
-            discard_until_end_of_stream(&mut stream).await;
-        });
+            read_until_end_of_stream(&mut stream).await
+        })
+        .await;
+        server.magic_packet_received = Some(magic_packet_received);
+        server
+    }
+
+    /// Answers the handshake, waits `delay`, then starts TLS as the client
+    /// that accepts any certificate, as Exasol does once it receives the
+    /// IMPORT statement, and sends `GET /001.csv` over it.
+    pub(crate) async fn requesting_over_tls_after(delay: Duration) -> Self {
+        Self::spawn(move |listener| async move {
+            let stream = accept_and_handshake(&listener).await;
+            tokio::time::sleep(delay).await;
+            let mut tls = client_handshake(stream, "localhost", client_config(None, false))
+                .await
+                .expect("the driver must accept the TLS handshake that the peer starts");
+            let request =
+                format!("GET /001.csv HTTP/1.1\r\nHost: {INTERNAL_IP}:{INTERNAL_PORT}\r\n\r\n");
+            tls.write_all(request.as_bytes())
+                .await
+                .expect("send the GET over TLS");
+            tls.flush().await.expect("flush the GET");
+            read_until_end_of_stream(&mut tls).await
+        })
+        .await
+    }
+
+    /// Answers the handshake, then sends only the 5-byte header of a TLS
+    /// handshake record and stops, so the driver stalls mid-handshake.
+    pub(crate) async fn stalling_mid_tls_handshake() -> Self {
+        Self::spawn(|listener| async move {
+            let mut stream = accept_and_handshake(&listener).await;
+            stream
+                .write_all(&TLS_HANDSHAKE_RECORD_HEADER)
+                .await
+                .expect("write the TLS record header");
+            stream.flush().await.expect("flush the TLS record header");
+            read_until_end_of_stream(&mut stream).await
+        })
+        .await
+    }
+
+    /// Answers the handshake and then closes its sending side before any TLS
+    /// byte, reading on until the driver closes the tunnel.
+    pub(crate) async fn closing_after_handshake() -> Self {
+        Self::spawn(|listener| async move {
+            let mut stream = accept_and_handshake(&listener).await;
+            stream.shutdown().await.expect("close the sending side");
+            read_until_end_of_stream(&mut stream).await
+        })
+        .await
+    }
+
+    /// Reports whether the driver opened another tunnel connection after the
+    /// first one.
+    pub(crate) async fn accepts_another_connection(&self) -> bool {
+        tokio::time::timeout(RECONNECT_WINDOW, self.listener.accept())
+            .await
+            .is_ok()
+    }
+
+    async fn spawn<F, Fut>(script: F) -> Self
+    where
+        F: FnOnce(Arc<TcpListener>) -> Fut,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        let (listener, host, port) = bind_loopback().await;
+        let listener = Arc::new(listener);
+        let peer = tokio::spawn(script(Arc::clone(&listener)));
         Self {
             host,
             port,
+            listener,
             peer,
-            magic_packet_received: Some(magic_packet_received),
+            magic_packet_received: None,
         }
     }
 
@@ -276,11 +345,12 @@ impl FakeExasolServer {
     }
 
     /// Waits for the peer task, which ends once the driver closes its end of
-    /// the tunnel connection.
-    pub(crate) async fn wait_for_disconnect(&mut self) {
+    /// the tunnel connection, and returns the bytes the peer read after its
+    /// scripted exchange.
+    pub(crate) async fn wait_for_disconnect(&mut self) -> Vec<u8> {
         (&mut self.peer)
             .await
-            .expect("the fake peer must not panic");
+            .expect("the fake peer must not panic")
     }
 }
 
@@ -346,7 +416,7 @@ impl SilentServer {
         let (listener, host, port) = bind_loopback().await;
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept the connection");
-            discard_until_end_of_stream(&mut stream).await;
+            read_until_end_of_stream(&mut stream).await;
         });
         Self {
             host,
@@ -369,7 +439,7 @@ impl SilentServer {
             let (stream, _) = listener.accept().await.expect("accept the connection");
             // A client that rejects the certificate fails the handshake; that ends the peer.
             if let Ok(mut tls_stream) = acceptor.accept(stream).await {
-                discard_until_end_of_stream(&mut tls_stream).await;
+                read_until_end_of_stream(&mut tls_stream).await;
             }
         });
         Self {
@@ -424,9 +494,12 @@ impl Drop for SilentServer {
     }
 }
 
-async fn discard_until_end_of_stream(stream: &mut (impl tokio::io::AsyncRead + Unpin)) {
-    let mut discarded = Vec::new();
-    let _ = stream.read_to_end(&mut discarded).await;
+/// A TLS read fails when the driver closes without `close_notify`, so any
+/// read error ends the stream here like end of stream does.
+async fn read_until_end_of_stream(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    let mut received = Vec::new();
+    let _ = stream.read_to_end(&mut received).await;
+    received
 }
 
 async fn bind_loopback() -> (TcpListener, String, u16) {

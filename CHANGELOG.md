@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.2
+
+- Fix: imports and exports with `use_tls(true)` complete instead of failing with `HTTP tunnel setup timeout after 30000ms (TLS handshake)`. The driver now takes the TLS server role and completes the handshake that Exasol starts after it receives the IMPORT or EXPORT statement. Fixes #53.
+- Changed: `HttpTransportClient::connect` and `connect_with_timeout` with TLS return after the EXA handshake. TLS handshake errors come from the first tunnel read or write. A separate 30-second TLS handshake bound starts when that read or write begins, which can be before the statement is dispatched. An explicit `CsvExportOptions::timeout_ms` also covers the TLS handshake.
+
 ## 0.21.1
 
 - Fix: over the native protocol, a prepared statement with a bound TIMESTAMP parameter no longer breaks the connection. This covers a bound Arrow Timestamp column, a Python `datetime` parameter, and TIMESTAMP text. TIMESTAMP text outside the form `YYYY-MM-DD[ HH[:MI[:SS[.FFFFFFFFF]]]]` fails before execution. ISO 8601 text with a `T` separator bound to a TIMESTAMP parameter still fails on both transports, and a bound Arrow Timestamp column never produces such text. Fixes #38.

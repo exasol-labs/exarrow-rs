@@ -17,6 +17,8 @@
 //!
 //! For encrypted connections, ad-hoc self-signed certificates are generated using `rcgen`.
 //! SHA-256 fingerprints are computed for Exasol 8.32.0+ compatibility.
+//! The driver is the TLS server of the tunnel: Exasol starts the TLS handshake
+//! as the client after it receives the IMPORT or EXPORT statement.
 
 use std::io;
 use std::sync::Arc;
@@ -24,18 +26,17 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use rcgen::{CertifiedKey, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{server, TlsAcceptor};
 
 use crate::error::TransportError;
 
 use super::deadline::{SetupDeadline, SetupStep};
-use super::tls::NoVerifier;
 
 /// EXA tunneling protocol magic number.
 /// This is sent as the first 4 bytes of the handshake.
@@ -56,7 +57,8 @@ pub const EXA_RESPONSE_PACKET_SIZE: usize = 24;
 /// HTTP chunk size for data transfer (64KB).
 pub const HTTP_CHUNK_SIZE: usize = 64 * 1024;
 
-/// The bound that [`HttpTransportClient::connect`] puts on tunnel setup.
+/// The bound that [`HttpTransportClient::connect`] puts on the TCP connect and
+/// the EXA handshake together, and separately on the TLS handshake.
 const TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Generates the EXA tunneling magic packet.
@@ -273,22 +275,16 @@ impl TlsCertificate {
             .map_err(|e| TransportError::TlsError(format!("Failed to create TLS config: {e}")))
     }
 
-    /// Creates a rustls `ClientConfig` from this certificate.
+    /// Returns a rustls `ClientConfig` with an empty root store and no client certificate.
     ///
-    /// This creates a client configuration that trusts the self-signed certificate
-    /// (for connecting to Exasol with TLS using this ad-hoc certificate).
+    /// The HTTP tunnel does not use it, because the driver is the TLS server of the tunnel.
+    /// It stays for API compatibility.
     ///
     /// # Errors
     ///
     /// Returns `TransportError::TlsError` if configuration fails.
     pub fn to_client_config(&self) -> Result<ClientConfig, TransportError> {
-        // Create an empty root store - we won't verify server certs since
-        // we're using ad-hoc certificates with Exasol's custom TLS mode
         let root_store = RootCertStore::empty();
-
-        // Build client config that doesn't verify server certificate
-        // This is necessary because Exasol uses the client's ad-hoc certificate
-        // and we include the fingerprint in the SQL statement
         let config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -297,11 +293,44 @@ impl TlsCertificate {
     }
 }
 
-/// Internal enum to hold either TCP or TLS client stream.
-/// The TLS variant is boxed to reduce enum size difference.
-enum ClientConnectionStream {
-    Tcp(TcpStream),
-    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+/// A tunnel byte stream that can carry HTTP: plain TCP, or TLS after the handshake.
+trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> TunnelIo for T {}
+
+/// The TLS server side of a tunnel whose handshake has not started yet.
+struct PendingTlsHandshake {
+    tcp_stream: TcpStream,
+    acceptor: TlsAcceptor,
+    bound: Duration,
+}
+
+impl PendingTlsHandshake {
+    /// Accepts the handshake that Exasol starts as the TLS client, within a
+    /// bound that starts now and includes the wait for Exasol's first byte.
+    async fn complete(self) -> Result<server::TlsStream<TcpStream>, TransportError> {
+        let Self {
+            tcp_stream,
+            acceptor,
+            bound,
+        } = self;
+        SetupDeadline::start("HTTP tunnel setup", bound)
+            .run(SetupStep::TlsHandshake, async {
+                acceptor
+                    .accept(tcp_stream)
+                    .await
+                    .map_err(|e| TransportError::TlsError(format!("TLS handshake failed: {e}")))
+            })
+            .await
+    }
+}
+
+enum TunnelStream {
+    Open(Box<dyn TunnelIo>),
+    TlsHandshakePending(PendingTlsHandshake),
+    /// The TLS handshake failed, was abandoned, or was skipped by `shutdown`,
+    /// and the socket is closed.
+    Closed,
 }
 
 /// HTTP Transport Client for connecting TO Exasol.
@@ -310,11 +339,15 @@ enum ClientConnectionStream {
 /// handshake to establish a data transfer channel. Unlike the server mode,
 /// this works through firewalls and NAT because it only makes outbound connections.
 ///
-/// # Example
-///
+/// With TLS, the client is the TLS server of the tunnel. Exasol starts the TLS
+/// handshake as the client once it receives the IMPORT or EXPORT statement that
+/// names the tunnel, so the client completes the handshake inside its first
+/// tunnel read or write. That read or write may begin before the statement is
+/// dispatched: as the TLS server, the client sends no TLS byte until Exasol's
+/// first handshake message arrives. A tunnel whose TLS handshake failed stays
+/// failed, and every later read or write returns an error at once.
 pub struct HttpTransportClient {
-    /// The underlying stream (either TCP or TLS)
-    stream: ClientConnectionStream,
+    stream: TunnelStream,
     /// Internal address from handshake response (format: "host:port")
     internal_addr: String,
     /// TLS certificate (for fingerprint extraction), if TLS is enabled
@@ -322,14 +355,15 @@ pub struct HttpTransportClient {
 }
 
 impl HttpTransportClient {
-    /// Connects to Exasol and performs the EXA tunneling handshake, within a
-    /// fixed 30-second setup deadline.
+    /// Connects to Exasol and performs the EXA tunneling handshake, with
+    /// 30-second setup bounds.
     ///
-    /// One deadline bounds the TCP connect, the EXA handshake, and the TLS
-    /// handshake together. It does not follow the connection timeout of any
-    /// `Connection`, and `CsvExportOptions::timeout_ms` does not cover it. A
-    /// stalled setup fails with `HTTP tunnel setup timeout after 30000ms (<step>)`.
-    /// Use [`connect_with_timeout`](Self::connect_with_timeout) to choose the bound.
+    /// One 30-second deadline bounds the TCP connect and the EXA handshake
+    /// together. With TLS, a separate 30-second bound covers the TLS handshake,
+    /// which runs inside the first tunnel read or write. Neither bound follows
+    /// the connection timeout of any `Connection`. A stalled step fails with
+    /// `HTTP tunnel setup timeout after 30000ms (<step>)`. Use
+    /// [`connect_with_timeout`](Self::connect_with_timeout) to choose the bounds.
     ///
     /// # Arguments
     ///
@@ -339,52 +373,67 @@ impl HttpTransportClient {
     ///
     /// # Returns
     ///
-    /// A connected `HttpTransportClient` ready for data transfer.
+    /// A connected `HttpTransportClient` ready for data transfer. With TLS, its
+    /// TLS handshake is still pending.
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if connection or handshake fails, or if setup
-    /// does not finish within 30 seconds.
+    /// Returns `TransportError` if the TCP connect or the EXA handshake fails or
+    /// does not finish within 30 seconds, or if the TLS certificate cannot be
+    /// generated. TLS handshake errors come from the first tunnel read or write.
     pub async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Self, TransportError> {
         Self::connect_with_timeout(host, port, use_tls, TUNNEL_SETUP_TIMEOUT).await
     }
 
-    /// Connects to Exasol and performs the EXA tunneling handshake, within
-    /// `setup_timeout`.
+    /// Connects to Exasol and performs the EXA tunneling handshake, with
+    /// setup bounds of `setup_timeout`.
     ///
     /// # Protocol Flow
     ///
-    /// The EXA tunneling protocol requires a specific order of operations:
-    /// 1. Connect TCP to Exasol (unencrypted)
-    /// 2. Send magic packet over plain TCP
-    /// 3. Receive response packet with internal address over plain TCP
-    /// 4. If TLS is enabled, wrap the connection with TLS
-    /// 5. Send/receive HTTP data (optionally over TLS)
+    /// 1. Connect TCP to Exasol (unencrypted).
+    /// 2. Send the magic packet over plain TCP.
+    /// 3. Receive the response packet with the internal address over plain TCP.
+    ///    Without TLS, the tunnel is ready and this method returns.
+    /// 4. With TLS, generate an ad-hoc certificate for the `PUBLIC KEY` clause
+    ///    and return with the TLS handshake pending. The client is the TLS
+    ///    server of the tunnel and sends no TLS byte on its own.
+    /// 5. The caller sends the IMPORT or EXPORT statement and serves the tunnel
+    ///    concurrently. Exasol starts the TLS handshake as the client after it
+    ///    receives the statement, and the first tunnel read or write completes
+    ///    it. That read or write can begin before the statement is dispatched.
+    /// 6. HTTP data flows, over TLS when it is enabled.
     ///
-    /// This order is critical - TLS must be applied AFTER the handshake, not before.
-    ///
-    /// One deadline of `setup_timeout` bounds steps 1 to 4 together: time spent
+    /// One deadline of `setup_timeout` bounds steps 1 to 3 together: time spent
     /// in one step is not granted again to the next. `CsvExportOptions::timeout_ms`
-    /// does not cover this setup. When the deadline passes, the error reads
-    /// `HTTP tunnel setup timeout after <ms>ms (<step>)` with the step that was
-    /// running (`TCP connect`, `EXA handshake`, or `TLS handshake`), and the
-    /// socket is released.
+    /// does not cover them. When that deadline passes, this method fails with
+    /// `HTTP tunnel setup timeout after <ms>ms (<step>)`, where the step is
+    /// `TCP connect` or `EXA handshake`, and the socket is released.
+    ///
+    /// With TLS, the handshake of step 5 gets a separate bound of
+    /// `setup_timeout`, however long steps 1 to 3 took. That bound starts when
+    /// the first tunnel read or write begins, so it can include statement
+    /// dispatch, and it includes the wait for Exasol's first TLS byte. When it
+    /// passes, that read or write fails with `HTTP tunnel setup timeout after
+    /// <ms>ms (TLS handshake)`, and the socket is released.
     ///
     /// # Arguments
     ///
     /// * `host` - The Exasol host to connect to
     /// * `port` - The port to connect to (same as WebSocket port)
     /// * `use_tls` - Whether to use TLS encryption for data transfer
-    /// * `setup_timeout` - The bound on the whole setup
+    /// * `setup_timeout` - The bound on steps 1 to 3, and the separate bound on
+    ///   the TLS handshake
     ///
     /// # Returns
     ///
-    /// A connected `HttpTransportClient` ready for data transfer.
+    /// A connected `HttpTransportClient` ready for data transfer. With TLS, its
+    /// TLS handshake is still pending.
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if connection or handshake fails, or if setup
-    /// does not finish within `setup_timeout`.
+    /// Returns `TransportError` if the TCP connect or the EXA handshake fails or
+    /// does not finish within `setup_timeout`, or if the TLS certificate cannot
+    /// be generated. TLS handshake errors come from the first tunnel read or write.
     pub async fn connect_with_timeout(
         host: &str,
         port: u16,
@@ -410,41 +459,21 @@ impl HttpTransportClient {
 
         if !use_tls {
             return Ok(Self {
-                stream: ClientConnectionStream::Tcp(tcp_stream),
+                stream: TunnelStream::Open(Box::new(tcp_stream)),
                 internal_addr,
                 tls_certificate: None,
             });
         }
 
-        // Generating the certificate takes no I/O, so it stays outside any step.
         let cert = TlsCertificate::generate()?;
-        let cert_der = CertificateDer::from(cert.certificate_der.clone());
-        let key_der = PrivatePkcs8KeyDer::from(cert.private_key_der.clone());
-
-        // Exasol authenticates the tunnel by the fingerprint of this client
-        // certificate, so the server certificate is accepted unchecked.
-        let connector = TlsConnector::from(Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_client_auth_cert(vec![cert_der], key_der.into())
-                .map_err(|e| TransportError::TlsError(format!("Failed to set client cert: {e}")))?,
-        ));
-        let server_name = "exasol"
-            .try_into()
-            .map_err(|e| TransportError::TlsError(format!("Invalid server name: {e:?}")))?;
-
-        let tls_stream = deadline
-            .run(SetupStep::TlsHandshake, async {
-                connector
-                    .connect(server_name, tcp_stream)
-                    .await
-                    .map_err(|e| TransportError::TlsError(format!("TLS handshake failed: {e}")))
-            })
-            .await?;
+        let acceptor = TlsAcceptor::from(Arc::new(cert.to_server_config()?));
 
         Ok(Self {
-            stream: ClientConnectionStream::Tls(Box::new(tls_stream)),
+            stream: TunnelStream::TlsHandshakePending(PendingTlsHandshake {
+                tcp_stream,
+                acceptor,
+                bound: setup_timeout,
+            }),
             internal_addr,
             tls_certificate: Some(cert),
         })
@@ -482,30 +511,21 @@ impl HttpTransportClient {
     /// # Errors
     ///
     /// Returns `TransportError::IoError` if writing fails.
+    ///
+    /// On a TLS tunnel, the first read or write completes the TLS handshake and returns
+    /// `TransportError::TlsError` if it fails, or `TransportError::IoError` with
+    /// `HTTP tunnel setup timeout after <ms>ms (TLS handshake)` if the bound elapses.
+    /// After a failed handshake, every call returns `TransportError::IoError` at once.
     pub async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => {
-                stream
-                    .write_all(data)
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to write data: {e}")))?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to flush data: {e}")))?;
-            }
-            ClientConnectionStream::Tls(stream) => {
-                stream
-                    .write_all(data)
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to write data: {e}")))?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|e| TransportError::IoError(format!("Failed to flush data: {e}")))?;
-            }
-        }
-        Ok(())
+        let stream = self.open_stream().await?;
+        stream
+            .write_all(data)
+            .await
+            .map_err(|e| TransportError::IoError(format!("Failed to write data: {e}")))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| TransportError::IoError(format!("Failed to flush data: {e}")))
     }
 
     /// Reads data from Exasol (for EXPORT operations).
@@ -521,32 +541,58 @@ impl HttpTransportClient {
     /// # Errors
     ///
     /// Returns `TransportError::IoError` if reading fails.
+    ///
+    /// On a TLS tunnel, the first read or write completes the TLS handshake and returns
+    /// `TransportError::TlsError` if it fails, or `TransportError::IoError` with
+    /// `HTTP tunnel setup timeout after <ms>ms (TLS handshake)` if the bound elapses.
+    /// After a failed handshake, every call returns `TransportError::IoError` at once.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => stream
-                .read(buf)
-                .await
-                .map_err(|e| TransportError::IoError(format!("Failed to read data: {e}"))),
-            ClientConnectionStream::Tls(stream) => stream
-                .read(buf)
-                .await
-                .map_err(|e| TransportError::IoError(format!("Failed to read data: {e}"))),
-        }
+        self.open_stream()
+            .await?
+            .read(buf)
+            .await
+            .map_err(|e| TransportError::IoError(format!("Failed to read data: {e}")))
     }
 
     /// Shuts down the connection cleanly.
+    ///
+    /// A tunnel whose TLS handshake has not started is shut down over plain
+    /// TCP without a handshake, and it stays closed.
     ///
     /// # Errors
     ///
     /// Returns `TransportError::IoError` if shutdown fails.
     pub async fn shutdown(&mut self) -> Result<(), TransportError> {
+        let result = match &mut self.stream {
+            TunnelStream::Open(stream) => stream.shutdown().await,
+            TunnelStream::TlsHandshakePending(pending) => {
+                let result = pending.tcp_stream.shutdown().await;
+                self.stream = TunnelStream::Closed;
+                result
+            }
+            TunnelStream::Closed => Ok(()),
+        };
+        result.map_err(|e| TransportError::IoError(format!("Failed to shutdown connection: {e}")))
+    }
+
+    /// Returns the stream that carries HTTP, completing a pending TLS handshake
+    /// first. The tunnel is marked closed while the handshake runs, so a failed
+    /// or abandoned handshake leaves it closed and a later call fails at once
+    /// instead of reusing the consumed socket.
+    async fn open_stream(&mut self) -> Result<&mut Box<dyn TunnelIo>, TransportError> {
+        self.stream = match std::mem::replace(&mut self.stream, TunnelStream::Closed) {
+            TunnelStream::TlsHandshakePending(pending) => {
+                TunnelStream::Open(Box::new(pending.complete().await?))
+            }
+            state => state,
+        };
         match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => stream.shutdown().await.map_err(|e| {
-                TransportError::IoError(format!("Failed to shutdown connection: {e}"))
-            }),
-            ClientConnectionStream::Tls(stream) => stream.shutdown().await.map_err(|e| {
-                TransportError::IoError(format!("Failed to shutdown connection: {e}"))
-            }),
+            TunnelStream::Open(stream) => Ok(stream),
+            TunnelStream::TlsHandshakePending(_) | TunnelStream::Closed => {
+                Err(TransportError::IoError(
+                    "HTTP tunnel is closed: its TLS handshake failed or never ran".to_string(),
+                ))
+            }
         }
     }
 
@@ -564,52 +610,7 @@ impl HttpTransportClient {
     ///
     /// Returns `TransportError` if reading or parsing fails.
     pub async fn read_http_request(&mut self) -> Result<HttpRequest, TransportError> {
-        match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => parse_http_request(stream).await,
-            ClientConnectionStream::Tls(stream) => parse_http_request(stream.as_mut()).await,
-        }
-    }
-
-    /// Reads exact bytes from the stream into the buffer.
-    ///
-    /// This is a helper method that abstracts the TCP/TLS stream dispatch.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - The buffer to read into
-    ///
-    /// # Errors
-    ///
-    /// Returns `io::Error` if reading fails.
-    async fn read_exact_bytes(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => {
-                stream.read_exact(buf).await?;
-                Ok(())
-            }
-            ClientConnectionStream::Tls(stream) => {
-                stream.read_exact(buf).await?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Reads a line from the stream.
-    ///
-    /// This is a helper method that abstracts the TCP/TLS stream dispatch.
-    ///
-    /// # Returns
-    ///
-    /// The line as a string (without CRLF).
-    ///
-    /// # Errors
-    ///
-    /// Returns `io::Error` if reading fails.
-    async fn read_line_from_stream(&mut self) -> io::Result<String> {
-        match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => read_line(stream).await,
-            ClientConnectionStream::Tls(stream) => read_line(stream.as_mut()).await,
-        }
+        parse_http_request(self.open_stream().await?).await
     }
 
     /// Reads the body of a chunked transfer encoded request.
@@ -624,11 +625,12 @@ impl HttpTransportClient {
     ///
     /// Returns `TransportError` if reading fails or chunked encoding is invalid.
     pub async fn read_chunked_body(&mut self) -> Result<Vec<u8>, TransportError> {
+        let stream = self.open_stream().await?;
         let mut body = Vec::new();
 
         loop {
             // Read chunk size line
-            let size_line = self.read_line_from_stream().await.map_err(|e| {
+            let size_line = read_line(stream).await.map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to read chunk size: {e}"))
             })?;
 
@@ -637,7 +639,7 @@ impl HttpTransportClient {
             if chunk_size == 0 {
                 // Final chunk - read the trailing CRLF
                 let mut trailer = [0u8; 2];
-                self.read_exact_bytes(&mut trailer).await.map_err(|e| {
+                stream.read_exact(&mut trailer).await.map_err(|e| {
                     TransportError::ProtocolError(format!("Failed to read chunk trailer: {e}"))
                 })?;
                 break;
@@ -645,7 +647,7 @@ impl HttpTransportClient {
 
             // Read chunk data
             let mut chunk = vec![0u8; chunk_size];
-            self.read_exact_bytes(&mut chunk).await.map_err(|e| {
+            stream.read_exact(&mut chunk).await.map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to read chunk data: {e}"))
             })?;
 
@@ -653,7 +655,7 @@ impl HttpTransportClient {
 
             // Read trailing CRLF after chunk data
             let mut crlf = [0u8; 2];
-            self.read_exact_bytes(&mut crlf).await.map_err(|e| {
+            stream.read_exact(&mut crlf).await.map_err(|e| {
                 TransportError::ProtocolError(format!("Failed to read chunk CRLF: {e}"))
             })?;
         }
@@ -780,8 +782,9 @@ impl HttpTransportClient {
     ///    driver responds with `200 OK` + `Content-Length` and the full
     ///    body (rare but legal).
     ///
-    /// The method loops until the peer closes the connection (signalled by
-    /// an `IoError` or `ProtocolError` from `read_http_request`), at which
+    /// With TLS, the TLS handshake completes before the first request is read.
+    /// The method then loops until the peer closes the connection (signalled
+    /// by an `IoError` or `ProtocolError` from `read_http_request`), at which
     /// point it returns `Ok(())`. Any unexpected method (e.g. `PUT`) is
     /// rejected with `405 Method Not Allowed` and yields a
     /// `TransportError::ProtocolError`. A malformed `Range` header yields
@@ -793,21 +796,14 @@ impl HttpTransportClient {
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` only on unrecoverable conditions: an
-    /// unexpected method or a write failure. Connection close is treated as
-    /// successful completion.
+    /// Returns `TransportError` only on unrecoverable conditions: a failed TLS
+    /// handshake, an unexpected method, or a write failure. Connection close
+    /// after the handshake is treated as successful completion.
     pub async fn handle_parquet_import_requests(
         &mut self,
         file_bytes: &[u8],
     ) -> Result<(), TransportError> {
-        match &mut self.stream {
-            ClientConnectionStream::Tcp(stream) => {
-                serve_parquet_range_requests(stream, file_bytes).await
-            }
-            ClientConnectionStream::Tls(stream) => {
-                serve_parquet_range_requests(stream.as_mut(), file_bytes).await
-            }
-        }
+        serve_parquet_range_requests(self.open_stream().await?, file_bytes).await
     }
 
     /// Handles an EXPORT request from Exasol.
@@ -843,7 +839,9 @@ impl HttpTransportClient {
             self.read_chunked_body().await?
         } else if let Some(content_length) = request.content_length() {
             let mut body = vec![0u8; content_length];
-            self.read_exact_bytes(&mut body)
+            self.open_stream()
+                .await?
+                .read_exact(&mut body)
                 .await
                 .map_err(|e| TransportError::IoError(format!("Failed to read body: {e}")))?;
             body
@@ -2721,27 +2719,197 @@ mod tests {
         finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
     }
 
-    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
-    #[tokio::test]
-    async fn connect_with_timeout_fails_at_the_tls_handshake_when_the_peer_goes_silent_after_the_handshake(
-    ) {
-        let mut server = FakeExasolServer::silent_after_handshake().await;
+    /// How fast an operation on a tunnel whose TLS handshake already failed
+    /// must fail: well below `SETUP_BOUND`, so it cannot have waited for one.
+    const FAILED_TUNNEL_BOUND: Duration = Duration::from_millis(50);
 
-        let error = finish_within(
+    async fn connect_with_tls(server: &FakeExasolServer) -> HttpTransportClient {
+        finish_within(
             LOOPBACK_TEST_BOUND,
             HttpTransportClient::connect_with_timeout(&server.host, server.port, true, SETUP_BOUND),
         )
         .await
-        .err()
-        .expect("a peer that never answers the TLS handshake must fail the setup");
+        .expect("a TLS tunnel connects once the EXA handshake completes")
+    }
 
+    fn assert_tls_handshake_timed_out(error: &TransportError) {
         assert!(
             error
                 .to_string()
                 .contains("HTTP tunnel setup timeout after 300ms (TLS handshake)"),
             "{error}"
         );
+    }
+
+    /// Runs a second import request on a tunnel whose TLS handshake failed and
+    /// checks that it fails at once, sends nothing, and opens no connection.
+    async fn assert_tunnel_stays_failed(
+        client: &mut HttpTransportClient,
+        server: &mut FakeExasolServer,
+    ) {
+        let received = finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+
+        finish_within(FAILED_TUNNEL_BOUND, client.handle_import_request())
+            .await
+            .expect_err("a tunnel whose TLS handshake failed must not serve a request");
+
+        assert!(
+            received.is_empty(),
+            "the driver sent {} bytes into a failed TLS handshake",
+            received.len()
+        );
+        assert!(
+            !server.accepts_another_connection().await,
+            "a failed TLS tunnel must not open a new connection"
+        );
+    }
+
+    /// Scenario: TLS handshake starts after the IMPORT or EXPORT statement is sent
+    #[tokio::test]
+    async fn connect_with_tls_returns_before_any_tls_data_is_exchanged() {
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+
+        let client = connect_with_tls(&server).await;
+        assert!(client.public_key_fingerprint().is_some());
+        drop(client);
+
+        let received = finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        assert!(
+            received.is_empty(),
+            "connect sent {} bytes after the magic packet",
+            received.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_of_a_pending_tls_tunnel_closes_it_without_a_handshake() {
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+        let mut client = connect_with_tls(&server).await;
+
+        client
+            .shutdown()
+            .await
+            .expect("a pending TLS tunnel shuts down over plain TCP");
+
+        let received = finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        let error = finish_within(FAILED_TUNNEL_BOUND, client.handle_import_request())
+            .await
+            .expect_err("a shut down tunnel must not serve a request");
+        assert!(
+            received.is_empty(),
+            "shutdown sent {} bytes",
+            received.len()
+        );
+        assert!(
+            error.to_string().contains("HTTP tunnel is closed"),
+            "{error}"
+        );
+        assert!(!server.accepts_another_connection().await);
+    }
+
+    /// Scenario: TLS encryption with ad-hoc certificates
+    /// Scenario: HTTP transport TLS against Exasol SaaS / production
+    /// Scenario: TLS tunnel fails with the step named when Exasol does not start the TLS handshake
+    #[tokio::test]
+    async fn tls_tunnel_accepts_the_handshake_that_the_peer_starts_as_tls_client() {
+        let mut server = FakeExasolServer::requesting_over_tls_after(Duration::ZERO).await;
+        let mut client = connect_with_tls(&server).await;
+
+        let request = finish_within(LOOPBACK_TEST_BOUND, client.handle_import_request())
+            .await
+            .expect("the driver must serve the GET over TLS");
+        client.write_chunked_body(b"1,a\n").await.expect("write");
+        client.write_final_chunk().await.expect("final chunk");
+        drop(client);
+
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.path, "/001.csv");
+        let response = finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        let response = String::from_utf8(response).expect("the response is text");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.ends_with("\r\n\r\n4\r\n1,a\n\r\n0\r\n\r\n"),
+            "{response}"
+        );
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    #[tokio::test]
+    async fn tls_handshake_bound_starts_at_the_first_tunnel_read_or_write() {
+        let server = FakeExasolServer::requesting_over_tls_after(SETUP_BOUND * 2).await;
+        let mut client = connect_with_tls(&server).await;
+
+        tokio::time::sleep(SETUP_BOUND * 2).await;
+        let request = finish_within(LOOPBACK_TEST_BOUND, client.handle_import_request())
+            .await
+            .expect("the TLS bound starts at the first read, so the late handshake fits in it");
+
+        assert_eq!(request.path, "/001.csv");
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    /// Scenario: TLS tunnel fails with the step named when Exasol does not start the TLS handshake
+    #[tokio::test]
+    async fn tls_tunnel_fails_with_the_step_named_when_the_peer_sends_no_tls_byte() {
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+        let mut client = connect_with_tls(&server).await;
+
+        let error = finish_within(LOOPBACK_TEST_BOUND, client.handle_import_request())
+            .await
+            .expect_err("a peer that never starts the TLS handshake must fail the tunnel");
+
+        assert_tls_handshake_timed_out(&error);
         finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        drop(client);
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    /// Scenario: A TLS tunnel stays failed after a failed TLS handshake
+    #[tokio::test]
+    async fn tls_handshake_fails_with_the_step_named_when_the_peer_stalls_mid_handshake() {
+        let mut server = FakeExasolServer::stalling_mid_tls_handshake().await;
+        let mut client = connect_with_tls(&server).await;
+
+        let error = finish_within(LOOPBACK_TEST_BOUND, client.handle_import_request())
+            .await
+            .expect_err("a peer that stalls mid-handshake must fail the tunnel");
+
+        assert_tls_handshake_timed_out(&error);
+        assert_tunnel_stays_failed(&mut client, &mut server).await;
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    #[tokio::test]
+    async fn parquet_tunnel_fails_with_the_step_named_when_the_peer_stalls_mid_handshake() {
+        let server = FakeExasolServer::stalling_mid_tls_handshake().await;
+        let mut client = connect_with_tls(&server).await;
+
+        let error = finish_within(
+            LOOPBACK_TEST_BOUND,
+            client.handle_parquet_import_requests(b"PAR1"),
+        )
+        .await
+        .expect_err("a stalled TLS handshake must fail the Parquet tunnel, not end it as a close");
+
+        assert!(error.to_string().contains("(TLS handshake)"), "{error}");
+    }
+
+    /// Scenario: Tunnel setup fails with the step named when the peer stops answering
+    /// Scenario: TLS tunnel fails with the step named when Exasol does not start the TLS handshake
+    /// Scenario: A TLS tunnel stays failed after a failed TLS handshake
+    #[tokio::test]
+    async fn tls_tunnel_fails_when_the_peer_closes_before_the_handshake() {
+        let mut server = FakeExasolServer::closing_after_handshake().await;
+        let mut client = connect_with_tls(&server).await;
+
+        let started = tokio::time::Instant::now();
+        let error = finish_within(LOOPBACK_TEST_BOUND, client.handle_import_request())
+            .await
+            .expect_err("a peer that closes before the TLS handshake must fail the tunnel");
+
+        assert!(started.elapsed() < SETUP_BOUND, "{error}");
+        assert!(!error.to_string().contains("timeout"), "{error}");
+        assert_tunnel_stays_failed(&mut client, &mut server).await;
     }
 
     /// Scenario: EXA tunneling handshake in client mode

@@ -115,7 +115,9 @@ pub struct CsvExportOptions {
     /// Whether to include column headers in the output (default: false).
     pub with_column_names: bool,
 
-    /// Use TLS for the HTTP transport (default: true).
+    /// Whether to encrypt the HTTP transport tunnel with TLS (default: `false`).
+    /// `true` encrypts the tunnel, including against Exasol Docker. The control
+    /// connection's TLS does not cover the tunnel data.
     pub use_tls: bool,
 
     /// Client-side timeout in milliseconds for the export operation (default: `None`).
@@ -428,14 +430,17 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
 ///
 /// # Timeout behavior
 ///
-/// Tunnel setup comes first and is bounded by the 30-second setup deadline of
-/// `HttpTransportClient::connect`, whatever `options.timeout_ms` says. A stalled
-/// setup fails with `ExportError::HttpTransportError`.
+/// The tunnel's TCP connect and EXA handshake come first and are bounded by
+/// the 30-second setup deadline of `HttpTransportClient::connect`, whatever
+/// `options.timeout_ms` says. A stalled step fails with
+/// `ExportError::HttpTransportError`.
 ///
 /// `options.timeout_ms` bounds what follows (SQL execution, tunnel transfer,
-/// and the callback) and is unset by default. The tunnel read after setup has
-/// no timeout of its own, so a failing EXPORT statement aborts the pending
-/// transport task instead of being awaited alongside it.
+/// and the callback) and is unset by default. With TLS, the tunnel task runs
+/// the TLS handshake under its own 30-second bound inside that window, so a
+/// shorter `timeout_ms` can elapse first. Only a TLS tunnel's handshake has a
+/// bound: the tunnel read after it has none, so a failing EXPORT statement
+/// aborts the pending transport task instead of being awaited alongside it.
 ///
 /// When a configured bound elapses, the transport is terminated only if the EXPORT response
 /// had not been read yet, because an elapse during the callback leaves the
@@ -813,7 +818,10 @@ mod tests {
     }
     use crate::error::TransportError;
     use crate::transport::protocol::QueryResult;
-    use crate::transport::test_support::{FakeExasolServer, MockTransport, StalledQueryTransport};
+    use crate::transport::test_support::{
+        finish_within, FakeExasolServer, MockTransport, StalledQueryTransport, DISCONNECT_BOUND,
+        LOOPBACK_TEST_BOUND,
+    };
     use std::time::Duration;
 
     // Tests for CsvExportOptions
@@ -1166,6 +1174,82 @@ mod tests {
             transport_terminated,
             "an unread EXPORT response can no longer be matched to a request"
         );
+    }
+
+    /// The 30-second TLS handshake bound of the tunnel, which the export does not configure.
+    const TLS_HANDSHAKE_BOUND: Duration = Duration::from_secs(30);
+
+    /// An export timeout far below the TLS handshake bound.
+    const TLS_EXPORT_TIMEOUT_MS: u64 = 300;
+
+    /// Scenario: Explicit export timeout covers a pending TLS handshake
+    #[tokio::test]
+    async fn test_export_to_callback_with_tls_times_out_while_the_tls_handshake_is_pending() {
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+        let mut mock = MockTransport::new();
+        mock.expect_terminate().times(1).return_const(());
+        let mut transport = StalledQueryTransport::new(mock);
+
+        let error = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_callback(
+                &mut transport,
+                ExportSource::Query {
+                    sql: "SELECT * FROM users".to_string(),
+                },
+                tunnel_options(&server)
+                    .use_tls(true)
+                    .timeout_ms(TLS_EXPORT_TIMEOUT_MS),
+                collect_body,
+            ),
+        )
+        .await
+        .expect_err("an export timeout shorter than the TLS bound must fail the export first");
+
+        assert_eq!(unwrap_timeout(error), (TLS_EXPORT_TIMEOUT_MS, true));
+        finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+    }
+
+    /// The clock pauses only after real time let the tunnel task reach its TLS
+    /// handshake, and resumes before the disconnect is awaited: with a paused
+    /// clock, a timer bounding that wait could fire before the peer task runs.
+    ///
+    /// Scenario: No client-side export timeout by default
+    #[tokio::test]
+    async fn test_export_to_callback_with_tls_closes_the_tunnel_at_the_tls_handshake_bound_without_an_export_timer(
+    ) {
+        let mut server = FakeExasolServer::silent_after_handshake().await;
+        let mut mock = MockTransport::new();
+        mock.expect_terminate().never();
+        let mut transport = StalledQueryTransport::new(mock);
+
+        let export = export_to_callback(
+            &mut transport,
+            ExportSource::Query {
+                sql: "SELECT * FROM users".to_string(),
+            },
+            tunnel_options(&server).use_tls(true),
+            collect_body,
+        );
+        tokio::pin!(export);
+        let started = tokio::time::timeout(Duration::from_millis(500), &mut export).await;
+        assert!(started.is_err(), "the EXPORT statement never responds");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), server.wait_for_disconnect())
+                .await
+                .is_err(),
+            "the tunnel must stay open until the TLS handshake bound elapses"
+        );
+
+        tokio::time::pause();
+        tokio::time::sleep(TLS_HANDSHAKE_BOUND).await;
+        tokio::time::resume();
+
+        finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        if let Ok(outcome) = tokio::time::timeout(Duration::from_millis(50), &mut export).await {
+            panic!("the export ended without an export timeout: {outcome:?}");
+        }
     }
 
     #[tokio::test]
