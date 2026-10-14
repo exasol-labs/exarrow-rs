@@ -49,8 +49,7 @@ connection.execute_statement(&stmt).await?;
 | `i32`, `i64` | `DECIMAL` / `INTEGER` |
 | `f64` | `DOUBLE` |
 | `bool` | `BOOLEAN` |
-| `chrono::NaiveDate` | `DATE` |
-| `chrono::NaiveDateTime` | `TIMESTAMP` |
+| `&str` / `String` text `YYYY-MM-DD`, optionally followed by spaces and `h`, `h:m`, `h:m:s`, or `h:m:s.f` | `DATE` (time part ignored), `TIMESTAMP` |
 
 ## Multiple Executions
 

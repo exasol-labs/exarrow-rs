@@ -2891,6 +2891,199 @@ fn test_bind_unconvertible_value_stores_no_row() {
     drop_test_schema(&mut conn, &schema_name);
 }
 
+/// Read a temporal column as `Option<i64>`: microseconds since the epoch for a Timestamp,
+/// days since the epoch for a Date32.
+fn temporal_values_in(column: &dyn Array) -> Vec<Option<i64>> {
+    if let Some(values) = column
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+    {
+        return values.iter().collect();
+    }
+    if let Some(values) = column.as_any().downcast_ref::<arrow::array::Date32Array>() {
+        return values.iter().map(|day| day.map(i64::from)).collect();
+    }
+    panic!("unexpected temporal column type {:?}", column.data_type());
+}
+
+/// Bind the temporal RecordBatch of the spec scenario over the transport that `uri` selects,
+/// and check what Exasol stored.
+fn assert_bound_temporal_values_are_stored(uri: String) {
+    use arrow::array::{
+        Date32Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow::datatypes::TimeUnit;
+
+    let mut driver = ManagedDriver::load_dynamic_from_filename(
+        get_library_path(),
+        Some(b"ExarrowDriverInit"),
+        AdbcVersion::V110,
+    )
+    .expect("Failed to load driver");
+    let db = driver
+        .new_database_with_opts(vec![(OptionDatabase::Uri, OptionValue::String(uri))])
+        .expect("Failed to create database");
+    let mut conn = db.new_connection().expect("Failed to create connection");
+
+    let schema_name = generate_unique_test_name("TEST_BIND_TEMPORAL");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!(
+            "CREATE TABLE {schema_name}.T (TS_S TIMESTAMP(6), TS_MS TIMESTAMP(6), TS_US TIMESTAMP(6), \
+             TS_NS TIMESTAMP(6), TS_BERLIN TIMESTAMP(6), TS_LOCAL TIMESTAMP(6) WITH LOCAL TIME ZONE, D DATE)"
+        ),
+    );
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(format!(
+        "INSERT INTO {schema_name}.T VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ))
+    .unwrap();
+    stmt.prepare().unwrap();
+
+    let timestamp = |unit, zone: Option<&str>| DataType::Timestamp(unit, zone.map(Into::into));
+    // Rows: after 1970, before 1970, all null.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("ts_s", timestamp(TimeUnit::Second, None), true),
+            Field::new("ts_ms", timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("ts_us", timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("ts_ns", timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "ts_berlin",
+                timestamp(TimeUnit::Microsecond, Some("Europe/Berlin")),
+                true,
+            ),
+            Field::new(
+                "ts_local",
+                timestamp(TimeUnit::Microsecond, Some("UTC")),
+                true,
+            ),
+            Field::new("d", DataType::Date32, true),
+        ])),
+        vec![
+            Arc::new(TimestampSecondArray::from(vec![
+                Some(1_704_096_000),
+                Some(-1),
+                None,
+            ])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(1_704_096_000_123),
+                Some(-1),
+                None,
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_704_096_000_123_456),
+                Some(-999_999),
+                None,
+            ])),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                Some(1_704_096_000_123_456_000),
+                Some(-1_000),
+                None,
+            ])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![
+                    Some(1_704_096_000_000_000),
+                    Some(-1_000_000),
+                    None,
+                ])
+                .with_timezone("Europe/Berlin"),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![
+                    Some(1_704_096_000_000_000),
+                    Some(-999_999),
+                    None,
+                ])
+                .with_timezone("UTC"),
+            ),
+            // 2024-01-01, 1968-01-01, null.
+            Arc::new(Date32Array::from(vec![Some(19_723), Some(-731), None])),
+        ],
+    )
+    .unwrap();
+
+    stmt.bind(batch).unwrap();
+    assert_eq!(stmt.execute_update().expect("bound insert"), Some(3));
+
+    let mut read = conn.new_statement().unwrap();
+    read.set_sql_query(format!(
+        "SELECT TS_S, TS_MS, TS_US, TS_NS, TS_BERLIN, TS_LOCAL, D FROM {schema_name}.T ORDER BY D NULLS LAST"
+    ))
+    .unwrap();
+    let mut columns: Vec<Vec<Option<i64>>> = vec![Vec::new(); 7];
+    for batch in read.execute().unwrap() {
+        let batch = batch.unwrap();
+        for (values, column) in columns.iter_mut().zip(batch.columns()) {
+            values.extend(temporal_values_in(column.as_ref()));
+        }
+    }
+    // Ordered by D: the row before 1970, the row after 1970, the null row. Microseconds since
+    // the epoch, except the last column, which holds days.
+    assert_eq!(
+        columns,
+        vec![
+            vec![Some(-1_000_000), Some(1_704_096_000_000_000), None],
+            vec![Some(-1_000), Some(1_704_096_000_123_000), None],
+            vec![Some(-999_999), Some(1_704_096_000_123_456), None],
+            vec![Some(-1), Some(1_704_096_000_123_456), None],
+            vec![Some(-1_000_000), Some(1_704_096_000_000_000), None],
+            vec![Some(-999_999), Some(1_704_096_000_000_000), None],
+            vec![Some(-731), Some(19_723), None],
+        ]
+    );
+
+    // A time zone only changes the instant, never the stored UTC date and time.
+    let mut zoned = conn.new_statement().unwrap();
+    zoned
+        .set_sql_query(format!(
+            "SELECT TO_CHAR(TS_BERLIN, 'YYYY-MM-DD HH24:MI:SS') || ' ' || TO_CHAR(TS_LOCAL, 'YYYY-MM-DD HH24:MI:SS') \
+             FROM {schema_name}.T WHERE D = DATE '2024-01-01'"
+        ))
+        .unwrap();
+    let mut zoned_rows = Vec::new();
+    for batch in zoned.execute().unwrap() {
+        zoned_rows.extend(strings_in(batch.unwrap().column(0).as_ref()));
+    }
+    assert_eq!(zoned_rows, vec!["2024-01-01 08:00:00 2024-01-01 08:00:00"]);
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT COUNT(*) FROM {schema_name}.T")),
+        vec![3]
+    );
+
+    drop(stmt);
+    drop(read);
+    drop(zoned);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
+///
+/// Compares date and time values, not instants: Exasol reads a value bound to a
+/// `TIMESTAMP WITH LOCAL TIME ZONE` column in the session time zone.
+#[test]
+fn test_bind_arrow_temporal_values_round_trip() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_bound_temporal_values_are_stored(get_test_uri());
+}
+
+/// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_bind_arrow_temporal_values_round_trip_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_bound_temporal_values_are_stored(format!("{}&transport=websocket", get_test_uri()));
+}
+
 /// Scenario: A zero-row bound batch runs no execution
 #[test]
 fn test_bind_zero_row_batch_runs_no_execution() {

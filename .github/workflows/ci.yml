@@ -282,12 +282,12 @@ jobs:
         run: cargo test --no-default-features --features websocket --tests --no-run
 
       - name: Build FFI library for driver manager tests
-        run: cargo build --release --features ffi
+        run: cargo build --release --features 'ffi websocket'
 
       - name: Run driver manager tests
         env:
           REQUIRE_EXASOL: "1"
-        run: cargo test --features ffi --test driver_manager_tests -- --include-ignored --test-threads=1
+        run: cargo test --features 'ffi websocket' --test driver_manager_tests -- --include-ignored --test-threads=1
 
       - name: Set up Python
         uses: actions/setup-python@v5

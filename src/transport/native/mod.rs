@@ -16,6 +16,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use crate::error::TransportError;
+use crate::types::conversion::{
+    parse_date_text, parse_timestamp_text, DATE_TEXT_FORM, TIMESTAMP_TEXT_FORM,
+};
 
 use super::deadline::SetupStep;
 use super::lifecycle::{self, ConnectionLifecycle, ConnectionState, LifecycleSteps};
@@ -32,9 +35,9 @@ use self::constants::{
     ATTR_RANDOM_PHRASE, ATTR_RELEASE_VERSION, ATTR_SESSIONID, ATTR_TIMEZONE, CMD_CLOSE_PREPARED,
     CMD_CLOSE_RESULTSET, CMD_CREATE_PREPARED, CMD_DISCONNECT, CMD_EXECUTE, CMD_EXECUTE_PREPARED,
     CMD_FETCH2, CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
-    MAX_DATA_MESSAGE_SIZE, PROTOCOL_VERSION, SMALL_RESULTSET, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL,
-    T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_TIMESTAMP,
-    T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
+    MAX_DATA_MESSAGE_SIZE, PROTOCOL_VERSION, SMALL_RESULTSET, TIMESTAMP_PARAM_PRECISION, T_BOOLEAN,
+    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR,
+    T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
 };
 use self::encryption::ChaCha20Encryptor;
 use self::framing::{MessageHeader, SerialCounter};
@@ -540,6 +543,9 @@ impl NativeTcpTransport {
                 buf.extend_from_slice(&prec.to_le_bytes());
                 buf.extend_from_slice(&scale.to_le_bytes());
             }
+            T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC => {
+                buf.extend_from_slice(&TIMESTAMP_PARAM_PRECISION.to_le_bytes());
+            }
             _ => {}
         }
     }
@@ -643,7 +649,11 @@ impl NativeTcpTransport {
         value: &serde_json::Value,
         scale: i32,
     ) -> Result<(), TransportError> {
-        if value.is_null() {
+        let empty_temporal = matches!(
+            wire_type,
+            T_DATE | T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC
+        ) && value.as_str() == Some("");
+        if value.is_null() || empty_temporal {
             buf.push(0u8); // null marker
             return Ok(());
         }
@@ -664,14 +674,18 @@ impl NativeTcpTransport {
             }
             T_DATE => {
                 // Date as packed integer: (year<<16)+(month<<8)+day
-                let s = value.as_str().unwrap_or("2000-01-01");
-                let packed = Self::parse_date_to_packed(s);
+                let f = parse_date_text(Self::temporal_text(value, DATE_TEXT_FORM)?)
+                    .map_err(TransportError::SerializationError)?;
+                let packed = ((f.year as i32) << 16) + ((f.month as i32) << 8) + f.day as i32;
                 buf.extend_from_slice(&packed.to_le_bytes());
             }
             T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC => {
                 // Timestamp: [year:2 LE][month:1][day:1][hour:1][min:1][sec:1][nanos:4 LE]
-                let s = value.as_str().unwrap_or("2000-01-01 00:00:00");
-                Self::write_timestamp_bytes(buf, s);
+                let f = parse_timestamp_text(Self::temporal_text(value, TIMESTAMP_TEXT_FORM)?)
+                    .map_err(TransportError::SerializationError)?;
+                buf.extend_from_slice(&f.year.to_le_bytes());
+                buf.extend_from_slice(&[f.month, f.day, f.hour, f.minute, f.second]);
+                buf.extend_from_slice(&(f.nanos as i32).to_le_bytes());
             }
             _ => {
                 // String-like types (CHAR, VARCHAR, etc.)
@@ -730,51 +744,15 @@ impl NativeTcpTransport {
         0
     }
 
-    /// Parse a date string "YYYY-MM-DD" into packed int format.
-    fn parse_date_to_packed(s: &str) -> i32 {
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() == 3 {
-            let year: i32 = parts[0].parse().unwrap_or(2000);
-            let month: i32 = parts[1].parse().unwrap_or(1);
-            let day: i32 = parts[2].parse().unwrap_or(1);
-            (year << 16) + (month << 8) + day
-        } else {
-            (2000 << 16) + (1 << 8) + 1
-        }
-    }
-
-    /// Write timestamp bytes: [year:2 LE][month:1][day:1][hour:1][min:1][sec:1][nanos:4 LE]
-    fn write_timestamp_bytes(buf: &mut Vec<u8>, s: &str) {
-        // Parse "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD HH:MM:SS.ffffff"
-        let date_part = &s[..10.min(s.len())];
-        let time_part = if s.len() > 11 { &s[11..] } else { "00:00:00" };
-
-        let parts: Vec<&str> = date_part.split('-').collect();
-        let year: i16 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(2000);
-        let month: u8 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
-        let day: u8 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(1);
-
-        let time_parts: Vec<&str> = time_part.split(':').collect();
-        let hour: u8 = time_parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minute: u8 = time_parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-        let sec_str = time_parts.get(2).unwrap_or(&"0");
-        let sec_parts: Vec<&str> = sec_str.split('.').collect();
-        let second: u8 = sec_parts[0].parse().unwrap_or(0);
-        let nanos: i32 = if sec_parts.len() > 1 {
-            let frac = sec_parts[1];
-            let padded = format!("{:0<9}", frac);
-            padded[..9].parse().unwrap_or(0)
-        } else {
-            0
-        };
-
-        buf.extend_from_slice(&year.to_le_bytes());
-        buf.push(month);
-        buf.push(day);
-        buf.push(hour);
-        buf.push(minute);
-        buf.push(second);
-        buf.extend_from_slice(&nanos.to_le_bytes());
+    fn temporal_text<'a>(
+        value: &'a serde_json::Value,
+        form: &str,
+    ) -> Result<&'a str, TransportError> {
+        value.as_str().ok_or_else(|| {
+            TransportError::SerializationError(format!(
+                "Cannot read {value} as a date or timestamp, expected {form}"
+            ))
+        })
     }
 
     /// Convert a response to QueryResult, caching column metadata and the fetch
@@ -2194,57 +2172,6 @@ mod tests {
         assert_eq!(encoded_param(T_CHAR, serde_json::json!(42), 0), expected);
     }
 
-    #[test]
-    fn packed_dates_fall_back_field_by_field() {
-        let default = (2000 << 16) + (1 << 8) + 1;
-
-        // Wrong number of dash-separated fields.
-        assert_eq!(NativeTcpTransport::parse_date_to_packed("2024-01"), default);
-        // Three fields, none of them numeric.
-        assert_eq!(
-            NativeTcpTransport::parse_date_to_packed("not-a-date"),
-            default
-        );
-        // Only the unparsable field falls back.
-        assert_eq!(
-            NativeTcpTransport::parse_date_to_packed("2024-xx-05"),
-            (2024 << 16) + (1 << 8) + 5
-        );
-    }
-
-    #[test]
-    fn timestamps_encode_their_fractional_seconds_as_nanoseconds() {
-        let mut buf = Vec::new();
-        NativeTcpTransport::write_timestamp_bytes(&mut buf, "2024-03-09 14:25:36.123456");
-
-        let mut expected = 2024i16.to_le_bytes().to_vec();
-        expected.extend_from_slice(&[3, 9, 14, 25, 36]);
-        expected.extend_from_slice(&123_456_000i32.to_le_bytes());
-        assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn timestamps_without_a_time_part_default_to_midnight() {
-        let mut buf = Vec::new();
-        NativeTcpTransport::write_timestamp_bytes(&mut buf, "2024-03-09");
-
-        let mut expected = 2024i16.to_le_bytes().to_vec();
-        expected.extend_from_slice(&[3, 9, 0, 0, 0]);
-        expected.extend_from_slice(&0i32.to_le_bytes());
-        assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn unparsable_timestamp_fields_fall_back_to_their_defaults() {
-        let mut buf = Vec::new();
-        NativeTcpTransport::write_timestamp_bytes(&mut buf, "bad-value! xx:yy:zz");
-
-        let mut expected = 2000i16.to_le_bytes().to_vec();
-        expected.extend_from_slice(&[1, 1, 0, 0, 0]);
-        expected.extend_from_slice(&0i32.to_le_bytes());
-        assert_eq!(buf, expected);
-    }
-
     // --- CMD_EXECUTE_PREPARED payload ---
 
     #[test]
@@ -2351,6 +2278,224 @@ mod tests {
         expected.extend_from_slice(&123i64.to_le_bytes());
 
         assert_eq!(payload, expected);
+    }
+
+    // --- Temporal parameters ---
+
+    fn timestamp_type(name: &str) -> super::super::messages::DataType {
+        let mut dt = super::super::messages::DataType::decimal(0, 0);
+        dt.type_name = name.to_string();
+        dt
+    }
+
+    fn encoded(wire_type: u32, value: serde_json::Value) -> Result<Vec<u8>, TransportError> {
+        let mut buf = Vec::new();
+        NativeTcpTransport::write_param_value(&mut buf, wire_type, &value, 0)?;
+        Ok(buf)
+    }
+
+    fn ts_bytes(year: i16, rest: [u8; 5], nanos: i32) -> Vec<u8> {
+        let mut v = vec![1u8];
+        v.extend_from_slice(&year.to_le_bytes());
+        v.extend_from_slice(&rest);
+        v.extend_from_slice(&nanos.to_le_bytes());
+        v
+    }
+
+    /// Scenario: Outbound precision on a TIMESTAMP parameter column header
+    #[test]
+    fn prepared_payload_writes_timestamp_precision_for_each_timestamp_wire_type() {
+        for (name, wire) in [
+            ("TIMESTAMP", T_TIMESTAMP),
+            ("TIMESTAMP WITH LOCAL TIME ZONE", T_TIMESTAMP_UTC),
+        ] {
+            let handle = PreparedStatementHandle::new(
+                1,
+                1,
+                vec![timestamp_type(name)],
+                vec![Some("TS".to_string())],
+            );
+            let parameters = vec![vec![serde_json::json!("2024-03-09 14:25:36")]];
+
+            let payload =
+                NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters))
+                    .unwrap();
+
+            let mut tail = (wire as i32).to_le_bytes().to_vec();
+            tail.extend_from_slice(&9i32.to_le_bytes());
+            tail.extend_from_slice(&ts_bytes(2024, [3, 9, 14, 25, 36], 0));
+            assert_eq!(payload[payload.len() - tail.len()..], tail[..]);
+        }
+
+        let mut buf = Vec::new();
+        let handle = PreparedStatementHandle::new(1, 1, Vec::new(), Vec::new());
+        NativeTcpTransport::write_column_metadata(&mut buf, &handle, 0, T_TIMESTAMP_LOCAL_TZ);
+        assert_eq!(buf, 9i32.to_le_bytes());
+    }
+
+    /// Scenario: Outbound precision on a TIMESTAMP parameter column header
+    #[test]
+    fn prepared_payload_ranges_repeat_the_timestamp_precision() {
+        let handle = PreparedStatementHandle::new(
+            1,
+            1,
+            vec![timestamp_type("TIMESTAMP")],
+            vec![Some("TS".to_string())],
+        );
+        let parameters = vec![vec![
+            serde_json::json!("2024-03-09 14:25:36"),
+            serde_json::json!("2024-03-10 14:25:36"),
+        ]];
+        let encoded = NativeTcpTransport::split_parameter_rows(&handle, &parameters, 0).unwrap();
+        let payloads = range_payloads(&handle, &encoded);
+
+        assert_eq!(payloads.len(), 2);
+        let mut header = (T_TIMESTAMP as i32).to_le_bytes().to_vec();
+        header.extend_from_slice(&9i32.to_le_bytes());
+        for payload in &payloads {
+            assert!(payload.windows(header.len()).any(|w| w == &header[..]));
+        }
+    }
+
+    /// Scenario: DATE and TIMESTAMP parameter text is encoded field by field
+    #[test]
+    fn temporal_text_in_the_accepted_forms_encodes_field_by_field() {
+        let ts = |text: &str| encoded(T_TIMESTAMP, serde_json::json!(text)).unwrap();
+        assert_eq!(
+            ts("2024-03-09 14:25:36.123456"),
+            ts_bytes(2024, [3, 9, 14, 25, 36], 123_456_000)
+        );
+        assert_eq!(ts("2024-1-1 8:0:0"), ts_bytes(2024, [1, 1, 8, 0, 0], 0));
+        assert_eq!(ts("2024-03-09"), ts_bytes(2024, [3, 9, 0, 0, 0], 0));
+        assert_eq!(ts("2024-03-09 14"), ts_bytes(2024, [3, 9, 14, 0, 0], 0));
+        assert_eq!(ts("2024-03-09 14:25"), ts_bytes(2024, [3, 9, 14, 25, 0], 0));
+        assert_eq!(
+            ts("2024-03-09 14:25:36."),
+            ts_bytes(2024, [3, 9, 14, 25, 36], 0)
+        );
+        assert_eq!(
+            ts("2024-03-09 14:25:36.5"),
+            ts_bytes(2024, [3, 9, 14, 25, 36], 500_000_000)
+        );
+        assert_eq!(
+            ts("2024-03-09 14:25:36.123456789"),
+            ts_bytes(2024, [3, 9, 14, 25, 36], 123_456_789)
+        );
+        assert_eq!(
+            ts(" 2024-03-09 14:25 "),
+            ts_bytes(2024, [3, 9, 14, 25, 0], 0)
+        );
+        assert_eq!(
+            ts("2024-03-09   14:25"),
+            ts_bytes(2024, [3, 9, 14, 25, 0], 0)
+        );
+        assert_eq!(ts("1500-02-29"), ts_bytes(1500, [2, 29, 0, 0, 0], 0));
+
+        assert_eq!(
+            encoded(T_TIMESTAMP, serde_json::json!("")).unwrap(),
+            vec![0]
+        );
+        assert_eq!(encoded(T_DATE, serde_json::json!("")).unwrap(), vec![0]);
+
+        let mut date = vec![1u8];
+        date.extend_from_slice(&((2024i32 << 16) + (3 << 8) + 9).to_le_bytes());
+        assert_eq!(
+            encoded(T_DATE, serde_json::json!("2024-03-09")).unwrap(),
+            date
+        );
+        let mut jan2 = vec![1u8];
+        jan2.extend_from_slice(&((2024i32 << 16) + (1 << 8) + 2).to_le_bytes());
+        for text in [
+            "2024-01-02 08:30",
+            "2024-01-02 23:59:59",
+            "2024-01-02 08:60:60",
+        ] {
+            assert_eq!(encoded(T_DATE, serde_json::json!(text)).unwrap(), jan2);
+        }
+    }
+
+    /// Scenario: DATE and TIMESTAMP parameter text is encoded field by field
+    #[test]
+    fn out_of_range_temporal_fields_are_sent_as_written() {
+        for wire in [T_DATE, T_TIMESTAMP] {
+            for text in ["2024-13-01", "2024-02-30"] {
+                assert!(encoded(wire, serde_json::json!(text)).is_ok());
+            }
+        }
+        assert_eq!(
+            encoded(T_TIMESTAMP, serde_json::json!("2024-01-01 25:00:00")).unwrap(),
+            ts_bytes(2024, [1, 1, 25, 0, 0], 0)
+        );
+    }
+
+    /// Scenario: DATE and TIMESTAMP parameter values in another form are rejected before execution
+    #[test]
+    fn temporal_values_in_other_forms_are_rejected() {
+        let rejected = |wire: u32, value: serde_json::Value, form: &str| {
+            let text = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or(value.to_string());
+            match encoded(wire, value) {
+                Err(TransportError::SerializationError(msg)) => {
+                    assert!(msg.contains(&text) && msg.contains(form), "{msg}")
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+        };
+        for text in [
+            "2024-01-01T08:00:00",
+            "garbage",
+            "   ",
+            "\t2024-01-01",
+            "2024-01-01 08:00:",
+            "2024-01-01 08:00:00.1234567890",
+            "12345-01-01",
+        ] {
+            rejected(
+                T_TIMESTAMP,
+                serde_json::json!(text),
+                "YYYY-MM-DD HH:MI:SS.FFFFFFFFF",
+            );
+        }
+        rejected(
+            T_TIMESTAMP,
+            serde_json::json!(true),
+            "YYYY-MM-DD HH:MI:SS.FFFFFFFFF",
+        );
+        for text in [
+            "2024/01/02",
+            "2024-01-02 24:00",
+            "2024-01-02 08:61",
+            "2024-01-02 08:30:61",
+        ] {
+            rejected(T_DATE, serde_json::json!(text), "YYYY-MM-DD");
+        }
+        rejected(T_DATE, serde_json::json!(5), "YYYY-MM-DD");
+    }
+
+    /// Scenario: DATE and TIMESTAMP parameter values in another form are rejected before execution
+    #[test]
+    fn prepared_payload_with_a_rejected_temporal_value_fails() {
+        let handle = PreparedStatementHandle::new(
+            1,
+            1,
+            vec![timestamp_type("TIMESTAMP")],
+            vec![Some("TS".to_string())],
+        );
+        let parameters = vec![vec![
+            serde_json::json!("2024-03-09 14:25:36"),
+            serde_json::json!("garbage"),
+        ]];
+
+        assert!(matches!(
+            NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters)),
+            Err(TransportError::SerializationError(_))
+        ));
+        assert!(matches!(
+            NativeTcpTransport::split_parameter_rows(&handle, &parameters, 1 << 20),
+            Err(TransportError::SerializationError(_))
+        ));
     }
 
     // --- Splitting a parameter set into data messages ---

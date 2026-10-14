@@ -155,6 +155,86 @@ fn timestamp_unit_to_micros(unit: &TimeUnit, value: i64) -> Result<i64, String> 
     })
 }
 
+/// Accepted form of DATE parameter text, quoted in rejection messages.
+pub const DATE_TEXT_FORM: &str = "YYYY-MM-DD";
+/// Accepted form of TIMESTAMP parameter text, quoted in rejection messages.
+pub const TIMESTAMP_TEXT_FORM: &str = "YYYY-MM-DD HH:MI:SS.FFFFFFFFF";
+
+/// Date and time fields exactly as written in parameter text, with no calendar check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemporalFields {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub nanos: u32,
+}
+
+fn digits(part: &str, max_len: usize) -> Option<u32> {
+    if part.is_empty() || part.len() > max_len || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+fn parse_temporal_fields(text: &str) -> Option<TemporalFields> {
+    let text = text.trim_matches(' ');
+    let (date, time) = match text.split_once(' ') {
+        Some((date, time)) => (date, Some(time.trim_start_matches(' '))),
+        None => (text, None),
+    };
+    let mut date_parts = date.split('-');
+    let year = digits(date_parts.next()?, 4)?;
+    let month = digits(date_parts.next()?, 2)?;
+    let day = digits(date_parts.next()?, 2)?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let mut fields = TemporalFields {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        nanos: 0,
+    };
+    if let Some(time) = time {
+        let mut parts = time.splitn(3, ':');
+        fields.hour = digits(parts.next()?, 2)? as u8;
+        if let Some(minute) = parts.next() {
+            fields.minute = digits(minute, 2)? as u8;
+        }
+        if let Some(seconds) = parts.next() {
+            let (sec, frac) = seconds.split_once('.').unwrap_or((seconds, ""));
+            fields.second = digits(sec, 2)? as u8;
+            if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            fields.nanos = format!("{frac:0<9}").parse().ok()?;
+        }
+    }
+    Some(fields)
+}
+
+/// Parses TIMESTAMP parameter text: `Y-M-D`, optionally followed by spaces and `h`, `h:m`, `h:m:s`
+/// or `h:m:s.f` (up to 9 fraction digits). Leading and trailing spaces are ignored.
+pub fn parse_timestamp_text(text: &str) -> Result<TemporalFields, String> {
+    parse_temporal_fields(text).ok_or_else(|| {
+        format!("Cannot read '{text}' as a timestamp, expected {TIMESTAMP_TEXT_FORM}")
+    })
+}
+
+/// Parses DATE parameter text in the forms of [`parse_timestamp_text`]. A DATE keeps only the
+/// date fields; the time fields must stay within the bounds Exasol's text cast accepts.
+pub fn parse_date_text(text: &str) -> Result<TemporalFields, String> {
+    parse_temporal_fields(text)
+        .filter(|f| f.hour <= 23 && f.minute <= 60 && f.second <= 60)
+        .ok_or_else(|| format!("Cannot read '{text}' as a date, expected {DATE_TEXT_FORM}"))
+}
+
 /// Parses a timestamp string to microseconds since Unix epoch.
 ///
 /// Supports formats:
@@ -346,6 +426,40 @@ pub fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, String
 
 #[cfg(test)]
 mod tests {
+    /// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
+    #[test]
+    fn formatter_output_parses_back_to_its_fields() {
+        for (days, y, m, d) in [
+            (-719_162, 1, 1, 1),
+            (2_932_896, 9999, 12, 31),
+            (-1, 1969, 12, 31),
+        ] {
+            let f = parse_date_text(&format_date32(days).unwrap()).unwrap();
+            assert_eq!((f.year, f.month, f.day), (y, m, d));
+        }
+        for (micros, y, mo, d, h, mi, s, nanos) in [
+            (-62_135_596_800_000_000, 1, 1, 1, 0, 0, 0, 0),
+            (
+                253_402_300_799_999_999,
+                9999,
+                12,
+                31,
+                23,
+                59,
+                59,
+                999_999_000,
+            ),
+            (-999_999, 1969, 12, 31, 23, 59, 59, 1000),
+        ] {
+            let text = format_timestamp(&TimeUnit::Microsecond, micros).unwrap();
+            let f = parse_timestamp_text(&text).unwrap();
+            assert_eq!(
+                (f.year, f.month, f.day, f.hour, f.minute, f.second, f.nanos),
+                (y, mo, d, h, mi, s, nanos)
+            );
+        }
+    }
+
     use super::*;
 
     // Tests for pre-1970 day counts

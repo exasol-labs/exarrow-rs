@@ -180,6 +180,10 @@ pub const MAX_DATA_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 /// ChaCha20 key length in bytes.
 pub const CHACHA20_KEY_LEN: usize = 32;
 
+/// Fractional-seconds precision written in a TIMESTAMP parameter column header.
+/// The encoder always sends a nanosecond field, so the header declares the maximum.
+pub const TIMESTAMP_PARAM_PRECISION: i32 = 9;
+
 #[cfg(test)]
 mod tests {
     use super::*;

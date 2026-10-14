@@ -1986,6 +1986,119 @@ async fn test_prepared_statement_with_parameters() {
     conn.close().await.expect("Failed to close connection");
 }
 
+async fn single_string(conn: &mut Connection, sql: &str) -> String {
+    let batches = conn.execute(sql).await.unwrap().fetch_all().await.unwrap();
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    col.value(0).to_string()
+}
+
+/// Scenario: DATE and TIMESTAMP text parameters are stored or rejected on both transports
+#[tokio::test]
+async fn test_prepared_temporal_text_parameters() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema = generate_test_schema_name();
+    let _ = conn
+        .execute_update(&format!("CREATE SCHEMA {schema}"))
+        .await;
+    conn.execute_update(&format!(
+        "CREATE TABLE {schema}.T (TS TIMESTAMP(6), D DATE)"
+    ))
+    .await
+    .expect("Failed to create table");
+
+    let mut prepared = conn
+        .prepare(&format!("INSERT INTO {schema}.T VALUES (?, ?)"))
+        .await
+        .expect("Failed to prepare insert");
+
+    let stored = [
+        (
+            "2024-01-01 08:00:00.123456",
+            "2024-01-02",
+            "2024-01-01 08:00:00.123456 2024-01-02",
+        ),
+        (
+            " 2024-01-01 08:00:00 ",
+            "2024-01-02 08:30",
+            "2024-01-01 08:00:00.000000 2024-01-02",
+        ),
+    ];
+    for (ts, d, expected) in stored {
+        conn.execute_update(&format!("DELETE FROM {schema}.T"))
+            .await
+            .unwrap();
+        prepared.clear_parameters();
+        prepared.bind(0, ts).unwrap();
+        prepared.bind(1, d).unwrap();
+        conn.execute_prepared_update(&prepared)
+            .await
+            .unwrap_or_else(|e| panic!("{ts:?}/{d:?}: {e}"));
+        let rs = conn
+            .execute(&format!(
+                "SELECT TO_CHAR(TS, 'YYYY-MM-DD HH24:MI:SS.FF6') || ' ' || TO_CHAR(D) FROM {schema}.T"
+            ))
+            .await
+            .unwrap();
+        let batches = rs.fetch_all().await.unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), expected);
+    }
+
+    let row_summary = format!(
+        "SELECT TO_CHAR(COUNT(*)) || ':' || TO_CHAR(COUNT(TS)) || ':' || TO_CHAR(COUNT(D)) FROM {schema}.T"
+    );
+
+    // Empty text binds as NULL for both column types.
+    conn.execute_update(&format!("DELETE FROM {schema}.T"))
+        .await
+        .unwrap();
+    prepared.clear_parameters();
+    prepared.bind(0, "").unwrap();
+    prepared.bind(1, "").unwrap();
+    conn.execute_prepared_update(&prepared)
+        .await
+        .expect("empty text must store NULL");
+    assert_eq!(single_string(&mut conn, &row_summary).await, "1:0:0");
+
+    // Rejected text fails before execution and stores no row.
+    conn.execute_update(&format!("DELETE FROM {schema}.T"))
+        .await
+        .unwrap();
+    let rejected = [
+        ("2024-01-01T08:00:00", "2024-01-02"),
+        ("garbage", "2024-01-02"),
+        ("2024-01-01 08:00:", "2024-01-02"),
+        ("   ", "2024-01-02"),
+        ("2024-01-01 08:00:00", "2024/01/02"),
+        ("2024-01-01 08:00:00", "2024-01-02 25:00:00"),
+    ];
+    for (ts, d) in rejected {
+        prepared.clear_parameters();
+        prepared.bind(0, ts).unwrap();
+        prepared.bind(1, d).unwrap();
+        assert!(
+            conn.execute_prepared_update(&prepared).await.is_err(),
+            "{ts:?}/{d:?} must be rejected"
+        );
+    }
+    assert_eq!(single_string(&mut conn, &row_summary).await, "0:0:0");
+
+    let _ = conn
+        .execute_update(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await;
+    conn.close().await.unwrap();
+}
+
 /// 8.3 Test prepared statement with SELECT and parameters
 #[tokio::test]
 async fn test_prepared_select_with_parameters() {
