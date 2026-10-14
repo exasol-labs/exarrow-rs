@@ -185,7 +185,8 @@ impl Connection {
 
         // Authenticate
         let credentials =
-            TransportCredentials::new(params.username.clone(), params.password().to_string());
+            TransportCredentials::new(params.username.clone(), params.password().to_string())
+                .with_client(params.client_name.clone(), params.client_version.clone());
         let session_info = transport
             .authenticate(&credentials)
             .await
@@ -208,7 +209,6 @@ impl Connection {
         // Create session config from connection params. `query_timeout` seeds
         // the applied-value baseline that `execute_statement` reconciles against.
         let session_config = SessionConfig {
-            idle_timeout: params.idle_timeout,
             query_timeout: params.query_timeout,
             ..Default::default()
         };
@@ -2830,7 +2830,6 @@ mod tests {
             .host("db.example.invalid")
             .username("tester")
             .password("s3cr3t-pw")
-            .idle_timeout(Duration::from_secs(120))
             .build()
             .expect("params");
 
@@ -2839,7 +2838,6 @@ mod tests {
             .expect("connect");
 
         assert_eq!(conn.session_id(), "1739284756");
-        assert_eq!(conn.session.config().idle_timeout, Duration::from_secs(120));
         let server = conn.session.server_info();
         assert_eq!(server.release_version, "8.32.0");
         assert_eq!(server.database_name, "exadb");

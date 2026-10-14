@@ -4,6 +4,7 @@
 //! parameters with validation.
 
 use crate::error::ConnectionError;
+use crate::{DRIVER_NAME, DRIVER_VERSION};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -34,9 +35,6 @@ pub struct ConnectionParams {
     /// attribute is set and the server's own `QUERY_TIMEOUT` governs.
     pub query_timeout: Option<Duration>,
 
-    /// Idle connection timeout
-    pub idle_timeout: Duration,
-
     /// Enable TLS/SSL encryption
     pub use_tls: bool,
 
@@ -54,9 +52,6 @@ pub struct ConnectionParams {
 
     /// Transport type override (native or websocket)
     pub transport: Option<String>,
-
-    /// Additional connection attributes
-    pub attributes: HashMap<String, String>,
 }
 
 impl ConnectionParams {
@@ -79,8 +74,8 @@ impl ConnectionParams {
     /// back to empty; a missing username fails with `Username is required`, so
     /// no connection logs in as a user the caller did not name. Given values
     /// are used verbatim and never percent-decoded, because they are not part
-    /// of the URI. The credential query keys are always consumed, so none of
-    /// them is kept as a connection attribute.
+    /// of the URI. The credential query keys are always consumed, so the
+    /// unknown-key check never sees them.
     pub(crate) fn parse_with_credentials(
         uri: &str,
         username: Option<&str>,
@@ -174,7 +169,6 @@ impl fmt::Debug for ConnectionParams {
             .field("schema", &self.schema)
             .field("connection_timeout", &self.connection_timeout)
             .field("query_timeout", &self.query_timeout)
-            .field("idle_timeout", &self.idle_timeout)
             .field("use_tls", &self.use_tls)
             .field(
                 "validate_server_certificate",
@@ -184,7 +178,6 @@ impl fmt::Debug for ConnectionParams {
             .field("client_name", &self.client_name)
             .field("client_version", &self.client_version)
             .field("transport", &self.transport)
-            .field("attributes", &self.attributes)
             .finish()
     }
 }
@@ -209,14 +202,12 @@ pub struct ConnectionBuilder {
     schema: Option<String>,
     connection_timeout: Option<Duration>,
     query_timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
     use_tls: Option<bool>,
     validate_server_certificate: Option<bool>,
     certificate_fingerprint: Option<String>,
     client_name: Option<String>,
     client_version: Option<String>,
     transport: Option<String>,
-    attributes: HashMap<String, String>,
 }
 
 impl ConnectionBuilder {
@@ -230,14 +221,12 @@ impl ConnectionBuilder {
             schema: None,
             connection_timeout: None,
             query_timeout: None,
-            idle_timeout: None,
             use_tls: None,
             validate_server_certificate: None,
             certificate_fingerprint: None,
             client_name: None,
             client_version: None,
             transport: None,
-            attributes: HashMap::new(),
         }
     }
 
@@ -283,9 +272,9 @@ impl ConnectionBuilder {
         self
     }
 
-    /// Set the idle connection timeout.
-    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = Some(timeout);
+    /// Deprecated: the driver never closed idle connections, so this has no effect.
+    #[deprecated(note = "idle_timeout has no effect and will be removed in a later release")]
+    pub fn idle_timeout(self, _timeout: Duration) -> Self {
         self
     }
 
@@ -322,12 +311,6 @@ impl ConnectionBuilder {
     /// Set the transport type (native or websocket).
     pub fn transport(mut self, transport: &str) -> Self {
         self.transport = Some(transport.to_string());
-        self
-    }
-
-    /// Add a custom connection attribute.
-    pub fn attribute(mut self, key: &str, value: &str) -> Self {
-        self.attributes.insert(key.to_string(), value.to_string());
         self
     }
 
@@ -375,7 +358,6 @@ impl ConnectionBuilder {
         // Validate timeouts
         let connection_timeout = self.connection_timeout.unwrap_or(Duration::from_secs(30));
         let query_timeout = self.query_timeout;
-        let idle_timeout = self.idle_timeout.unwrap_or(Duration::from_secs(600));
 
         if connection_timeout.as_secs() > 300 {
             return Err(ConnectionError::InvalidParameter {
@@ -392,16 +374,14 @@ impl ConnectionBuilder {
             schema: self.schema,
             connection_timeout,
             query_timeout,
-            idle_timeout,
             use_tls: self.use_tls.unwrap_or(true),
             validate_server_certificate: self.validate_server_certificate.unwrap_or(true),
             certificate_fingerprint: self.certificate_fingerprint,
-            client_name: self.client_name.unwrap_or_else(|| "exarrow-rs".to_string()),
+            client_name: self.client_name.unwrap_or_else(|| DRIVER_NAME.to_string()),
             client_version: self
                 .client_version
-                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+                .unwrap_or_else(|| DRIVER_VERSION.to_string()),
             transport: self.transport,
-            attributes: self.attributes,
         })
     }
 }
@@ -423,7 +403,6 @@ impl fmt::Debug for ConnectionBuilder {
             .field("schema", &self.schema)
             .field("connection_timeout", &self.connection_timeout)
             .field("query_timeout", &self.query_timeout)
-            .field("idle_timeout", &self.idle_timeout)
             .field("use_tls", &self.use_tls)
             .field(
                 "validate_server_certificate",
@@ -433,7 +412,6 @@ impl fmt::Debug for ConnectionBuilder {
             .field("client_name", &self.client_name)
             .field("client_version", &self.client_version)
             .field("transport", &self.transport)
-            .field("attributes", &self.attributes)
             .finish()
     }
 }
@@ -525,6 +503,28 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), ConnectionError> {
     }
 }
 
+/// Query keys the parser implements. `idle_timeout` is deprecated and left out on purpose.
+const ACCEPTED_QUERY_KEYS: &[&str] = &[
+    "timeout",
+    "connection_timeout",
+    "query_timeout",
+    "tls",
+    "use_tls",
+    "ssl",
+    "validate_certificate",
+    "verify_certificate",
+    "validateservercertificate",
+    "client_name",
+    "client_version",
+    "certificate_fingerprint",
+    "certificatefingerprint",
+    "transport",
+    "user",
+    "username",
+    "password",
+    "pass",
+];
+
 /// Apply query parameters to builder.
 ///
 /// Errors name the query key and never repeat its value, because an unencoded
@@ -542,7 +542,8 @@ fn apply_query_params(
                 builder = builder.query_timeout(parse_timeout(&key, &value)?);
             }
             "idle_timeout" => {
-                builder = builder.idle_timeout(parse_timeout(&key, &value)?);
+                parse_timeout(&key, &value)?;
+                log::warn!("Connection parameter 'idle_timeout' is deprecated and has no effect");
             }
             "tls" | "use_tls" | "ssl" => {
                 let use_tls = parse_bool(&key, &value)?;
@@ -577,8 +578,13 @@ fn apply_query_params(
                 }
             }
             _ => {
-                // Store as custom attribute
-                builder = builder.attribute(&key, &value);
+                return Err(ConnectionError::InvalidParameter {
+                    parameter: key,
+                    message: format!(
+                        "Unknown connection parameter. Accepted parameters: {}",
+                        ACCEPTED_QUERY_KEYS.join(", ")
+                    ),
+                });
             }
         }
     }
@@ -614,6 +620,47 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, ConnectionError> {
 mod tests {
     use super::*;
 
+    fn sample_value_for(key: &str) -> &'static str {
+        match key {
+            "timeout" | "connection_timeout" | "query_timeout" => "10",
+            "tls"
+            | "use_tls"
+            | "ssl"
+            | "validate_certificate"
+            | "verify_certificate"
+            | "validateservercertificate" => "true",
+            "transport" => "native",
+            _ => "sample",
+        }
+    }
+
+    struct WarningRecorder(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for WarningRecorder {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if record.level() == log::Level::Warn {
+                self.0.lock().unwrap().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Installs the process-wide recorder once; every test thread shares it.
+    fn install_warning_recorder() -> &'static std::sync::Mutex<Vec<String>> {
+        static RECORDER: WarningRecorder = WarningRecorder(std::sync::Mutex::new(Vec::new()));
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&RECORDER).expect("no other logger in the unit-test binary");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        &RECORDER.0
+    }
+
     #[test]
     fn test_builder_minimal() {
         let params = ConnectionBuilder::new()
@@ -640,7 +687,6 @@ mod tests {
             .query_timeout(Duration::from_secs(60))
             .use_tls(true)
             .client_name("test-client")
-            .attribute("custom", "value")
             .build()
             .unwrap();
 
@@ -653,7 +699,6 @@ mod tests {
         assert_eq!(params.query_timeout, Some(Duration::from_secs(60)));
         assert!(params.use_tls);
         assert_eq!(params.client_name, "test-client");
-        assert_eq!(params.attributes.get("custom"), Some(&"value".to_string()));
     }
 
     #[test]
@@ -867,18 +912,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_idle_timeout() {
-        let params = ConnectionBuilder::new()
-            .host("localhost")
-            .username("test")
-            .idle_timeout(Duration::from_secs(120))
-            .build()
-            .unwrap();
-
-        assert_eq!(params.idle_timeout, Duration::from_secs(120));
-    }
-
-    #[test]
     fn test_builder_validate_server_certificate() {
         let params = ConnectionBuilder::new()
             .host("localhost")
@@ -913,7 +946,6 @@ mod tests {
 
         assert_eq!(params.connection_timeout, Duration::from_secs(30));
         assert_eq!(params.query_timeout, None);
-        assert_eq!(params.idle_timeout, Duration::from_secs(600));
         assert!(params.use_tls);
         assert!(params.validate_server_certificate);
         assert_eq!(params.client_name, "exarrow-rs");
@@ -952,12 +984,27 @@ mod tests {
         assert_eq!(params.query_timeout, Some(Duration::from_secs(60)));
     }
 
+    /// Scenario: Idle timeout
     #[test]
-    fn test_parse_idle_timeout() {
-        let params =
-            ConnectionParams::from_str("exasol://user@localhost?idle_timeout=120").unwrap();
+    fn idle_timeout_is_accepted_with_a_deprecation_warning() {
+        let warnings = install_warning_recorder();
 
-        assert_eq!(params.idle_timeout, Duration::from_secs(120));
+        let result = ConnectionParams::from_str("exasol://user@localhost?idle_timeout=120");
+
+        assert!(result.is_ok(), "got: {result:?}");
+        let recorded = warnings.lock().unwrap();
+        let about_idle_timeout: Vec<&String> = recorded
+            .iter()
+            .filter(|message| message.contains("idle_timeout"))
+            .collect();
+        assert!(
+            about_idle_timeout.iter().any(|message| {
+                message.contains("deprecated")
+                    && message.contains("no effect")
+                    && !message.contains("120")
+            }),
+            "got: {about_idle_timeout:?}"
+        );
     }
 
     #[test]
@@ -1007,16 +1054,17 @@ mod tests {
         ));
     }
 
+    /// Scenario: Idle timeout with an invalid value
     #[test]
     fn test_parse_invalid_idle_timeout_value() {
-        let result =
-            ConnectionParams::from_str("exasol://user@localhost?idle_timeout=not_a_number");
+        let result = ConnectionParams::from_str("exasol://user@localhost?idle_timeout=Qx7");
 
-        assert!(result.is_err());
+        let error = result.unwrap_err();
         assert!(matches!(
-            result.unwrap_err(),
+            &error,
             ConnectionError::InvalidParameter { parameter, .. } if parameter == "idle_timeout"
         ));
+        assert!(!error.to_string().contains("Qx7"), "got: {error}");
     }
 
     // ============================================================
@@ -1136,15 +1184,40 @@ mod tests {
         assert_eq!(params.client_version, "2.0.0");
     }
 
+    /// Scenario: Unknown connection-string parameter is rejected
     #[test]
-    fn test_parse_custom_attribute_param() {
-        let params =
-            ConnectionParams::from_str("exasol://user@localhost?custom_key=custom_value").unwrap();
+    fn unknown_query_parameters_are_rejected_by_name() {
+        for key in ["autocommit", "queryTimeout"] {
+            let uri = format!("exasol://alice:Secret1@db.example.com:8563?{key}=Qx7");
 
-        assert_eq!(
-            params.attributes.get("custom_key"),
-            Some(&"custom_value".to_string())
-        );
+            let error = ConnectionParams::from_str(&uri).unwrap_err();
+
+            let ConnectionError::InvalidParameter { parameter, message } = &error else {
+                panic!("expected InvalidParameter for {key}, got: {error:?}");
+            };
+            assert_eq!(parameter, key);
+            assert!(message.contains("query_timeout"), "got: {message}");
+            assert!(!message.contains("idle_timeout"), "got: {message}");
+            let shown = error.to_string();
+            assert!(!shown.contains("Qx7"), "got: {shown}");
+            assert!(!shown.contains("Secret1"), "got: {shown}");
+        }
+    }
+
+    #[test]
+    fn accepted_query_keys_all_parse() {
+        let credential_keys = ["user", "username", "password", "pass"];
+        for key in ACCEPTED_QUERY_KEYS
+            .iter()
+            .filter(|key| !credential_keys.contains(key))
+        {
+            let value = sample_value_for(key);
+            let uri = format!("exasol://alice@db.example.com:8563?{key}={value}");
+
+            let result = ConnectionParams::from_str(&uri);
+
+            assert!(result.is_ok(), "key {key} was rejected: {result:?}");
+        }
     }
 
     // ============================================================
@@ -1422,12 +1495,6 @@ mod tests {
 
         assert_eq!(params.username, "alice");
         assert_eq!(params.password(), "Secret1");
-        for key in ["user", "username", "password", "pass"] {
-            assert!(
-                !params.attributes.contains_key(key),
-                "credential key {key} must not be kept as an attribute"
-            );
-        }
     }
 
     /// Scenario: Query user applies when only the password option is set

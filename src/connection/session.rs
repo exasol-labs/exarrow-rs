@@ -13,9 +13,6 @@ use tokio::sync::RwLock;
 /// Session configuration.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// Session idle timeout
-    pub idle_timeout: Duration,
-
     /// Enable automatic session keepalive
     pub enable_keepalive: bool,
 
@@ -41,7 +38,6 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            idle_timeout: Duration::from_secs(600),
             enable_keepalive: true,
             keepalive_interval: Duration::from_secs(60),
             max_retries: 3,

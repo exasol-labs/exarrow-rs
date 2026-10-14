@@ -18,6 +18,7 @@ use tokio_tungstenite::{
 };
 
 use crate::error::TransportError;
+use crate::DRIVER_NAME;
 
 use super::deadline::SetupStep;
 use super::lifecycle::{self, ConnectionLifecycle, ConnectionState, LifecycleSteps};
@@ -419,6 +420,16 @@ impl Default for WebSocketTransport {
     }
 }
 
+fn auth_request(credentials: &Credentials, encrypted_password: String) -> AuthRequest {
+    AuthRequest::new(
+        credentials.username.clone(),
+        encrypted_password,
+        credentials.client_name.clone(),
+    )
+    .with_driver_name(DRIVER_NAME.to_string())
+    .with_client_version(credentials.client_version.clone())
+}
+
 #[async_trait]
 impl LifecycleSteps for WebSocketTransport {
     fn lifecycle_mut(&mut self) -> &mut ConnectionLifecycle {
@@ -446,11 +457,7 @@ impl LifecycleSteps for WebSocketTransport {
             Self::encrypt_password(&credentials.password, &key_data.public_key_pem)?;
 
         // Step 3: Send authentication request with encrypted password
-        let auth_request = AuthRequest::new(
-            credentials.username.clone(),
-            encrypted_password,
-            "exarrow-rs".to_string(),
-        );
+        let auth_request = auth_request(credentials, encrypted_password);
         let login_response: LoginResponse = self.send_receive(&auth_request).await?;
 
         // Check response status
@@ -810,6 +817,22 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const REJECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Scenario: Client name and version identify the session
+    #[test]
+    fn auth_request_reports_the_client_and_the_driver() {
+        let credentials = Credentials::new("user".to_string(), "pass".to_string())
+            .with_client("dbt".to_string(), "9.9".to_string());
+
+        let request = auth_request(&credentials, "encrypted".to_string());
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["clientName"], "dbt");
+        assert_eq!(json["clientVersion"], "9.9");
+        assert_eq!(json["driverName"], "exarrow-rs");
+        assert_eq!(json["username"], "user");
+        assert_eq!(json["password"], "encrypted");
+    }
 
     #[test]
     fn test_websocket_transport_new() {
