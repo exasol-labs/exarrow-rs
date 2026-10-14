@@ -71,7 +71,7 @@ The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builder
 * *THEN* the option builders `ParquetImportOptions` and `ParquetExportOptions` SHALL expose a single fluent method `use_tls(bool)` to control HTTP-transport TLS
 * *AND* the option builders MUST NOT expose `with_encryption(bool)` or `use_encryption(bool)` aliases
 * *AND* the underlying option struct field SHALL be named `use_tls` (renamed from `use_encryption`) so that public field access uses the same vocabulary as the builder
-* *AND* the default value of `use_tls` SHALL remain `false` to preserve current Docker/self-signed-cert behavior
+* *AND* the default value of `use_tls` SHALL remain `false`
 
 ### Scenario: CSV-path Parquet import keeps pre-epoch timestamps with fractional seconds
 

@@ -65,7 +65,7 @@ TCP connection that is "hijacked" into a bidirectional HTTP tunnel.
 
 ## Background
 
-The client establishes an outbound TCP connection to Exasol and performs a magic packet handshake to create a bidirectional HTTP tunnel. All data transfer occurs through this single established connection, enabling firewall-friendly operation requiring only outbound connections. TLS encryption uses ad-hoc RSA certificates with SHA-256 fingerprints passed in SQL PUBLIC KEY clauses. The HTTP-transport TLS layer is independent of the main control-channel TLS layer (WebSocket or native TCP); applications configure HTTP-transport TLS per import/export operation via `use_tls(bool)` on the corresponding option builder.
+The client establishes an outbound TCP connection to Exasol and performs a magic packet handshake to create a bidirectional HTTP tunnel. All data transfer occurs through this single established connection, enabling firewall-friendly operation requiring only outbound connections. With TLS, the IMPORT or EXPORT SQL names the tunnel certificate in a PUBLIC KEY clause.
 
 ## Scenarios
 
@@ -127,10 +127,12 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 
 * *GIVEN* an HTTP tunnel opened through `HttpTransportClient::connect_with_timeout` with a setup bound of N milliseconds
 * *AND* the peer accepts the TCP connection and then stops answering, either before it sends the EXA handshake response or, with TLS enabled, after the EXA handshake and before it completes the TLS handshake
-* *WHEN* the setup bound elapses
-* *THEN* the client SHALL fail the tunnel setup with an error message that contains `HTTP tunnel setup timeout after <N>ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`
-* *AND* one deadline SHALL bound the TCP connect, the EXA handshake, and the TLS handshake together, so time spent in one step SHALL NOT be granted again to a later step
-* *AND* the client SHALL close the tunnel connection
+* *WHEN* the bound for the stalled step elapses
+* *THEN* the client SHALL fail with an error message that contains `HTTP tunnel setup timeout after <N>ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`
+* *AND* a stall in the TCP connect or the EXA handshake SHALL fail `connect_with_timeout`, a stall in the TLS handshake SHALL fail the first tunnel operation that reads or writes data, and in both cases the client SHALL close the tunnel connection
+* *AND* one deadline of N milliseconds SHALL bound the TCP connect and the EXA handshake together, so time spent in one step SHALL NOT be granted again to the next
+* *AND* a separate bound of N milliseconds SHALL apply to the TLS handshake, SHALL start when the first tunnel read or write begins, whether before or after the IMPORT or EXPORT statement is dispatched, and SHALL include the wait for the first TLS byte from the peer
+* *AND* the TLS handshake bound SHALL be a full N milliseconds, whatever time the TCP connect and the EXA handshake used
 
 ### Scenario: Tunnel setup is bounded by 30 seconds by default
 
@@ -139,4 +141,22 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *WHEN* 30 seconds pass after the tunnel setup started
 * *THEN* the import or export SHALL fail with an error message that contains `HTTP tunnel setup timeout after 30000ms (EXA handshake)`
 * *AND* the driver MUST NOT send the IMPORT or EXPORT statement
-* *AND* the bound SHALL apply whether or not `CsvExportOptions::timeout_ms` is set, because that export timeout covers only the work after tunnel setup
+* *AND* the bound SHALL apply whether or not `CsvExportOptions::timeout_ms` is set, because that export timeout starts only after the TCP connect and the EXA handshake
+
+### Scenario: A TLS tunnel stays failed after a failed TLS handshake
+
+* *GIVEN* an HTTP tunnel with TLS enabled whose first read or write failed in the TLS handshake
+* *WHEN* the caller starts another read or write on the same client
+* *THEN* that read or write SHALL fail without waiting for a bound
+* *AND* the client SHALL NOT attempt a new TLS handshake, SHALL send no byte to the peer, and SHALL NOT open a new connection
+
+### Scenario: TLS tunnel fails with the step named when Exasol does not start the TLS handshake
+
+* *GIVEN* an HTTP tunnel opened with TLS enabled and a setup bound of N milliseconds
+* *AND* the first tunnel read or write has begun, before or after the IMPORT or EXPORT statement that names the tunnel is dispatched
+* *WHEN* Exasol sends no TLS byte on the tunnel within N milliseconds after that read or write began
+* *THEN* that read or write SHALL fail with an error message that contains `HTTP tunnel setup timeout after <N>ms (TLS handshake)`
+* *AND* the client SHALL close the tunnel connection
+* *AND* when Exasol starts the TLS handshake within the bound, the client SHALL complete it and serve the HTTP request
+* *AND* when the peer closes the tunnel connection before it sends a TLS byte, that read or write SHALL fail with an error before the bound elapses
+* *AND* when the IMPORT statement returns an error during the wait, the system SHALL stop serving the tunnel and SHALL return the Exasol error to the caller
