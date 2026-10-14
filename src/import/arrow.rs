@@ -71,7 +71,9 @@ pub struct ArrowImportOptions {
     pub batch_size: usize,
     /// CSV writer options
     pub csv_options: CsvWriterOptions,
-    /// Whether to use TLS for the HTTP transport tunnel
+    /// Whether to encrypt the HTTP transport tunnel with TLS (default: `false`).
+    /// `true` encrypts the tunnel, including against Exasol Docker. The control
+    /// connection's TLS does not cover the tunnel data.
     pub use_tls: bool,
     /// Exasol host for HTTP transport connection.
     /// This is typically the same host as the WebSocket connection.
@@ -752,6 +754,7 @@ mod tests {
         assert!(!options.write_header);
     }
 
+    /// Scenario: TLS for HTTP transport is configured uniformly via use_tls
     #[test]
     fn test_arrow_import_options_default() {
         let options = ArrowImportOptions::default();

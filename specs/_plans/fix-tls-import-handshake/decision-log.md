@@ -33,6 +33,17 @@
 - **Rationale:** The export path opens its tunnel through the same `HttpTransportClient::connect`, so the fix changes export with TLS as well. Shipping that change untested is the larger risk.
 - **Promotes to ADR:** no
 
+### [4] Reproduction of #53
+
+- **Decision:** #53 reproduces on both tags tried, and the probe confirms the diagnosis. Task 1.6 takes the first path: continue with task 2.
+- **Rationale:** Evidence from commit `2a9a331` with `src/` unchanged, run with `REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests with_tls -- --test-threads=1 --nocapture`:
+  - `exasol/docker-db:2025.2.1` (task 1.3): `test_csv_import_with_tls_completes` and `test_csv_export_with_tls_completes` both fail after about 30 seconds each (60.4 seconds for both). The import fails with `HttpTransportError("Failed to connect to Exasol: Network I/O error: HTTP tunnel setup timeout after 30000ms (TLS handshake)")`, and the export fails with the same message in `ExportError::HttpTransportError`.
+  - `exasol/docker-db:2026.1.0` (task 1.4): the image was already present locally, so no pull ran. Both tests fail the same way after about 30 seconds each (60.4 seconds for both), with the same error text.
+  - Task 1.5 probe on both tags: after `perform_handshake` on a raw `TcpStream`, Exasol writes no byte to the tunnel socket within 3 seconds before the statement. After an IMPORT with `AT 'https://<internal address>' PUBLIC KEY '<fingerprint>'`, Exasol's first bytes arrive after 64 ms on 2025.2.1 and 39 ms on 2026.1.0 and start with `16 03 01 02 00 01`: a TLS handshake record that carries a ClientHello. Exasol is the TLS client. When nothing answers, the IMPORT fails with `ETL-5105 ... OpenSSL SSL_connect: SSL_ERROR_SYSCALL ... [SSL connect error]`.
+  - A second probe wrapped the same raw socket with a `tokio_rustls::TlsAcceptor` built from `TlsCertificate::to_server_config`, concurrently with the IMPORT. On both tags the TLS handshake completed within 10 ms, Exasol sent `GET /001.csv HTTP/1.1`, and the IMPORT returned 3 rows. Exasol accepts the current ECDSA P-256 certificate, so the condition of task 3.4 did not occur.
+  - The probe test was temporary and is not part of the change.
+- **Promotes to ADR:** no
+
 ## Review Findings
 
 ### [plan-review] Bound on the wait for Exasol's first TLS byte

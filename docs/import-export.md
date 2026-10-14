@@ -30,7 +30,7 @@ Exasol import and export use **two independent TLS layers**. Enabling TLS on the
 
 ### Docker / local development
 
-The Exasol Docker container uses a self-signed certificate for the control connection. Use `?validateservercertificate=0` in the URI to accept it. For the HTTP transport tunnel, use `.use_tls(false)` — Exasol Docker's ad-hoc per-session certificate handling for the data channel is separate from the control-channel certificate and does not integrate with standard TLS validation.
+The Exasol Docker container uses a self-signed certificate for the control connection. Use `?validateservercertificate=0` in the URI to accept it. The HTTP transport tunnel works with `.use_tls(true)` against Docker as well. The driver generates an ad-hoc certificate for the tunnel, and Exasol checks it against the `PUBLIC KEY` fingerprint in the IMPORT or EXPORT statement, not against a certificate authority, so the control-channel certificate settings do not affect it.
 
 ```rust
 use exarrow_rs::adbc::Driver;
@@ -43,8 +43,8 @@ let database = driver.open(
 )?;
 let mut connection = database.connect().await?;
 
-// HTTP transport does NOT use TLS against Docker:
-let options = CsvImportOptions::default().use_tls(false);
+// The HTTP transport tunnel can use TLS against Docker too:
+let options = CsvImportOptions::default().use_tls(true);
 connection.import_csv_from_files("my_table", &["data.csv"], options).await?;
 ```
 
@@ -68,15 +68,17 @@ let options = CsvImportOptions::default().use_tls(true);
 connection.import_csv_from_files("my_table", &["data.csv"], options).await?;
 ```
 
-**Default**: `.use_tls(false)` is the Docker-safe default. Switch to `.use_tls(true)` for any production or SaaS Exasol host. The same `.use_tls(bool)` method is available on all six option builders: `CsvImportOptions`, `CsvExportOptions`, `ParquetImportOptions`, `ParquetExportOptions`, `ArrowImportOptions`, and `ArrowExportOptions`.
+**Default**: `.use_tls(false)`, so the tunnel stays plain unless you enable TLS. Set `.use_tls(true)` to encrypt the bulk data, against Docker as well as against production or SaaS hosts. The same `.use_tls(bool)` method is available on all six option builders: `CsvImportOptions`, `CsvExportOptions`, `ParquetImportOptions`, `ParquetExportOptions`, `ArrowImportOptions`, and `ArrowExportOptions`.
 
 ## Tunnel Setup Timeout
 
-Every import and export opens an HTTP tunnel to Exasol before it sends its statement. One 30-second deadline bounds the whole setup: the TCP connect, the EXA handshake, and the TLS handshake share it, so time spent in one step is not granted again to the next.
+Every import and export opens an HTTP tunnel to Exasol before it sends its statement. One 30-second deadline bounds the TCP connect and the EXA handshake together, so time spent in one step is not granted again to the next. With `.use_tls(true)`, a separate 30-second bound covers the TLS handshake. Time spent in the TCP connect and the EXA handshake does not shorten the TLS handshake bound.
 
-A stalled setup fails with `HTTP tunnel setup timeout after 30000ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`. The error is `ImportError::HttpTransportError` for an import and `ExportError::HttpTransportError` for an export. The driver has sent no IMPORT or EXPORT statement at that point.
+With TLS, Exasol starts the TLS handshake after it receives the IMPORT or EXPORT statement, and the driver completes it. The TLS bound starts when the driver starts serving the tunnel, which can be before it dispatches the statement. The bound covers statement dispatch and the wait for Exasol to start the handshake, so the statement does not get a full 30 seconds. An import whose statement needs longer than the time left before Exasol starts the handshake, for example on a lock wait, fails with `HTTP tunnel setup timeout after 30000ms (TLS handshake)`.
 
-Neither the connection timeout nor `CsvExportOptions::timeout_ms` changes this bound.
+A stalled setup fails with `HTTP tunnel setup timeout after 30000ms (<step>)`, where `<step>` is `TCP connect`, `EXA handshake`, or `TLS handshake`. For the `TCP connect` and `EXA handshake` steps, the error is `ImportError::HttpTransportError` for an import and `ExportError::HttpTransportError` for an export, and the driver has sent no IMPORT or EXPORT statement at that point. For the `TLS handshake` step, an import returns the tunnel error after the IMPORT statement has returned, and an export returns the EXPORT statement's error (`ExportError::SqlExecutionError`), because the export awaits the statement before it reads the tunnel result.
+
+The connection timeout changes neither bound. `CsvExportOptions::timeout_ms` does not change the deadline for the TCP connect and the EXA handshake. An explicit `timeout_ms` also covers the TLS handshake, so a value below 30 seconds can return `ExportError::Timeout` before the TLS bound elapses.
 
 ## Supported Formats
 
@@ -278,7 +280,7 @@ let rows = connection.export_csv_to_file(source, Path::new("/tmp/export.csv"), o
 
 By default, `CsvExportOptions::default()` arms no client-side timer. The export runs for as long as the EXPORT statement takes on the server, and completes even if that takes longer than five minutes.
 
-Call `.timeout_ms(ms)` to opt in to a client-side bound on the export after tunnel setup (SQL execution, HTTP transfer, and your callback, together). Tunnel setup has its own 30-second limit, described in [Tunnel Setup Timeout](#tunnel-setup-timeout):
+Call `.timeout_ms(ms)` to opt in to a client-side bound on the export that starts after the tunnel's EXA handshake (SQL execution, HTTP transfer, and your callback, together). With `.use_tls(true)`, it also covers the tunnel's TLS handshake. The TCP connect and the EXA handshake have their own 30-second limit, described in [Tunnel Setup Timeout](#tunnel-setup-timeout):
 
 ```rust
 let options = CsvExportOptions::default().timeout_ms(30_000); // 30-second client-side bound
