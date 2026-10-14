@@ -3317,6 +3317,7 @@ fn test_get_current_catalog() {
     assert_eq!(catalog, "EXA", "CurrentCatalog should be EXA");
 }
 
+/// Scenario: Get parameter schema after prepare
 #[test]
 fn test_parameter_schema_names() {
     skip_if_no_library!();
@@ -3973,4 +3974,250 @@ fn test_driver_manager_uri_parse_error_omits_uri_values() {
     );
     assert!(!error.message.contains("Qx7"), "got: {}", error.message);
     assert!(!error.message.contains("Kp9"), "got: {}", error.message);
+}
+
+/// Load the driver and open a connection to the database at `uri`.
+///
+/// The driver and database are returned with the connection, because a
+/// connection must not outlive them.
+fn open_connection(
+    uri: String,
+) -> (
+    ManagedDriver,
+    ManagedDatabase,
+    adbc_driver_manager::ManagedConnection,
+) {
+    let mut driver = load_driver();
+    let db = driver
+        .new_database_with_opts(vec![(OptionDatabase::Uri, OptionValue::String(uri))])
+        .expect("Failed to create database");
+    let conn = db.new_connection().expect("Failed to create connection");
+    (driver, db, conn)
+}
+
+/// The result schema that `execute_schema` reports for `sql` on a fresh statement.
+fn execute_schema_of<C: AdbcConnection>(conn: &mut C, sql: &str) -> Schema {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(sql).unwrap();
+    stmt.execute_schema()
+        .unwrap_or_else(|e| panic!("execute_schema of {sql:?} failed: {e:?}"))
+}
+
+fn field_names(schema: &Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+/// Check `execute_schema` over the transport that `uri` selects: the schema of a query that
+/// fails at run time, and the schema of a zero-row query that equals what `execute` reports.
+fn assert_execute_schema_reports_columns_without_running(uri: String) {
+    let (_driver, _db, mut conn) = open_connection(uri);
+    let schema_name = generate_unique_test_name("TEST_EXEC_SCHEMA");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (TXT VARCHAR(10))"),
+    );
+    execute_ddl(
+        &mut conn,
+        format!("INSERT INTO {schema_name}.T VALUES ('x')"),
+    );
+    execute_ddl(
+        &mut conn,
+        format!(
+            "CREATE TABLE {schema_name}.E (ID DECIMAL(18,0), NAME VARCHAR(50), AMOUNT DECIMAL(10,2), \
+             D DATE, TS TIMESTAMP, F DOUBLE, B BOOLEAN)"
+        ),
+    );
+
+    let failing_sql = format!("SELECT CAST(TXT AS DECIMAL(9,0)) AS N FROM {schema_name}.T");
+    let mut failing = conn.new_statement().unwrap();
+    failing.set_sql_query(&failing_sql).unwrap();
+    assert!(
+        failing.execute().is_err(),
+        "the cast of 'x' must fail when the query runs"
+    );
+    let schema = execute_schema_of(&mut conn, &failing_sql);
+    assert_eq!(schema.fields().len(), 1);
+    let field = &schema.fields()[0];
+    assert_eq!(field.name(), "N");
+    assert!(field.is_nullable());
+    assert_eq!(field.data_type(), &DataType::Decimal128(9, 0));
+
+    let zero_row_sql =
+        format!("SELECT ID*2 AS DOUBLED, UPPER(NAME), AMOUNT, D, TS, F, B FROM {schema_name}.E");
+    let mut prepared = conn.new_statement().unwrap();
+    prepared.set_sql_query(&zero_row_sql).unwrap();
+    prepared.prepare().unwrap();
+    let schema = prepared.execute_schema().expect("execute_schema");
+    assert_eq!(schema.fields().len(), 7);
+    assert_eq!(schema.fields()[0].name(), "DOUBLED");
+    assert!(!schema.fields()[1].name().is_empty());
+    let mut executed = conn.new_statement().unwrap();
+    executed.set_sql_query(&zero_row_sql).unwrap();
+    let reader = executed.execute().expect("execute");
+    assert_eq!(schema, *reader.schema());
+
+    drop(reader);
+    drop(failing);
+    drop(prepared);
+    drop(executed);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Execute schema returns the result columns of a query without executing it
+#[test]
+fn test_execute_schema_reports_columns_without_running_the_query() {
+    skip_if_no_library!();
+
+    assert_execute_schema_reports_columns_without_running(get_test_uri());
+}
+
+/// Scenario: Execute schema returns the result columns of a query without executing it
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_execute_schema_reports_columns_without_running_the_query_websocket() {
+    skip_if_no_library!();
+
+    assert_execute_schema_reports_columns_without_running(format!(
+        "{}&transport=websocket",
+        get_test_uri()
+    ));
+}
+
+/// Scenario: Execute schema of a parameterized query needs no bound parameters
+#[test]
+fn test_execute_schema_of_parameterized_select_needs_no_binding() {
+    skip_if_no_library!();
+
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = generate_unique_test_name("TEST_EXEC_SCHEMA_PARAM");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (ID DECIMAL(18,0), NAME VARCHAR(50))"),
+    );
+
+    let mut stmt = conn.new_statement().unwrap();
+    stmt.set_sql_query(format!("SELECT ID, NAME FROM {schema_name}.T WHERE ID = ?"))
+        .unwrap();
+    stmt.prepare().unwrap();
+    let schema = stmt
+        .execute_schema()
+        .expect("execute_schema must not need bound parameters");
+
+    assert_eq!(field_names(&schema), vec!["ID", "NAME"]);
+
+    drop(stmt);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Execute schema of a statement without a result set returns an empty schema
+#[test]
+fn test_execute_schema_of_row_count_statement_is_empty_and_runs_nothing() {
+    skip_if_no_library!();
+
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = generate_unique_test_name("TEST_EXEC_SCHEMA_COUNT");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (ID DECIMAL(18,0))"),
+    );
+    execute_ddl(&mut conn, format!("INSERT INTO {schema_name}.T VALUES (1)"));
+
+    for sql in [
+        format!("INSERT INTO {schema_name}.T VALUES (2)"),
+        format!("DELETE FROM {schema_name}.T"),
+    ] {
+        let schema = execute_schema_of(&mut conn, &sql);
+        assert_eq!(schema.fields().len(), 0, "{sql}");
+    }
+
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT ID FROM {schema_name}.T")),
+        vec![1]
+    );
+
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Setting new SQL discards the earlier prepare
+#[test]
+fn test_execute_schema_follows_sql_set_after_prepare() {
+    skip_if_no_library!();
+
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = generate_unique_test_name("TEST_EXEC_SCHEMA_RESET");
+    execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(
+        &mut conn,
+        format!("CREATE TABLE {schema_name}.T (ID DECIMAL(18,0), NAME VARCHAR(50))"),
+    );
+
+    let select_where = format!("SELECT ID FROM {schema_name}.T WHERE ID = ?");
+    let mut first = conn.new_statement().unwrap();
+    first.set_sql_query(&select_where).unwrap();
+    first.prepare().unwrap();
+    first
+        .set_sql_query(format!("SELECT NAME, ID FROM {schema_name}.T"))
+        .unwrap();
+    let error = first
+        .get_parameter_schema()
+        .expect_err("the new SQL has not been prepared");
+    assert_eq!(error.status, Status::InvalidState);
+    let schema = first.execute_schema().expect("execute_schema");
+    assert_eq!(field_names(&schema), vec!["NAME", "ID"]);
+
+    let mut second = conn.new_statement().unwrap();
+    second.set_sql_query(&select_where).unwrap();
+    second.prepare().unwrap();
+    second
+        .set_sql_query(format!("INSERT INTO {schema_name}.T (ID) VALUES (?)"))
+        .unwrap();
+    second
+        .bind(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("ID", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![7]))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    second.execute_update().expect("bound insert");
+    assert_eq!(
+        integers_from(&mut conn, format!("SELECT ID FROM {schema_name}.T")),
+        vec![7]
+    );
+
+    drop(first);
+    drop(second);
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Execute schema without SQL fails
+#[test]
+fn test_execute_schema_without_sql_fails_with_invalid_state() {
+    skip_if_no_library!();
+
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+
+    let mut no_sql = conn.new_statement().unwrap();
+    let error = no_sql
+        .execute_schema()
+        .expect_err("a statement without SQL has no schema");
+    assert_eq!(error.status, Status::InvalidState);
+
+    let mut ingest_only = conn.new_statement().unwrap();
+    ingest_only
+        .set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String("T".to_string()),
+        )
+        .unwrap();
+    let error = ingest_only
+        .execute_schema()
+        .expect_err("an ingest-only statement has no schema");
+    assert_eq!(error.status, Status::InvalidState);
 }

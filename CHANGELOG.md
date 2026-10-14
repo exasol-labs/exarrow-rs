@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.3
+
+- Fix: ADBC `execute_schema`, which Python reaches through `cursor.adbc_execute_schema`, returns the result schema of a statement without running it. It used to run the statement, so an INSERT, UPDATE, or DELETE changed data before the call failed, and a SELECT with parameter markers failed. A statement without a result set returns a schema with no fields. Fixes #62.
+- Fix: after `set_sql_query` sets different SQL on a prepared ADBC statement, `execute` and `execute_update` with bound parameters prepare and run the new SQL instead of the earlier prepared statement, and `get_parameter_schema` fails with `InvalidState` until the statement is prepared again.
+- Changed: over the native transport, `execute_schema` of a query that returns rows reports the types of a zero-row result, which are also the types over the WebSocket transport. DECIMAL columns that Exasol sends as integers are Decimal128 instead of Int64 or Int32, TIMESTAMP WITH LOCAL TIME ZONE is a Timestamp with time zone UTC, INTERVAL is Interval instead of Utf8, and GEOMETRY and HASHTYPE are Binary instead of Utf8. The batches that `execute` returns over the native transport keep their types.
+
 ## 0.21.2
 
 - Fix: imports and exports with `use_tls(true)` complete instead of failing with `HTTP tunnel setup timeout after 30000ms (TLS handshake)`. The driver now takes the TLS server role and completes the handshake that Exasol starts after it receives the IMPORT or EXPORT statement. Fixes #53.
