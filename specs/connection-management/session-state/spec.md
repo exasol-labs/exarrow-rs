@@ -4,7 +4,7 @@ Specifies the client-side session state of a connection and how statement execut
 
 ## Background
 
-The client-side session state SHALL be one of `Ready`, `InTransaction`, `Closing`, or `Closed`. A statement execution, a prepare, a prepared-statement execution, or a transaction start SHALL begin only in `Ready` or `InTransaction`, and the driver SHALL keep the session in that state while the operation runs, so that no exit path of an operation, including an error or an abandoned execution, leaves a state that blocks the next operation. Session establishment, termination, and timeouts are specified in `connection-management/session-and-lifecycle`.
+The client-side session state SHALL be one of `Ready`, `InTransaction`, `Closing`, or `Closed`. A statement execution, a prepare, a prepared-statement execution, or a transaction start SHALL begin only in `Ready` or `InTransaction`, and the driver SHALL keep the session in that state while the operation runs, so that no exit path of an operation, including an error or an abandoned execution, leaves a state that blocks the next operation. Session establishment and termination are specified in `connection-management/session-and-lifecycle`, and timeouts in `connection-management/query-timeout` and `connection-management/connection-timeout`.
 
 ## Scenarios
 

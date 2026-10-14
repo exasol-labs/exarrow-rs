@@ -4,7 +4,7 @@ Specifies session management, connection pooling foundation, and timeout configu
 
 ## Background
 
-The system SHALL manage database session lifecycle from establishment through termination. Connections SHALL support clean state reset to enable future pooling implementations. Configurable timeouts SHALL govern connection, query, and idle operations. The connection timeout, which bounds opening a connection, is specified in `connection-management/connection-timeout`. The idle timeout SHALL apply a sensible non-zero default. The query-execution timeout SHALL be a server-enforced session setting and default to unset: when a caller configures a query timeout, the driver SHALL forward it to Exasol as the `queryTimeout` session attribute so the server aborts an over-running query and reports the abort through the normal response cycle, and the driver SHALL NOT wrap query execution through `Connection::execute_statement()` in a client-side timer. A client-side bound on a CSV export is a separate, export-scoped setting specified in `import-export/csv-export-timeout`. Absent an explicit query timeout, the driver SHALL set no `queryTimeout` attribute and the server-side `QUERY_TIMEOUT` setting SHALL govern. If the driver ever gives up on a running query client-side, it MUST terminate the connection rather than abandon the in-flight request and leave the session open server-side. Default-schema activation on connect is specified in the `connection-management/schema-activation` feature. The client-side session states and the rules for operations in each state are specified in `connection-management/session-state`.
+The system SHALL manage database session lifecycle from establishment through termination. Connections SHALL support clean state reset to enable future pooling implementations. Configurable timeouts SHALL govern connection and query operations, and the query timeout and the deprecated idle timeout are specified in `connection-management/query-timeout`. The connection timeout, which bounds opening a connection, is specified in `connection-management/connection-timeout`. The driver has no idle timeout and never closes a connection because the connection is idle, so the `idle_timeout` connection-string parameter is deprecated and has no effect. The query-execution timeout SHALL be a server-enforced session setting and default to unset: when a caller configures a query timeout, the driver SHALL forward it to Exasol as the `queryTimeout` session attribute so the server aborts an over-running query and reports the abort through the normal response cycle, and the driver SHALL NOT wrap query execution through `Connection::execute_statement()` in a client-side timer. A client-side bound on a CSV export is a separate, export-scoped setting specified in `import-export/csv-export-timeout`. Absent an explicit query timeout, the driver SHALL set no `queryTimeout` attribute and the server-side `QUERY_TIMEOUT` setting SHALL govern. If the driver ever gives up on a running query client-side, it MUST terminate the connection rather than abandon the in-flight request and leave the session open server-side. Default-schema activation on connect is specified in the `connection-management/schema-activation` feature. The client-side session states and the rules for operations in each state are specified in `connection-management/session-state`.
 
 ## Scenarios
 
@@ -44,31 +44,6 @@ The system SHALL manage database session lifecycle from establishment through te
 * *WHEN* checking if a connection is usable
 * *THEN* it SHALL provide a health check method
 * *AND* it SHALL return connection validity status
-
-### Scenario: Query timeout
-
-* *GIVEN* an explicit query timeout is configured via the `query_timeout=` connection-string parameter, the `ConnectionParams::query_timeout()` builder, or `Statement::set_timeout()`
-* *WHEN* the connection is established or the statement executes
-* *THEN* the driver SHALL forward the configured timeout to Exasol as the `queryTimeout` session attribute
-* *AND* the server SHALL abort a query whose execution time exceeds the configured timeout and SHALL report the abort as an error through the normal response cycle
-* *AND* the driver MUST NOT wrap query execution through `Connection::execute_statement()` in a client-side timer
-* *AND* the connection SHALL remain usable for subsequent statements after a server-reported timeout
-
-### Scenario: No query timeout by default
-
-* *GIVEN* a connection with no query timeout configured
-* *WHEN* the connection is established and a query is executed via `Connection::execute_statement()`
-* *THEN* the driver MUST NOT set the `queryTimeout` session attribute
-* *AND* the driver MUST NOT wrap query execution in a client-side timer
-* *AND* IF a prior statement on the same connection set the `queryTimeout` session attribute, the driver MUST reset it to `0` (unlimited) before executing so no stale server timeout is inherited
-* *AND* the query SHALL run until the server returns a result or the server-side `QUERY_TIMEOUT` setting terminates it
-
-### Scenario: Idle timeout
-
-* *GIVEN* timeout settings are configured
-* *WHEN* a connection is idle
-* *THEN* it SHALL support optional idle timeout configuration
-* *AND* it SHALL close connections that exceed idle timeout
 
 ### Scenario: Terminate a connection whose in-flight response is no longer trusted
 
