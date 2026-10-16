@@ -88,6 +88,22 @@ The connection timeout changes neither bound. `CsvExportOptions::timeout_ms` doe
 | Parquet   | Yes    | Yes    | Columnar with compression     |
 | Arrow IPC | Yes    | Yes    | Direct RecordBatch transfer   |
 
+## Memory Use
+
+Each import function holds a different amount of data in memory. A "piece" is at most 64 KiB, and a "batch" is one Arrow RecordBatch of `batch_size` rows.
+
+| Function | Held in memory |
+|----------|----------------|
+| `import_from_parquet` | Native path: the whole file, read once. CSV path: a few batches of CSV and the Parquet row group being decoded, whatever the file size. |
+| `import_from_parquet_stream` | Both paths: the whole stream, because Parquet keeps its metadata at the end of the file. On the CSV path, a few batches of CSV come on top. |
+| `import_parquet_from_files` | One file: as `import_from_parquet`. Several files, native path: every whole file at once, one per connection. Several files, CSV path: a few batches of CSV and one row group per file. |
+| `import_csv_from_file` | The whole file, plus a compressed copy when compression is set. |
+| `import_csv_from_files` | One file: as `import_csv_from_file`. Several files: one 64 KiB piece per file. When compression is set, each file also holds its encoder state: an estimated few hundred KB for gzip and an estimated 5 MB for bzip2 at its default level 6 (libbzip2 documents 400 KB plus 8 times the 600 KB block). A file whose extension marks it as compressed is sent as stored and has no encoder. |
+| `import_from_record_batches` | The CSV of all batches, held more than once, plus the batches the caller holds. |
+| `import_from_arrow_ipc` | The whole input, plus the CSV of all batches, held more than once. |
+
+To bound memory for Parquet or Arrow data, decode the data yourself and pass the RecordBatches in groups to `import_from_record_batches`. Each call is one IMPORT statement and holds the CSV of its own batches more than once. Each call commits separately unless autocommit is off, so a failure in a later group leaves the earlier groups in the table.
+
 ## CSV Import
 
 ```rust
@@ -117,6 +133,8 @@ println!("Imported {} rows", rows);
 | `null_string` | String representing NULL values |
 
 ## Parquet Import
+
+See [Memory Use](#memory-use) for what each Parquet import holds in memory.
 
 ```rust
 use exarrow_rs::import::ParquetImportOptions;
@@ -303,22 +321,22 @@ If you want a bound that never leaves the connection in an uncertain state, set 
 
 ## Parallel Import
 
-For large datasets, import multiple files in parallel:
+For large datasets, import multiple files in parallel. Each file streams through its own HTTP connection in 64 KiB pieces. See [Memory Use](#memory-use) for the memory each import function holds.
 
 ```rust
-use exarrow_rs::import::ParallelImportOptions;
+use exarrow_rs::import::CsvImportOptions;
+use std::path::PathBuf;
 
 let files = vec![
-    Path::new("/data/part-001.csv"),
-    Path::new("/data/part-002.csv"),
-    Path::new("/data/part-003.csv"),
+    PathBuf::from("/data/part-001.csv"),
+    PathBuf::from("/data/part-002.csv"),
+    PathBuf::from("/data/part-003.csv"),
 ];
 
-let rows = connection.import_csv_parallel(
+let rows = connection.import_csv_from_files(
     "my_table",
-    &files,
+    files,
     CsvImportOptions::default(),
-    ParallelImportOptions::default().with_max_connections(4),
 ).await?;
 ```
 

@@ -21,7 +21,7 @@ pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
 ///
 /// A panicked task and a failed stream are indistinguishable to callers, so
 /// both collapse into `ImportError` here rather than at every call site.
-fn resolve_stream_task(
+pub(crate) fn resolve_stream_task(
     joined: Result<Result<(), ImportError>, tokio::task::JoinError>,
 ) -> Result<(), ImportError> {
     match joined {
@@ -257,20 +257,11 @@ pub async fn stream_files_parallel(
     file_data: Vec<Vec<u8>>,
     _compression: Compression,
 ) -> Result<(), ImportError> {
-    if connections.len() != file_data.len() {
-        return Err(ImportError::InvalidConfig(format!(
-            "Connection count ({}) != file data count ({})",
-            connections.len(),
-            file_data.len()
-        )));
-    }
-
-    // Spawn streaming tasks for each connection/file pair
-    let mut stream_handles: Vec<JoinHandle<Result<(), ImportError>>> =
-        Vec::with_capacity(connections.len());
-
-    for (idx, (mut client, data)) in connections.into_iter().zip(file_data).enumerate() {
-        let handle = tokio::spawn(async move {
+    let indexed_data: Vec<(usize, Vec<u8>)> = file_data.into_iter().enumerate().collect();
+    stream_in_parallel(
+        connections,
+        indexed_data,
+        |mut client, (idx, data)| async move {
             // Wait for HTTP GET from Exasol
             client.handle_import_request().await.map_err(|e| {
                 ImportError::ParallelImportError(format!(
@@ -292,22 +283,50 @@ pub async fn stream_files_parallel(
                     "File {} failed to send final chunk: {e}",
                     idx
                 ))
-            })?;
+            })
+        },
+    )
+    .await
+}
 
-            Ok(())
-        });
-
-        stream_handles.push(handle);
+/// Streams item N through connection N, each in a task of its own, and joins
+/// the tasks fail-fast.
+///
+/// Every multi-file import shares this fan-out, so the count check, the
+/// concurrency, and the error reporting of `join_stream_handles` hold for all
+/// of them alike.
+pub(crate) async fn stream_in_parallel<T, F, Fut>(
+    connections: Vec<HttpTransportClient>,
+    items: Vec<T>,
+    mut stream_one: F,
+) -> Result<(), ImportError>
+where
+    F: FnMut(HttpTransportClient, T) -> Fut,
+    Fut: Future<Output = Result<(), ImportError>> + Send + 'static,
+{
+    if connections.len() != items.len() {
+        return Err(ImportError::InvalidConfig(format!(
+            "Connection count ({}) != file count ({})",
+            connections.len(),
+            items.len()
+        )));
     }
 
-    join_stream_handles(stream_handles).await
+    let handles = connections
+        .into_iter()
+        .zip(items)
+        .map(|(client, item)| tokio::spawn(stream_one(client, item)))
+        .collect();
+    join_stream_handles(handles).await
 }
 
 /// Await every streaming task with fail-fast semantics.
 ///
 /// Tasks are polled concurrently, so a failure in any stream is reported
 /// without waiting for earlier streams. The error carries the index of the
-/// failing task so a multi-file import points at the file that broke. Dropping
+/// failing task so a multi-file import points at the file that broke. A
+/// `ConversionError` passes through unwrapped, so a multi-file import reports
+/// a bad value with the same variant as a single-file import. Dropping
 /// a `JoinHandle` detaches its task, so a guard holds the abort handles from
 /// the call on and aborts the unfinished tasks after the first failure or when
 /// the returned future is dropped.
@@ -330,8 +349,9 @@ fn join_stream_handles(
                 .map_err(|e| {
                     ImportError::ParallelImportError(format!("Stream task {} panicked: {e}", idx))
                 })?
-                .map_err(|e| {
-                    ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx))
+                .map_err(|e| match e {
+                    e @ ImportError::ConversionError(_) => e,
+                    e => ImportError::ParallelImportError(format!("Stream {} failed: {e}", idx)),
                 })?;
         }
 
@@ -372,19 +392,11 @@ pub async fn stream_parquet_files_parallel(
     connections: Vec<HttpTransportClient>,
     file_paths: Vec<PathBuf>,
 ) -> Result<(), ImportError> {
-    if connections.len() != file_paths.len() {
-        return Err(ImportError::InvalidConfig(format!(
-            "Connection count ({}) != file count ({})",
-            connections.len(),
-            file_paths.len()
-        )));
-    }
-
-    let mut stream_handles: Vec<JoinHandle<Result<(), ImportError>>> =
-        Vec::with_capacity(connections.len());
-
-    for (idx, (mut client, path)) in connections.into_iter().zip(file_paths).enumerate() {
-        let handle = tokio::spawn(async move {
+    let indexed_paths: Vec<(usize, PathBuf)> = file_paths.into_iter().enumerate().collect();
+    stream_in_parallel(
+        connections,
+        indexed_paths,
+        |mut client, (idx, path)| async move {
             let file_bytes = tokio::fs::read(&path).await.map_err(|e| {
                 ImportError::ParallelImportError(format!(
                     "File {}: failed to read '{}': {e}",
@@ -401,15 +413,10 @@ pub async fn stream_parquet_files_parallel(
                         "File {}: parquet range-request handler failed: {e}",
                         idx
                     ))
-                })?;
-
-            Ok(())
-        });
-
-        stream_handles.push(handle);
-    }
-
-    join_stream_handles(stream_handles).await
+                })
+        },
+    )
+    .await
 }
 
 /// Converts multiple Parquet files to CSV format in parallel.
@@ -439,70 +446,38 @@ pub async fn convert_parquet_files_to_csv(
     column_separator: char,
     column_delimiter: char,
 ) -> Result<Vec<Vec<u8>>, ImportError> {
-    use crate::import::parquet::{record_batch_to_csv, ParquetImportOptions};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use crate::import::parquet::{open_parquet_csv_file, render_parquet_csv, ParquetImportOptions};
+
+    let options = ParquetImportOptions::default()
+        .with_batch_size(batch_size)
+        .with_null_value(null_value)
+        .with_column_separator(column_separator)
+        .with_column_delimiter(column_delimiter);
 
     // Spawn blocking conversion tasks in parallel
     let mut conversion_handles: Vec<JoinHandle<Result<Vec<u8>, ImportError>>> =
         Vec::with_capacity(paths.len());
 
     for (idx, path) in paths.into_iter().enumerate() {
-        let null_value = null_value.clone();
+        let options = options.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            // Read Parquet file
-            let file = std::fs::File::open(&path).map_err(|e| {
-                ImportError::ParallelImportError(format!(
-                    "Failed to open Parquet file {}: {e}",
-                    path.display()
-                ))
-            })?;
+            let source = open_parquet_csv_file(&path, &options)?;
 
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                ImportError::ParallelImportError(format!(
-                    "Failed to read Parquet file {}: {e}",
-                    path.display()
-                ))
-            })?;
-
-            let reader = builder.with_batch_size(batch_size).build().map_err(|e| {
-                ImportError::ParallelImportError(format!(
-                    "Failed to build Parquet reader for {}: {e}",
-                    path.display()
-                ))
-            })?;
-
-            // Create options for CSV conversion
-            let options = ParquetImportOptions::default()
-                .with_null_value(&null_value)
-                .with_column_separator(column_separator)
-                .with_column_delimiter(column_delimiter);
-
-            // Convert all batches to CSV
             let mut csv_data = Vec::new();
-            for batch_result in reader {
-                let batch = batch_result.map_err(|e| {
-                    ImportError::ParallelImportError(format!(
-                        "Failed to read batch from {}: {e}",
-                        path.display()
-                    ))
-                })?;
-
-                // Keep ConversionError so callers see the same variant as a single-file import.
-                let csv_rows = record_batch_to_csv(&batch, &options).map_err(|e| match e {
-                    ImportError::ConversionError(msg) => {
-                        ImportError::ConversionError(format!("{}: {msg}", path.display()))
-                    }
-                    e => ImportError::ParallelImportError(format!(
-                        "Failed to convert batch to CSV from {}: {e}",
-                        path.display()
-                    )),
-                })?;
-
-                for row in csv_rows {
-                    csv_data.extend_from_slice(row.as_bytes());
-                    csv_data.push(b'\n');
+            render_parquet_csv(source.reader, &options, |buffer| {
+                csv_data.extend(buffer);
+                Ok(())
+            })
+            // Keep ConversionError so callers see the same variant as a single-file import.
+            .map_err(|e| match e {
+                ImportError::ConversionError(msg) => {
+                    ImportError::ConversionError(format!("{}: {msg}", path.display()))
                 }
-            }
+                e => ImportError::ParallelImportError(format!(
+                    "Failed to read batch from {}: {e}",
+                    path.display()
+                )),
+            })?;
 
             Ok(csv_data)
         });
@@ -541,6 +516,9 @@ pub async fn convert_parquet_files_to_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_support::{
+        finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+    };
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -738,6 +716,59 @@ mod tests {
             err.to_string().contains("Stream task 1 panicked"),
             "got: {err}"
         );
+    }
+
+    /// Scenario: Parallel CSV-path Parquet import that fails on a value imports no rows
+    #[tokio::test]
+    async fn test_join_stream_handles_keeps_conversion_error() {
+        let handles = vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async {
+                Err(ImportError::ConversionError(
+                    "b.parquet: date 2932897 is out of range".to_string(),
+                ))
+            }),
+        ];
+
+        let err = join_stream_handles(handles).await.unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(m) if m == "b.parquet: date 2932897 is out of range"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_files_parallel_sends_each_file_through_its_own_connection() {
+        let mut servers = vec![
+            FakeExasolServer::requesting_import().await,
+            FakeExasolServer::requesting_import().await,
+        ];
+        let mut connections = Vec::new();
+        for server in &servers {
+            connections.push(server.connect_tunnel().await);
+        }
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_files_parallel(
+                connections,
+                vec![b"1,a\n".to_vec(), b"2,b\n".to_vec()],
+                Compression::None,
+            ),
+        )
+        .await
+        .expect("both streams succeed");
+
+        let mut bodies = Vec::new();
+        for server in &mut servers {
+            bodies.push(ChunkedBody::parse(
+                &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+            ));
+        }
+        assert_eq!(bodies[0].data(), b"1,a\n");
+        assert_eq!(bodies[1].data(), b"2,b\n");
+        assert!(bodies.iter().all(|body| body.terminated));
     }
 
     #[tokio::test]

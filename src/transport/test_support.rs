@@ -10,8 +10,9 @@
 //! Doubles here: `MockTransport` and `StalledQueryTransport` for the
 //! `TransportProtocol` trait with `transport_session_info` as the session a
 //! mocked login reports, `FakeExasolServer` for the HTTP-tunnel wire
-//! format (answering, silent before or after its handshake, or starting,
-//! stalling, or refusing the TLS handshake that Exasol runs as the client),
+//! format (answering, requesting an import, silent before or after its
+//! handshake, or starting, stalling, or refusing the TLS handshake that Exasol
+//! runs as the client) with `ChunkedBody` to split what it received,
 //! `SilentServer` for a peer that accepts and then never answers (plain,
 //! after TLS, or after the WebSocket upgrade), and `FakeWebSocketServer`
 //! (`websocket` feature) for scripted WebSocket API exchanges.
@@ -25,11 +26,11 @@ use crate::transport::protocol::{
     ConnectionParams, Credentials, PreparedStatementHandle, QueryResult,
 };
 use crate::transport::tls::{client_config, client_handshake};
-use crate::transport::TransportProtocol;
+use crate::transport::{HttpTransportClient, TransportProtocol};
 use async_trait::async_trait;
 use mockall::mock;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -212,6 +213,7 @@ pub(crate) struct FakeExasolServer {
     listener: Arc<TcpListener>,
     peer: JoinHandle<Vec<u8>>,
     magic_packet_received: Option<oneshot::Receiver<()>>,
+    first_body_chunk_received: Option<mpsc::Receiver<()>>,
 }
 
 impl FakeExasolServer {
@@ -260,6 +262,35 @@ impl FakeExasolServer {
         .await;
         server.magic_packet_received = Some(magic_packet_received);
         server
+    }
+
+    /// Answers the handshake, sends a plain `GET /001.csv` as Exasol does for
+    /// an IMPORT, and reads the response until the driver closes the tunnel.
+    /// [`first_body_chunk_signal`](Self::first_body_chunk_signal) fires once
+    /// the first whole body chunk has arrived.
+    pub(crate) async fn requesting_import() -> Self {
+        let (received, first_body_chunk_received) = mpsc::channel();
+        let mut server = Self::spawn(|listener| async move {
+            let mut stream = accept_and_handshake(&listener).await;
+            let request =
+                format!("GET /001.csv HTTP/1.1\r\nHost: {INTERNAL_IP}:{INTERNAL_PORT}\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("send the GET");
+            stream.flush().await.expect("flush the GET");
+            read_response_signalling_first_body_chunk(&mut stream, received).await
+        })
+        .await;
+        server.first_body_chunk_received = Some(first_body_chunk_received);
+        server
+    }
+
+    /// Opens a plain tunnel to this peer and completes the EXA handshake.
+    pub(crate) async fn connect_tunnel(&self) -> HttpTransportClient {
+        HttpTransportClient::connect(&self.host, self.port, false)
+            .await
+            .expect("the tunnel connects once the EXA handshake completes")
     }
 
     /// Answers the handshake, waits `delay`, then starts TLS as the client
@@ -331,7 +362,17 @@ impl FakeExasolServer {
             listener,
             peer,
             magic_packet_received: None,
+            first_body_chunk_received: None,
         }
+    }
+
+    /// The signal of [`requesting_import`](Self::requesting_import) that fires
+    /// once the first whole body chunk has arrived. It is a std channel, so a
+    /// blocking thread such as a Parquet read can wait on it with a timeout.
+    pub(crate) fn first_body_chunk_signal(&mut self) -> mpsc::Receiver<()> {
+        self.first_body_chunk_received
+            .take()
+            .expect("only requesting_import signals the first body chunk, and only once")
     }
 
     /// Waits until the peer of [`silent_before_handshake`](Self::silent_before_handshake)
@@ -502,6 +543,72 @@ async fn read_until_end_of_stream(stream: &mut (impl tokio::io::AsyncRead + Unpi
     received
 }
 
+async fn read_response_signalling_first_body_chunk(
+    stream: &mut TcpStream,
+    first_body_chunk: mpsc::Sender<()>,
+) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut pending_signal = Some(first_body_chunk);
+    let mut buffer = [0u8; 16 * 1024];
+    while let Ok(read @ 1..) = stream.read(&mut buffer).await {
+        received.extend_from_slice(&buffer[..read]);
+        if let Some(signal) =
+            pending_signal.take_if(|_| !ChunkedBody::parse(&received).chunks.is_empty())
+        {
+            let _ = signal.send(());
+        }
+    }
+    received
+}
+
+/// The body of a chunked HTTP response as a fake peer received it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ChunkedBody {
+    pub(crate) chunks: Vec<Vec<u8>>,
+    /// Whether the zero-length chunk that ends a chunked body arrived.
+    pub(crate) terminated: bool,
+}
+
+impl ChunkedBody {
+    /// Splits `response` into its body chunks. An incomplete trailing chunk is
+    /// left out, as a peer that saw the connection close mid-chunk would.
+    pub(crate) fn parse(response: &[u8]) -> Self {
+        let mut body = Self {
+            chunks: Vec::new(),
+            terminated: false,
+        };
+        let Some((_, mut rest)) = split_at_first(response, b"\r\n\r\n") else {
+            return body;
+        };
+        while let Some((size_line, after_size)) = split_at_first(rest, b"\r\n") {
+            let size_line = std::str::from_utf8(size_line).expect("a chunk size line is ASCII");
+            let size = usize::from_str_radix(size_line.trim(), 16).expect("a chunk size is hex");
+            if size == 0 {
+                body.terminated = after_size.starts_with(b"\r\n");
+                break;
+            }
+            if after_size.len() < size + 2 {
+                break;
+            }
+            body.chunks.push(after_size[..size].to_vec());
+            rest = &after_size[size + 2..];
+        }
+        body
+    }
+
+    /// The body bytes, every chunk joined in order.
+    pub(crate) fn data(&self) -> Vec<u8> {
+        self.chunks.concat()
+    }
+}
+
+fn split_at_first<'a>(bytes: &'a [u8], separator: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    let position = bytes
+        .windows(separator.len())
+        .position(|window| window == separator)?;
+    Some((&bytes[..position], &bytes[position + separator.len()..]))
+}
+
 async fn bind_loopback() -> (TcpListener, String, u16) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -599,5 +706,67 @@ impl FakeWebSocketServer {
 impl Drop for FakeWebSocketServer {
     fn drop(&mut self) {
         self.peer.abort();
+    }
+}
+
+mod tests {
+    use super::{
+        finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+    };
+
+    const HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    fn response(body: &[u8]) -> Vec<u8> {
+        [HEADERS, body].concat()
+    }
+
+    #[test]
+    fn chunked_body_splits_the_chunks_and_reports_the_terminating_chunk() {
+        let body = ChunkedBody::parse(&response(b"4\r\n1,a\n\r\n3\r\nb\nc\r\n0\r\n\r\n"));
+
+        assert_eq!(body.chunks, vec![b"1,a\n".to_vec(), b"b\nc".to_vec()]);
+        assert!(body.terminated);
+        assert_eq!(body.data(), b"1,a\nb\nc");
+    }
+
+    #[test]
+    fn chunked_body_of_a_truncated_response_keeps_the_whole_chunks_only() {
+        let body = ChunkedBody::parse(&response(b"4\r\n1,a\n\r\n5\r\nab"));
+
+        assert_eq!(body.chunks, vec![b"1,a\n".to_vec()]);
+        assert!(!body.terminated);
+    }
+
+    #[test]
+    fn chunked_body_without_complete_headers_is_empty() {
+        let body = ChunkedBody::parse(b"HTTP/1.1 200 OK\r\n");
+
+        assert!(body.chunks.is_empty());
+        assert!(!body.terminated);
+    }
+
+    #[tokio::test]
+    async fn requesting_import_sends_a_get_and_signals_the_first_body_chunk() {
+        let mut server = FakeExasolServer::requesting_import().await;
+        let first_body_chunk = server.first_body_chunk_signal();
+        let mut client = server.connect_tunnel().await;
+
+        let request = finish_within(LOOPBACK_TEST_BOUND, client.handle_import_request())
+            .await
+            .expect("the peer sends a GET");
+        assert!(first_body_chunk.try_recv().is_err());
+        client.write_chunked_body(b"1,a\n").await.expect("write");
+        tokio::task::spawn_blocking(move || first_body_chunk.recv_timeout(DISCONNECT_BOUND))
+            .await
+            .expect("the waiting thread must not panic")
+            .expect("the peer signals the first body chunk");
+        client.write_final_chunk().await.expect("final chunk");
+        drop(client);
+
+        assert_eq!(request.path, "/001.csv");
+        let received = finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+        let body = ChunkedBody::parse(&received);
+        assert_eq!(body.chunks, vec![b"1,a\n".to_vec()]);
+        assert!(body.terminated);
     }
 }

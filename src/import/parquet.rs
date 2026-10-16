@@ -8,7 +8,7 @@
 //!
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -19,7 +19,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::file::reader::ChunkReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::query::import::{ImportFileEntry, ImportFormat, ImportQuery, RowSeparator};
@@ -27,8 +28,8 @@ use crate::transport::HttpTransportClient;
 use crate::types::{infer_schema_from_parquet, infer_schema_from_parquet_files, ColumnNameMode};
 
 use super::parallel::{
-    convert_parquet_files_to_csv, finish_import, stream_files_parallel,
-    stream_parquet_files_parallel, ParallelTransportPool, CHUNK_SIZE as CHUNKED_TRANSFER_SIZE,
+    finish_import, resolve_stream_task, stream_in_parallel, stream_parquet_files_parallel,
+    ParallelTransportPool, CHUNK_SIZE as CHUNKED_TRANSFER_SIZE,
 };
 use super::source::IntoFileSources;
 use super::ImportError;
@@ -274,16 +275,15 @@ where
         return serve_parquet_bytes(execute_sql, table, &options, file_bytes).await;
     }
 
-    let csv_data = parquet_to_csv_bytes(
+    let source = open_parquet_csv_reader(
         tokio::fs::File::open(file_path).await?.into_std().await,
         &options,
     )?;
-
-    if csv_data.is_empty() {
+    if source.row_count == 0 {
         return Ok(0);
     }
 
-    stream_csv_bytes(execute_sql, table, &options, csv_data).await
+    serve_parquet_csv(execute_sql, table, &options, source.reader).await
 }
 
 /// Execute a CREATE TABLE statement, treating an "already exists" failure as success.
@@ -302,27 +302,123 @@ where
     }
 }
 
-/// Read a Parquet source and render every batch as CSV rows terminated by LF.
-fn parquet_to_csv_bytes<R>(
+/// A Parquet source opened for CSV conversion.
+pub(crate) struct ParquetCsvSource {
+    /// The row count that the footer reports, known before any row group is decoded.
+    pub(crate) row_count: u64,
+    /// Decodes the row groups lazily, one RecordBatch of `batch_size` rows at a time.
+    pub(crate) reader: ParquetRecordBatchReader,
+}
+
+/// Reads the footer of `source` and builds a reader at `options.batch_size`.
+///
+/// Only the footer is read here, so a caller can reject a broken file and
+/// skip a row-less one before it connects or runs any SQL.
+pub(crate) fn open_parquet_csv_reader<R>(
     source: R,
     options: &ParquetImportOptions,
-) -> Result<Vec<u8>, ImportError>
+) -> Result<ParquetCsvSource, ImportError>
 where
-    R: parquet::file::reader::ChunkReader + 'static,
+    R: ChunkReader + 'static,
 {
     let builder = ParquetRecordBatchReaderBuilder::try_new(source)?;
+    let footer_rows = builder.metadata().file_metadata().num_rows();
+    let row_count = u64::try_from(footer_rows).map_err(|_| {
+        ImportError::ParquetError(format!(
+            "the Parquet footer reports a negative row count: {footer_rows}"
+        ))
+    })?;
     let reader = builder.with_batch_size(options.batch_size).build()?;
+    Ok(ParquetCsvSource { row_count, reader })
+}
 
-    let mut csv_data = Vec::new();
-    for batch_result in reader {
-        let batch = batch_result?;
-        for row in record_batch_to_csv(&batch, options)? {
-            csv_data.extend_from_slice(row.as_bytes());
-            csv_data.push(b'\n');
+/// Opens the Parquet file at `path` for CSV conversion, with errors that name
+/// the file, as a multi-file import reports them.
+pub(crate) fn open_parquet_csv_file(
+    path: &Path,
+    options: &ParquetImportOptions,
+) -> Result<ParquetCsvSource, ImportError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        ImportError::ParallelImportError(format!(
+            "Failed to open Parquet file {}: {e}",
+            path.display()
+        ))
+    })?;
+    open_parquet_csv_reader(file, options).map_err(|e| {
+        ImportError::ParallelImportError(format!(
+            "Failed to read Parquet file {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Renders each RecordBatch of `reader` as one buffer of LF-terminated CSV
+/// rows and hands it to `emit` before it decodes the next batch.
+///
+/// Memory therefore stays at one batch of CSV here, whatever the file size.
+/// Rendering stops at the first error from the reader, the conversion, or `emit`.
+pub(crate) fn render_parquet_csv<E>(
+    reader: ParquetRecordBatchReader,
+    options: &ParquetImportOptions,
+    mut emit: E,
+) -> Result<(), ImportError>
+where
+    E: FnMut(Vec<u8>) -> Result<(), ImportError>,
+{
+    for batch in reader {
+        let mut buffer = Vec::new();
+        for row in record_batch_to_csv(&batch?, options)? {
+            buffer.extend_from_slice(row.as_bytes());
+            buffer.push(b'\n');
+        }
+        emit(buffer)?;
+    }
+    Ok(())
+}
+
+/// How many rendered RecordBatches may wait between a CSV producer and its tunnel.
+const RENDERED_BATCH_QUEUE: usize = 2;
+
+/// Answers the IMPORT request on `client` and streams `reader` to it as CSV.
+///
+/// A blocking producer renders one RecordBatch at a time into a bounded queue,
+/// so memory stays at a few batches per file and decoding stays off the async
+/// workers. The body ends with the terminating chunk only after the whole file
+/// converted: after a conversion error or a panic the connection closes without
+/// it, so Exasol fails the IMPORT instead of loading part of the file. When this
+/// future fails or is dropped, the closed queue stops the producer at its next batch.
+pub(crate) async fn stream_parquet_csv(
+    mut client: HttpTransportClient,
+    reader: ParquetRecordBatchReader,
+    options: ParquetImportOptions,
+) -> Result<(), ImportError> {
+    client.handle_import_request().await.map_err(|e| {
+        ImportError::HttpTransportError(format!("Failed to handle import request: {e}"))
+    })?;
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(RENDERED_BATCH_QUEUE);
+    let producer = tokio::task::spawn_blocking(move || {
+        render_parquet_csv(reader, &options, |buffer| {
+            sender.blocking_send(buffer).map_err(|_| {
+                ImportError::ChannelError("the HTTP tunnel stopped taking CSV".to_string())
+            })
+        })
+    });
+
+    while let Some(buffer) = receiver.recv().await {
+        for piece in buffer.chunks(CHUNKED_TRANSFER_SIZE) {
+            client
+                .write_chunked_body(piece)
+                .await
+                .map_err(ImportError::TransportError)?;
         }
     }
 
-    Ok(csv_data)
+    resolve_stream_task(producer.await)?;
+    client
+        .write_final_chunk()
+        .await
+        .map_err(ImportError::TransportError)
 }
 
 /// Serve raw Parquet bytes to the server over the native HEAD/GET-Range protocol.
@@ -360,42 +456,25 @@ where
     finish_import(execute_sql(sql).await, stream_handle).await
 }
 
-/// Stream converted CSV bytes to the server using chunked transfer encoding.
-async fn stream_csv_bytes<F, Fut>(
+/// Run one CSV IMPORT that converts `reader` while it streams it.
+async fn serve_parquet_csv<F, Fut>(
     execute_sql: F,
     table: &str,
     options: &ParquetImportOptions,
-    csv_data: Vec<u8>,
+    reader: ParquetRecordBatchReader,
 ) -> Result<u64, ImportError>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<u64, String>>,
 {
-    let mut client = connect_transport(options).await?;
+    let client = connect_transport(options).await?;
 
     let query = build_single_file_csv_query(table, options, client.internal_address());
     let sql = with_public_key(query, client.public_key_fingerprint()).build();
 
     // Run data streaming and SQL execution concurrently: the SQL statement is
     // what makes the server open the tunnel the stream task writes into.
-    let stream_handle = tokio::spawn(async move {
-        // This call also sends the chunked response headers
-        client.handle_import_request().await.map_err(|e| {
-            ImportError::HttpTransportError(format!("Failed to handle import request: {e}"))
-        })?;
-
-        for chunk in csv_data.chunks(CHUNKED_TRANSFER_SIZE) {
-            client
-                .write_chunked_body(chunk)
-                .await
-                .map_err(ImportError::TransportError)?;
-        }
-
-        client
-            .write_final_chunk()
-            .await
-            .map_err(ImportError::TransportError)
-    });
+    let stream_handle = tokio::spawn(stream_parquet_csv(client, reader, options.clone()));
 
     finish_import(execute_sql(sql).await, stream_handle).await
 }
@@ -454,12 +533,18 @@ fn apply_csv_format(query: ImportQuery, options: &ParquetImportOptions) -> Impor
 
 /// Imports data from a Parquet stream into an Exasol table.
 ///
-/// This function reads Parquet data from an async reader, converts each
-/// RecordBatch to CSV format, and streams the data to Exasol via HTTP transport.
+/// This function reads Parquet data from an async reader and streams it to
+/// Exasol via HTTP transport, as CSV or, on the native path, as Parquet.
 ///
-/// Note: Since Parquet files require random access to read footer metadata,
-/// the entire stream is buffered into memory before parsing. For very large
-/// Parquet files, consider using `import_from_parquet()` with a file path instead.
+/// # Memory
+///
+/// The function buffers the whole stream in memory on both import paths,
+/// because Parquet keeps its metadata at the end of the file. To bound memory,
+/// decode the Parquet data yourself and pass the RecordBatches in groups to
+/// `import_from_record_batches`. Each call is one IMPORT statement and holds
+/// the CSV of its own batches more than once. Each call commits separately
+/// unless autocommit is off, so a failure in a later group leaves the earlier
+/// groups in the table. `import_from_arrow_ipc` also reads its whole input.
 ///
 /// # Protocol Flow
 ///
@@ -510,20 +595,19 @@ where
         return serve_parquet_bytes(execute_sql, table, &options, buffer).await;
     }
 
-    let csv_data = parquet_to_csv_bytes(Bytes::from(buffer), &options)?;
-
-    if csv_data.is_empty() {
+    let source = open_parquet_csv_reader(Bytes::from(buffer), &options)?;
+    if source.row_count == 0 {
         return Ok(0);
     }
 
-    stream_csv_bytes(execute_sql, table, &options, csv_data).await
+    serve_parquet_csv(execute_sql, table, &options, source.reader).await
 }
 
 /// Imports data from multiple Parquet files in parallel into an Exasol table.
 ///
-/// This function converts each Parquet file to CSV format concurrently using
-/// tokio spawn_blocking tasks, then streams the converted data through parallel
-/// HTTP transport connections.
+/// On the CSV conversion path, each file converts in its own spawn_blocking
+/// task while its CSV streams through that file's HTTP transport connection,
+/// so memory holds a few RecordBatches of CSV per file, not whole files.
 ///
 /// For a single file, this function delegates to `import_from_parquet` for
 /// optimal single-file performance.
@@ -622,44 +706,54 @@ where
         return finish_import(execute_sql(sql).await, stream_handle).await;
     }
 
-    // Convert all Parquet files to CSV in parallel
-    let csv_data_vec = convert_parquet_files_to_csv(
-        paths,
-        options.batch_size,
-        options.null_value.clone(),
-        options.column_separator,
-        options.column_delimiter,
-    )
-    .await?;
-
-    // Check for empty data
-    if csv_data_vec.iter().all(|d| d.is_empty()) {
+    let mut files = Vec::with_capacity(num_files);
+    for path in paths {
+        let source = open_parquet_csv_file(&path, &options)?;
+        files.push((path, source));
+    }
+    if files.iter().all(|(_, source)| source.row_count == 0) {
         return Ok(0);
     }
 
-    // Establish parallel connections
     let pool =
         ParallelTransportPool::connect(&options.host, options.port, options.use_tls, num_files)
             .await?;
-
-    // Build multi-file IMPORT SQL
-    let query = build_multi_file_parquet_query(table, &options, pool.query_file_entries());
-    let sql = query.build();
-
-    // Get connections for streaming
-    let connections = pool.into_connections();
-
-    // Spawn parallel streaming task
-    let stream_handle = tokio::spawn(async move {
-        stream_files_parallel(
-            connections,
-            csv_data_vec,
-            crate::query::import::Compression::None,
-        )
-        .await
-    });
+    let sql = build_multi_file_parquet_query(table, &options, pool.query_file_entries()).build();
+    let readers = files
+        .into_iter()
+        .map(|(path, source)| (path, source.reader))
+        .collect();
+    let stream_handle = tokio::spawn(stream_parquet_files_as_csv(
+        pool.into_connections(),
+        readers,
+        options,
+    ));
 
     finish_import(execute_sql(sql).await, stream_handle).await
+}
+
+/// Streams each Parquet file as CSV through its own connection, all at once.
+///
+/// Each file starts converting when its connection receives Exasol's GET, and
+/// Exasol requests every file of one IMPORT together. Every error names the
+/// file; a bad value keeps the `ConversionError` variant of a single-file import.
+async fn stream_parquet_files_as_csv(
+    connections: Vec<HttpTransportClient>,
+    files: Vec<(PathBuf, ParquetRecordBatchReader)>,
+    options: ParquetImportOptions,
+) -> Result<(), ImportError> {
+    stream_in_parallel(connections, files, |client, (path, reader)| {
+        let stream = stream_parquet_csv(client, reader, options.clone());
+        async move {
+            stream.await.map_err(|e| match e {
+                ImportError::ConversionError(message) => {
+                    ImportError::ConversionError(format!("{}: {message}", path.display()))
+                }
+                e => ImportError::ParallelImportError(format!("{}: {e}", path.display())),
+            })
+        }
+    })
+    .await
 }
 
 /// Build an ImportQuery for multi-file Parquet import (CSV conversion path).
@@ -1032,7 +1126,9 @@ fn format_decimal128(value: i128, scale: i8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::test_support::FakeExasolServer;
+    use crate::transport::test_support::{
+        finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+    };
     use arrow::array::{ArrayRef, StringBuilder};
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -1941,19 +2037,194 @@ mod tests {
         assert_eq!(quoted.column_name_mode, ColumnNameMode::Quoted);
     }
 
+    fn no_sql_may_run(sql: String) -> std::future::Ready<Result<u64, String>> {
+        panic!("no SQL may run, got: {sql}")
+    }
+
+    /// Scenario: Import multiple Parquet files in parallel
     #[tokio::test]
     async fn test_import_from_parquet_files_returns_zero_when_every_file_is_row_less() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let first = create_empty_test_parquet_file(temp_dir.path(), "first.parquet");
         let second = create_empty_test_parquet_file(temp_dir.path(), "second.parquet");
         let options = ParquetImportOptions::default();
-        let execute_sql = |_sql: String| async { Ok::<u64, String>(1) };
 
-        let rows = import_from_parquet_files(execute_sql, "t", vec![first, second], options, false)
-            .await
-            .expect("row-less files are not an error");
+        let rows =
+            import_from_parquet_files(no_sql_may_run, "t", vec![first, second], options, false)
+                .await
+                .expect("row-less files are not an error");
 
         assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_import_from_parquet_files_names_a_missing_file_before_any_sql() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let present = create_test_parquet_file(temp_dir.path(), "present.parquet");
+        let missing = temp_dir.path().join("missing.parquet");
+        let options = ParquetImportOptions::default();
+
+        let err =
+            import_from_parquet_files(no_sql_may_run, "t", vec![present, missing], options, false)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(err, ImportError::ParallelImportError(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Failed to open Parquet file"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("missing.parquet"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_import_from_parquet_files_names_a_non_parquet_file_before_any_sql() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let valid = create_test_parquet_file(temp_dir.path(), "valid.parquet");
+        let not_parquet = temp_dir.path().join("not_parquet.parquet");
+        std::fs::write(&not_parquet, b"definitely not parquet").expect("write the fixture");
+
+        let err = import_from_parquet_files(
+            no_sql_may_run,
+            "t",
+            vec![valid, not_parquet],
+            ParquetImportOptions::default(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ImportError::ParallelImportError(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Failed to read Parquet file"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("not_parquet.parquet"),
+            "got: {err}"
+        );
+    }
+
+    /// Lets each of `parties` producers wait, up to `GATED_READ_BOUND`, until
+    /// all of them have arrived.
+    struct Rendezvous {
+        parties: usize,
+        arrived: std::sync::Mutex<usize>,
+        all_arrived: std::sync::Condvar,
+    }
+
+    impl Rendezvous {
+        fn new(parties: usize) -> Self {
+            Self {
+                parties,
+                arrived: std::sync::Mutex::new(0),
+                all_arrived: std::sync::Condvar::new(),
+            }
+        }
+
+        fn arrive_and_wait(&self) -> Result<(), String> {
+            let mut arrived = self.arrived.lock().expect("rendezvous");
+            *arrived += 1;
+            self.all_arrived.notify_all();
+            let (arrived, wait) = self
+                .all_arrived
+                .wait_timeout_while(arrived, GATED_READ_BOUND, |arrived| *arrived < self.parties)
+                .expect("rendezvous");
+            if wait.timed_out() {
+                return Err(format!(
+                    "only {} of {} producers started",
+                    *arrived, self.parties
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// Scenario: Parquet conversion is parallelized
+    #[tokio::test]
+    async fn test_parquet_csv_producers_start_together_on_concurrent_gets() {
+        let mut servers = [
+            FakeExasolServer::requesting_import().await,
+            FakeExasolServer::requesting_import().await,
+        ];
+        let rendezvous = Arc::new(Rendezvous::new(2));
+        let options = ParquetImportOptions::default().with_batch_size(100);
+        let mut files = Vec::new();
+        for name in ["a.parquet", "b.parquet"] {
+            let bytes = parquet_with_row_groups(&id_name_row_groups(2, 100));
+            let first_row_group = ObservedParquet::new(bytes.clone()).row_group_range(0);
+            let rendezvous = Arc::clone(&rendezvous);
+            let file = ObservedParquet::watching(bytes, first_row_group, move || {
+                rendezvous.arrive_and_wait()
+            });
+            let source = open_parquet_csv_reader(file, &options).expect("open");
+            files.push((std::path::PathBuf::from(name), source.reader));
+        }
+        let connections = vec![
+            servers[0].connect_tunnel().await,
+            servers[1].connect_tunnel().await,
+        ];
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_files_as_csv(connections, files, options),
+        )
+        .await
+        .expect("both producers must run at the same time");
+
+        for server in &mut servers {
+            let received = finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
+            assert!(ChunkedBody::parse(&received).terminated);
+        }
+    }
+
+    /// Scenario: Parallel CSV-path Parquet import that fails on a value imports no rows
+    /// Scenario: Fail-fast on Parquet conversion error
+    #[tokio::test]
+    async fn test_stream_parquet_files_as_csv_names_the_file_of_a_conversion_error() {
+        let mut servers = [
+            FakeExasolServer::requesting_import().await,
+            FakeExasolServer::requesting_import().await,
+        ];
+        let options = ParquetImportOptions::default().with_batch_size(DATE_ROWS_PER_GROUP as usize);
+        let good = parquet_with_row_groups(&id_name_row_groups(1, 10));
+        let bad = parquet_with_row_groups(&row_groups_with_out_of_range_last_date());
+        let files = vec![
+            (
+                std::path::PathBuf::from("good.parquet"),
+                open_parquet_csv_reader(good, &options)
+                    .expect("open")
+                    .reader,
+            ),
+            (
+                std::path::PathBuf::from("bad.parquet"),
+                open_parquet_csv_reader(bad, &options).expect("open").reader,
+            ),
+        ];
+        let connections = vec![
+            servers[0].connect_tunnel().await,
+            servers[1].connect_tunnel().await,
+        ];
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_files_as_csv(connections, files, options),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(m) if m.starts_with("bad.parquet: ") && m.contains(&OUT_OF_RANGE_DATE32.to_string())),
+            "got: {err}"
+        );
+        let received = finish_within(DISCONNECT_BOUND, servers[1].wait_for_disconnect()).await;
+        assert!(!ChunkedBody::parse(&received).terminated);
     }
 
     #[tokio::test]
@@ -1975,25 +2246,544 @@ mod tests {
     }
 
     #[test]
-    fn test_parquet_to_csv_bytes_renders_lf_terminated_rows() {
+    fn test_render_parquet_csv_renders_lf_terminated_rows() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let path = create_test_parquet_file(temp_dir.path(), "rows.parquet");
         let file = std::fs::File::open(&path).expect("open file");
+        let options = ParquetImportOptions::default();
+        let source = open_parquet_csv_reader(file, &options).expect("open");
+        let mut csv = Vec::new();
 
-        let csv = parquet_to_csv_bytes(file, &ParquetImportOptions::default()).expect("conversion");
+        render_parquet_csv(source.reader, &options, |buffer| {
+            csv.extend(buffer);
+            Ok(())
+        })
+        .expect("conversion");
 
+        assert_eq!(source.row_count, 2);
         assert_eq!(String::from_utf8(csv).unwrap(), "1,a\n2,b\n");
     }
 
     #[test]
-    fn test_parquet_to_csv_bytes_rejects_non_parquet_content() {
-        let err = parquet_to_csv_bytes(
+    fn test_open_parquet_csv_reader_rejects_non_parquet_content() {
+        let err = open_parquet_csv_reader(
             Bytes::from_static(b"definitely not parquet"),
             &ParquetImportOptions::default(),
         )
-        .unwrap_err();
+        .err()
+        .expect("non-Parquet content must not open");
 
         assert!(matches!(err, ImportError::ParquetError(_)), "got: {err}");
+    }
+
+    #[test]
+    fn test_render_parquet_csv_stops_at_the_first_emit_error() {
+        let file = parquet_with_row_groups(&id_name_row_groups(3, 10));
+        let options = ParquetImportOptions::default().with_batch_size(10);
+        let source = open_parquet_csv_reader(file, &options).expect("open");
+        let mut emitted = 0;
+
+        let err = render_parquet_csv(source.reader, &options, |_| {
+            emitted += 1;
+            Err(ImportError::ChannelError("sink closed".to_string()))
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::ChannelError(_)), "got: {err}");
+        assert_eq!(emitted, 1);
+    }
+
+    /// Scenario: CSV-path Parquet import sends CSV one RecordBatch at a time
+    #[test]
+    fn test_render_parquet_csv_emits_first_batch_before_decoding_last_row_group() {
+        let row_groups = id_name_row_groups(8, 100);
+        let file = ObservedParquet::new(parquet_with_row_groups(&row_groups));
+        let last_row_group = file.row_group_range(7);
+        let options = ParquetImportOptions::default().with_batch_size(100);
+        let source = open_parquet_csv_reader(file.clone(), &options).expect("open");
+        let mut buffers = Vec::new();
+        let mut reads_at_first_buffer = None;
+
+        render_parquet_csv(source.reader, &options, |buffer| {
+            reads_at_first_buffer.get_or_insert_with(|| file.reads());
+            buffers.push(buffer);
+            Ok(())
+        })
+        .expect("render");
+
+        let reads_at_first_buffer = reads_at_first_buffer.expect("a buffer must arrive");
+        assert!(
+            !touches(&reads_at_first_buffer, &last_row_group),
+            "the last row group {last_row_group:?} was read before the first buffer: {reads_at_first_buffer:?}"
+        );
+        assert!(touches(&file.reads(), &last_row_group));
+        assert_eq!(buffers.len(), 8);
+        assert_eq!(buffers.concat(), expected_csv(&row_groups));
+    }
+
+    /// `ID` and `NAME` rows, one batch per row group, with ids counting up from 0.
+    fn id_name_row_groups(row_groups: usize, rows_per_group: usize) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ID", DataType::Int64, false),
+            Field::new("NAME", DataType::Utf8, false),
+        ]));
+        (0..row_groups)
+            .map(|group| {
+                let ids: Vec<i64> = (group * rows_per_group..(group + 1) * rows_per_group)
+                    .map(|id| id as i64)
+                    .collect();
+                let names: Vec<String> = ids.iter().map(|id| format!("name_{id}")).collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(StringArray::from(names)),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect()
+    }
+
+    /// Writes each batch as its own row group.
+    fn parquet_with_row_groups(row_groups: &[RecordBatch]) -> Bytes {
+        let mut file = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut file, row_groups[0].schema(), None)
+                .expect("writer");
+        for batch in row_groups {
+            writer.write(batch).expect("write");
+            writer.flush().expect("flush a row group");
+        }
+        writer.close().expect("close");
+        Bytes::from(file)
+    }
+
+    fn expected_csv(batches: &[RecordBatch]) -> Vec<u8> {
+        let options = ParquetImportOptions::default();
+        batches
+            .iter()
+            .flat_map(|batch| record_batch_to_csv(batch, &options).expect("rows"))
+            .flat_map(|row| [row.into_bytes(), b"\n".to_vec()])
+            .flatten()
+            .collect()
+    }
+
+    fn touches(reads: &[std::ops::Range<u64>], range: &std::ops::Range<u64>) -> bool {
+        reads
+            .iter()
+            .any(|read| read.start < range.end && range.start < read.end)
+    }
+
+    type FirstTouchHook = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
+    /// A byte range and the hook that runs the first time a read reaches it.
+    struct WatchedRange {
+        range: std::ops::Range<u64>,
+        on_first_touch: std::sync::Mutex<Option<FirstTouchHook>>,
+    }
+
+    /// An in-memory Parquet file that records the byte range of every read
+    /// and runs a blocking hook the first time a read reaches a watched range.
+    #[derive(Clone)]
+    struct ObservedParquet {
+        bytes: Bytes,
+        reads: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+        watch: Option<Arc<WatchedRange>>,
+    }
+
+    impl ObservedParquet {
+        fn new(bytes: Bytes) -> Self {
+            Self {
+                bytes,
+                reads: Arc::default(),
+                watch: None,
+            }
+        }
+
+        fn watching(
+            bytes: Bytes,
+            range: std::ops::Range<u64>,
+            on_first_touch: impl FnOnce() -> Result<(), String> + Send + 'static,
+        ) -> Self {
+            let on_first_touch: FirstTouchHook = Box::new(on_first_touch);
+            Self {
+                watch: Some(Arc::new(WatchedRange {
+                    range,
+                    on_first_touch: std::sync::Mutex::new(Some(on_first_touch)),
+                })),
+                ..Self::new(bytes)
+            }
+        }
+
+        fn reads(&self) -> Vec<std::ops::Range<u64>> {
+            self.reads.lock().expect("read log").clone()
+        }
+
+        /// The bytes from the first to the last column chunk of row group `index`.
+        fn row_group_range(&self, index: usize) -> std::ops::Range<u64> {
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(self.bytes.clone()).expect("footer");
+            let chunks: Vec<(u64, u64)> = builder
+                .metadata()
+                .row_group(index)
+                .columns()
+                .iter()
+                .map(|column| column.byte_range())
+                .collect();
+            let start = chunks
+                .iter()
+                .map(|(start, _)| *start)
+                .min()
+                .expect("a column");
+            let end = chunks
+                .iter()
+                .map(|(start, length)| start + length)
+                .max()
+                .expect("a column");
+            start..end
+        }
+
+        fn observe(&self, read: std::ops::Range<u64>) -> parquet::errors::Result<()> {
+            self.reads.lock().expect("read log").push(read.clone());
+            let Some(watch) = self.watch.as_deref() else {
+                return Ok(());
+            };
+            if !touches(&[read], &watch.range) {
+                return Ok(());
+            }
+            let hook = watch.on_first_touch.lock().expect("hook").take();
+            hook.map_or(Ok(()), |hook| hook())
+                .map_err(parquet::errors::ParquetError::General)
+        }
+    }
+
+    impl parquet::file::reader::Length for ObservedParquet {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    impl parquet::file::reader::ChunkReader for ObservedParquet {
+        type T = bytes::buf::Reader<Bytes>;
+
+        /// A page header read starts inside its own column chunk, so its start
+        /// offset is enough to place it.
+        fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+            self.observe(start..start + 1)?;
+            self.bytes.get_read(start)
+        }
+
+        fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+            self.observe(start..start + length as u64)?;
+            self.bytes.get_bytes(start, length)
+        }
+    }
+
+    /// How long a gated Parquet read waits before it fails the conversion, so
+    /// a failing run ends instead of leaving a blocking thread behind.
+    const GATED_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    const OUT_OF_RANGE_DATE32: i32 = 2_932_897;
+    const DATE_ROW_GROUPS: i64 = 4;
+    const DATE_ROWS_PER_GROUP: i64 = 1_000;
+
+    async fn wait_for(signal: std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || signal.recv_timeout(GATED_READ_BOUND))
+            .await
+            .expect("the waiting thread must not panic")
+            .expect("the signal must fire");
+    }
+
+    /// `DATE_ROW_GROUPS` row groups of `DATE_ROWS_PER_GROUP` `ID`/`D` rows whose very last date is after 9999-12-31.
+    fn row_groups_with_out_of_range_last_date() -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ID", DataType::Int64, false),
+            Field::new("D", DataType::Date32, false),
+        ]));
+        let last_id = DATE_ROW_GROUPS * DATE_ROWS_PER_GROUP - 1;
+        (0..DATE_ROW_GROUPS)
+            .map(|group| {
+                let ids: Vec<i64> =
+                    (group * DATE_ROWS_PER_GROUP..(group + 1) * DATE_ROWS_PER_GROUP).collect();
+                let dates: Vec<i32> = ids
+                    .iter()
+                    .map(|id| {
+                        if *id == last_id {
+                            OUT_OF_RANGE_DATE32
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(Date32Array::from(dates)),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect()
+    }
+
+    /// Scenario: CSV-path Parquet import sends CSV one RecordBatch at a time
+    #[tokio::test]
+    async fn test_stream_parquet_csv_sends_every_batch_and_the_terminating_chunk() {
+        let mut server = FakeExasolServer::requesting_import().await;
+        let row_groups = id_name_row_groups(3, 5_000);
+        let options = ParquetImportOptions::default().with_batch_size(5_000);
+        let source =
+            open_parquet_csv_reader(parquet_with_row_groups(&row_groups), &options).expect("open");
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_csv(server.connect_tunnel().await, source.reader, options),
+        )
+        .await
+        .expect("the stream succeeds");
+
+        let body = ChunkedBody::parse(
+            &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+        );
+        assert_eq!(body.data(), expected_csv(&row_groups));
+        assert!(body.terminated);
+        assert!(
+            body.chunks.len() > row_groups.len(),
+            "a batch above 64 KiB spans pieces"
+        );
+        assert!(body
+            .chunks
+            .iter()
+            .all(|chunk| chunk.len() <= CHUNKED_TRANSFER_SIZE));
+    }
+
+    /// Scenario: CSV-path Parquet import that fails on a later RecordBatch imports no rows
+    #[tokio::test]
+    async fn test_stream_parquet_csv_conversion_error_withholds_the_terminating_chunk() {
+        let mut server = FakeExasolServer::requesting_import().await;
+        let file = parquet_with_row_groups(&row_groups_with_out_of_range_last_date());
+        let options = ParquetImportOptions::default().with_batch_size(DATE_ROWS_PER_GROUP as usize);
+        let source = open_parquet_csv_reader(file, &options).expect("open");
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_csv(server.connect_tunnel().await, source.reader, options),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(message) if message.contains(&OUT_OF_RANGE_DATE32.to_string())),
+            "got: {err}"
+        );
+        let body = ChunkedBody::parse(
+            &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+        );
+        assert!(!body.terminated);
+    }
+
+    #[tokio::test]
+    async fn test_stream_parquet_csv_producer_panic_withholds_the_terminating_chunk() {
+        let mut server = FakeExasolServer::requesting_import().await;
+        let bytes = parquet_with_row_groups(&id_name_row_groups(4, 100));
+        let second_row_group = ObservedParquet::new(bytes.clone()).row_group_range(1);
+        let file = ObservedParquet::watching(bytes, second_row_group, || -> Result<(), String> {
+            panic!("the Parquet source failed mid-file")
+        });
+        let options = ParquetImportOptions::default().with_batch_size(100);
+        let source = open_parquet_csv_reader(file, &options).expect("open");
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_csv(server.connect_tunnel().await, source.reader, options),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::StreamError(_)), "got: {err}");
+        let body = ChunkedBody::parse(
+            &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+        );
+        assert!(!body.terminated);
+    }
+
+    /// Scenario: CSV-path Parquet import sends CSV one RecordBatch at a time
+    #[tokio::test]
+    async fn test_stream_parquet_csv_writes_first_batch_before_decoding_last_row_group() {
+        let mut server = FakeExasolServer::requesting_import().await;
+        let first_body_chunk = server.first_body_chunk_signal();
+        let row_groups = id_name_row_groups(8, 100);
+        let bytes = parquet_with_row_groups(&row_groups);
+        let last_row_group = ObservedParquet::new(bytes.clone()).row_group_range(7);
+        let file = ObservedParquet::watching(bytes, last_row_group, move || {
+            first_body_chunk
+                .recv_timeout(GATED_READ_BOUND)
+                .map_err(|_| {
+                    "the last row group was read before the peer received a body chunk".to_string()
+                })
+        });
+        let options = ParquetImportOptions::default().with_batch_size(100);
+        let source = open_parquet_csv_reader(file, &options).expect("open");
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_csv(server.connect_tunnel().await, source.reader, options),
+        )
+        .await
+        .expect("the stream succeeds");
+
+        let body = ChunkedBody::parse(
+            &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+        );
+        assert_eq!(body.data(), expected_csv(&row_groups));
+        assert!(body.terminated);
+    }
+
+    #[tokio::test]
+    async fn test_stream_parquet_csv_stops_the_producer_when_the_tunnel_task_is_aborted() {
+        let mut server = FakeExasolServer::requesting_import().await;
+        let first_body_chunk = server.first_body_chunk_signal();
+        let bytes = parquet_with_row_groups(&id_name_row_groups(8, 100));
+        let probe = ObservedParquet::new(bytes.clone());
+        let (third_row_group, last_row_group) =
+            (probe.row_group_range(2), probe.row_group_range(7));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let file = ObservedParquet::watching(bytes, third_row_group, move || {
+            released
+                .recv_timeout(GATED_READ_BOUND)
+                .map_err(|_| "the test never released the producer".to_string())
+        });
+        let options = ParquetImportOptions::default().with_batch_size(100);
+        let source = open_parquet_csv_reader(file.clone(), &options).expect("open");
+        let tunnel = tokio::spawn(stream_parquet_csv(
+            server.connect_tunnel().await,
+            source.reader,
+            options,
+        ));
+
+        wait_for(first_body_chunk).await;
+        tunnel.abort();
+        let cancelled = finish_within(LOOPBACK_TEST_BOUND, tunnel)
+            .await
+            .unwrap_err();
+        release
+            .send(())
+            .expect("the producer waits at the third row group");
+        finish_within(LOOPBACK_TEST_BOUND, async {
+            while Arc::strong_count(&file.reads) > 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(cancelled.is_cancelled());
+        assert!(
+            !touches(&file.reads(), &last_row_group),
+            "the producer kept decoding after its tunnel task was aborted"
+        );
+    }
+
+    /// The IMPORT statements that [`exasol_import`] ran, with the body each one received.
+    type ImportLog = Arc<std::sync::Mutex<Vec<(String, ChunkedBody)>>>;
+
+    /// Plays Exasol's side of one IMPORT statement against `server`: it ends
+    /// when the driver closes the tunnel, and it fails when the body lacks the
+    /// terminating chunk, as Exasol does. It returns the number of body lines.
+    fn exasol_import(
+        server: FakeExasolServer,
+        log: ImportLog,
+    ) -> impl FnMut(String) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, String>> + Send>>
+    {
+        let mut server = Some(server);
+        move |sql| {
+            let mut server = server.take().expect("only one IMPORT statement runs");
+            let log = Arc::clone(&log);
+            Box::pin(async move {
+                let received =
+                    finish_within(LOOPBACK_TEST_BOUND, server.wait_for_disconnect()).await;
+                let body = ChunkedBody::parse(&received);
+                let outcome = if body.terminated {
+                    Ok(body.data().iter().filter(|byte| **byte == b'\n').count() as u64)
+                } else {
+                    Err("the tunnel body ended without the terminating chunk".to_string())
+                };
+                log.lock().expect("import log").push((sql, body));
+                outcome
+            })
+        }
+    }
+
+    fn tunnel_options(server: &FakeExasolServer, batch_size: usize) -> ParquetImportOptions {
+        ParquetImportOptions::default()
+            .with_exasol_host(server.host.clone())
+            .with_exasol_port(server.port)
+            .with_batch_size(batch_size)
+    }
+
+    /// Scenario: CSV-path Parquet import that fails on a later RecordBatch imports no rows
+    #[tokio::test]
+    async fn test_import_from_parquet_stream_conversion_error_fails_after_the_import_starts() {
+        let server = FakeExasolServer::requesting_import().await;
+        let options = tunnel_options(&server, DATE_ROWS_PER_GROUP as usize);
+        let file = parquet_with_row_groups(&row_groups_with_out_of_range_last_date());
+        let log = ImportLog::default();
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            import_from_parquet_stream(
+                exasol_import(server, Arc::clone(&log)),
+                "T",
+                &file[..],
+                options,
+                false,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(message) if message.contains(&OUT_OF_RANGE_DATE32.to_string())),
+            "got: {err}"
+        );
+        let log = log.lock().expect("import log");
+        let [(sql, body)] = log.as_slice() else {
+            panic!("exactly one IMPORT statement must run, got {}", log.len());
+        };
+        assert!(sql.contains("FROM CSV"), "got: {sql}");
+        assert!(!body.terminated);
+    }
+
+    /// Scenario: CSV-path Parquet import sends CSV one RecordBatch at a time
+    #[tokio::test]
+    async fn test_import_from_parquet_streams_every_row_through_one_import() {
+        let server = FakeExasolServer::requesting_import().await;
+        let options = tunnel_options(&server, 100);
+        let row_groups = id_name_row_groups(8, 100);
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("rows.parquet");
+        std::fs::write(&path, parquet_with_row_groups(&row_groups)).expect("write file");
+        let log = ImportLog::default();
+
+        let rows = finish_within(
+            LOOPBACK_TEST_BOUND,
+            import_from_parquet(
+                exasol_import(server, Arc::clone(&log)),
+                "T",
+                &path,
+                options,
+                false,
+            ),
+        )
+        .await
+        .expect("the import succeeds");
+
+        assert_eq!(rows, 800);
+        let log = log.lock().expect("import log");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1.data(), expected_csv(&row_groups));
+        assert!(log[0].1.terminated);
     }
 
     #[tokio::test]
