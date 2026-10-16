@@ -50,6 +50,7 @@
 //! | `get_objects` | Supported |
 //! | `get_table_schema` | Supported |
 //! | `get_parameter_schema` | Supported |
+//! | `execute_schema` | Supported |
 //! | `bulk_ingestion` | Supported |
 //! | Partitioned results | Not supported |
 //! | Substrait plans | Not supported |
@@ -2324,17 +2325,10 @@ impl adbc_core::Statement for FfiStatement {
     }
 
     fn execute_schema(&mut self) -> AdbcResult<Schema> {
-        if self.prepared.is_none() {
-            self.prepare()?;
-        }
-
-        let sql = self.require_sql()?;
-        let conn_arc = self.require_connection()?;
-        let batches = query_batches(&conn_arc, &sql)?;
-
-        Ok(batches
-            .first()
-            .map_or_else(Schema::empty, |batch| batch.schema().as_ref().clone()))
+        let (prepared, _) = self.prepared_with_connection()?;
+        let schema = ResultSet::build_schema(&prepared.handle_ref().result_columns)
+            .map_err(to_adbc_error)?;
+        Ok(schema.as_ref().clone())
     }
 
     fn execute_partitions(&mut self) -> AdbcResult<PartitionedResult> {
@@ -2398,7 +2392,12 @@ impl adbc_core::Statement for FfiStatement {
     }
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> AdbcResult<()> {
-        self.sql = Some(query.as_ref().to_string());
+        let query = query.as_ref();
+        // A prepare belongs to the SQL text it ran for.
+        if self.sql.as_deref() != Some(query) {
+            self.prepared = None;
+        }
+        self.sql = Some(query.to_string());
         Ok(())
     }
 
@@ -2667,11 +2666,15 @@ mod tests {
         assert_eq!(exasol, ExasolType::Varchar { size: 100 });
     }
 
+    /// Scenario: Get parameter schema without prepare
     #[test]
     fn test_get_parameter_schema_not_prepared() {
         let stmt = FfiStatement::new();
-        let result = stmt.get_parameter_schema();
-        assert!(result.is_err());
+        let error = stmt
+            .get_parameter_schema()
+            .expect_err("an unprepared statement has no parameter schema");
+        assert_eq!(error.status, AdbcStatus::InvalidState);
+        assert!(error.message.contains("prepare"), "got: {}", error.message);
     }
 
     #[test]
@@ -4557,6 +4560,42 @@ mod tests {
         (stmt, conn)
     }
 
+    fn transport_that_never_executes() -> MockTransport {
+        let mut transport = schema_transport();
+        transport.expect_execute_query().never();
+        transport.expect_execute_prepared_statement().never();
+        transport
+    }
+
+    fn handle_with_columns(
+        handle: i32,
+        num_params: i32,
+        columns: &[(&str, ExaDataType)],
+    ) -> PreparedStatementHandle {
+        PreparedStatementHandle::new(handle, num_params, Vec::new(), Vec::new())
+            .with_result_columns(
+                columns
+                    .iter()
+                    .map(|(name, data_type)| ColumnInfo {
+                        name: name.to_string(),
+                        data_type: data_type.clone(),
+                    })
+                    .collect(),
+            )
+    }
+
+    fn expect_prepare_of(
+        transport: &mut MockTransport,
+        sql: &'static str,
+        handle: PreparedStatementHandle,
+    ) {
+        transport
+            .expect_create_prepared_statement()
+            .times(1)
+            .withf(move |requested| requested == sql)
+            .returning(move |_| Ok(handle.clone()));
+    }
+
     fn int32_batch(columns: &[(&str, Vec<i32>)]) -> RecordBatch {
         use arrow::array::{ArrayRef, Int32Array};
         let fields: Vec<Field> = columns
@@ -4731,5 +4770,182 @@ mod tests {
             "got: {}",
             error.message
         );
+    }
+
+    /// Scenario: Execute schema returns the result columns of a query without executing it
+    /// Scenario: Execute schema of a parameterized query needs no bound parameters
+    #[test]
+    fn execute_schema_maps_result_columns_without_executing() {
+        let mut transport = transport_that_never_executes();
+        let handle = handle_with_columns(
+            17,
+            1,
+            &[
+                ("N", ExaDataType::decimal(18, 0)),
+                ("NAME", ExaDataType::varchar(50)),
+            ],
+        );
+        expect_prepare_of(&mut transport, "SELECT N, NAME FROM T WHERE ID = ?", handle);
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("SELECT N, NAME FROM T WHERE ID = ?")
+            .expect("sql");
+
+        let schema = stmt.execute_schema().expect("execute_schema");
+
+        let expected = Schema::new(vec![
+            Field::new("N", DataType::Decimal128(18, 0), true),
+            Field::new("NAME", DataType::Utf8, true),
+        ]);
+        assert_eq!(schema, expected);
+    }
+
+    /// Scenario: Execute schema of a statement without a result set returns an empty schema
+    #[test]
+    fn execute_schema_of_row_count_statement_is_empty() {
+        let mut transport = transport_that_never_executes();
+        expect_prepare_of(
+            &mut transport,
+            "INSERT INTO T VALUES (2)",
+            row_count_handle(2),
+        );
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("INSERT INTO T VALUES (2)").expect("sql");
+
+        let schema = stmt.execute_schema().expect("execute_schema");
+
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    /// Scenario: Setting new SQL discards the earlier prepare
+    #[test]
+    fn set_sql_query_discards_the_prepared_statement() {
+        let mut transport = transport_that_never_executes();
+        let column_a = [("A", ExaDataType::decimal(18, 0))];
+        let column_b = [("B", ExaDataType::decimal(18, 0))];
+        expect_prepare_of(
+            &mut transport,
+            "SELECT A FROM T",
+            handle_with_columns(17, 0, &column_a),
+        );
+        expect_prepare_of(
+            &mut transport,
+            "SELECT B FROM T",
+            handle_with_columns(18, 0, &column_b),
+        );
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("SELECT A FROM T").expect("sql");
+        stmt.prepare().expect("prepare A");
+
+        stmt.set_sql_query("SELECT B FROM T").expect("sql");
+
+        let error = stmt
+            .get_parameter_schema()
+            .expect_err("the new SQL is not prepared");
+        assert_eq!(error.status, AdbcStatus::InvalidState);
+        let schema = stmt.execute_schema().expect("execute_schema");
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "B");
+    }
+
+    /// Scenario: Setting new SQL discards the earlier prepare
+    #[test]
+    fn bound_execute_after_set_sql_query_runs_the_new_sql() {
+        let mut transport = schema_transport();
+        expect_prepare_of(
+            &mut transport,
+            "SELECT A FROM T WHERE ID = ?",
+            result_set_handle(1),
+        );
+        expect_prepare_of(
+            &mut transport,
+            "INSERT INTO T VALUES (?)",
+            PreparedStatementHandle::new(18, 1, Vec::new(), Vec::new()),
+        );
+        transport.expect_execute_query().never();
+        transport
+            .expect_execute_prepared_statement()
+            .times(1)
+            .withf(|handle, _| handle.handle == 18)
+            .returning(|_, _| Ok(QueryResult::RowCount { count: 1 }));
+        transport
+            .expect_execute_prepared_statement()
+            .never()
+            .withf(|handle, _| handle.handle == 17);
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("SELECT A FROM T WHERE ID = ?")
+            .expect("sql");
+        stmt.prepare().expect("prepare A");
+        stmt.set_sql_query("INSERT INTO T VALUES (?)").expect("sql");
+        stmt.bind(int32_batch(&[("A", vec![1])])).expect("bind");
+
+        let mut reader = stmt.execute().expect("execute");
+
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn set_sql_query_with_unchanged_sql_keeps_the_prepared_statement() {
+        let mut transport = transport_that_never_executes();
+        expect_prepare_of(&mut transport, "SELECT N FROM T", result_set_handle(0));
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("SELECT N FROM T").expect("sql");
+        stmt.prepare().expect("prepare");
+
+        stmt.set_sql_query("SELECT N FROM T").expect("same sql");
+
+        stmt.get_parameter_schema()
+            .expect("the prepare still belongs to the SQL text");
+        let schema = stmt.execute_schema().expect("execute_schema");
+        assert_eq!(schema.field(0).name(), "N");
+    }
+
+    /// Scenario: Execute schema without SQL fails
+    #[test]
+    fn execute_schema_without_sql_fails_with_invalid_state() {
+        let mut transport = transport_that_never_executes();
+        transport.expect_create_prepared_statement().never();
+        let conn = connected_connection(transport);
+        let inner = conn.inner.as_ref().map(Arc::clone).expect("connected");
+        let mut stmt = FfiStatement::with_connection(inner);
+        stmt.set_option(
+            OptionStatement::Other("adbc.ingest.target_table".to_string()),
+            OptionValue::String("T".to_string()),
+        )
+        .expect("option");
+
+        let error = stmt
+            .execute_schema()
+            .expect_err("a statement without SQL has no schema");
+
+        assert_eq!(error.status, AdbcStatus::InvalidState);
+    }
+
+    /// Scenario: Execute schema reports a result-set column type that has no Arrow mapping
+    #[test]
+    fn execute_schema_reports_an_unmappable_result_column_type() {
+        let mut transport = transport_that_never_executes();
+        let binary = ExaDataType {
+            type_name: "BINARY".to_string(),
+            precision: None,
+            scale: None,
+            size: None,
+            character_set: None,
+            with_local_time_zone: None,
+            fraction: None,
+        };
+        expect_prepare_of(
+            &mut transport,
+            "SELECT B FROM T",
+            handle_with_columns(17, 0, &[("B", binary)]),
+        );
+        let (mut stmt, _conn) = statement_over(transport);
+        stmt.set_sql_query("SELECT B FROM T").expect("sql");
+
+        let error = stmt
+            .execute_schema()
+            .expect_err("BINARY has no Arrow mapping");
+
+        assert_eq!(error.status, AdbcStatus::Internal);
+        assert!(error.message.contains("BINARY"), "got: {}", error.message);
     }
 }

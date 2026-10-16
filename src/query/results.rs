@@ -375,7 +375,10 @@ impl ResultSet {
     }
 
     /// Build Arrow schema from column information.
-    fn build_schema(columns: &[ColumnInfo]) -> Result<Arc<Schema>, ConversionError> {
+    ///
+    /// Query results and ADBC `execute_schema` must report the same column
+    /// types, so both build the schema with this function.
+    pub(crate) fn build_schema(columns: &[ColumnInfo]) -> Result<Arc<Schema>, ConversionError> {
         let fields: Result<Vec<Field>, ConversionError> = columns
             .iter()
             .map(|col| {
