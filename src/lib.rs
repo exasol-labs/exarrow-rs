@@ -91,6 +91,12 @@
 //! }
 //! ```
 
+/// Driver name reported to the server at login, and the default client name.
+pub(crate) const DRIVER_NAME: &str = "exarrow-rs";
+
+/// Driver version reported to the server at login, and the default client version.
+pub(crate) const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // Module declarations
 pub mod adbc;
 pub mod arrow_conversion;

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.0
+
+- Breaking: a connection-string query key that the driver does not implement fails with `ConnectionError::InvalidParameter`, which names the key and lists the accepted keys, and an ADBC driver manager reports `InvalidArguments`. Before, the driver ignored the key, and the docs wrongly said it reached the server as a session attribute. Keys are case-sensitive. `autocommit=` and `queryTimeout=` now fail: use `query_timeout`, and the ADBC `AutoCommit` option or `begin_transaction()`. Fixes #73.
+- Breaking: `ConnectionParams.attributes`, `ConnectionBuilder::attribute`, `ConnectionParams.idle_timeout`, and `SessionConfig.idle_timeout` are removed. `transport::Credentials` gains `client_name` and `client_version`, and `build_login_packet` takes `&Credentials`.
+- Deprecated: the `idle_timeout` query key and `ConnectionBuilder::idle_timeout` have no effect. The driver never closed idle connections. The query key logs a warning through the `log` crate. Callers that load the driver through an ADBC driver manager, such as dbt and Python, see no runtime warning, so the docs and this changelog are their notice.
+- Fix: `client_name` and `client_version` reach Exasol on the native and the WebSocket transport, so `EXA_DBA_SESSIONS.CLIENT` shows `dbt 9.9` for `client_name=dbt&client_version=9.9`. The driver name stays `exarrow-rs`. Fixes #75.
+
 ## 0.21.3
 
 - Fix: ADBC `execute_schema`, which Python reaches through `cursor.adbc_execute_schema`, returns the result schema of a statement without running it. It used to run the statement, so an INSERT, UPDATE, or DELETE changed data before the call failed, and a SELECT with parameter markers failed. A statement without a result set returns a schema with no fields. Fixes #62.

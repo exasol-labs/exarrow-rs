@@ -78,6 +78,8 @@ To change the current schema after connecting, call `connection.set_schema("othe
 
 All parameters are set via URL query string (`?key=value&key2=value2`).
 
+A key that is neither in the table nor the deprecated `idle_timeout` fails the parse with an error that names the key and lists the accepted keys. Keys are case-sensitive, so `Query_Timeout` fails.
+
 | Parameter | Aliases | Default | Description |
 |---|---|---|---|
 | `transport` | — | `native` | Transport protocol: `native` (default) or `websocket` (requires `websocket` feature) |
@@ -85,12 +87,13 @@ All parameters are set via URL query string (`?key=value&key2=value2`).
 | `validate_certificate` | `verify_certificate`, `validateservercertificate` | `true` | Validate the server's TLS certificate |
 | `certificate_fingerprint` | `certificatefingerprint` | — | Pin connection to a specific server certificate (SHA-256 hex of DER cert) |
 | `connection_timeout` | `timeout` | `30` | Time limit in seconds for opening a connection: TCP connect, TLS handshake, WebSocket upgrade, and login together (max 300, see [Timeouts](#timeouts)) |
-| `query_timeout` | — | unset | Query timeout in seconds, forwarded to Exasol as the server-enforced `queryTimeout` session attribute (see [Session Attributes](#session-attributes)). When unset, no attribute is set and the server's own `QUERY_TIMEOUT` governs — the driver imposes no client-side timer. |
-| `idle_timeout` | — | `600` | Idle connection timeout in seconds |
-| `client_name` | — | `exarrow-rs` | Client application name sent to server |
-| `client_version` | — | crate version | Client version string sent to server |
+| `query_timeout` | — | unset | Query timeout in seconds, set on the session as the server-enforced `queryTimeout` attribute (see [Session Attributes](#session-attributes)). When unset, no attribute is set and the server's own `QUERY_TIMEOUT` governs — the driver imposes no client-side timer. |
+| `client_name` | — | `exarrow-rs` | Client application name sent to the server. Exasol shows `<client_name> <client_version>` in the `CLIENT` column of `EXA_DBA_SESSIONS`. |
+| `client_version` | — | crate version | Client version string sent to the server. Exasol shows `<client_name> <client_version>` in the `CLIENT` column of `EXA_DBA_SESSIONS`. |
 | `user` / `username` | — | — | Username, used when the URI userinfo omits it (see [Credentials](#credentials)) |
 | `password` / `pass` | — | — | Password, used when the URI userinfo omits it (see [Credentials](#credentials)) |
+
+`idle_timeout` is deprecated and has no effect, because the driver never closed idle connections. The driver accepts the key and logs a warning through the [`log`](https://docs.rs/log) crate. An invalid value still fails the parse. `ConnectionBuilder::idle_timeout` is deprecated for the same reason.
 
 ### Boolean Parameter Values
 
@@ -106,6 +109,8 @@ Usernames and passwords containing special characters must be URL-encoded:
 ```
 exasol://user%40example.com:p%40ssword@localhost:8563
 ```
+
+An unencoded `?` in a password, and any `&` after it, can split off a fragment that the parser reads as a query key. The unknown-key error then names that fragment.
 
 ### IPv6 Support
 
@@ -136,19 +141,11 @@ A schema in the connection URI (for example `/my_schema`) or in `ConnectionParam
 
 ## Session Attributes
 
-Any unrecognized query parameter is forwarded as a session attribute to the Exasol server. Common attributes from the [Exasol WebSocket API](https://github.com/exasol/websocket-api):
+The driver sets session attributes itself. The connection string sets no other session attribute.
 
-| Attribute | Type | Description |
-|---|---|---|
-| `autocommit` | boolean | Auto-commit after each statement |
-| `feedbackInterval` | number | Heartbeat interval during query execution (seconds) |
-| `queryTimeout` | number | Server-side query timeout (seconds). This is the same attribute the `query_timeout` connection parameter forwards — see [Parameters](#parameters); they are not independent knobs. |
-| `resultSetMaxRows` | number | Max result set rows (0 = unlimited) |
-| `snapshotTransactionsEnabled` | boolean | Enable snapshot transactions |
-| `timestampUtcEnabled` | boolean | Enable UTC timestamp conversion |
-| `numericCharacters` | string | Group/decimal separators (e.g. `.,`) |
-
-The following attributes are read-only and cannot be set via the connection string: `compressionEnabled`, `openTransaction`, `dateFormat`, `dateLanguage`, `datetimeFormat`, `defaultLikeEscapeCharacter`, `timezone`, `timeZoneBehavior`.
+- `queryTimeout` comes from the `query_timeout` parameter.
+- Autocommit comes from the ADBC `AutoCommit` option and from `Connection::begin_transaction()`, `commit()`, and `rollback()`.
+- The current schema comes from the URI schema and from `set_schema()`.
 
 ## TLS Configuration
 

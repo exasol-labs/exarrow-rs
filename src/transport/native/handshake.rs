@@ -2,6 +2,8 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use num_bigint::BigUint;
 
 use crate::error::TransportError;
+use crate::transport::Credentials;
+use crate::DRIVER_NAME;
 
 use super::attributes::{AttributeSet, AttributeValue};
 use super::constants::{
@@ -21,21 +23,25 @@ pub struct AuthMessage {
 }
 
 /// Build the initial login packet sent when first connecting.
+/// It sends the username and the client identity from `credentials`, never the password, which `build_auth_message` sends RSA-encrypted.
 ///
 /// Format: [MAGIC 4B] [msg_len 4B] [protocol_version 4B] [change_date 4B] [attributes...]
 ///
 /// The Exasol C++ SDK writes these fields through `exaBswap32`, but that helper only swaps on
 /// big-endian hosts. On the little-endian platforms we support, the login packet stays LE.
-pub fn build_login_packet(username: &str) -> Vec<u8> {
+pub fn build_login_packet(credentials: &Credentials) -> Vec<u8> {
     let mut attrs = AttributeSet::new();
-    attrs.add(ATTR_USERNAME, AttributeValue::String(username.to_owned()));
+    attrs.add(
+        ATTR_USERNAME,
+        AttributeValue::String(credentials.username.clone()),
+    );
     attrs.add(
         ATTR_CLIENTNAME,
-        AttributeValue::String("exarrow-rs".to_owned()),
+        AttributeValue::String(credentials.client_name.clone()),
     );
     attrs.add(
         ATTR_DRIVERNAME,
-        AttributeValue::String("exarrow-rs".to_owned()),
+        AttributeValue::String(DRIVER_NAME.to_owned()),
     );
     attrs.add(
         ATTR_CLIENTOS,
@@ -43,7 +49,7 @@ pub fn build_login_packet(username: &str) -> Vec<u8> {
     );
     attrs.add(
         ATTR_CLIENTVERSION,
-        AttributeValue::String(env!("CARGO_PKG_VERSION").to_owned()),
+        AttributeValue::String(credentials.client_version.clone()),
     );
 
     let attr_bytes = attrs.serialize();
@@ -339,21 +345,21 @@ mod tests {
 
     #[test]
     fn login_packet_starts_with_magic() {
-        let packet = build_login_packet("sys");
+        let packet = build_login_packet(&Credentials::new("sys".to_string(), "pw".to_string()));
         let magic = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
         assert_eq!(magic, LOGIN_MAGIC);
     }
 
     #[test]
     fn login_packet_contains_protocol_version() {
-        let packet = build_login_packet("sys");
+        let packet = build_login_packet(&Credentials::new("sys".to_string(), "pw".to_string()));
         let version = u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]);
         assert_eq!(version, PROTOCOL_VERSION);
     }
 
     #[test]
     fn login_packet_contains_change_date() {
-        let packet = build_login_packet("sys");
+        let packet = build_login_packet(&Credentials::new("sys".to_string(), "pw".to_string()));
         let date = u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]);
         assert_eq!(date, CHANGE_DATE);
     }
@@ -405,15 +411,19 @@ mod tests {
 
     #[test]
     fn login_packet_msg_len_is_consistent() {
-        let packet = build_login_packet("test_user");
+        let packet =
+            build_login_packet(&Credentials::new("test_user".to_string(), "pw".to_string()));
         let msg_len = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]) as usize;
         // Total packet = 8 (magic + msg_len) + msg_len
         assert_eq!(packet.len(), 8 + msg_len);
     }
 
+    /// Scenario: Client name and version identify the session
     #[test]
     fn login_packet_identifies_the_user_and_the_driver() {
-        let packet = build_login_packet("test_user");
+        let credentials = Credentials::new("test_user".to_string(), "pw".to_string())
+            .with_client("dbt".to_string(), "9.9".to_string());
+        let packet = build_login_packet(&credentials);
         let attrs = parse_attributes(&packet[16..], 5).unwrap();
 
         assert_eq!(
@@ -422,7 +432,7 @@ mod tests {
         );
         assert_eq!(
             attrs.get(ATTR_CLIENTNAME),
-            Some(&AttributeValue::String("exarrow-rs".into()))
+            Some(&AttributeValue::String("dbt".into()))
         );
         assert_eq!(
             attrs.get(ATTR_DRIVERNAME),
@@ -434,9 +444,7 @@ mod tests {
         );
         assert_eq!(
             attrs.get(ATTR_CLIENTVERSION),
-            Some(&AttributeValue::String(
-                env!("CARGO_PKG_VERSION").to_owned()
-            ))
+            Some(&AttributeValue::String("9.9".into()))
         );
     }
 

@@ -2331,3 +2331,30 @@ async fn test_websocket_current_schema_follows_schema_changes_in_sql() {
     skip_if_no_exasol!();
     schema_activation::check_current_schema_follows_sql("websocket").await;
 }
+
+/// Scenario: Client name and version identify the session
+#[tokio::test]
+async fn test_client_name_and_version_identify_the_session_websocket() {
+    let connection_string = format!(
+        "{}&client_name=dbt&client_version=9.9",
+        ws_connection_string()
+    );
+    let database = Driver::new()
+        .open(&connection_string)
+        .expect("Connection string should parse");
+    let mut conn = database.connect().await.expect("Failed to connect");
+
+    let batches = conn
+        .query("SELECT CLIENT FROM EXA_DBA_SESSIONS WHERE SESSION_ID = CURRENT_SESSION")
+        .await
+        .expect("Session lookup should succeed");
+    let client = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("CLIENT should be a string column")
+        .value(0);
+
+    assert_eq!(client, "dbt 9.9");
+    conn.close().await.expect("Failed to close connection");
+}

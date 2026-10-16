@@ -1,6 +1,6 @@
 # Feature: Credential Sources
 
-The driver takes the database username and password from the ADBC `username` and `password` database options, from the userinfo part of the connection URI, or from the URI query parameters. It resolves them into one set of connection parameters, so the credentials reach the server exactly as the caller gave them and a connection never logs in as a user the caller did not name. A password that is not percent-encoded can shift into the host, port, or query part of the URI, so an error from parsing the URI names the field at fault and never repeats a value from the URI.
+The driver takes the database username and password from the ADBC `username` and `password` database options, from the userinfo part of the connection URI, or from the URI query parameters. It resolves them into one set of connection parameters, so the credentials reach the server exactly as the caller gave them and a connection never logs in as a user the caller did not name. A password that is not percent-encoded can shift into the host, port, or query part of the URI. An error from parsing the URI names the field at fault, the query key, or the position of a query parameter without `=`, and never repeats the userinfo or a query value. The error names an unknown query key as written, so a password with an unencoded `?` can show a fragment in that error.
 
 ## Background
 
@@ -62,7 +62,7 @@ The driver takes the database username and password from the ADBC `username` and
 * *WHEN* the URI is parsed into connection parameters
 * *THEN* the username SHALL be `alice`
 * *AND* the password SHALL be `Secret1`
-* *AND* the connection attributes MUST NOT contain the keys `user`, `username`, `password`, or `pass`
+* *AND* parsing MUST NOT reject `user`, `username`, `password`, or `pass` as an unknown parameter
 
 ### Scenario: Query user applies when only the password option is set
 
