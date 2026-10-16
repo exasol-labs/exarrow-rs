@@ -86,8 +86,11 @@ use common::{
 #[cfg(feature = "native")]
 use common::{
     get_password, get_test_connection_string_with_transport, get_test_connection_with_transport,
+    large_export_query, large_export_rows, PieceStats,
 };
 use exarrow_rs::adbc::{Connection, Driver};
+#[cfg(feature = "native")]
+use exarrow_rs::export::csv::export_to_callback;
 use exarrow_rs::export::csv::{CsvExportOptions, ExportError};
 use exarrow_rs::query::export::ExportSource;
 #[cfg(feature = "native")]
@@ -746,11 +749,9 @@ async fn cleanup_schema(conn: &mut Connection, schema_name: &str) {
         .await;
 }
 
-/// Connects a native transport, authenticates, and creates `{schema_name}.T
-/// (ID DECIMAL(18,0), NAME VARCHAR(50))` — the shared fixture the native
-/// result-column tests and the WebSocket parity test must stay aligned with.
+/// Connects a native transport with TLS and authenticates.
 #[cfg(feature = "native")]
-async fn connect_native_with_test_table(schema_name: &str) -> NativeTcpTransport {
+async fn connect_native() -> NativeTcpTransport {
     let params = ConnectionParams::new(get_host(), get_port())
         .with_tls(true)
         .with_validate_server_certificate(false);
@@ -762,6 +763,15 @@ async fn connect_native_with_test_table(schema_name: &str) -> NativeTcpTransport
         .authenticate(&creds)
         .await
         .expect("Failed to authenticate");
+    transport
+}
+
+/// Connects a native transport, authenticates, and creates `{schema_name}.T
+/// (ID DECIMAL(18,0), NAME VARCHAR(50))` — the shared fixture the native
+/// result-column tests and the WebSocket parity test must stay aligned with.
+#[cfg(feature = "native")]
+async fn connect_native_with_test_table(schema_name: &str) -> NativeTcpTransport {
+    let mut transport = connect_native().await;
 
     transport
         .execute_query(&format!("CREATE SCHEMA {}", schema_name))
@@ -3835,6 +3845,103 @@ async fn test_csv_export_timeout_during_callback_keeps_connection_usable() {
     assert_eq!(batches[0].num_rows(), 1);
 
     conn.close().await.expect("Failed to close connection");
+}
+
+// Section: Streaming CSV export to a callback
+
+/// The longest a streaming export test waits for an export, so a deadlock
+/// fails the test instead of hanging it.
+#[cfg(feature = "native")]
+const STREAMING_EXPORT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(feature = "native")]
+fn tunnel_export_options() -> CsvExportOptions {
+    CsvExportOptions::default()
+        .use_tls(false)
+        .exasol_host(get_host())
+        .exasol_port(get_port())
+}
+
+#[cfg(feature = "native")]
+fn large_export_source(rows: u32) -> ExportSource {
+    ExportSource::Query {
+        sql: large_export_query(rows),
+    }
+}
+
+/// Scenario: Export to callback
+/// Scenario: Export data flow (Exasol sends data to client)
+/// Scenario: Export body is forwarded in bounded pieces
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_export_to_callback_receives_a_large_query_in_pieces() {
+    skip_if_no_exasol!();
+
+    let rows = large_export_rows();
+    let mut transport = connect_native().await;
+
+    let stats = tokio::time::timeout(
+        STREAMING_EXPORT_LIMIT,
+        export_to_callback(
+            &mut transport,
+            large_export_source(rows),
+            tunnel_export_options(),
+            |mut receiver| async move {
+                let mut stats = PieceStats::default();
+                while let Some(piece) = receiver.recv().await {
+                    stats.record(&piece);
+                }
+                Ok(stats)
+            },
+        ),
+    )
+    .await
+    .expect("the export must finish within the limit")
+    .expect("a large export to a callback must succeed");
+
+    assert_eq!(stats.line_feeds, rows as usize);
+    assert!(stats.pieces > 16, "expected more than 16 pieces: {stats:?}");
+    assert!(
+        stats.largest <= 65_536,
+        "a piece exceeded 64 KiB: {stats:?}"
+    );
+
+    transport.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Export callback returns before the transfer completes
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_export_to_callback_returns_the_callback_value_when_it_stops_early() {
+    skip_if_no_exasol!();
+
+    let mut transport = connect_native().await;
+
+    let first = tokio::time::timeout(
+        STREAMING_EXPORT_LIMIT,
+        export_to_callback(
+            &mut transport,
+            large_export_source(large_export_rows()),
+            tunnel_export_options(),
+            |mut receiver| async move { Ok(receiver.recv().await) },
+        ),
+    )
+    .await
+    .expect("the export must finish within the limit")
+    .expect("an export whose callback stops early must succeed")
+    .expect("the export body has a first piece");
+
+    assert!(
+        (1..=65_536).contains(&first.len()),
+        "the first piece holds {} bytes",
+        first.len()
+    );
+    transport
+        .execute_query("SELECT 1")
+        .await
+        .expect("the transport must stay usable after the export");
+
+    transport.close().await.expect("Failed to close connection");
 }
 
 // Section: Paged fetch (native transport)

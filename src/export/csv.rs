@@ -18,19 +18,22 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bzip2::read::BzDecoder;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
 
 use crate::query::export::{Compression, ExportQuery, ExportSource, RowSeparator};
 use crate::transport::protocol::TransportProtocol;
 use crate::transport::HttpTransportClient;
 
-/// Default buffer size for data pipe channels (number of chunks).
+/// How many export body pieces wait for the consumer before the driver stops
+/// reading the tunnel.
 const DEFAULT_PIPE_BUFFER_SIZE: usize = 16;
 
 /// Error types for export operations.
@@ -279,15 +282,37 @@ pub struct DataPipeReceiver {
 }
 
 impl DataPipeReceiver {
-    /// Receives the next chunk of data.
+    /// Receives the next piece of the export body while the EXPORT statement
+    /// runs.
     ///
-    /// Returns `None` when all data has been received.
+    /// A piece holds at most 64 KiB (65536 bytes) of the body, in the order
+    /// the tunnel delivers it. With compression configured, a piece carries
+    /// the compressed bytes as Exasol sent them. Piece boundaries follow the
+    /// tunnel transfer, not CSV records, so a record can span two pieces.
+    ///
+    /// At most 16 pieces wait here. While they wait, the driver stops reading
+    /// the tunnel and Exasol stops sending, so a slow consumer slows the
+    /// EXPORT statement.
+    ///
+    /// Returns `None` once the body has ended, completely or cut short by a
+    /// broken tunnel; [`export_to_callback`] reports which.
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.rx.recv().await
     }
 }
 
+fn data_pipe() -> (mpsc::Sender<Vec<u8>>, DataPipeReceiver) {
+    let (sink, rx) = mpsc::channel(DEFAULT_PIPE_BUFFER_SIZE);
+    (sink, DataPipeReceiver { rx })
+}
+
 /// Exports data from an Exasol table or query to a file.
+///
+/// The file receives the body while the EXPORT statement runs: each piece of
+/// at most 64 KiB (65536 bytes) is written as it arrives, and a compressed
+/// piece is decompressed first. Slow writes to the file slow the EXPORT
+/// statement on the server. When the export fails, the file can hold partial
+/// output. Errors follow the precedence that [`export_to_callback`] documents.
 ///
 /// # Arguments
 ///
@@ -321,6 +346,12 @@ pub async fn export_to_file<T: TransportProtocol + ?Sized>(
 
 /// Exports data from an Exasol table or query to an async writer.
 ///
+/// The writer receives the body while the EXPORT statement runs: each piece
+/// of at most 64 KiB (65536 bytes) is written as it arrives, and a compressed
+/// piece is decompressed first. A slow writer slows the EXPORT statement on
+/// the server. When the export fails, the writer can hold partial output.
+/// Errors follow the precedence that [`export_to_callback`] documents.
+///
 /// # Arguments
 ///
 /// * `ws_transport` - WebSocket transport for executing SQL
@@ -343,33 +374,14 @@ pub async fn export_to_stream<T: TransportProtocol + ?Sized, W: AsyncWrite + Unp
 ) -> Result<u64, ExportError> {
     let compression = options.compression;
 
-    // Use the callback variant to process data
     export_to_callback(ws_transport, source, options, |mut receiver| async move {
-        let mut row_count = 0u64;
-        let mut buffer = Vec::new();
-
-        // Collect all data first
-        while let Some(chunk) = receiver.recv().await {
-            buffer.extend_from_slice(&chunk);
-        }
-
-        // Decompress if needed
-        let data = decompress(buffer, compression)?;
-
-        // Write to output and count rows
-        writer.write_all(&data).await?;
-        writer.flush().await?;
-
-        // Count rows by counting newlines
-        for byte in &data {
-            if *byte == b'\n' {
-                row_count += 1;
-            }
-        }
-
-        Ok(row_count)
+        write_decoded(&mut receiver, compression, &mut writer).await
     })
     .await
+}
+
+fn count_line_feeds(data: &[u8]) -> u64 {
+    data.iter().filter(|&&byte| byte == b'\n').count() as u64
 }
 
 /// Exports data from an Exasol table or query to an in-memory list of rows.
@@ -402,17 +414,9 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
     let compression = options.compression;
 
     export_to_callback(ws_transport, source, options, |mut receiver| async move {
-        let mut buffer = Vec::new();
+        let mut data = Vec::new();
+        write_decoded(&mut receiver, compression, &mut data).await?;
 
-        // Collect all data
-        while let Some(chunk) = receiver.recv().await {
-            buffer.extend_from_slice(&chunk);
-        }
-
-        // Decompress if needed
-        let data = decompress(buffer, compression)?;
-
-        // Parse CSV data
         let csv_string = String::from_utf8(data).map_err(|e| ExportError::CsvParseError {
             row: 0,
             message: format!("Invalid UTF-8: {}", e),
@@ -427,6 +431,23 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
 ///
 /// This is the most flexible export method, allowing you to process the data
 /// stream however you need.
+///
+/// # Streaming
+///
+/// The callback runs while the EXPORT statement runs and receives the body
+/// through its [`DataPipeReceiver`] in pieces of at most 64 KiB (65536
+/// bytes), in tunnel order. With compression configured, the pieces carry the
+/// compressed bytes as Exasol sent them. A CSV record can span two pieces.
+///
+/// At most 16 pieces wait for the callback. While they wait, the driver stops
+/// reading the tunnel, so a slow callback slows the EXPORT statement on the
+/// server, and memory does not grow with the size of the export. Exasol
+/// returns the EXPORT statement only after the driver has read the whole body,
+/// which is why the callback cannot wait for the statement before it reads.
+///
+/// A callback may return `Ok` before it has received every piece. The driver
+/// then reads and discards the rest of the body, lets the statement finish,
+/// and returns the callback's value when the statement succeeds.
 ///
 /// # Timeout behavior
 ///
@@ -445,6 +466,8 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
 /// When a configured bound elapses, the transport is terminated only if the EXPORT response
 /// had not been read yet, because an elapse during the callback leaves the
 /// transport in sync and terminating it would break a healthy connection.
+/// A slow callback that stalls the transfer keeps the response unread, so a
+/// timeout during such a stall terminates the transport.
 /// Tracking that with an `AtomicBool` rather than a `Cell` is deliberate:
 /// `&Cell<bool>` is not `Send`, which would make this future `!Send` and stop
 /// callers from spawning a long export.
@@ -462,7 +485,19 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
 ///
 /// # Errors
 ///
-/// Returns `ExportError` if the export fails.
+/// When several parts fail, the first matching rule decides the error:
+///
+/// 1. The callback fails after a broken tunnel ended its data early: the
+///    driver waits for the statement and returns
+///    `ExportError::SqlExecutionError`, or the tunnel's
+///    `ExportError::HttpTransportError` if the statement succeeded.
+/// 2. The callback fails before the statement responds: the driver closes the
+///    tunnel, waits for the statement, and returns the callback's error.
+/// 3. The statement fails: the driver returns `ExportError::SqlExecutionError`
+///    at once, without waiting for the callback or the tunnel. The callback can
+///    have received part of the body.
+/// 4. The tunnel failed: `ExportError::HttpTransportError`.
+/// 5. Otherwise the callback's result.
 pub async fn export_to_callback<T, F, Fut, R>(
     ws_transport: &mut T,
     source: ExportSource,
@@ -475,7 +510,7 @@ where
     Fut: Future<Output = Result<R, ExportError>>,
 {
     // Connect to Exasol via HTTP transport client (performs handshake automatically)
-    let mut client = HttpTransportClient::connect(&options.host, options.port, options.use_tls)
+    let client = HttpTransportClient::connect(&options.host, options.port, options.use_tls)
         .await
         .map_err(|e| ExportError::HttpTransportError {
             message: format!("Failed to connect to Exasol: {e}"),
@@ -524,34 +559,8 @@ where
 
     let export_sql = query_builder.build();
 
-    // Create channel for data transfer
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(DEFAULT_PIPE_BUFFER_SIZE);
-    let receiver = DataPipeReceiver { rx };
-
-    // Spawn task to handle the export request from Exasol
-    // This task:
-    // 1. Waits for HTTP PUT request from Exasol
-    // 2. Reads CSV data from PUT request body (chunked or content-length)
-    // 3. Sends HTTP 200 OK response after receiving all data
-    let mut http_task =
-        tokio::spawn(async move {
-            // Use handle_export_request() to properly handle the EXPORT protocol
-            let (_request, body) = client.handle_export_request().await.map_err(|e| {
-                ExportError::HttpTransportError {
-                    message: format!("Failed to handle export request: {e}"),
-                }
-            })?;
-
-            // Send all data to receiver
-            if !body.is_empty() && tx.send(body).await.is_err() {
-                return Err(ExportError::ChannelError("Receiver dropped".to_string()));
-            }
-
-            // Shutdown connection gracefully
-            let _ = client.shutdown().await;
-
-            Ok::<(), ExportError>(())
-        });
+    let (sink, receiver) = data_pipe();
+    let mut tunnel = TunnelTask::spawn(client, sink);
 
     let sql_response_read = AtomicBool::new(false);
 
@@ -573,25 +582,11 @@ where
         result
     };
 
-    // Run callback with the receiver
     let callback_task = callback(receiver);
 
-    let work = async {
-        let sql_result = sql_task.await;
-
-        if let Err(sql_error) = sql_result {
-            http_task.abort();
-            return Err(sql_error);
-        }
-
-        let (http_result, callback_result) = tokio::join!(&mut http_task, callback_task);
-
-        http_result.map_err(|e| ExportError::HttpTransportError {
-            message: format!("HTTP task panicked: {e}"),
-        })??;
-
-        callback_result
-    };
+    // The callback must drain the pipe while the statement runs, because Exasol
+    // answers the statement only after the driver read the whole body.
+    let work = settle_export(sql_task, callback_task, &mut tunnel);
 
     let outcome = match options.timeout_ms {
         Some(bound_ms) => tokio::time::timeout(tokio::time::Duration::from_millis(bound_ms), work)
@@ -603,7 +598,7 @@ where
     match outcome {
         Ok(result) => result,
         Err(bound_ms) => {
-            http_task.abort();
+            tunnel.abort();
             let transport_terminated = !sql_response_read.load(Ordering::Relaxed);
             if transport_terminated {
                 ws_transport.terminate();
@@ -616,30 +611,288 @@ where
     }
 }
 
-/// Decompresses a buffer according to the configured compression.
+/// Forwards the EXPORT body from the tunnel to `sink` and answers 200 OK.
 ///
-/// Returns the buffer unchanged for `Compression::None`.
-fn decompress(buffer: Vec<u8>, compression: Compression) -> Result<Vec<u8>, ExportError> {
-    match compression {
-        Compression::Gzip => {
-            let decoder = GzDecoder::new(buffer.as_slice());
-            let mut decompressed = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::BufReader::new(decoder), &mut decompressed)
-                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
-            Ok(decompressed)
+/// A failure is recorded in `failed` before `sink` is dropped, so a consumer
+/// that sees its data end can tell a body cut short by a broken tunnel from a
+/// complete one, without racing the end of this task.
+async fn serve_export_tunnel(
+    mut client: HttpTransportClient,
+    sink: mpsc::Sender<Vec<u8>>,
+    failed: Arc<AtomicBool>,
+) -> Result<(), ExportError> {
+    let forwarded = client.handle_export_request(&sink).await;
+    if forwarded.is_err() {
+        failed.store(true, Ordering::Release);
+    }
+    drop(sink);
+
+    if let Err(e) = forwarded {
+        return Err(ExportError::HttpTransportError {
+            message: format!("Failed to handle export request: {e}"),
+        });
+    }
+    let _ = client.shutdown().await;
+    Ok(())
+}
+
+/// Hands the pieces from the tunnel to `sink` until `discard` fires, then
+/// keeps draining the tunnel without forwarding. A consumer that returned but
+/// kept its receiver alive would otherwise leave the tunnel blocked on `send`.
+async fn relay_pieces(
+    mut from_tunnel: mpsc::Receiver<Vec<u8>>,
+    sink: mpsc::Sender<Vec<u8>>,
+    discard: Arc<Notify>,
+) {
+    let mut discarding = false;
+    while let Some(piece) = from_tunnel.recv().await {
+        if discarding {
+            continue;
         }
-        Compression::Bzip2 => {
-            let decoder = BzDecoder::new(buffer.as_slice());
-            let mut decompressed = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::BufReader::new(decoder), &mut decompressed)
-                .map_err(|e| ExportError::DecompressionError(e.to_string()))?;
-            Ok(decompressed)
+        tokio::select! {
+            sent = sink.send(piece) => discarding = sent.is_err(),
+            () = discard.notified() => discarding = true,
         }
-        Compression::None => Ok(buffer),
     }
 }
 
-/// Parses CSV data into a vector of rows.
+struct TunnelTask {
+    handle: JoinHandle<Result<(), ExportError>>,
+    relay: JoinHandle<()>,
+    discard: Arc<Notify>,
+    failed: Arc<AtomicBool>,
+}
+
+impl TunnelTask {
+    fn spawn(client: HttpTransportClient, sink: mpsc::Sender<Vec<u8>>) -> Self {
+        let failed = Arc::new(AtomicBool::new(false));
+        let discard = Arc::new(Notify::new());
+        let (tunnel_sink, from_tunnel) = mpsc::channel(1);
+        let relay = tokio::spawn(relay_pieces(from_tunnel, sink, Arc::clone(&discard)));
+        let handle = tokio::spawn(serve_export_tunnel(
+            client,
+            tunnel_sink,
+            Arc::clone(&failed),
+        ));
+        Self {
+            handle,
+            relay,
+            discard,
+            failed,
+        }
+    }
+
+    /// Stops forwarding pieces to the consumer, which has returned. The tunnel
+    /// still reads the body to its end so the request can be answered.
+    fn discard(&self) {
+        self.discard.notify_one();
+    }
+
+    fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn abort(&self) {
+        self.handle.abort();
+        self.relay.abort();
+    }
+
+    async fn join(&mut self) -> Result<(), ExportError> {
+        (&mut self.handle)
+            .await
+            .map_err(|e| ExportError::HttpTransportError {
+                message: format!("HTTP task panicked: {e}"),
+            })?
+    }
+}
+
+/// Awaits the statement, the callback, and the tunnel together and applies
+/// the error precedence that [`export_to_callback`] documents.
+async fn settle_export<Q, R>(
+    sql_task: impl Future<Output = Result<Q, ExportError>>,
+    callback_task: impl Future<Output = Result<R, ExportError>>,
+    tunnel: &mut TunnelTask,
+) -> Result<R, ExportError> {
+    tokio::pin!(sql_task, callback_task);
+    tokio::select! {
+        biased;
+        callback_result = &mut callback_task => match callback_result {
+            Ok(value) => {
+                tunnel.discard();
+                if let Err(sql_error) = sql_task.await {
+                    tunnel.abort();
+                    return Err(sql_error);
+                }
+                tunnel.join().await?;
+                Ok(value)
+            }
+            // The tunnel failed before the callback saw its data end, so
+            // the callback failed on a body that a broken tunnel cut short.
+            Err(callback_error) if tunnel.has_failed() => {
+                sql_task.await?;
+                tunnel.join().await?;
+                Err(callback_error)
+            }
+            Err(callback_error) => {
+                tunnel.abort();
+                // Closing the tunnel fails the statement; reading its
+                // response keeps the transport in sync.
+                let _ = sql_task.await;
+                Err(callback_error)
+            }
+        },
+        sql_result = &mut sql_task => match sql_result {
+            Err(sql_error) => {
+                tunnel.abort();
+                Err(sql_error)
+            }
+            Ok(_) => {
+                let (tunnel_result, callback_result) =
+                    tokio::join!(tunnel.join(), callback_task);
+                tunnel_result?;
+                callback_result
+            }
+        },
+    }
+}
+
+/// Upper bound of one decoded block. A highly compressible piece decodes to
+/// many blocks, and the consumer awaits each one before the next is decoded.
+const DECODED_BLOCK_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct FeedState {
+    data: Vec<u8>,
+    position: usize,
+    ended: bool,
+}
+
+/// The input of a decoder: it hands out the pieces pushed so far and reports
+/// `WouldBlock` when it needs the next one, so a decoder never has to buffer
+/// the output of a piece it cannot finish.
+struct PieceFeed(Arc<Mutex<FeedState>>);
+
+impl io::Read for PieceFeed {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let len = out.len().min(state.data.len() - state.position);
+        if len == 0 {
+            return match state.ended || out.is_empty() {
+                true => Ok(0),
+                false => Err(io::ErrorKind::WouldBlock.into()),
+            };
+        }
+        out[..len].copy_from_slice(&state.data[state.position..state.position + len]);
+        state.position += len;
+        Ok(len)
+    }
+}
+
+/// Decodes an export body piece by piece into blocks of at most
+/// [`DECODED_BLOCK_MAX_BYTES`], so neither a compressed body nor the decoded
+/// output of one compressed piece has to be complete in memory.
+struct PieceDecoder {
+    feed: Arc<Mutex<FeedState>>,
+    reader: Box<dyn io::Read + Send>,
+    codec: &'static str,
+}
+
+impl PieceDecoder {
+    fn new(compression: Compression) -> Self {
+        let feed = Arc::new(Mutex::new(FeedState::default()));
+        let input = PieceFeed(Arc::clone(&feed));
+        let (reader, codec): (Box<dyn io::Read + Send>, _) = match compression {
+            Compression::None => (Box::new(input), "plain"),
+            Compression::Gzip => (Box::new(MultiGzDecoder::new(input)), "gzip"),
+            Compression::Bzip2 => (Box::new(BzDecoder::new(input)), "bzip2"),
+        };
+        Self {
+            feed,
+            reader,
+            codec,
+        }
+    }
+
+    fn feed_state(&self) -> std::sync::MutexGuard<'_, FeedState> {
+        self.feed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Adds the next piece of the body. Call [`Self::next_block`] until it
+    /// returns `None` before the next push.
+    fn push(&mut self, piece: Vec<u8>) {
+        let mut state = self.feed_state();
+        if state.position == state.data.len() {
+            state.data = piece;
+            state.position = 0;
+        } else {
+            state.data.extend_from_slice(&piece);
+        }
+    }
+
+    /// Marks the end of the body. `next_block` then fails when the compressed
+    /// stream did not reach its end.
+    fn end(&mut self) {
+        self.feed_state().ended = true;
+    }
+
+    /// Returns the next decoded block, or `None` when the pushed input is used
+    /// up (or, after [`Self::end`], the body is complete).
+    fn next_block(&mut self) -> Result<Option<Vec<u8>>, ExportError> {
+        let mut block = vec![0u8; DECODED_BLOCK_MAX_BYTES];
+        match self.reader.read(&mut block) {
+            Ok(0) => Ok(None),
+            Ok(len) => {
+                block.truncate(len);
+                Ok(Some(block))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                Err(ExportError::DecompressionError(format!(
+                    "The {} stream of the export body ended before it was complete: {e}",
+                    self.codec
+                )))
+            }
+            Err(e) => Err(ExportError::DecompressionError(format!(
+                "Failed to decode the {} export body: {e}",
+                self.codec
+            ))),
+        }
+    }
+}
+
+/// Decodes the body from `receiver` into `writer` and returns the number of
+/// line feeds written. Each block is written before the next one is decoded.
+async fn write_decoded<W: AsyncWrite + Unpin>(
+    receiver: &mut DataPipeReceiver,
+    compression: Compression,
+    writer: &mut W,
+) -> Result<u64, ExportError> {
+    let mut decoder = PieceDecoder::new(compression);
+    let mut line_feeds = 0;
+
+    while let Some(piece) = receiver.recv().await {
+        decoder.push(piece);
+        line_feeds += write_blocks(&mut decoder, writer).await?;
+    }
+    decoder.end();
+    line_feeds += write_blocks(&mut decoder, writer).await?;
+    writer.flush().await?;
+
+    Ok(line_feeds)
+}
+
+async fn write_blocks<W: AsyncWrite + Unpin>(
+    decoder: &mut PieceDecoder,
+    writer: &mut W,
+) -> Result<u64, ExportError> {
+    let mut line_feeds = 0;
+    while let Some(block) = decoder.next_block()? {
+        writer.write_all(&block).await?;
+        line_feeds += count_line_feeds(&block);
+    }
+    Ok(line_feeds)
+}
+
 fn parse_csv(
     data: &str,
     separator: char,
@@ -819,10 +1072,13 @@ mod tests {
     use crate::error::TransportError;
     use crate::transport::protocol::QueryResult;
     use crate::transport::test_support::{
-        finish_within, FakeExasolServer, MockTransport, StalledQueryTransport, DISCONNECT_BOUND,
+        finish_within, FakeExasolServer, GatedQueryTransport, MockTransport, DISCONNECT_BOUND,
         LOOPBACK_TEST_BOUND,
     };
+    use std::io::Write;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::oneshot;
 
     // Tests for CsvExportOptions
 
@@ -986,7 +1242,7 @@ mod tests {
     /// The clock is paused only after the export has had real time to open its
     /// tunnel and enter the SQL leg: auto-advance would otherwise jump past a
     /// timer that was not armed yet. Starting late cannot turn this red, since
-    /// `StalledQueryTransport::execute_query` never resolves.
+    /// `GatedQueryTransport::stalled` never resolves.
     ///
     /// Scenario: No client-side export timeout by default
     #[tokio::test]
@@ -996,7 +1252,7 @@ mod tests {
         // Only reached if the guard regresses; allowed so the panic below
         // reports that rather than an unexpected mock call.
         mock.expect_terminate().return_const(());
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let options = tunnel_options(&server);
         assert_eq!(
@@ -1155,7 +1411,7 @@ mod tests {
         let server = FakeExasolServer::silent_after_handshake().await;
         let mut mock = MockTransport::new();
         mock.expect_terminate().times(1).return_const(());
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let error = export_to_callback(
             &mut transport,
@@ -1188,7 +1444,7 @@ mod tests {
         let mut server = FakeExasolServer::silent_after_handshake().await;
         let mut mock = MockTransport::new();
         mock.expect_terminate().times(1).return_const(());
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let error = finish_within(
             LOOPBACK_TEST_BOUND,
@@ -1221,7 +1477,7 @@ mod tests {
         let mut server = FakeExasolServer::silent_after_handshake().await;
         let mut mock = MockTransport::new();
         mock.expect_terminate().never();
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let export = export_to_callback(
             &mut transport,
@@ -1277,6 +1533,437 @@ mod tests {
         assert!(
             !transport_terminated,
             "the EXPORT response was already read, so the transport is still in sync"
+        );
+    }
+
+    // Tests for streaming the export body
+
+    fn users_query() -> ExportSource {
+        ExportSource::Query {
+            sql: "SELECT * FROM users".to_string(),
+        }
+    }
+
+    /// A transport whose EXPORT statement answers `result` once `release`
+    /// fires, and which must never be terminated.
+    fn gated_transport(
+        release: oneshot::Receiver<()>,
+        result: Result<QueryResult, TransportError>,
+    ) -> GatedQueryTransport {
+        let mut mock = MockTransport::new();
+        mock.expect_terminate().never();
+        GatedQueryTransport::new(mock, release, result)
+    }
+
+    fn statement_failure() -> TransportError {
+        TransportError::ProtocolError("the EXPORT tunnel was closed".to_string())
+    }
+
+    fn already_open_gate() -> oneshot::Receiver<()> {
+        let (open, gate) = oneshot::channel();
+        open.send(()).unwrap();
+        gate
+    }
+
+    async fn collect_pieces(mut receiver: DataPipeReceiver) -> Result<Vec<Vec<u8>>, ExportError> {
+        let mut pieces = Vec::new();
+        while let Some(piece) = receiver.recv().await {
+            pieces.push(piece);
+        }
+        Ok(pieces)
+    }
+
+    fn assert_statement_failure(outcome: Result<impl std::fmt::Debug, ExportError>) {
+        match outcome {
+            Err(ExportError::SqlExecutionError { message }) => {
+                assert!(
+                    message.contains("the EXPORT tunnel was closed"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected the statement's SqlExecutionError, got {other:?}"),
+        }
+    }
+
+    fn assert_200_ok(after_last_chunk: &[u8]) {
+        assert!(
+            after_last_chunk.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "the peer must read 200 OK after its last chunk, read {:?}",
+            String::from_utf8_lossy(after_last_chunk)
+        );
+    }
+
+    /// The server sends its second and third chunk only after the callback
+    /// holds the first piece, so a driver that collects the body first hangs.
+    ///
+    /// Scenario: Export data flow (Exasol sends data to client)
+    /// Scenario: Export to callback
+    #[tokio::test]
+    async fn test_export_to_callback_receives_the_first_piece_before_the_server_sends_the_last() {
+        let chunks = vec![
+            b"1,alice\n".to_vec(),
+            vec![b'x'; 65_536 + 1_000],
+            b"3,carol\n".to_vec(),
+        ];
+        let (open_gate, gate) = oneshot::channel();
+        let (mut server, response_received) =
+            FakeExasolServer::serving_chunked_put(chunks.clone(), gate).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(3)));
+
+        let pieces = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_callback(
+                &mut transport,
+                users_query(),
+                tunnel_options(&server),
+                |mut receiver| async move {
+                    let first = receiver.recv().await.expect("the first piece");
+                    let _ = open_gate.send(());
+                    let mut pieces = vec![first];
+                    pieces.extend(collect_pieces(receiver).await?);
+                    Ok(pieces)
+                },
+            ),
+        )
+        .await
+        .expect("the export must complete once the callback drains the body");
+
+        let sizes: Vec<usize> = pieces.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [8, 65_536, 1_000, 8]);
+        assert_eq!(pieces.concat(), chunks.concat());
+        assert_200_ok(&finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await);
+    }
+
+    /// Scenario: Export to callback
+    #[tokio::test]
+    async fn test_export_to_callback_delivers_compressed_pieces_as_sent() {
+        let body = gzip(&csv_text(1_000));
+        let chunks: Vec<Vec<u8>> = body.chunks(100).map(<[u8]>::to_vec).collect();
+        let (server, response_received) =
+            FakeExasolServer::serving_chunked_put(chunks.clone(), already_open_gate()).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(1_000)));
+
+        let pieces = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_callback(
+                &mut transport,
+                users_query(),
+                tunnel_options(&server).compression(Compression::Gzip),
+                collect_pieces,
+            ),
+        )
+        .await
+        .expect("a compressed export must complete");
+
+        assert_eq!(pieces, chunks);
+    }
+
+    /// Scenario: Export to async stream
+    #[tokio::test]
+    async fn test_export_to_stream_writes_the_first_piece_before_the_server_sends_the_last() {
+        let first_rows = b"1,alice\n";
+        let last_rows = b"2,bob\n3,carol\n";
+        let (open_gate, gate) = oneshot::channel();
+        let (server, response_received) = FakeExasolServer::serving_chunked_put(
+            vec![first_rows.to_vec(), last_rows.to_vec()],
+            gate,
+        )
+        .await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(3)));
+        let (writer, mut written) = tokio::io::duplex(1024);
+
+        let (rows, output) = finish_within(LOOPBACK_TEST_BOUND, async {
+            tokio::join!(
+                export_to_stream(
+                    &mut transport,
+                    users_query(),
+                    writer,
+                    tunnel_options(&server)
+                ),
+                async {
+                    let mut output = vec![0u8; first_rows.len()];
+                    written.read_exact(&mut output).await.unwrap();
+                    let _ = open_gate.send(());
+                    written.read_to_end(&mut output).await.unwrap();
+                    output
+                }
+            )
+        })
+        .await;
+
+        assert_eq!(rows.expect("the export must complete"), 3);
+        assert_eq!(output, [&first_rows[..], last_rows].concat());
+    }
+
+    /// Scenario: Export with compression
+    /// Scenario: Export to async stream
+    #[tokio::test]
+    async fn test_export_to_stream_decompresses_gzip_pieces_before_the_server_sends_the_last() {
+        let first_rows = b"1,alice\n2,bob\n";
+        let last_rows = b"3,carol\n";
+        let (first_piece, last_piece) = gzip_flushed_after(first_rows, last_rows);
+        let (open_gate, gate) = oneshot::channel();
+        let (server, response_received) =
+            FakeExasolServer::serving_chunked_put(vec![first_piece, last_piece], gate).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(3)));
+        let (writer, mut written) = tokio::io::duplex(1024);
+
+        let (rows, output) = finish_within(LOOPBACK_TEST_BOUND, async {
+            tokio::join!(
+                export_to_stream(
+                    &mut transport,
+                    users_query(),
+                    writer,
+                    tunnel_options(&server).compression(Compression::Gzip),
+                ),
+                async {
+                    let mut output = vec![0u8; first_rows.len()];
+                    written.read_exact(&mut output).await.unwrap();
+                    let _ = open_gate.send(());
+                    written.read_to_end(&mut output).await.unwrap();
+                    output
+                }
+            )
+        })
+        .await;
+
+        assert_eq!(rows.expect("the export must complete"), 3);
+        assert_eq!(output, [&first_rows[..], last_rows].concat());
+    }
+
+    /// Scenario: Export with compression
+    /// Scenario: Export to in-memory list
+    #[tokio::test]
+    async fn test_export_to_list_parses_rows_from_compressed_pieces() {
+        let body = bzip2(&csv_text(1_000));
+        let chunks: Vec<Vec<u8>> = body.chunks(100).map(<[u8]>::to_vec).collect();
+        let (server, response_received) =
+            FakeExasolServer::serving_chunked_put(chunks, already_open_gate()).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(1_000)));
+
+        let rows = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_list(
+                &mut transport,
+                users_query(),
+                tunnel_options(&server).compression(Compression::Bzip2),
+            ),
+        )
+        .await
+        .expect("a compressed export to a list must complete");
+
+        assert_eq!(rows.len(), 1_000);
+        assert_eq!(rows[0], ["0", "name_0"]);
+        assert_eq!(rows[999], ["999", "name_999"]);
+    }
+
+    /// The statement answers only after the callback saw its data end and
+    /// returned success.
+    ///
+    /// Scenario: Export statement fails while data streams
+    #[tokio::test]
+    async fn test_export_to_callback_returns_the_sql_error_after_the_callback_received_pieces() {
+        let (server, _closed) =
+            FakeExasolServer::closing_after_first_chunk(b"1,alice\n".to_vec()).await;
+        let (release, released) = oneshot::channel();
+        let mut transport = gated_transport(released, Err(statement_failure()));
+        let (report_data, data_ended) = oneshot::channel();
+
+        let (outcome, received) = finish_within(LOOPBACK_TEST_BOUND, async {
+            tokio::join!(
+                export_to_callback(
+                    &mut transport,
+                    users_query(),
+                    tunnel_options(&server),
+                    |receiver| async move {
+                        let pieces = collect_pieces(receiver).await?;
+                        let _ = report_data.send(pieces.concat());
+                        Ok(pieces)
+                    },
+                ),
+                async {
+                    let received = data_ended.await.expect("the callback sees its data end");
+                    let _ = release.send(());
+                    received
+                }
+            )
+        })
+        .await;
+
+        assert_eq!(received, b"1,alice\n");
+        assert_statement_failure(outcome);
+    }
+
+    /// Scenario: Export statement fails while data streams
+    /// Scenario: Export with compression
+    #[tokio::test]
+    async fn test_export_to_stream_returns_the_sql_error_when_a_gzip_tunnel_closes_mid_body() {
+        let (first_piece, _never_sent) = gzip_flushed_after(b"1,alice\n", b"2,bob\n");
+        let (server, closed) = FakeExasolServer::closing_after_first_chunk(first_piece).await;
+        let mut transport = gated_transport(closed, Err(statement_failure()));
+        let mut written = Vec::new();
+
+        let outcome = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_stream(
+                &mut transport,
+                users_query(),
+                &mut written,
+                tunnel_options(&server).compression(Compression::Gzip),
+            ),
+        )
+        .await;
+
+        assert_statement_failure(outcome);
+    }
+
+    /// The callback fails on its cut-short data before the statement answers.
+    ///
+    /// Scenario: Export statement fails while data streams
+    #[tokio::test]
+    async fn test_export_to_callback_returns_the_sql_error_when_the_callback_fails_on_a_cut_short_body(
+    ) {
+        let (server, _closed) =
+            FakeExasolServer::closing_after_first_chunk(b"1,alice\n".to_vec()).await;
+        let (release, released) = oneshot::channel();
+        let mut transport = gated_transport(released, Err(statement_failure()));
+
+        let outcome = export_failing_on_a_cut_short_body(&mut transport, &server, release).await;
+
+        assert_statement_failure(outcome);
+    }
+
+    #[tokio::test]
+    async fn test_export_to_callback_returns_the_tunnel_error_when_the_statement_succeeds_after_the_tunnel_broke(
+    ) {
+        let (server, _closed) =
+            FakeExasolServer::closing_after_first_chunk(b"1,alice\n".to_vec()).await;
+        let (release, released) = oneshot::channel();
+        let mut transport = gated_transport(released, Ok(QueryResult::row_count(1)));
+
+        let outcome = export_failing_on_a_cut_short_body(&mut transport, &server, release).await;
+
+        match outcome {
+            Err(ExportError::HttpTransportError { message }) => {
+                assert!(
+                    message.contains("Failed to handle export request"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected the tunnel's HttpTransportError, got {other:?}"),
+        }
+    }
+
+    /// Runs an export whose callback fails with a `DecompressionError` once its
+    /// data ends, and fires `release` only after that failure.
+    async fn export_failing_on_a_cut_short_body(
+        transport: &mut GatedQueryTransport,
+        server: &FakeExasolServer,
+        release: oneshot::Sender<()>,
+    ) -> Result<(), ExportError> {
+        let (report_failure, callback_failed) = oneshot::channel();
+        let (outcome, ()) = finish_within(LOOPBACK_TEST_BOUND, async {
+            tokio::join!(
+                export_to_callback(
+                    transport,
+                    users_query(),
+                    tunnel_options(server),
+                    |receiver| async move {
+                        collect_pieces(receiver).await?;
+                        let _ = report_failure.send(());
+                        Err(ExportError::DecompressionError("cut short".to_string()))
+                    },
+                ),
+                async {
+                    callback_failed.await.expect("the callback fails");
+                    let _ = release.send(());
+                }
+            )
+        })
+        .await;
+        outcome
+    }
+
+    /// The callback drops its receiver after the first of 40 pieces, before
+    /// the server sends the other 39.
+    ///
+    /// Scenario: Export callback returns before the transfer completes
+    #[tokio::test]
+    async fn test_export_to_callback_returns_the_callback_value_when_it_stops_before_the_last_piece(
+    ) {
+        let chunks: Vec<Vec<u8>> = (0..40).map(|i| format!("{i},row\n").into_bytes()).collect();
+        let (open_gate, gate) = oneshot::channel();
+        let (mut server, response_received) =
+            FakeExasolServer::serving_chunked_put(chunks.clone(), gate).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(40)));
+
+        let first = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_callback(
+                &mut transport,
+                users_query(),
+                tunnel_options(&server),
+                |mut receiver| async move {
+                    let first = receiver.recv().await;
+                    drop(receiver);
+                    let _ = open_gate.send(());
+                    Ok(first)
+                },
+            ),
+        )
+        .await
+        .expect("the statement finishes after the driver discarded the rest");
+
+        assert_eq!(first, Some(chunks[0].clone()));
+        assert_200_ok(&finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await);
+    }
+
+    /// The statement answers only after the server saw the driver close the
+    /// tunnel, and the export must wait for that answer.
+    ///
+    /// Scenario: Export consumer fails while data streams
+    #[tokio::test]
+    async fn test_export_to_callback_returns_the_callback_error_after_the_sql_response() {
+        let (_gate_never_opens, gate) = oneshot::channel();
+        let chunks = vec![b"1,alice\n".to_vec(), b"2,bob\n".to_vec()];
+        let (mut server, _response_received) =
+            FakeExasolServer::serving_chunked_put(chunks, gate).await;
+        let (release, released) = oneshot::channel();
+        let mut transport = gated_transport(released, Err(statement_failure()));
+        let statement_answered = AtomicBool::new(false);
+        let options = tunnel_options(&server);
+
+        let ((outcome, answered_before_return), ()) = finish_within(LOOPBACK_TEST_BOUND, async {
+            tokio::join!(
+                async {
+                    let outcome = export_to_callback(
+                        &mut transport,
+                        users_query(),
+                        options,
+                        |mut receiver| async move {
+                            receiver.recv().await;
+                            Err::<(), _>(ExportError::IoError(io::Error::other("disk full")))
+                        },
+                    )
+                    .await;
+                    (outcome, statement_answered.load(Ordering::SeqCst))
+                },
+                async {
+                    server.wait_for_disconnect().await;
+                    statement_answered.store(true, Ordering::SeqCst);
+                    let _ = release.send(());
+                }
+            )
+        })
+        .await;
+
+        match outcome {
+            Err(ExportError::IoError(error)) => assert_eq!(error.to_string(), "disk full"),
+            other => panic!("expected the callback's IoError, got {other:?}"),
+        }
+        assert!(
+            answered_before_return,
+            "the export must wait for the EXPORT response before it returns"
         );
     }
 
@@ -1468,6 +2155,24 @@ mod tests {
         assert!(chunk3.is_none());
     }
 
+    /// Scenario: Export applies backpressure to a slow consumer
+    #[tokio::test]
+    async fn test_export_pipe_holds_at_most_16_pieces() {
+        let (sink, mut receiver) = data_pipe();
+        for piece in 0..16u8 {
+            sink.try_send(vec![piece])
+                .expect("the pipe holds 16 waiting pieces");
+        }
+
+        assert!(matches!(
+            sink.try_send(vec![16]),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert_eq!(receiver.recv().await, Some(vec![0]));
+        sink.try_send(vec![16])
+            .expect("a taken piece frees one slot");
+    }
+
     #[tokio::test]
     async fn test_data_pipe_receiver_empty() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
@@ -1504,60 +2209,272 @@ mod tests {
         assert_eq!(result[1], vec!["1", "2", "3"]);
     }
 
-    // Tests for decompression
+    // Tests for PieceDecoder
 
+    fn csv_text(rows: usize) -> Vec<u8> {
+        (0..rows)
+            .map(|i| format!("{i},name_{i}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn bzip2(data: &[u8]) -> Vec<u8> {
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn decode_in_pieces(
+        compression: Compression,
+        body: &[u8],
+        piece_len: usize,
+    ) -> Result<Vec<u8>, ExportError> {
+        let mut decoder = PieceDecoder::new(compression);
+        let mut decoded = Vec::new();
+        for piece in body.chunks(piece_len) {
+            decoder.push(piece.to_vec());
+            while let Some(block) = decoder.next_block()? {
+                decoded.extend(block);
+            }
+        }
+        decoder.end();
+        while let Some(block) = decoder.next_block()? {
+            decoded.extend(block);
+        }
+        Ok(decoded)
+    }
+
+    /// Scenario: Export with compression
     #[test]
-    fn test_gzip_decompression() {
-        use flate2::write::GzEncoder;
-        use std::io::Write;
+    fn test_piece_decoder_decodes_gzip_split_into_pieces() {
+        let csv = csv_text(5_000);
 
-        // Create gzip compressed data
-        let original = b"hello,world\n1,2\n";
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let decoded = decode_in_pieces(Compression::Gzip, &gzip(&csv), 7).unwrap();
 
-        // Decompress using our logic
-        let decoder = GzDecoder::new(compressed.as_slice());
-        let mut decompressed = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(decoder), &mut decompressed)
-            .unwrap();
+        assert_eq!(decoded, csv);
+    }
 
-        assert_eq!(decompressed, original);
+    /// Scenario: Export with compression
+    #[test]
+    fn test_piece_decoder_decodes_bzip2_split_into_pieces() {
+        let csv = csv_text(5_000);
 
-        // Parse the decompressed CSV
-        let csv_string = String::from_utf8(decompressed).unwrap();
-        let rows = parse_csv(&csv_string, ',', '"').unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec!["hello", "world"]);
-        assert_eq!(rows[1], vec!["1", "2"]);
+        let decoded = decode_in_pieces(Compression::Bzip2, &bzip2(&csv), 7).unwrap();
+
+        assert_eq!(decoded, csv);
+    }
+
+    /// Compresses `first_rows` and `last_rows` into one gzip stream with a sync
+    /// flush between them, as a streaming compressor emits it, and returns the
+    /// two halves.
+    fn gzip_flushed_after(first_rows: &[u8], last_rows: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(first_rows).unwrap();
+        encoder.flush().unwrap();
+        let first_half = std::mem::take(encoder.get_mut());
+        encoder.write_all(last_rows).unwrap();
+        (first_half, encoder.finish().unwrap())
+    }
+
+    /// Scenario: Export with compression
+    #[test]
+    fn test_piece_decoder_yields_output_before_the_last_piece() {
+        let first_rows = b"1,alice\n2,bob\n";
+        let (first_piece, last_piece) = gzip_flushed_after(first_rows, b"3,carol\n");
+        let mut decoder = PieceDecoder::new(Compression::Gzip);
+
+        decoder.push(first_piece);
+        let decoded_first = decoder.next_block().unwrap().unwrap();
+        assert!(decoder.next_block().unwrap().is_none());
+        decoder.push(last_piece);
+        let mut decoded_rest = Vec::new();
+        while let Some(block) = decoder.next_block().unwrap() {
+            decoded_rest.extend(block);
+        }
+        decoder.end();
+        assert!(decoder.next_block().unwrap().is_none());
+
+        assert_eq!(decoded_first, first_rows);
+        assert_eq!(decoded_rest, b"3,carol\n");
+    }
+
+    /// Scenario: Export with compression
+    #[test]
+    fn test_piece_decoder_rejects_a_truncated_gzip_stream() {
+        let body = gzip(&csv_text(100));
+
+        let error = decode_in_pieces(Compression::Gzip, &body[..body.len() - 4], 7)
+            .expect_err("a gzip stream without its trailer is incomplete");
+
+        assert!(
+            matches!(error, ExportError::DecompressionError(_)),
+            "{error:?}"
+        );
+    }
+
+    /// Scenario: Export with compression
+    #[test]
+    fn test_piece_decoder_rejects_a_truncated_bzip2_stream() {
+        let body = bzip2(&csv_text(100));
+
+        let error = decode_in_pieces(Compression::Bzip2, &body[..body.len() - 4], 7)
+            .expect_err("a bzip2 stream without its end marker is incomplete");
+
+        assert!(
+            matches!(error, ExportError::DecompressionError(_)),
+            "{error:?}"
+        );
     }
 
     #[test]
-    fn test_bzip2_decompression() {
-        use bzip2::write::BzEncoder;
-        use std::io::Write;
+    fn test_piece_decoder_passes_an_uncompressed_piece_through() {
+        let mut decoder = PieceDecoder::new(Compression::None);
 
-        // Create bzip2 compressed data
-        let original = b"foo,bar\na,b\n";
-        let mut encoder = BzEncoder::new(Vec::new(), bzip2::Compression::default());
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
+        decoder.push(b"1,alice\n".to_vec());
 
-        // Decompress using our logic
-        let decoder = BzDecoder::new(compressed.as_slice());
-        let mut decompressed = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(decoder), &mut decompressed)
-            .unwrap();
+        assert_eq!(decoder.next_block().unwrap().unwrap(), b"1,alice\n");
+        assert!(decoder.next_block().unwrap().is_none());
+    }
 
-        assert_eq!(decompressed, original);
+    #[test]
+    fn test_piece_decoder_rejects_a_corrupt_gzip_piece() {
+        let mut decoder = PieceDecoder::new(Compression::Gzip);
 
-        // Parse the decompressed CSV
-        let csv_string = String::from_utf8(decompressed).unwrap();
-        let rows = parse_csv(&csv_string, ',', '"').unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec!["foo", "bar"]);
-        assert_eq!(rows[1], vec!["a", "b"]);
+        decoder.push(b"not a gzip stream".to_vec());
+        let error = decoder
+            .next_block()
+            .expect_err("bytes without a gzip header are corrupt");
+
+        assert!(
+            matches!(error, ExportError::DecompressionError(_)),
+            "{error:?}"
+        );
+    }
+
+    /// Records the largest single write, which is what the decoder bounds.
+    #[derive(Default)]
+    struct WriteSizeRecorder {
+        largest_write: usize,
+    }
+
+    impl AsyncWrite for WriteSizeRecorder {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.largest_write = self.largest_write.max(buf.len());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One piece of 64 KiB at most that decodes to 4 MiB reaches the writer
+    /// in bounded blocks.
+    ///
+    /// Scenario: Export with compression
+    async fn assert_compressible_body_reaches_the_writer_in_bounded_blocks(
+        compression: Compression,
+        compressed: Vec<u8>,
+    ) {
+        const ROWS: u64 = 1024 * 1024;
+        assert!(compressed.len() <= 64 * 1024, "{} bytes", compressed.len());
+        let (open_gate, gate) = oneshot::channel();
+        open_gate.send(()).unwrap();
+        let (server, response_received) =
+            FakeExasolServer::serving_chunked_put(vec![compressed], gate).await;
+        let mut transport =
+            gated_transport(response_received, Ok(QueryResult::row_count(ROWS as i64)));
+        let mut recorder = WriteSizeRecorder::default();
+
+        let rows = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_stream(
+                &mut transport,
+                users_query(),
+                &mut recorder,
+                tunnel_options(&server).compression(compression),
+            ),
+        )
+        .await
+        .expect("the export decodes the body");
+
+        assert_eq!(rows, ROWS);
+        assert!(
+            recorder.largest_write <= DECODED_BLOCK_MAX_BYTES,
+            "one write held {} bytes",
+            recorder.largest_write
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_to_stream_writes_a_highly_compressible_gzip_body_in_bounded_blocks() {
+        let csv = "1,x\n".repeat(1024 * 1024);
+
+        assert_compressible_body_reaches_the_writer_in_bounded_blocks(
+            Compression::Gzip,
+            gzip(csv.as_bytes()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_export_to_stream_writes_a_highly_compressible_bzip2_body_in_bounded_blocks() {
+        let csv = "1,x\n".repeat(1024 * 1024);
+
+        assert_compressible_body_reaches_the_writer_in_bounded_blocks(
+            Compression::Bzip2,
+            bzip2(csv.as_bytes()),
+        )
+        .await;
+    }
+
+    /// The valid callback `|receiver| async move { Ok(receiver) }` keeps its
+    /// receiver alive, so the tunnel must discard the rest of the body.
+    ///
+    /// Scenario: Export callback returns before the transfer completes
+    #[tokio::test]
+    async fn test_export_to_callback_finishes_when_the_callback_returns_with_its_receiver_alive() {
+        let chunks: Vec<Vec<u8>> = (0..40).map(|i| format!("{i},row\n").into_bytes()).collect();
+        let (open_gate, gate) = oneshot::channel();
+        open_gate.send(()).unwrap();
+        let (mut server, response_received) =
+            FakeExasolServer::serving_chunked_put(chunks, gate).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(40)));
+
+        let receiver = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_callback(
+                &mut transport,
+                users_query(),
+                tunnel_options(&server),
+                |receiver| async move { Ok(receiver) },
+            ),
+        )
+        .await
+        .expect("the statement finishes after the driver discarded the body");
+
+        assert_200_ok(&finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await);
+        drop(receiver);
     }
 
     // Tests for export options with column names

@@ -4813,7 +4813,7 @@ mod tests {
     /// Scenario: An abandoned execution leaves the session state unchanged
     #[tokio::test(start_paused = true)]
     async fn abandoned_execution_leaves_the_session_state_unchanged() {
-        use crate::transport::test_support::StalledQueryTransport;
+        use crate::transport::test_support::GatedQueryTransport;
 
         for in_transaction in [false, true] {
             let mut mock = MockTransport::new();
@@ -4821,10 +4821,12 @@ mod tests {
             mock.expect_authenticate()
                 .returning(|_| Ok(transport_session_info()));
             mock.expect_set_autocommit().returning(|_| Ok(()));
-            let mut conn =
-                Connection::connect_with_transport(test_params(), StalledQueryTransport::new(mock))
-                    .await
-                    .expect("connect");
+            let mut conn = Connection::connect_with_transport(
+                test_params(),
+                GatedQueryTransport::stalled(mock),
+            )
+            .await
+            .expect("connect");
             if in_transaction {
                 conn.begin_transaction().await.expect("begin");
             }

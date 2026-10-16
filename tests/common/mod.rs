@@ -415,6 +415,57 @@ pub fn long_running_count_query(side_rows: u32) -> String {
     )
 }
 
+const DEFAULT_LARGE_EXPORT_ROWS: u32 = 200_000;
+
+/// Row count of the large CSV export tests: `EXARROW_LARGE_EXPORT_ROWS`, or
+/// `DEFAULT_LARGE_EXPORT_ROWS`, about 10 MB of CSV. Panics on a value that is
+/// not a row count, so a typo cannot shrink a manual memory check unnoticed.
+#[allow(dead_code)]
+pub fn large_export_rows() -> u32 {
+    let Ok(rows) = env::var("EXARROW_LARGE_EXPORT_ROWS") else {
+        return DEFAULT_LARGE_EXPORT_ROWS;
+    };
+    rows.parse().unwrap_or_else(|e| {
+        panic!("EXARROW_LARGE_EXPORT_ROWS must be a row count, got {rows:?}: {e}")
+    })
+}
+
+/// A query of `rows` rows of about 50 CSV bytes each, every row ending in one
+/// line feed, so an export of it spans many 64 KiB pieces.
+#[allow(dead_code)]
+pub fn large_export_query(rows: u32) -> String {
+    format!(
+        "SELECT t.v AS v, RPAD(TO_CHAR(t.v), 42, 'x') AS s FROM VALUES BETWEEN 1 AND {rows} AS t(v)"
+    )
+}
+
+/// What an export consumer received, piece by piece. It keeps only the first
+/// and the last piece, so a large export stays out of the test's memory.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct PieceStats {
+    pub pieces: usize,
+    pub bytes: usize,
+    pub line_feeds: usize,
+    pub largest: usize,
+    pub first: Option<Vec<u8>>,
+    pub last: Option<Vec<u8>>,
+}
+
+#[allow(dead_code)]
+impl PieceStats {
+    pub fn record(&mut self, piece: &[u8]) {
+        self.pieces += 1;
+        self.bytes += piece.len();
+        self.line_feeds += piece.iter().filter(|&&byte| byte == b'\n').count();
+        self.largest = self.largest.max(piece.len());
+        if self.first.is_none() {
+            self.first = Some(piece.to_vec());
+        }
+        self.last = Some(piece.to_vec());
+    }
+}
+
 /// Disable Exasol's query result cache for the current session so a
 /// cartesian-product query genuinely recomputes every time it runs, instead
 /// of returning a cached result from a prior invocation with the same text.
