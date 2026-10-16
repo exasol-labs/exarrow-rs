@@ -5,6 +5,7 @@
 //! protocol implementations (WebSocket in Phase 1, gRPC in Phase 2).
 
 use crate::error::TransportError;
+use crate::{DRIVER_NAME, DRIVER_VERSION};
 use async_trait::async_trait;
 
 use super::messages::{ColumnInfo, DataType, ResultData, ResultSetHandle, SessionInfo};
@@ -76,19 +77,39 @@ impl ConnectionParams {
     }
 }
 
-/// User credentials for authentication.
+/// Login identity: the user, the password, and the client the server reports.
+///
+/// The client name and version appear in `EXA_DBA_SESSIONS.CLIENT` as
+/// `<client_name> <client_version>`. They default to the driver name and the
+/// crate version; the login message always reports the driver name separately.
 #[derive(Debug, Clone)]
 pub struct Credentials {
     /// Username
     pub username: String,
     /// Password (will be cleared after use)
     pub password: String,
+    /// Client name the server reports for the session
+    pub client_name: String,
+    /// Client version the server reports for the session
+    pub client_version: String,
 }
 
 impl Credentials {
-    /// Create new credentials.
+    /// Create new credentials that identify the client as this driver.
     pub fn new(username: String, password: String) -> Self {
-        Self { username, password }
+        Self {
+            username,
+            password,
+            client_name: DRIVER_NAME.to_string(),
+            client_version: DRIVER_VERSION.to_string(),
+        }
+    }
+
+    /// Replace the client name and version the server reports for the session.
+    pub fn with_client(mut self, client_name: String, client_version: String) -> Self {
+        self.client_name = client_name;
+        self.client_version = client_version;
+        self
     }
 }
 
@@ -491,6 +512,24 @@ mod tests {
         let creds = Credentials::new("user".to_string(), "pass".to_string());
         assert_eq!(creds.username, "user");
         assert_eq!(creds.password, "pass");
+    }
+
+    #[test]
+    fn credentials_default_to_the_driver_identity() {
+        let creds = Credentials::new("user".to_string(), "pass".to_string());
+
+        assert_eq!(creds.client_name, "exarrow-rs");
+        assert_eq!(creds.client_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn with_client_replaces_the_client_name_and_version() {
+        let creds = Credentials::new("user".to_string(), "pass".to_string())
+            .with_client("dbt".to_string(), "9.9".to_string());
+
+        assert_eq!(creds.client_name, "dbt");
+        assert_eq!(creds.client_version, "9.9");
+        assert_eq!(creds.username, "user");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "exarrow-rs"
-version = "0.21.4"
+version = "0.22.1"
 edition = "2021"
 license = "MIT"
 authors = ["Exasol Labs <labs@exasol.com>"]
@@ -36,6 +36,9 @@ serde_json = "1.0"
 
 # Error handling
 thiserror = "2.0"
+
+# Logging facade (the application chooses the logger)
+log = "0.4"
 
 # Native root certificates for rustls
 rustls-native-certs = "0.8"

@@ -84,8 +84,10 @@ use common::{
     END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
 #[cfg(feature = "native")]
-use common::{get_password, get_test_connection_with_transport};
-use exarrow_rs::adbc::Connection;
+use common::{
+    get_password, get_test_connection_string_with_transport, get_test_connection_with_transport,
+};
+use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::export::csv::{CsvExportOptions, ExportError};
 use exarrow_rs::query::export::ExportSource;
 #[cfg(feature = "native")]
@@ -3996,4 +3998,47 @@ async fn test_pre_1970_dates_and_timestamps_keep_their_calendar_day() {
     );
 
     conn.close().await.expect("Failed to close connection");
+}
+
+async fn session_client_column(connection_string: &str) -> String {
+    let database = Driver::new()
+        .open(connection_string)
+        .expect("Connection string should parse");
+    let mut conn = database.connect().await.expect("Failed to connect");
+
+    let batches = conn
+        .query("SELECT CLIENT FROM EXA_DBA_SESSIONS WHERE SESSION_ID = CURRENT_SESSION")
+        .await
+        .expect("Session lookup should succeed");
+    let client = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("CLIENT should be a string column")
+        .value(0)
+        .to_string();
+
+    conn.close().await.expect("Failed to close connection");
+    client
+}
+
+/// Scenario: Client name and version identify the session
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_client_name_and_version_identify_the_session_native() {
+    let connection_string = format!(
+        "{}&client_name=dbt&client_version=9.9",
+        get_test_connection_string_with_transport("native")
+    );
+
+    assert_eq!(session_client_column(&connection_string).await, "dbt 9.9");
+}
+
+/// Scenario: Default client identification
+#[tokio::test]
+async fn test_default_client_identification() {
+    assert_eq!(
+        session_client_column(&get_test_connection_string()).await,
+        format!("exarrow-rs {}", env!("CARGO_PKG_VERSION"))
+    );
 }

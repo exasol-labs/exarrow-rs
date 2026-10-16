@@ -710,7 +710,9 @@ impl Drop for FakeWebSocketServer {
 }
 
 mod tests {
-    use super::*;
+    use super::{
+        finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+    };
 
     const HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
 

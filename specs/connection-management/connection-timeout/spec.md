@@ -1,6 +1,6 @@
 # Feature: Connection Timeout
 
-The connection timeout limits how long opening a connection to Exasol may take. A server, proxy, or load balancer that accepts the TCP connection and then stops answering fails the connection within that limit instead of blocking the caller. The connection timeout does not bound query execution, whose timeout `connection-management/session-and-lifecycle` specifies.
+The connection timeout limits how long opening a connection to Exasol may take. A server, proxy, or load balancer that accepts the TCP connection and then stops answering fails the connection within that limit instead of blocking the caller. The connection timeout does not bound query execution, whose timeout `connection-management/query-timeout` specifies.
 
 ## Background
 

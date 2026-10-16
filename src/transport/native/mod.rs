@@ -929,7 +929,7 @@ impl LifecycleSteps for NativeTcpTransport {
         credentials: &Credentials,
     ) -> Result<SessionInfo, TransportError> {
         // Phase 1: Send login packet
-        let login_packet = handshake::build_login_packet(&credentials.username);
+        let login_packet = handshake::build_login_packet(credentials);
         self.send_raw(&login_packet).await?;
 
         // Phase 1 response: Server responds with a standard 21-byte header + attribute payload

@@ -1,10 +1,17 @@
 # Changelog
 
-## 0.21.4
+## 0.22.1
 
 - Fix: the CSV path of `import_from_parquet`, `import_from_parquet_stream`, and `import_parquet_from_files` sends a Parquet file as CSV one RecordBatch at a time. It used to convert the whole file to one CSV buffer before it sent any byte, and `import_parquet_from_files` held the CSV of every file at once. Memory now stays at a few RecordBatches of CSV per file. A value that cannot convert in a later RecordBatch fails the import with `ImportError::ConversionError` after the IMPORT starts, and Exasol imports no rows from that file. A file that is not Parquet and a path that cannot be opened still fail before any SQL runs. Refs #69.
 - Fix: `import_csv_from_files` with several files streams each file in pieces of 64 KiB and compresses it while it streams, instead of reading each whole file and its compressed copy into memory. A missing file still fails with `ImportError::IoError` before any connection or SQL. A read error after a file opens now fails the import with `ParallelImportError` after the IMPORT starts, and the message names the file. Refs #69.
 - Docs: `import_from_parquet_stream` buffers the whole stream on both import paths, because Parquet keeps its metadata at the end of the file. The rustdoc no longer suggests `import_from_parquet` with a file path as the alternative, and explains how to bound memory with `import_from_record_batches`. `docs/import-export.md` has a new Memory Use section, and its Parallel Import example calls `import_csv_from_files`. Refs #69.
+
+## 0.22.0
+
+- Breaking: a connection-string query key that the driver does not implement fails with `ConnectionError::InvalidParameter`, which names the key and lists the accepted keys, and an ADBC driver manager reports `InvalidArguments`. Before, the driver ignored the key, and the docs wrongly said it reached the server as a session attribute. Keys are case-sensitive. `autocommit=` and `queryTimeout=` now fail: use `query_timeout`, and the ADBC `AutoCommit` option or `begin_transaction()`. Fixes #73.
+- Breaking: `ConnectionParams.attributes`, `ConnectionBuilder::attribute`, `ConnectionParams.idle_timeout`, and `SessionConfig.idle_timeout` are removed. `transport::Credentials` gains `client_name` and `client_version`, and `build_login_packet` takes `&Credentials`.
+- Deprecated: the `idle_timeout` query key and `ConnectionBuilder::idle_timeout` have no effect. The driver never closed idle connections. The query key logs a warning through the `log` crate. Callers that load the driver through an ADBC driver manager, such as dbt and Python, see no runtime warning, so the docs and this changelog are their notice.
+- Fix: `client_name` and `client_version` reach Exasol on the native and the WebSocket transport, so `EXA_DBA_SESSIONS.CLIENT` shows `dbt 9.9` for `client_name=dbt&client_version=9.9`. The driver name stays `exarrow-rs`. Fixes #75.
 
 ## 0.21.3
 
