@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.23.0
+
+- Fix: CSV export to a file, a stream, or a callback (`export_csv_to_file`, `export_csv_to_stream`, `export_to_file`, `export_to_stream`, `export_to_callback`) passes data on in pieces of at most 64 KiB while the EXPORT statement runs. Memory use stays bounded, with at most 16 pieces waiting, instead of holding the complete result before the first byte reaches the consumer. `export_csv_to_list`, Arrow export, and Parquet export still hold the complete result. Fixes #59.
+- Fix: gzip and bz2 compressed CSV exports decompress each piece as it arrives instead of holding the compressed and the decompressed body in memory together. A truncated compressed stream fails with `ExportError::DecompressionError`.
+- Changed: an `export_to_callback` callback receives many chunks of at most 64 KiB instead of one, and a CSV record can span two chunks. With compression set, the chunks stay compressed.
+- Changed: a slow writer or callback slows the EXPORT statement on the server. A timeout during such a stall reports `transport_terminated: true`, and output already written can be partial when the export fails.
+- Breaking: `HttpTransportClient::read_chunked_body` and `HttpTransportClient::handle_export_request` take a `&tokio::sync::mpsc::Sender<Vec<u8>>` and send the body pieces to it. `read_chunked_body` returns `()`, and `handle_export_request` returns only the `HttpRequest`.
+
 ## 0.22.1
 
 - Fix: the CSV path of `import_from_parquet`, `import_from_parquet_stream`, and `import_parquet_from_files` sends a Parquet file as CSV one RecordBatch at a time. It used to convert the whole file to one CSV buffer before it sent any byte, and `import_parquet_from_files` held the CSV of every file at once. Memory now stays at a few RecordBatches of CSV per file. A value that cannot convert in a later RecordBatch fails the import with `ImportError::ConversionError` after the IMPORT starts, and Exasol imports no rows from that file. A file that is not Parquet and a path that cannot be opened still fail before any SQL runs. Refs #69.

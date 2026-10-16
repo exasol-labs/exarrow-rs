@@ -57,6 +57,10 @@ pub const EXA_RESPONSE_PACKET_SIZE: usize = 24;
 /// HTTP chunk size for data transfer (64KB).
 pub const HTTP_CHUNK_SIZE: usize = 64 * 1024;
 
+/// The largest piece of an EXPORT body that the driver forwards in one channel
+/// message, whatever chunk size or Content-Length Exasol declares.
+pub(crate) const EXPORT_PIECE_MAX_BYTES: usize = 64 * 1024;
+
 /// The bound that [`HttpTransportClient::connect`] puts on the TCP connect and
 /// the EXA handshake together, and separately on the TLS handshake.
 const TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -613,54 +617,24 @@ impl HttpTransportClient {
         parse_http_request(self.open_stream().await?).await
     }
 
-    /// Reads the body of a chunked transfer encoded request.
+    /// Reads the body of a chunked transfer encoded request up to its
+    /// zero-length terminator and forwards it to `sink` in pieces of at most
+    /// 64 KiB, in tunnel order, as it reads them.
     ///
-    /// This reads all chunks until the final empty chunk and returns the complete body.
-    ///
-    /// # Returns
-    ///
-    /// The complete body data as a vector of bytes.
+    /// The body never sits in memory as a whole: the next piece is read only
+    /// after `sink` accepted the previous one, so a full channel stops the
+    /// tunnel read and the server waits. A closed `sink` does not stop the read:
+    /// the rest of the body is read and discarded, so the request can still be
+    /// answered and the EXPORT statement can finish.
     ///
     /// # Errors
     ///
     /// Returns `TransportError` if reading fails or chunked encoding is invalid.
-    pub async fn read_chunked_body(&mut self) -> Result<Vec<u8>, TransportError> {
-        let stream = self.open_stream().await?;
-        let mut body = Vec::new();
-
-        loop {
-            // Read chunk size line
-            let size_line = read_line(stream).await.map_err(|e| {
-                TransportError::ProtocolError(format!("Failed to read chunk size: {e}"))
-            })?;
-
-            let chunk_size = parse_chunk_size(&size_line)?;
-
-            if chunk_size == 0 {
-                // Final chunk - read the trailing CRLF
-                let mut trailer = [0u8; 2];
-                stream.read_exact(&mut trailer).await.map_err(|e| {
-                    TransportError::ProtocolError(format!("Failed to read chunk trailer: {e}"))
-                })?;
-                break;
-            }
-
-            // Read chunk data
-            let mut chunk = vec![0u8; chunk_size];
-            stream.read_exact(&mut chunk).await.map_err(|e| {
-                TransportError::ProtocolError(format!("Failed to read chunk data: {e}"))
-            })?;
-
-            body.extend_from_slice(&chunk);
-
-            // Read trailing CRLF after chunk data
-            let mut crlf = [0u8; 2];
-            stream.read_exact(&mut crlf).await.map_err(|e| {
-                TransportError::ProtocolError(format!("Failed to read chunk CRLF: {e}"))
-            })?;
-        }
-
-        Ok(body)
+    pub async fn read_chunked_body(
+        &mut self,
+        sink: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), TransportError> {
+        forward_chunked_body(self.open_stream().await?, sink).await
     }
 
     /// Writes an HTTP response with headers and optional body.
@@ -806,25 +780,28 @@ impl HttpTransportClient {
         serve_parquet_range_requests(self.open_stream().await?, file_bytes).await
     }
 
-    /// Handles an EXPORT request from Exasol.
+    /// Handles the EXPORT request from Exasol: reads the HTTP PUT, forwards
+    /// its body to `sink` in pieces of at most 64 KiB while Exasol sends it,
+    /// and answers HTTP 200 OK after the last piece.
     ///
-    /// This method implements the correct EXPORT protocol flow:
-    /// 1. Wait for HTTP PUT request from Exasol
-    /// 2. Verify it's a PUT request with chunked encoding
-    /// 3. Read all data from the PUT request body
-    /// 4. Send HTTP 200 OK response
+    /// The body may be chunked or carry a Content-Length. Exasol returns the
+    /// EXPORT statement only after it received the 200 OK, so the caller must
+    /// drain `sink` while this runs: a full channel stops the tunnel read. A
+    /// closed `sink` makes this read and discard the rest of the body and still
+    /// answer 200 OK, so the EXPORT statement finishes.
     ///
     /// # Returns
     ///
-    /// A tuple of (request, body) where request is the parsed HTTP request
-    /// and body is the complete data received from Exasol.
+    /// The parsed HTTP PUT request.
     ///
     /// # Errors
     ///
-    /// Returns `TransportError` if the request is not a PUT or if I/O fails.
+    /// Returns `TransportError` if the request is not a PUT, if it has neither
+    /// a Content-Length nor chunked encoding, or if I/O fails.
     pub async fn handle_export_request(
         &mut self,
-    ) -> Result<(HttpRequest, Vec<u8>), TransportError> {
+        sink: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<HttpRequest, TransportError> {
         let request = self.read_http_request().await?;
 
         if request.method != HttpMethod::Put {
@@ -834,27 +811,19 @@ impl HttpTransportClient {
             )));
         }
 
-        // Read the body based on transfer encoding
-        let body = if request.is_chunked() {
-            self.read_chunked_body().await?
+        if request.is_chunked() {
+            self.read_chunked_body(sink).await?;
         } else if let Some(content_length) = request.content_length() {
-            let mut body = vec![0u8; content_length];
-            self.open_stream()
-                .await?
-                .read_exact(&mut body)
-                .await
-                .map_err(|e| TransportError::IoError(format!("Failed to read body: {e}")))?;
-            body
+            forward_sized_body(self.open_stream().await?, content_length, sink).await?;
         } else {
             return Err(TransportError::ProtocolError(
                 "PUT request has no Content-Length or Transfer-Encoding".to_string(),
             ));
-        };
+        }
 
-        // Send 200 OK response
         self.write_http_response(200, "OK", &[], None).await?;
 
-        Ok((request, body))
+        Ok(request)
     }
 }
 
@@ -1030,6 +999,57 @@ pub async fn read_line<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Strin
     }
 
     String::from_utf8(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Forwards a chunked transfer encoded body from `stream` to `sink` up to its
+/// zero-length terminator, as [`HttpTransportClient::read_chunked_body`]
+/// describes. Each chunk goes through [`forward_sized_body`], so a declared
+/// chunk size never sets the size of an allocation.
+async fn forward_chunked_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    sink: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), TransportError> {
+    loop {
+        let size_line = read_line(stream).await.map_err(|e| {
+            TransportError::ProtocolError(format!("Failed to read chunk size: {e}"))
+        })?;
+        let chunk_size = parse_chunk_size(&size_line)?;
+        forward_sized_body(stream, chunk_size, sink).await?;
+
+        let mut crlf = [0u8; 2];
+        stream.read_exact(&mut crlf).await.map_err(|e| {
+            TransportError::ProtocolError(format!(
+                "Failed to read the CRLF after a {chunk_size}-byte chunk: {e}"
+            ))
+        })?;
+        if chunk_size == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Forwards the next `len` bytes of `stream` to `sink` in pieces of at most
+/// [`EXPORT_PIECE_MAX_BYTES`], reading each piece only after `sink` accepted
+/// the previous one. Once `sink` is closed, the remaining pieces are read and
+/// discarded, so the caller can still answer the request.
+async fn forward_sized_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    len: usize,
+    sink: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), TransportError> {
+    let mut remaining = len;
+    while remaining > 0 {
+        let mut piece = vec![0u8; remaining.min(EXPORT_PIECE_MAX_BYTES)];
+        stream.read_exact(&mut piece).await.map_err(|e| {
+            TransportError::IoError(format!(
+                "Failed to read body: {remaining} of {len} bytes still expected: {e}"
+            ))
+        })?;
+        remaining -= piece.len();
+        // A closed channel means the consumer stopped early; the body is still read to its end.
+        let _ = sink.send(piece).await;
+    }
+    Ok(())
 }
 
 /// Serves a Parquet file over the given async stream using HTTP range
@@ -1418,6 +1438,10 @@ mod tests {
         exa_response_packet, finish_within, FakeExasolServer, SilentServer, DISCONNECT_BOUND,
         LOOPBACK_TEST_BOUND,
     };
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
 
     const SETUP_BOUND: Duration = Duration::from_millis(300);
 
@@ -1638,6 +1662,185 @@ mod tests {
             result.unwrap_err(),
             TransportError::ProtocolError(_)
         ));
+    }
+
+    /// A paused clock reaches it only once the forwarder is idle, so a
+    /// forwarder still running after it is waiting on its channel.
+    const STALL_WINDOW: Duration = Duration::from_millis(50);
+
+    /// Counts the bytes read through it, so a test sees how far a forwarder
+    /// has read its tunnel while the forwarder still borrows the stream.
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+            self.bytes_read
+                .fetch_add(buf.filled().len() - before, Ordering::SeqCst);
+            polled
+        }
+    }
+
+    async fn received_pieces(mut receiver: mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut pieces = Vec::new();
+        while let Some(piece) = receiver.recv().await {
+            pieces.push(piece);
+        }
+        pieces
+    }
+
+    fn numbered_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Scenario: Export data flow (Exasol sends data to client)
+    /// Scenario: Export body is forwarded in bounded pieces
+    #[tokio::test]
+    async fn test_forward_chunked_body_delivers_the_first_chunk_before_the_terminator_arrives() {
+        let (mut peer, mut stream) = tokio::io::duplex(1024);
+        let (sink, mut receiver) = mpsc::channel(16);
+        peer.write_all(&encode_chunk(b"1,alice\n")).await.unwrap();
+
+        let forwarding = forward_chunked_body(&mut stream, &sink);
+        tokio::pin!(forwarding);
+        let first = tokio::select! {
+            piece = receiver.recv() => piece,
+            result = &mut forwarding => panic!("the body ended before its terminator arrived: {result:?}"),
+        };
+        assert_eq!(first.as_deref(), Some(&b"1,alice\n"[..]));
+
+        peer.write_all(&encode_chunk(b"2,bob\n")).await.unwrap();
+        peer.write_all(&encode_chunk(&[])).await.unwrap();
+        forwarding
+            .await
+            .expect("a complete chunked body must forward without error");
+        assert_eq!(receiver.recv().await.as_deref(), Some(&b"2,bob\n"[..]));
+        assert!(receiver.try_recv().is_err(), "the body holds two pieces");
+    }
+
+    /// Scenario: Export body is forwarded in bounded pieces
+    #[tokio::test]
+    async fn test_forward_chunked_body_splits_a_chunk_larger_than_64_kib_into_pieces() {
+        let data = numbered_bytes(2 * 65_536 + 100);
+        let body = [encode_chunk(&data), encode_chunk(&[])].concat();
+        let (sink, receiver) = mpsc::channel(16);
+
+        forward_chunked_body(&mut body.as_slice(), &sink)
+            .await
+            .expect("a complete chunked body must forward without error");
+        drop(sink);
+
+        let pieces = received_pieces(receiver).await;
+        let sizes: Vec<usize> = pieces.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [65_536, 65_536, 100]);
+        assert_eq!(pieces.concat(), data);
+    }
+
+    /// Scenario: Export data flow (Exasol sends data to client)
+    /// Scenario: Export body is forwarded in bounded pieces
+    #[tokio::test]
+    async fn test_forward_sized_body_forwards_a_content_length_body_in_pieces() {
+        let data = numbered_bytes(65_536 + 10);
+        let tunnel_bytes = [data.as_slice(), b"NEXT"].concat();
+        let mut stream = tunnel_bytes.as_slice();
+        let (sink, receiver) = mpsc::channel(16);
+
+        forward_sized_body(&mut stream, data.len(), &sink)
+            .await
+            .expect("a complete Content-Length body must forward without error");
+        drop(sink);
+
+        let pieces = received_pieces(receiver).await;
+        let sizes: Vec<usize> = pieces.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [65_536, 10]);
+        assert_eq!(pieces.concat(), data);
+        assert_eq!(stream, b"NEXT", "the body ends at its Content-Length");
+    }
+
+    /// Scenario: Export applies backpressure to a slow consumer
+    /// Scenario: Export body is forwarded in bounded pieces
+    #[tokio::test(start_paused = true)]
+    async fn test_forward_chunked_body_stops_reading_while_the_channel_is_full() {
+        let chunk = encode_chunk(b"row\n");
+        let body = [&chunk[..], &chunk, &chunk, &encode_chunk(&[])].concat();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let mut stream = CountingReader {
+            inner: body.as_slice(),
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let (sink, mut receiver) = mpsc::channel(1);
+        let forwarding = forward_chunked_body(&mut stream, &sink);
+        tokio::pin!(forwarding);
+        let chunk_crlf = 2;
+
+        assert!(tokio::time::timeout(STALL_WINDOW, &mut forwarding)
+            .await
+            .is_err());
+        // One piece waits in the channel and one is read but not queued.
+        assert_eq!(
+            bytes_read.load(Ordering::SeqCst),
+            2 * chunk.len() - chunk_crlf
+        );
+
+        assert_eq!(receiver.recv().await.as_deref(), Some(&b"row\n"[..]));
+        assert!(tokio::time::timeout(STALL_WINDOW, &mut forwarding)
+            .await
+            .is_err());
+        assert_eq!(
+            bytes_read.load(Ordering::SeqCst),
+            3 * chunk.len() - chunk_crlf
+        );
+
+        let (forwarded, rest) = tokio::join!(forwarding, async {
+            [receiver.recv().await, receiver.recv().await]
+        });
+        forwarded.expect("a drained channel lets the forwarder finish the body");
+        assert_eq!(rest, [Some(b"row\n".to_vec()), Some(b"row\n".to_vec())]);
+        assert_eq!(bytes_read.load(Ordering::SeqCst), body.len());
+    }
+
+    /// Scenario: Export body is forwarded in bounded pieces
+    #[tokio::test]
+    async fn test_forward_chunked_body_discards_the_rest_of_the_body_when_the_receiver_is_dropped()
+    {
+        let rows: Vec<Vec<u8>> = (0..4).map(|i| format!("{i},row\n").into_bytes()).collect();
+        let chunks: Vec<Vec<u8>> = rows.iter().map(|row| encode_chunk(row)).collect();
+        let body = [chunks.concat(), encode_chunk(&[])].concat();
+        let mut stream = body.as_slice();
+        let (sink, mut receiver) = mpsc::channel(1);
+
+        let (forwarded, first) = tokio::join!(forward_chunked_body(&mut stream, &sink), async {
+            let first = receiver.recv().await;
+            drop(receiver);
+            first
+        });
+
+        forwarded.expect("a closed channel must not fail the body read");
+        assert_eq!(first, Some(rows[0].clone()));
+        assert!(stream.is_empty(), "the body must be read to its terminator");
+    }
+
+    #[tokio::test]
+    async fn test_forward_chunked_body_fails_when_the_body_ends_inside_a_declared_chunk() {
+        let body = b"FFFFFFFFFFFF\r\nonly a few bytes";
+        let (sink, _receiver) = mpsc::channel(16);
+
+        let error = forward_chunked_body(&mut body.as_slice(), &sink)
+            .await
+            .expect_err("a body that ends inside a chunk must fail");
+
+        assert!(
+            matches!(error, TransportError::IoError(_)),
+            "expected an IoError, got {error:?}"
+        );
     }
 
     #[test]
