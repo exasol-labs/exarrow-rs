@@ -139,7 +139,9 @@ impl ConnectionParams {
             builder = builder.schema(schema);
         }
 
-        builder = apply_query_params(builder, params)?;
+        // A query that holds '@' means an unencoded '?' and '@' in the password shifted into it.
+        let redact_keys = query_string.is_some_and(|query| query.contains('@'));
+        builder = apply_query_params(builder, params, redact_keys)?;
 
         builder.build()
     }
@@ -528,10 +530,12 @@ const ACCEPTED_QUERY_KEYS: &[&str] = &[
 /// Apply query parameters to builder.
 ///
 /// Errors name the query key and never repeat its value, because an unencoded
-/// password can shift into the query string.
+/// password can shift into the query string. When `redact_keys` is set, an unknown key
+/// is not echoed, because it may be a fragment of that password.
 fn apply_query_params(
     mut builder: ConnectionBuilder,
     params: HashMap<String, String>,
+    redact_keys: bool,
 ) -> Result<ConnectionBuilder, ConnectionError> {
     for (key, value) in params {
         match key.as_str() {
@@ -578,10 +582,18 @@ fn apply_query_params(
                 }
             }
             _ => {
+                let (parameter, hint) = if redact_keys {
+                    (
+                        "<redacted>".to_string(),
+                        " The query contains '@': percent-encode '?' and '@' in the user name and password.",
+                    )
+                } else {
+                    (key, "")
+                };
                 return Err(ConnectionError::InvalidParameter {
-                    parameter: key,
+                    parameter,
                     message: format!(
-                        "Unknown connection parameter. Accepted parameters: {}",
+                        "Unknown connection parameter.{hint} Accepted parameters: {}",
                         ACCEPTED_QUERY_KEYS.join(", ")
                     ),
                 });
@@ -1202,6 +1214,22 @@ mod tests {
             assert!(!shown.contains("Qx7"), "got: {shown}");
             assert!(!shown.contains("Secret1"), "got: {shown}");
         }
+    }
+
+    /// Scenario: Unknown connection-string parameter is rejected
+    #[test]
+    fn unknown_key_is_redacted_when_a_password_shifted_into_the_query() {
+        let uri = "exasol://alice:p@ss?SecretSuffix=x@db.example.com:8563";
+
+        let error = ConnectionParams::from_str(uri).unwrap_err();
+
+        let shown = format!("{error} {error:?}");
+        assert!(
+            matches!(error, ConnectionError::InvalidParameter { .. }),
+            "got: {shown}"
+        );
+        assert!(!shown.contains("SecretSuffix"), "got: {shown}");
+        assert!(!shown.contains("p@ss"), "got: {shown}");
     }
 
     #[test]
