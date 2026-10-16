@@ -26,9 +26,10 @@ Parallel import establishes N parallel HTTP transport connections (one per file)
 ### Scenario: Import multiple Parquet files in parallel
 
 * *GIVEN* multiple Parquet files exist on disk for import
-* *AND* the connected Exasol server's `release_version` is below `2025.1.11`
+* *AND* the CSV conversion path is selected, because the connected Exasol server's `release_version` is below `2025.1.11` or `ParquetImportOptions::with_native_parquet(Some(false))` is set
 * *WHEN* user calls import_parquet_from_files with a list of Parquet file paths
-* *THEN* system SHALL convert all Parquet files to CSV format in parallel using tokio tasks and stream the converted CSV through N parallel HTTP transport connections
+* *THEN* system SHALL convert each Parquet file to CSV one RecordBatch at a time in its own blocking task, and SHALL stream each file's CSV through its own HTTP transport connection while the conversion runs, with N parallel connections for N files, and MUST NOT hold the CSV of a whole file in memory at once
+* *AND* when every file holds zero rows, the system SHALL return 0 without opening an HTTP transport connection or running IMPORT SQL
 * *AND* the generated IMPORT SQL SHALL use `FROM CSV` with `.csv` file names and the existing CSV format option clauses
 
 ### Scenario: Native parallel Parquet import on Exasol 2025.1.11+
