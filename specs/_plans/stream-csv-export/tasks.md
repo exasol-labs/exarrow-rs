@@ -3,7 +3,7 @@
 ## PR Lifecycle
 - [x] resolved
 - [x] implemented
-- [ ] version-bumped
+- [x] version-bumped
 - [ ] tested-green
 - [ ] recorded
 - [ ] pr-ready
