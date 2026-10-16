@@ -1072,8 +1072,8 @@ mod tests {
     use crate::error::TransportError;
     use crate::transport::protocol::QueryResult;
     use crate::transport::test_support::{
-        finish_within, FakeExasolServer, GatedQueryTransport, MockTransport, StalledQueryTransport,
-        DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+        finish_within, FakeExasolServer, GatedQueryTransport, MockTransport, DISCONNECT_BOUND,
+        LOOPBACK_TEST_BOUND,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -1242,7 +1242,7 @@ mod tests {
     /// The clock is paused only after the export has had real time to open its
     /// tunnel and enter the SQL leg: auto-advance would otherwise jump past a
     /// timer that was not armed yet. Starting late cannot turn this red, since
-    /// `StalledQueryTransport::execute_query` never resolves.
+    /// `GatedQueryTransport::stalled` never resolves.
     ///
     /// Scenario: No client-side export timeout by default
     #[tokio::test]
@@ -1252,7 +1252,7 @@ mod tests {
         // Only reached if the guard regresses; allowed so the panic below
         // reports that rather than an unexpected mock call.
         mock.expect_terminate().return_const(());
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let options = tunnel_options(&server);
         assert_eq!(
@@ -1411,7 +1411,7 @@ mod tests {
         let server = FakeExasolServer::silent_after_handshake().await;
         let mut mock = MockTransport::new();
         mock.expect_terminate().times(1).return_const(());
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let error = export_to_callback(
             &mut transport,
@@ -1444,7 +1444,7 @@ mod tests {
         let mut server = FakeExasolServer::silent_after_handshake().await;
         let mut mock = MockTransport::new();
         mock.expect_terminate().times(1).return_const(());
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let error = finish_within(
             LOOPBACK_TEST_BOUND,
@@ -1477,7 +1477,7 @@ mod tests {
         let mut server = FakeExasolServer::silent_after_handshake().await;
         let mut mock = MockTransport::new();
         mock.expect_terminate().never();
-        let mut transport = StalledQueryTransport::new(mock);
+        let mut transport = GatedQueryTransport::stalled(mock);
 
         let export = export_to_callback(
             &mut transport,
@@ -2402,7 +2402,8 @@ mod tests {
         open_gate.send(()).unwrap();
         let (server, response_received) =
             FakeExasolServer::serving_chunked_put(vec![compressed], gate).await;
-        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(ROWS as i64)));
+        let mut transport =
+            gated_transport(response_received, Ok(QueryResult::row_count(ROWS as i64)));
         let mut recorder = WriteSizeRecorder::default();
 
         let rows = finish_within(

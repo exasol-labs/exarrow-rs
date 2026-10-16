@@ -87,118 +87,26 @@ pub(crate) fn exa_response_packet(ip: &str, port: i32) -> [u8; EXA_RESPONSE_PACK
     packet
 }
 
-/// A transport whose `execute_query` never resolves, delegating every other
-/// call to the wrapped mock.
+/// A transport whose `execute_query` is held back, delegating every other call
+/// to the wrapped mock. It either never resolves ([`Self::stalled`]) or
+/// resolves with a preset result once a signal fires ([`Self::new`]).
 ///
 /// `mockall` hands back an already-ready future, so a mock on its own cannot
-/// represent a SQL response that is still outstanding — the one state a
+/// represent a SQL response that is still outstanding, the one state a
 /// client-side deadline exists to interrupt. Delegating the rest keeps
 /// expectations and their verification with the inner mock.
-pub(crate) struct StalledQueryTransport {
-    inner: MockTransport,
-}
-
-impl StalledQueryTransport {
-    pub(crate) fn new(inner: MockTransport) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl TransportProtocol for StalledQueryTransport {
-    async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
-        self.inner.connect(params).await
-    }
-
-    async fn authenticate(
-        &mut self,
-        credentials: &Credentials,
-    ) -> Result<SessionInfo, TransportError> {
-        self.inner.authenticate(credentials).await
-    }
-
-    async fn execute_query(&mut self, _sql: &str) -> Result<QueryResult, TransportError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_results(
-        &mut self,
-        handle: ResultSetHandle,
-    ) -> Result<ResultData, TransportError> {
-        self.inner.fetch_results(handle).await
-    }
-
-    async fn close_result_set(&mut self, handle: ResultSetHandle) -> Result<(), TransportError> {
-        self.inner.close_result_set(handle).await
-    }
-
-    async fn create_prepared_statement(
-        &mut self,
-        sql: &str,
-    ) -> Result<PreparedStatementHandle, TransportError> {
-        self.inner.create_prepared_statement(sql).await
-    }
-
-    async fn execute_prepared_statement(
-        &mut self,
-        handle: &PreparedStatementHandle,
-        parameters: Option<Vec<Vec<serde_json::Value>>>,
-    ) -> Result<QueryResult, TransportError> {
-        self.inner
-            .execute_prepared_statement(handle, parameters)
-            .await
-    }
-
-    async fn close_prepared_statement(
-        &mut self,
-        handle: &PreparedStatementHandle,
-    ) -> Result<(), TransportError> {
-        self.inner.close_prepared_statement(handle).await
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        self.inner.close().await
-    }
-
-    fn terminate(&mut self) {
-        self.inner.terminate();
-    }
-
-    fn is_connected(&self) -> bool {
-        self.inner.is_connected()
-    }
-
-    async fn set_autocommit(&mut self, enabled: bool) -> Result<(), TransportError> {
-        self.inner.set_autocommit(enabled).await
-    }
-
-    async fn set_query_timeout(&mut self, timeout_secs: u64) -> Result<(), TransportError> {
-        self.inner.set_query_timeout(timeout_secs).await
-    }
-
-    async fn set_current_schema(&mut self, schema: &str) -> Result<(), TransportError> {
-        self.inner.set_current_schema(schema).await
-    }
-
-    async fn refresh_current_schema(&mut self) -> Result<Option<String>, TransportError> {
-        self.inner.refresh_current_schema().await
-    }
-
-    fn current_schema(&self) -> Option<String> {
-        self.inner.current_schema()
-    }
-}
-
-/// A transport whose `execute_query` resolves with a preset result once a
-/// signal fires, delegating every other call to the wrapped mock.
 ///
 /// Exasol answers an EXPORT statement only after the tunnel transfer ended, so
 /// a loopback test of the export order has to decide when the response
 /// arrives, which a mock's ready future cannot. A dropped signal never fires.
 pub(crate) struct GatedQueryTransport {
     inner: MockTransport,
-    release: Option<oneshot::Receiver<()>>,
-    result: Option<Result<QueryResult, TransportError>>,
+    answer: Option<Answer>,
+}
+
+struct Answer {
+    release: oneshot::Receiver<()>,
+    result: Result<QueryResult, TransportError>,
 }
 
 impl GatedQueryTransport {
@@ -209,8 +117,14 @@ impl GatedQueryTransport {
     ) -> Self {
         Self {
             inner,
-            release: Some(release),
-            result: Some(result),
+            answer: Some(Answer { release, result }),
+        }
+    }
+
+    pub(crate) fn stalled(inner: MockTransport) -> Self {
+        Self {
+            inner,
+            answer: None,
         }
     }
 }
@@ -229,16 +143,13 @@ impl TransportProtocol for GatedQueryTransport {
     }
 
     async fn execute_query(&mut self, _sql: &str) -> Result<QueryResult, TransportError> {
-        let release = self
-            .release
-            .take()
-            .expect("a GatedQueryTransport answers one statement");
-        if release.await.is_err() {
+        let Some(answer) = self.answer.take() else {
+            return std::future::pending().await;
+        };
+        if answer.release.await.is_err() {
             std::future::pending::<()>().await;
         }
-        self.result
-            .take()
-            .expect("the preset result belongs to the one statement")
+        answer.result
     }
 
     async fn fetch_results(
