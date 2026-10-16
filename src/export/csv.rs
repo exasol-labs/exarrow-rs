@@ -18,14 +18,14 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use bzip2::write::BzDecoder;
-use flate2::write::MultiGzDecoder;
+use bzip2::read::BzDecoder;
+use flate2::read::MultiGzDecoder;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use crate::query::export::{Compression, ExportQuery, ExportSource, RowSeparator};
@@ -375,21 +375,7 @@ pub async fn export_to_stream<T: TransportProtocol + ?Sized, W: AsyncWrite + Unp
     let compression = options.compression;
 
     export_to_callback(ws_transport, source, options, |mut receiver| async move {
-        let mut decoder = PieceDecoder::new(compression);
-        let mut row_count = 0u64;
-
-        while let Some(piece) = receiver.recv().await {
-            let decoded = decoder.push(piece)?;
-            writer.write_all(&decoded).await?;
-            row_count += count_line_feeds(&decoded);
-        }
-
-        let rest = decoder.finish()?;
-        writer.write_all(&rest).await?;
-        row_count += count_line_feeds(&rest);
-        writer.flush().await?;
-
-        Ok(row_count)
+        write_decoded(&mut receiver, compression, &mut writer).await
     })
     .await
 }
@@ -428,13 +414,8 @@ pub async fn export_to_list<T: TransportProtocol + ?Sized>(
     let compression = options.compression;
 
     export_to_callback(ws_transport, source, options, |mut receiver| async move {
-        let mut decoder = PieceDecoder::new(compression);
         let mut data = Vec::new();
-
-        while let Some(piece) = receiver.recv().await {
-            data.extend_from_slice(&decoder.push(piece)?);
-        }
-        data.extend_from_slice(&decoder.finish()?);
+        write_decoded(&mut receiver, compression, &mut data).await?;
 
         let csv_string = String::from_utf8(data).map_err(|e| ExportError::CsvParseError {
             row: 0,
@@ -655,16 +636,56 @@ async fn serve_export_tunnel(
     Ok(())
 }
 
+/// Hands the pieces from the tunnel to `sink` until `discard` fires, then
+/// keeps draining the tunnel without forwarding. A consumer that returned but
+/// kept its receiver alive would otherwise leave the tunnel blocked on `send`.
+async fn relay_pieces(
+    mut from_tunnel: mpsc::Receiver<Vec<u8>>,
+    sink: mpsc::Sender<Vec<u8>>,
+    discard: Arc<Notify>,
+) {
+    let mut discarding = false;
+    while let Some(piece) = from_tunnel.recv().await {
+        if discarding {
+            continue;
+        }
+        tokio::select! {
+            sent = sink.send(piece) => discarding = sent.is_err(),
+            () = discard.notified() => discarding = true,
+        }
+    }
+}
+
 struct TunnelTask {
     handle: JoinHandle<Result<(), ExportError>>,
+    relay: JoinHandle<()>,
+    discard: Arc<Notify>,
     failed: Arc<AtomicBool>,
 }
 
 impl TunnelTask {
     fn spawn(client: HttpTransportClient, sink: mpsc::Sender<Vec<u8>>) -> Self {
         let failed = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(serve_export_tunnel(client, sink, Arc::clone(&failed)));
-        Self { handle, failed }
+        let discard = Arc::new(Notify::new());
+        let (tunnel_sink, from_tunnel) = mpsc::channel(1);
+        let relay = tokio::spawn(relay_pieces(from_tunnel, sink, Arc::clone(&discard)));
+        let handle = tokio::spawn(serve_export_tunnel(
+            client,
+            tunnel_sink,
+            Arc::clone(&failed),
+        ));
+        Self {
+            handle,
+            relay,
+            discard,
+            failed,
+        }
+    }
+
+    /// Stops forwarding pieces to the consumer, which has returned. The tunnel
+    /// still reads the body to its end so the request can be answered.
+    fn discard(&self) {
+        self.discard.notify_one();
     }
 
     fn has_failed(&self) -> bool {
@@ -673,6 +694,7 @@ impl TunnelTask {
 
     fn abort(&self) {
         self.handle.abort();
+        self.relay.abort();
     }
 
     async fn join(&mut self) -> Result<(), ExportError> {
@@ -696,6 +718,7 @@ async fn settle_export<Q, R>(
         biased;
         callback_result = &mut callback_task => match callback_result {
             Ok(value) => {
+                tunnel.discard();
                 if let Err(sql_error) = sql_task.await {
                     tunnel.abort();
                     return Err(sql_error);
@@ -733,72 +756,143 @@ async fn settle_export<Q, R>(
     }
 }
 
-/// Decodes an export body one piece at a time, so a compressed body never has
-/// to be complete in memory before its first rows reach the consumer.
-enum PieceDecoder {
-    Plain,
-    Gzip(Box<MultiGzDecoder<Vec<u8>>>),
-    Bzip2(BzDecoder<Vec<u8>>),
+/// Upper bound of one decoded block. A highly compressible piece decodes to
+/// many blocks, and the consumer awaits each one before the next is decoded.
+const DECODED_BLOCK_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct FeedState {
+    data: Vec<u8>,
+    position: usize,
+    ended: bool,
+}
+
+/// The input of a decoder: it hands out the pieces pushed so far and reports
+/// `WouldBlock` when it needs the next one, so a decoder never has to buffer
+/// the output of a piece it cannot finish.
+struct PieceFeed(Arc<Mutex<FeedState>>);
+
+impl io::Read for PieceFeed {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let len = out.len().min(state.data.len() - state.position);
+        if len == 0 {
+            return match state.ended || out.is_empty() {
+                true => Ok(0),
+                false => Err(io::ErrorKind::WouldBlock.into()),
+            };
+        }
+        out[..len].copy_from_slice(&state.data[state.position..state.position + len]);
+        state.position += len;
+        Ok(len)
+    }
+}
+
+/// Decodes an export body piece by piece into blocks of at most
+/// [`DECODED_BLOCK_MAX_BYTES`], so neither a compressed body nor the decoded
+/// output of one compressed piece has to be complete in memory.
+struct PieceDecoder {
+    feed: Arc<Mutex<FeedState>>,
+    reader: Box<dyn io::Read + Send>,
+    codec: &'static str,
 }
 
 impl PieceDecoder {
     fn new(compression: Compression) -> Self {
-        match compression {
-            Compression::None => Self::Plain,
-            Compression::Gzip => Self::Gzip(Box::new(MultiGzDecoder::new(Vec::new()))),
-            Compression::Bzip2 => Self::Bzip2(BzDecoder::new(Vec::new())),
-        }
-    }
-
-    /// Returns the bytes decoded so far that no earlier call returned. A
-    /// compressed piece can complete no output yet, so the result can be empty.
-    fn push(&mut self, piece: Vec<u8>) -> Result<Vec<u8>, ExportError> {
-        match self {
-            Self::Plain => Ok(piece),
-            Self::Gzip(decoder) => {
-                decode_piece(decoder.as_mut(), &piece, "gzip")?;
-                Ok(std::mem::take(decoder.get_mut()))
-            }
-            Self::Bzip2(decoder) => {
-                decode_piece(decoder, &piece, "bzip2")?;
-                Ok(std::mem::take(decoder.get_mut()))
-            }
-        }
-    }
-
-    /// Returns the decoded bytes still held, and fails when the compressed
-    /// stream did not reach its end.
-    fn finish(self) -> Result<Vec<u8>, ExportError> {
-        let incomplete = |codec: &str, e: io::Error| {
-            ExportError::DecompressionError(format!(
-                "The {codec} stream of the export body ended before it was complete: {e}"
-            ))
+        let feed = Arc::new(Mutex::new(FeedState::default()));
+        let input = PieceFeed(Arc::clone(&feed));
+        let (reader, codec): (Box<dyn io::Read + Send>, _) = match compression {
+            Compression::None => (Box::new(input), "plain"),
+            Compression::Gzip => (Box::new(MultiGzDecoder::new(input)), "gzip"),
+            Compression::Bzip2 => (Box::new(BzDecoder::new(input)), "bzip2"),
         };
-        match self {
-            Self::Plain => Ok(Vec::new()),
-            Self::Gzip(decoder) => decoder.finish().map_err(|e| incomplete("gzip", e)),
-            Self::Bzip2(mut decoder) => decoder.finish().map_err(|e| incomplete("bzip2", e)),
+        Self {
+            feed,
+            reader,
+            codec,
+        }
+    }
+
+    fn feed_state(&self) -> std::sync::MutexGuard<'_, FeedState> {
+        self.feed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Adds the next piece of the body. Call [`Self::next_block`] until it
+    /// returns `None` before the next push.
+    fn push(&mut self, piece: Vec<u8>) {
+        let mut state = self.feed_state();
+        if state.position == state.data.len() {
+            state.data = piece;
+            state.position = 0;
+        } else {
+            state.data.extend_from_slice(&piece);
+        }
+    }
+
+    /// Marks the end of the body. `next_block` then fails when the compressed
+    /// stream did not reach its end.
+    fn end(&mut self) {
+        self.feed_state().ended = true;
+    }
+
+    /// Returns the next decoded block, or `None` when the pushed input is used
+    /// up (or, after [`Self::end`], the body is complete).
+    fn next_block(&mut self) -> Result<Option<Vec<u8>>, ExportError> {
+        let mut block = vec![0u8; DECODED_BLOCK_MAX_BYTES];
+        match self.reader.read(&mut block) {
+            Ok(0) => Ok(None),
+            Ok(len) => {
+                block.truncate(len);
+                Ok(Some(block))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                Err(ExportError::DecompressionError(format!(
+                    "The {} stream of the export body ended before it was complete: {e}",
+                    self.codec
+                )))
+            }
+            Err(e) => Err(ExportError::DecompressionError(format!(
+                "Failed to decode the {} export body: {e}",
+                self.codec
+            ))),
         }
     }
 }
 
-fn decode_piece<D: io::Write>(
-    decoder: &mut D,
-    piece: &[u8],
-    codec: &str,
-) -> Result<(), ExportError> {
-    decoder
-        .write_all(piece)
-        .and_then(|()| decoder.flush())
-        .map_err(|e| {
-            ExportError::DecompressionError(format!(
-                "Failed to decode a {}-byte {codec} piece of the export body: {e}",
-                piece.len()
-            ))
-        })
+/// Decodes the body from `receiver` into `writer` and returns the number of
+/// line feeds written. Each block is written before the next one is decoded.
+async fn write_decoded<W: AsyncWrite + Unpin>(
+    receiver: &mut DataPipeReceiver,
+    compression: Compression,
+    writer: &mut W,
+) -> Result<u64, ExportError> {
+    let mut decoder = PieceDecoder::new(compression);
+    let mut line_feeds = 0;
+
+    while let Some(piece) = receiver.recv().await {
+        decoder.push(piece);
+        line_feeds += write_blocks(&mut decoder, writer).await?;
+    }
+    decoder.end();
+    line_feeds += write_blocks(&mut decoder, writer).await?;
+    writer.flush().await?;
+
+    Ok(line_feeds)
 }
 
-/// Parses CSV data into a vector of rows.
+async fn write_blocks<W: AsyncWrite + Unpin>(
+    decoder: &mut PieceDecoder,
+    writer: &mut W,
+) -> Result<u64, ExportError> {
+    let mut line_feeds = 0;
+    while let Some(block) = decoder.next_block()? {
+        writer.write_all(&block).await?;
+        line_feeds += count_line_feeds(&block);
+    }
+    Ok(line_feeds)
+}
+
 fn parse_csv(
     data: &str,
     separator: char,
@@ -2144,9 +2238,15 @@ mod tests {
         let mut decoder = PieceDecoder::new(compression);
         let mut decoded = Vec::new();
         for piece in body.chunks(piece_len) {
-            decoded.extend(decoder.push(piece.to_vec())?);
+            decoder.push(piece.to_vec());
+            while let Some(block) = decoder.next_block()? {
+                decoded.extend(block);
+            }
         }
-        decoded.extend(decoder.finish()?);
+        decoder.end();
+        while let Some(block) = decoder.next_block()? {
+            decoded.extend(block);
+        }
         Ok(decoded)
     }
 
@@ -2189,9 +2289,16 @@ mod tests {
         let (first_piece, last_piece) = gzip_flushed_after(first_rows, b"3,carol\n");
         let mut decoder = PieceDecoder::new(Compression::Gzip);
 
-        let decoded_first = decoder.push(first_piece).unwrap();
-        let mut decoded_rest = decoder.push(last_piece).unwrap();
-        decoded_rest.extend(decoder.finish().unwrap());
+        decoder.push(first_piece);
+        let decoded_first = decoder.next_block().unwrap().unwrap();
+        assert!(decoder.next_block().unwrap().is_none());
+        decoder.push(last_piece);
+        let mut decoded_rest = Vec::new();
+        while let Some(block) = decoder.next_block().unwrap() {
+            decoded_rest.extend(block);
+        }
+        decoder.end();
+        assert!(decoder.next_block().unwrap().is_none());
 
         assert_eq!(decoded_first, first_rows);
         assert_eq!(decoded_rest, b"3,carol\n");
@@ -2226,30 +2333,147 @@ mod tests {
     }
 
     #[test]
-    fn test_piece_decoder_passes_an_uncompressed_piece_through_without_a_copy() {
-        let piece = b"1,alice\n".to_vec();
-        let piece_address = piece.as_ptr();
+    fn test_piece_decoder_passes_an_uncompressed_piece_through() {
         let mut decoder = PieceDecoder::new(Compression::None);
 
-        let passed = decoder.push(piece).unwrap();
+        decoder.push(b"1,alice\n".to_vec());
 
-        assert_eq!(passed.as_ptr(), piece_address);
-        assert_eq!(passed, b"1,alice\n");
-        assert!(decoder.finish().unwrap().is_empty());
+        assert_eq!(decoder.next_block().unwrap().unwrap(), b"1,alice\n");
+        assert!(decoder.next_block().unwrap().is_none());
     }
 
     #[test]
     fn test_piece_decoder_rejects_a_corrupt_gzip_piece() {
         let mut decoder = PieceDecoder::new(Compression::Gzip);
 
+        decoder.push(b"not a gzip stream".to_vec());
         let error = decoder
-            .push(b"not a gzip stream".to_vec())
+            .next_block()
             .expect_err("bytes without a gzip header are corrupt");
 
         assert!(
             matches!(error, ExportError::DecompressionError(_)),
             "{error:?}"
         );
+    }
+
+    /// Records the largest single write, which is what the decoder bounds.
+    #[derive(Default)]
+    struct WriteSizeRecorder {
+        largest_write: usize,
+    }
+
+    impl AsyncWrite for WriteSizeRecorder {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.largest_write = self.largest_write.max(buf.len());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One piece of 64 KiB at most that decodes to 4 MiB reaches the writer
+    /// in bounded blocks.
+    ///
+    /// Scenario: Export with compression
+    async fn assert_compressible_body_reaches_the_writer_in_bounded_blocks(
+        compression: Compression,
+        compressed: Vec<u8>,
+    ) {
+        const ROWS: u64 = 1024 * 1024;
+        assert!(compressed.len() <= 64 * 1024, "{} bytes", compressed.len());
+        let (open_gate, gate) = oneshot::channel();
+        open_gate.send(()).unwrap();
+        let (server, response_received) =
+            FakeExasolServer::serving_chunked_put(vec![compressed], gate).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(ROWS as i64)));
+        let mut recorder = WriteSizeRecorder::default();
+
+        let rows = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_stream(
+                &mut transport,
+                users_query(),
+                &mut recorder,
+                tunnel_options(&server).compression(compression),
+            ),
+        )
+        .await
+        .expect("the export decodes the body");
+
+        assert_eq!(rows, ROWS);
+        assert!(
+            recorder.largest_write <= DECODED_BLOCK_MAX_BYTES,
+            "one write held {} bytes",
+            recorder.largest_write
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_to_stream_writes_a_highly_compressible_gzip_body_in_bounded_blocks() {
+        let csv = "1,x\n".repeat(1024 * 1024);
+
+        assert_compressible_body_reaches_the_writer_in_bounded_blocks(
+            Compression::Gzip,
+            gzip(csv.as_bytes()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_export_to_stream_writes_a_highly_compressible_bzip2_body_in_bounded_blocks() {
+        let csv = "1,x\n".repeat(1024 * 1024);
+
+        assert_compressible_body_reaches_the_writer_in_bounded_blocks(
+            Compression::Bzip2,
+            bzip2(csv.as_bytes()),
+        )
+        .await;
+    }
+
+    /// The valid callback `|receiver| async move { Ok(receiver) }` keeps its
+    /// receiver alive, so the tunnel must discard the rest of the body.
+    ///
+    /// Scenario: Export callback returns before the transfer completes
+    #[tokio::test]
+    async fn test_export_to_callback_finishes_when_the_callback_returns_with_its_receiver_alive() {
+        let chunks: Vec<Vec<u8>> = (0..40).map(|i| format!("{i},row\n").into_bytes()).collect();
+        let (open_gate, gate) = oneshot::channel();
+        open_gate.send(()).unwrap();
+        let (mut server, response_received) =
+            FakeExasolServer::serving_chunked_put(chunks, gate).await;
+        let mut transport = gated_transport(response_received, Ok(QueryResult::row_count(40)));
+
+        let receiver = finish_within(
+            LOOPBACK_TEST_BOUND,
+            export_to_callback(
+                &mut transport,
+                users_query(),
+                tunnel_options(&server),
+                |receiver| async move { Ok(receiver) },
+            ),
+        )
+        .await
+        .expect("the statement finishes after the driver discarded the body");
+
+        assert_200_ok(&finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await);
+        drop(receiver);
     }
 
     // Tests for export options with column names
