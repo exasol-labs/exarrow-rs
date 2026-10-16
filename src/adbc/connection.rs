@@ -1487,11 +1487,22 @@ impl Connection {
     /// Import Parquet data from an async reader into an Exasol table.
     ///
     /// This method reads Parquet data from an async reader and imports it into
-    /// the target table. The entire stream is buffered into memory because
-    /// Parquet requires random access to read file metadata.
+    /// the target table. It buffers the whole stream in memory on both import
+    /// paths, because Parquet keeps its metadata at the end of the file.
     ///
     /// When the connected server supports native Parquet import (Exasol 2025.1.11+),
     /// the buffered bytes are forwarded directly without CSV conversion.
+    ///
+    /// # Bounding memory
+    ///
+    /// To bound memory, decode the Parquet data yourself and pass the
+    /// RecordBatches in groups to
+    /// [`import_from_record_batches`](Self::import_from_record_batches). Each
+    /// call is one IMPORT statement and holds the CSV of its own batches more
+    /// than once. Each call commits separately unless autocommit is off, so a
+    /// failure in a later group leaves the earlier groups in the table.
+    /// [`import_from_arrow_ipc`](Self::import_from_arrow_ipc) also reads its
+    /// whole input.
     ///
     /// # Arguments
     ///
@@ -1533,8 +1544,10 @@ impl Connection {
 
     /// Import multiple Parquet files in parallel into an Exasol table.
     ///
-    /// This method converts each Parquet file to CSV format concurrently,
-    /// then streams the data through parallel HTTP transport connections.
+    /// On the CSV conversion path, each file converts to CSV while its CSV
+    /// streams through its own HTTP transport connection, so memory holds a few
+    /// RecordBatches of CSV per file, not whole files. The native Parquet path
+    /// reads each whole file into memory.
     ///
     /// For a single file, this method delegates to `import_from_parquet`.
     ///
@@ -1936,7 +1949,19 @@ impl Connection {
     /// Import Parquet data from an async reader into an Exasol table (blocking).
     ///
     /// This is a synchronous wrapper around [`import_from_parquet_stream`](Self::import_from_parquet_stream)
-    /// for use in non-async contexts.
+    /// for use in non-async contexts. It buffers the whole stream in memory on
+    /// both import paths, because Parquet keeps its metadata at the end of the
+    /// file.
+    ///
+    /// # Bounding memory
+    ///
+    /// To bound memory, decode the Parquet data yourself and import the
+    /// RecordBatches in groups with
+    /// [`blocking_import_from_record_batch`](Self::blocking_import_from_record_batch),
+    /// which imports one RecordBatch per call. Each call is one IMPORT
+    /// statement and holds the CSV of its batch more than once. Each call
+    /// commits separately unless autocommit is off, so a failure in a later
+    /// call leaves the earlier calls in the table.
     ///
     /// # Arguments
     ///

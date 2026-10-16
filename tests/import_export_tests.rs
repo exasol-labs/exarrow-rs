@@ -3867,3 +3867,458 @@ async fn test_csv_import_with_tls_into_missing_table_returns_error() {
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
 }
+
+// Section: Streaming CSV-path Parquet import
+//
+// These tests force the CSV path, because Exasol 2025.1.11 and newer select
+// the native Parquet path by default.
+
+/// A Date32 value for 10000-01-01, one day past Exasol's DATE range.
+const OUT_OF_RANGE_DATE32: i32 = 2_932_897;
+const DATE_ROW_GROUPS: i64 = 4;
+const DATE_ROWS_PER_GROUP: i64 = 1_000;
+const DATE_FILE_ROWS: i64 = DATE_ROW_GROUPS * DATE_ROWS_PER_GROUP;
+
+fn csv_path_options(batch_size: usize) -> ParquetImportOptions {
+    ParquetImportOptions::default()
+        .with_native_parquet(Some(false))
+        .with_batch_size(batch_size)
+}
+
+/// Writes one row per ID in `ids`, `rows_per_group` rows to a row group, with a
+/// distinct 100-character `PAYLOAD` per row. It writes one row group at a time,
+/// so the test never holds the whole file in memory.
+fn write_id_payload_parquet(
+    path: &std::path::Path,
+    ids: std::ops::Range<i64>,
+    rows_per_group: i64,
+) {
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("PAYLOAD", DataType::Utf8, false),
+    ]));
+    let file = std::fs::File::create(path).expect("Failed to create parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("Failed to create writer");
+    let row_groups = (ids.end - ids.start) / rows_per_group;
+    for group in 0..row_groups {
+        let start = ids.start + group * rows_per_group;
+        let ids: Vec<i64> = (start..start + rows_per_group).collect();
+        let payloads: Vec<String> = ids.iter().map(|id| format!("{id:0>100}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(payloads)),
+            ],
+        )
+        .expect("Failed to create RecordBatch");
+        writer.write(&batch).expect("Failed to write batch");
+        writer.flush().expect("Failed to flush a row group");
+    }
+    writer.close().expect("Failed to close writer");
+}
+
+/// Writes `DATE_ROW_GROUPS` row groups of `DATE_ROWS_PER_GROUP` `ID`/`D` rows
+/// with `ID` counting up from `first_id`. Every `D` is 1970-01-01 except the very last one, `last_date`.
+fn write_id_date_parquet(path: &std::path::Path, first_id: i64, last_date: i32) {
+    use arrow::array::Date32Array;
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("D", DataType::Date32, false),
+    ]));
+    let last_id = first_id + DATE_FILE_ROWS - 1;
+    let file = std::fs::File::create(path).expect("Failed to create parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("Failed to create writer");
+    for group in 0..DATE_ROW_GROUPS {
+        let start = first_id + group * DATE_ROWS_PER_GROUP;
+        let ids: Vec<i64> = (start..start + DATE_ROWS_PER_GROUP).collect();
+        let dates: Vec<i32> = ids
+            .iter()
+            .map(|id| if *id == last_id { last_date } else { 0 })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Date32Array::from(dates)),
+            ],
+        )
+        .expect("Failed to create RecordBatch");
+        writer.write(&batch).expect("Failed to write batch");
+        writer.flush().expect("Failed to flush a row group");
+    }
+    writer.close().expect("Failed to close writer");
+}
+
+async fn assert_id_count_and_sum(conn: &mut Connection, table: &str, ids: std::ops::Range<i64>) {
+    let (rows, sum) = (ids.end - ids.start, ids.sum::<i64>());
+    let count = count_of(conn, &format!("SELECT COUNT(*) FROM {table}")).await;
+    let total = count_of(conn, &format!("SELECT COALESCE(SUM(ID), 0) FROM {table}")).await;
+    assert_eq!(
+        (count, total),
+        (rows, sum),
+        "row count and SUM(ID) of {table}"
+    );
+}
+
+async fn within_import_hang_limit<T>(import: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(IMPORT_HANG_LIMIT, import)
+        .await
+        .unwrap_or_else(|_| panic!("the import must finish within {IMPORT_HANG_LIMIT:?}"))
+}
+
+/// Asserts that a failed import left `table` empty and the Connection usable.
+async fn assert_failed_import_left_no_rows(conn: &mut Connection, table: &str) {
+    assert_eq!(
+        count_of(conn, &format!("SELECT COUNT(*) FROM {table}")).await,
+        0
+    );
+    assert_eq!(count_of(conn, "SELECT 1").await, 1);
+}
+
+/// Scenario: CSV-path Parquet import sends CSV one RecordBatch at a time
+#[tokio::test]
+async fn test_parquet_import_csv_path_streams_multi_row_group_file() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), PAYLOAD VARCHAR(100)",
+    )
+    .await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("large.parquet");
+    write_id_payload_parquet(&path, 0..400_000, 10_000);
+    let table = format!("{schema_name}.T");
+
+    let rows =
+        within_import_hang_limit(conn.import_from_parquet(&table, &path, csv_path_options(10_000)))
+            .await
+            .expect("CSV-path Parquet import should succeed");
+
+    assert_eq!(rows, 400_000);
+    assert_id_count_and_sum(&mut conn, &table, 0..400_000).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: CSV-path Parquet import sends CSV one RecordBatch at a time
+#[tokio::test]
+async fn test_parquet_stream_import_csv_path_streams_multi_row_group_file() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), PAYLOAD VARCHAR(100)",
+    )
+    .await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("stream.parquet");
+    write_id_payload_parquet(&path, 0..8_000, 1_000);
+    let table = format!("{schema_name}.T");
+    let reader = tokio::fs::File::open(&path)
+        .await
+        .expect("Failed to open parquet file");
+
+    let rows = within_import_hang_limit(conn.import_from_parquet_stream(
+        &table,
+        reader,
+        csv_path_options(1_000),
+    ))
+    .await
+    .expect("CSV-path Parquet stream import should succeed");
+
+    assert_eq!(rows, 8_000);
+    assert_id_count_and_sum(&mut conn, &table, 0..8_000).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: CSV-path Parquet import that fails on a later RecordBatch imports no rows
+#[tokio::test]
+async fn test_parquet_import_csv_path_conversion_error_in_later_batch_imports_no_rows() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(&mut conn, &schema_name, "T", "ID DECIMAL(18,0), D DATE").await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("bad_date.parquet");
+    write_id_date_parquet(&path, 0, OUT_OF_RANGE_DATE32);
+    let table = format!("{schema_name}.T");
+
+    let err = within_import_hang_limit(conn.import_from_parquet(
+        &table,
+        &path,
+        csv_path_options(DATE_ROWS_PER_GROUP as usize),
+    ))
+    .await
+    .expect_err("a date outside Exasol's range must fail the import");
+
+    assert!(
+        matches!(&err, ImportError::ConversionError(message) if message.contains(&OUT_OF_RANGE_DATE32.to_string())),
+        "got: {err}"
+    );
+    assert_failed_import_left_no_rows(&mut conn, &table).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Import multiple Parquet files in parallel
+#[tokio::test]
+async fn test_parallel_parquet_import_csv_path_streams_multi_row_group_files() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), PAYLOAD VARCHAR(100)",
+    )
+    .await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let paths: Vec<_> = (0..3)
+        .map(|index| {
+            let path = temp_dir.path().join(format!("part{index}.parquet"));
+            write_id_payload_parquet(&path, index * 8_000..(index + 1) * 8_000, 1_000);
+            path
+        })
+        .collect();
+    let table = format!("{schema_name}.T");
+
+    let rows = within_import_hang_limit(conn.import_parquet_from_files(
+        &table,
+        paths,
+        csv_path_options(1_000),
+    ))
+    .await
+    .expect("parallel CSV-path Parquet import should succeed");
+
+    assert_eq!(rows, 24_000);
+    assert_id_count_and_sum(&mut conn, &table, 0..24_000).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Parallel CSV-path Parquet import that fails on a value imports no rows
+#[tokio::test]
+async fn test_parallel_parquet_import_csv_path_conversion_error_imports_no_rows() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(&mut conn, &schema_name, "T", "ID DECIMAL(18,0), D DATE").await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let good = temp_dir.path().join("good.parquet");
+    let bad = temp_dir.path().join("bad.parquet");
+    write_id_date_parquet(&good, 0, 0);
+    write_id_date_parquet(&bad, DATE_FILE_ROWS, OUT_OF_RANGE_DATE32);
+    let table = format!("{schema_name}.T");
+
+    let err = within_import_hang_limit(conn.import_parquet_from_files(
+        &table,
+        vec![good, bad.clone()],
+        csv_path_options(DATE_ROWS_PER_GROUP as usize),
+    ))
+    .await
+    .expect_err("a date outside Exasol's range must fail the import");
+
+    let bad_path = bad.display().to_string();
+    assert!(
+        matches!(&err, ImportError::ConversionError(message)
+            if message.contains(&bad_path) && message.contains(&OUT_OF_RANGE_DATE32.to_string())),
+        "got: {err}"
+    );
+    assert_failed_import_left_no_rows(&mut conn, &table).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+// Section: Streaming multi-file CSV import
+
+/// Writes `rows` CSV rows with `ID` counting up from `first_id` and a distinct
+/// 64-character payload per row. It writes row by row through a `BufWriter`,
+/// so the test never holds the whole file in memory.
+fn write_id_payload_csv(path: &std::path::Path, first_id: i64, rows: i64) {
+    use std::io::Write;
+
+    let file = std::fs::File::create(path).expect("Failed to create CSV file");
+    let mut writer = std::io::BufWriter::new(file);
+    for id in first_id..first_id + rows {
+        writeln!(writer, "{id},{id:0>64}").expect("Failed to write CSV row");
+    }
+    writer.flush().expect("Failed to flush CSV file");
+}
+
+/// Scenario: Parallel CSV import streams each file in pieces
+#[tokio::test]
+async fn test_parallel_csv_import_streams_large_files() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), PAYLOAD VARCHAR(64)",
+    )
+    .await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let paths: Vec<_> = (0..3)
+        .map(|index| {
+            let path = temp_dir.path().join(format!("part{index}.csv"));
+            write_id_payload_csv(&path, index * 200_000, 200_000);
+            path
+        })
+        .collect();
+    let table = format!("{schema_name}.T");
+
+    let rows = within_import_hang_limit(conn.import_csv_from_files(
+        &table,
+        paths,
+        CsvImportOptions::default().use_tls(false),
+    ))
+    .await
+    .expect("parallel CSV import should succeed");
+
+    assert_eq!(rows, 600_000);
+    assert_id_count_and_sum(&mut conn, &table, 0..600_000).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Parallel CSV import compresses each file while streaming it
+#[tokio::test]
+async fn test_parallel_csv_import_compresses_while_streaming() {
+    use exarrow_rs::query::import::Compression;
+
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+    for (table_name, compression) in [
+        ("T_GZIP", Compression::Gzip),
+        ("T_BZIP2", Compression::Bzip2),
+    ] {
+        create_table(
+            &mut conn,
+            &schema_name,
+            table_name,
+            "ID DECIMAL(18,0), PAYLOAD VARCHAR(64)",
+        )
+        .await;
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = temp_dir.path().join(format!("{table_name}_{index}.csv"));
+                write_id_payload_csv(&path, index * 20_000, 20_000);
+                path
+            })
+            .collect();
+        let table = format!("{schema_name}.{table_name}");
+
+        let rows = within_import_hang_limit(
+            conn.import_csv_from_files(
+                &table,
+                paths,
+                CsvImportOptions::default()
+                    .use_tls(false)
+                    .compression(compression),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{compression:?} parallel CSV import should succeed: {e}"));
+
+        assert_eq!(rows, 60_000, "{compression:?} row count");
+        assert_id_count_and_sum(&mut conn, &table, 0..60_000).await;
+    }
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Parallel CSV import fails before running IMPORT when a file cannot be opened
+#[tokio::test]
+async fn test_parallel_csv_import_missing_file_fails_before_import() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), PAYLOAD VARCHAR(64)",
+    )
+    .await;
+    let table = format!("{schema_name}.T");
+    conn.execute_update(&format!("INSERT INTO {table} VALUES (1, 'kept')"))
+        .await
+        .expect("INSERT should succeed");
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let first = temp_dir.path().join("first.csv");
+    write_id_payload_csv(&first, 10, 100);
+    let missing = temp_dir.path().join("missing.csv");
+
+    let err = within_import_hang_limit(conn.import_csv_from_files(
+        &table,
+        vec![first, missing],
+        CsvImportOptions::default().use_tls(false),
+    ))
+    .await
+    .expect_err("a missing file must fail the import");
+
+    assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+    assert_id_count_and_sum(&mut conn, &table, 1..2).await;
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}

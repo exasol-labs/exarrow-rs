@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bzip2::write::BzEncoder;
 use flate2::write::GzEncoder;
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::query::import::{Compression, ImportFileEntry, ImportQuery, RowSeparator, TrimMode};
 use crate::transport::HttpTransportClient;
 
-use super::parallel::{finish_import, stream_files_parallel, ParallelTransportPool};
+use super::parallel::{finish_import, stream_in_parallel, ParallelTransportPool};
 use super::source::IntoFileSources;
 use super::ImportError;
 
@@ -523,25 +523,22 @@ where
         ));
     }
 
-    // Read all files and detect compression
-    let compression = options.compression;
-    let mut file_data_vec: Vec<Vec<u8>> = Vec::with_capacity(paths.len());
-
-    for path in &paths {
-        let detected_compression = detect_compression(path, compression);
-        let file_is_compressed = is_compressed_file(path);
-
-        // Read file
-        let data = tokio::fs::read(path).await?;
-
-        // Apply compression if needed
-        let compressed_data = if file_is_compressed {
-            data
+    // Open every file first, so a missing file fails before any connection or SQL.
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths.iter() {
+        let file = tokio::fs::File::open(path).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("failed to open {}: {e}", path.display()))
+        })?;
+        let compression = if is_compressed_file(path) {
+            Compression::None
         } else {
-            compress_data(&data, detected_compression)?
+            options.compression
         };
-
-        file_data_vec.push(compressed_data);
+        files.push(OpenedCsvFile {
+            path: path.clone(),
+            reader: file,
+            compression,
+        });
     }
 
     // Establish parallel connections
@@ -556,10 +553,7 @@ where
     // Get connections for streaming
     let connections = pool.into_connections();
 
-    // Spawn parallel streaming task
-    let stream_handle = tokio::spawn(async move {
-        stream_files_parallel(connections, file_data_vec, compression).await
-    });
+    let stream_handle = tokio::spawn(stream_in_parallel(connections, files, stream_named_file));
 
     finish_import(execute_sql(sql).await, stream_handle).await
 }
@@ -912,29 +906,140 @@ async fn send_import_response(
     write_chunked_data(client, data).await
 }
 
-/// Compress data using the specified compression type.
-fn compress_data(data: &[u8], compression: Compression) -> Result<Vec<u8>, ImportError> {
-    match compression {
-        Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => {
-            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(data).map_err(|e| {
-                ImportError::CompressionError(format!("Gzip compression failed: {e}"))
-            })?;
-            encoder.finish().map_err(|e| {
-                ImportError::CompressionError(format!("Gzip finalization failed: {e}"))
-            })
-        }
-        Compression::Bzip2 => {
-            let mut encoder = BzEncoder::new(Vec::new(), bzip2::Compression::default());
-            encoder.write_all(data).map_err(|e| {
-                ImportError::CompressionError(format!("Bzip2 compression failed: {e}"))
-            })?;
-            encoder.finish().map_err(|e| {
-                ImportError::CompressionError(format!("Bzip2 finalization failed: {e}"))
-            })
+/// Compresses a stream piece by piece, so a caller holds one piece plus the
+/// encoder state instead of the whole input.
+enum StreamEncoder {
+    Gzip(GzEncoder<Vec<u8>>),
+    Bzip2(BzEncoder<Vec<u8>>),
+}
+
+impl StreamEncoder {
+    /// The encoder for `compression`, or `None` when the data goes out as is.
+    fn new(compression: Compression) -> Option<Self> {
+        match compression {
+            Compression::None => None,
+            Compression::Gzip => Some(Self::Gzip(GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ))),
+            Compression::Bzip2 => Some(Self::Bzip2(BzEncoder::new(
+                Vec::new(),
+                bzip2::Compression::default(),
+            ))),
         }
     }
+
+    /// Feeds one piece and returns the compressed bytes that became ready.
+    /// An encoder may hold a piece back until it has a full block, so the
+    /// result can be empty.
+    fn write(&mut self, piece: &[u8]) -> Result<Vec<u8>, ImportError> {
+        let (name, written, ready) = match self {
+            Self::Gzip(encoder) => ("Gzip", encoder.write_all(piece), encoder.get_mut()),
+            Self::Bzip2(encoder) => ("Bzip2", encoder.write_all(piece), encoder.get_mut()),
+        };
+        written.map_err(|e| {
+            ImportError::CompressionError(format!("{name} compression failed: {e}"))
+        })?;
+        Ok(std::mem::take(ready))
+    }
+
+    /// Ends the compressed stream and returns the bytes still pending.
+    fn finish(self) -> Result<Vec<u8>, ImportError> {
+        let (name, finished) = match self {
+            Self::Gzip(encoder) => ("Gzip", encoder.finish()),
+            Self::Bzip2(encoder) => ("Bzip2", encoder.finish()),
+        };
+        finished
+            .map_err(|e| ImportError::CompressionError(format!("{name} finalization failed: {e}")))
+    }
+}
+
+/// Compress data using the specified compression type.
+fn compress_data(data: &[u8], compression: Compression) -> Result<Vec<u8>, ImportError> {
+    let Some(mut encoder) = StreamEncoder::new(compression) else {
+        return Ok(data.to_vec());
+    };
+    let mut compressed = encoder.write(data)?;
+    compressed.extend(encoder.finish()?);
+    Ok(compressed)
+}
+
+/// Answers the IMPORT request on `client` and streams `reader` to it, one
+/// piece of at most 64 KiB at a time, compressed when `compression` is set.
+///
+/// Memory stays at one piece plus the encoder state, however large the file is.
+/// The body ends with the terminating chunk only at the end of the input: after
+/// a read error the connection closes without it, so Exasol fails the IMPORT
+/// instead of loading part of the file.
+async fn stream_file_to_connection<R>(
+    mut client: HttpTransportClient,
+    mut reader: R,
+    compression: Compression,
+) -> Result<(), ImportError>
+where
+    R: AsyncRead + Unpin,
+{
+    client.handle_import_request().await.map_err(|e| {
+        ImportError::HttpTransportError(format!("Failed to handle import request: {e}"))
+    })?;
+
+    let mut encoder = StreamEncoder::new(compression);
+    let mut piece = vec![0u8; DEFAULT_BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut piece).await?;
+        if read == 0 {
+            break;
+        }
+        let body = match encoder.as_mut() {
+            Some(encoder) => encoder.write(&piece[..read])?,
+            None => piece[..read].to_vec(),
+        };
+        write_body_piece(&mut client, &body).await?;
+    }
+
+    if let Some(encoder) = encoder {
+        write_body_piece(&mut client, &encoder.finish()?).await?;
+    }
+    client
+        .write_final_chunk()
+        .await
+        .map_err(ImportError::TransportError)
+}
+
+/// Writes `body` as one chunk, except when it is empty, because a zero-length
+/// chunk would end the response.
+async fn write_body_piece(
+    client: &mut HttpTransportClient,
+    body: &[u8],
+) -> Result<(), ImportError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    client
+        .write_chunked_body(body)
+        .await
+        .map_err(ImportError::TransportError)
+}
+
+/// A file of a multi-file import that is already open, with the compression
+/// its stream must apply.
+struct OpenedCsvFile<R> {
+    path: PathBuf,
+    reader: R,
+    compression: Compression,
+}
+
+/// Streams one file of a multi-file import and names the file in any error.
+async fn stream_named_file<R>(
+    client: HttpTransportClient,
+    file: OpenedCsvFile<R>,
+) -> Result<(), ImportError>
+where
+    R: AsyncRead + Unpin,
+{
+    stream_file_to_connection(client, file.reader, file.compression)
+        .await
+        .map_err(|e| ImportError::ParallelImportError(format!("{}: {e}", file.path.display())))
 }
 
 #[cfg(test)]
@@ -1553,12 +1658,14 @@ mod tests {
         assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
     }
 
+    /// Scenario: Parallel CSV import fails before running IMPORT when a file cannot be opened
     #[tokio::test]
-    async fn test_import_from_files_reports_an_unreadable_file_among_many() {
+    async fn test_import_from_files_missing_file_fails_before_connecting() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let existing = dir.path().join("first.csv");
         std::fs::write(&existing, b"1,a\n").expect("write file");
-        let execute_sql = |_sql: String| async { Ok::<u64, String>(1) };
+        let execute_sql =
+            |_sql: String| async { panic!("no IMPORT may run when a file cannot be opened") };
 
         let err = import_from_files(
             execute_sql,
@@ -1567,12 +1674,208 @@ mod tests {
                 existing,
                 std::path::PathBuf::from("/nonexistent/second.csv"),
             ],
-            CsvImportOptions::default(),
+            CsvImportOptions::default().exasol_port(1),
         )
         .await
         .unwrap_err();
 
         assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+        assert!(
+            err.to_string().contains("/nonexistent/second.csv"),
+            "got: {err}"
+        );
+    }
+
+    /// 64 KiB, then a read error, as a file that fails partway through.
+    struct FailsAfterOnePiece {
+        piece_sent: bool,
+    }
+
+    impl AsyncRead for FailsAfterOnePiece {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.piece_sent {
+                return std::task::Poll::Ready(Err(std::io::Error::other("disk read failed")));
+            }
+            self.piece_sent = true;
+            buf.put_slice(&vec![b'x'; DEFAULT_BUFFER_SIZE]);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Larger than one bzip2 block at the default level 6, so bzip2 emits bytes before `finish`.
+    const MORE_THAN_ONE_BZIP2_BLOCK: usize = 2 * 1024 * 1024;
+
+    /// At least `min_len` bytes of CSV rows that do not repeat.
+    fn non_repeating_csv(min_len: usize) -> Vec<u8> {
+        let mut csv = Vec::with_capacity(min_len + 64);
+        let mut row = 0u64;
+        while csv.len() < min_len {
+            let noise = row.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (row << 17);
+            csv.extend_from_slice(format!("{row},{noise:016x},{:08x}\n", noise >> 7).as_bytes());
+            row += 1;
+        }
+        csv
+    }
+
+    fn decompress(compression: Compression, body: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        match compression {
+            Compression::Gzip => flate2::read::GzDecoder::new(body).read_to_end(&mut decoded),
+            Compression::Bzip2 => bzip2::read::BzDecoder::new(body).read_to_end(&mut decoded),
+            Compression::None => unreachable!("an uncompressed body needs no decoder"),
+        }
+        .expect("the body is a complete compressed stream");
+        decoded
+    }
+
+    /// Scenario: Parallel CSV import compresses each file while streaming it
+    #[test]
+    fn test_stream_encoder_pieces_decompress_to_the_input() {
+        let input = non_repeating_csv(MORE_THAN_ONE_BZIP2_BLOCK);
+
+        for compression in [Compression::Gzip, Compression::Bzip2] {
+            let mut encoder = StreamEncoder::new(compression).expect("a compressing encoder");
+            let mut output = Vec::new();
+            let mut emitted_before_finish = false;
+
+            for piece in input.chunks(DEFAULT_BUFFER_SIZE) {
+                let compressed = encoder.write(piece).expect("write a piece");
+                emitted_before_finish |= !compressed.is_empty();
+                output.extend(compressed);
+            }
+            assert!(
+                emitted_before_finish,
+                "{compression:?} must emit bytes before finish"
+            );
+            output.extend(encoder.finish().expect("finish"));
+
+            assert!(
+                decompress(compression, &output) == input,
+                "{compression:?} output must decompress to the input"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stream_encoder_is_absent_without_compression() {
+        assert!(StreamEncoder::new(Compression::None).is_none());
+    }
+
+    /// Scenario: Parallel CSV import streams each file in pieces
+    #[tokio::test]
+    async fn test_stream_file_to_connection_sends_a_piece_before_reading_the_next() {
+        use crate::transport::test_support::{
+            finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+        };
+
+        let mut server = FakeExasolServer::requesting_import().await;
+        let reader = FailsAfterOnePiece { piece_sent: false };
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_file_to_connection(server.connect_tunnel().await, reader, Compression::None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+        let body = ChunkedBody::parse(
+            &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+        );
+        assert_eq!(body.data(), vec![b'x'; DEFAULT_BUFFER_SIZE]);
+        assert!(
+            !body.terminated,
+            "a read error must withhold the final chunk"
+        );
+    }
+
+    /// Scenario: Parallel CSV import streams each file in pieces
+    #[tokio::test]
+    async fn test_stream_file_to_connection_sends_an_uncompressed_file_in_pieces_and_ends_it() {
+        use crate::transport::test_support::{
+            finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+        };
+
+        let mut server = FakeExasolServer::requesting_import().await;
+        let input = non_repeating_csv(3 * DEFAULT_BUFFER_SIZE);
+
+        finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_file_to_connection(server.connect_tunnel().await, &input[..], Compression::None),
+        )
+        .await
+        .expect("the stream succeeds");
+
+        let body = ChunkedBody::parse(
+            &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+        );
+        assert_eq!(body.data(), input);
+        assert!(body.terminated);
+        assert!(body.chunks.iter().all(|c| c.len() <= DEFAULT_BUFFER_SIZE));
+    }
+
+    /// Scenario: Parallel CSV import compresses each file while streaming it
+    #[tokio::test]
+    async fn test_stream_file_to_connection_compressed_body_decompresses_to_the_file() {
+        use crate::transport::test_support::{
+            finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+        };
+
+        let input = non_repeating_csv(256 * 1024);
+
+        for compression in [Compression::Gzip, Compression::Bzip2] {
+            let mut server = FakeExasolServer::requesting_import().await;
+
+            finish_within(
+                LOOPBACK_TEST_BOUND,
+                stream_file_to_connection(server.connect_tunnel().await, &input[..], compression),
+            )
+            .await
+            .expect("the stream succeeds");
+
+            let body = ChunkedBody::parse(
+                &finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await,
+            );
+            assert!(body.terminated);
+            assert!(
+                decompress(compression, &body.data()) == input,
+                "{compression:?} body must decompress to the file"
+            );
+        }
+    }
+
+    /// Scenario: Fail-fast on streaming error
+    #[tokio::test]
+    async fn test_csv_file_task_read_error_names_the_path() {
+        use crate::transport::test_support::{
+            finish_within, FakeExasolServer, LOOPBACK_TEST_BOUND,
+        };
+
+        let server = FakeExasolServer::requesting_import().await;
+        let reader = FailsAfterOnePiece { piece_sent: false };
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_named_file(
+                server.connect_tunnel().await,
+                OpenedCsvFile {
+                    path: std::path::PathBuf::from("/data/part2.csv"),
+                    reader,
+                    compression: Compression::None,
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("/data/part2.csv"), "got: {message}");
+        assert!(message.contains("disk read failed"), "got: {message}");
     }
 
     /// Scenario: Tunnel setup is bounded by 30 seconds by default

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.4
+
+- Fix: the CSV path of `import_from_parquet`, `import_from_parquet_stream`, and `import_parquet_from_files` sends a Parquet file as CSV one RecordBatch at a time. It used to convert the whole file to one CSV buffer before it sent any byte, and `import_parquet_from_files` held the CSV of every file at once. Memory now stays at a few RecordBatches of CSV per file. A value that cannot convert in a later RecordBatch fails the import with `ImportError::ConversionError` after the IMPORT starts, and Exasol imports no rows from that file. A file that is not Parquet and a path that cannot be opened still fail before any SQL runs. Refs #69.
+- Fix: `import_csv_from_files` with several files streams each file in pieces of 64 KiB and compresses it while it streams, instead of reading each whole file and its compressed copy into memory. A missing file still fails with `ImportError::IoError` before any connection or SQL. A read error after a file opens now fails the import with `ParallelImportError` after the IMPORT starts, and the message names the file. Refs #69.
+- Docs: `import_from_parquet_stream` buffers the whole stream on both import paths, because Parquet keeps its metadata at the end of the file. The rustdoc no longer suggests `import_from_parquet` with a file path as the alternative, and explains how to bound memory with `import_from_record_batches`. `docs/import-export.md` has a new Memory Use section, and its Parallel Import example calls `import_csv_from_files`. Refs #69.
+
 ## 0.21.3
 
 - Fix: ADBC `execute_schema`, which Python reaches through `cursor.adbc_execute_schema`, returns the result schema of a statement without running it. It used to run the statement, so an INSERT, UPDATE, or DELETE changed data before the call failed, and a SELECT with parameter markers failed. A statement without a result set returns a schema with no fields. Fixes #62.
