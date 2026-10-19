@@ -25,29 +25,3 @@ This decision scopes `specs/_decision/008-remove-query-timeout.md` and does not 
 ### Consequences
 
 The export timer and the server-enforced `query_timeout` coexist as separate, scoped settings.
-
-## ADR: Add `TransportProtocol::terminate()` for a give-up that cannot trust the response stream
-
-**ID:** transport-terminate-no-round-trip
-**Plan:** fix-csv-export-timeout
-**Status:** Accepted
-
-### Context
-
-`client-give-up-terminates-connection` in `specs/_decision/008-remove-query-timeout.md` requires a give-up to terminate the connection. `TransportProtocol::close()` sends a disconnect and awaits the response. After an abandoned EXPORT, `close()` blocks until the EXPORT finishes server-side.
-
-### Decision
-
-`TransportProtocol` has a required method `fn terminate(&mut self)`. It drops the socket and marks the transport disconnected with no protocol round-trip. `export_to_callback` calls it before returning `ExportError::Timeout` when the timer elapses before the EXPORT response was read.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| New additive `terminate()` with no I/O | ✓ Chosen. It implements the give-up rule and a future `cancel` can reuse it |
-| Call `close()` | ✗ Rejected. It blocks while the abandoned EXPORT runs server-side |
-| Bound the disconnect round-trip inside both `close()` implementations | ✗ Rejected. It changes every close path, adds a magic wait value, and relies on undocumented `close()` behavior |
-
-### Consequences
-
-Both transports implement `terminate()` with the same outcome, and `close()` delegates its teardown to it. `Connection::is_closed()` reads the transport as well as the session. `export_to_callback` terminates only when the EXPORT response is still unread at elapse, tracked by a progress flag, and `ExportError::Timeout` carries `transport_terminated: bool`. A timeout during a slow callback leaves the healthy transport open.
