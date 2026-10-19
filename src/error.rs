@@ -112,10 +112,16 @@ pub enum ConversionError {
     UnsupportedType { exasol_type: String },
 
     /// Failed to convert value
-    #[error("Failed to convert value at row {row}, column {column}: {message}")]
+    #[error("Failed to convert value at row {row}, column {column} ({column_name}) to {target_type}: {message}; value: {value}")]
     ValueConversionFailed {
         row: usize,
         column: usize,
+        /// Column name from the result schema
+        column_name: String,
+        /// The JSON value that failed to convert, as JSON text
+        value: String,
+        /// Display text of the Arrow data type of the column
+        target_type: String,
         message: String,
     },
 
@@ -128,8 +134,19 @@ pub enum ConversionError {
     InvalidFormat(String),
 
     /// Overflow during conversion
-    #[error("Numeric overflow at row {row}, column {column}")]
-    NumericOverflow { row: usize, column: usize },
+    #[error("Numeric overflow at row {row}, column {column} ({column_name}) for {target_type}: {message}; value: {value}")]
+    NumericOverflow {
+        row: usize,
+        column: usize,
+        /// Column name from the result schema
+        column_name: String,
+        /// The JSON value that overflowed, as JSON text
+        value: String,
+        /// Display text of the Arrow data type of the column
+        target_type: String,
+        /// Why the value does not fit the target type
+        message: String,
+    },
 
     /// Invalid UTF-8 string
     #[error("Invalid UTF-8 string at row {row}, column {column}")]
@@ -138,6 +155,92 @@ pub enum ConversionError {
     /// Arrow error
     #[error("Arrow error: {0}")]
     ArrowError(String),
+}
+
+/// Failure of one per-value step while a JSON column becomes an Arrow array.
+///
+/// A per-value step knows the row and the reason but not the column, so the
+/// per-column step adds the column context through `into_conversion_error`,
+/// the only place that builds `ValueConversionFailed` and `NumericOverflow`.
+#[derive(Debug)]
+pub(crate) enum ColumnConversionError {
+    Value {
+        row: usize,
+        reason: String,
+        overflow: bool,
+    },
+    /// A column-level failure, such as an Arrow error, that needs no value context.
+    Other(ConversionError),
+}
+
+impl ColumnConversionError {
+    pub(crate) fn invalid_value(row: usize, reason: impl Into<String>) -> Self {
+        Self::Value {
+            row,
+            reason: reason.into(),
+            overflow: false,
+        }
+    }
+
+    pub(crate) fn overflow(row: usize, reason: impl Into<String>) -> Self {
+        Self::Value {
+            row,
+            reason: reason.into(),
+            overflow: true,
+        }
+    }
+
+    /// Attach the column index, name, failing value, and Arrow data type.
+    ///
+    /// `values` is the column's JSON values, indexed by row.
+    pub(crate) fn into_conversion_error(
+        self,
+        column: usize,
+        column_name: &str,
+        values: &[&serde_json::Value],
+        target_type: &arrow::datatypes::DataType,
+    ) -> ConversionError {
+        match self {
+            Self::Other(error) => error,
+            Self::Value {
+                row,
+                reason,
+                overflow,
+            } => {
+                let value = values
+                    .get(row)
+                    .map_or(serde_json::Value::Null, |v| (*v).clone())
+                    .to_string();
+                let column_name = column_name.to_string();
+                let target_type = target_type.to_string();
+                if overflow {
+                    ConversionError::NumericOverflow {
+                        row,
+                        column,
+                        column_name,
+                        value,
+                        target_type,
+                        message: reason,
+                    }
+                } else {
+                    ConversionError::ValueConversionFailed {
+                        row,
+                        column,
+                        column_name,
+                        value,
+                        target_type,
+                        message: reason,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl From<ConversionError> for ColumnConversionError {
+    fn from(error: ConversionError) -> Self {
+        Self::Other(error)
+    }
 }
 
 /// Errors related to transport protocol.
@@ -229,10 +332,62 @@ mod tests {
         let err = ConversionError::ValueConversionFailed {
             row: 5,
             column: 2,
+            column_name: "PRICE".to_string(),
+            value: "\"abc\"".to_string(),
+            target_type: "Float64".to_string(),
             message: "Invalid number format".to_string(),
         };
         assert!(err.to_string().contains("row 5"));
         assert!(err.to_string().contains("column 2"));
+    }
+
+    #[test]
+    fn column_context_turns_a_value_failure_into_value_conversion_failed() {
+        let values = [&serde_json::Value::Null, &serde_json::json!("yes")];
+        let err = ColumnConversionError::invalid_value(1, "Expected boolean")
+            .into_conversion_error(3, "FLAG", &values, &arrow::datatypes::DataType::Boolean);
+        match err {
+            ConversionError::ValueConversionFailed {
+                row,
+                column,
+                column_name,
+                value,
+                target_type,
+                message,
+            } => {
+                assert_eq!(
+                    (row, column, column_name.as_str(), message.as_str()),
+                    (1, 3, "FLAG", "Expected boolean")
+                );
+                assert_eq!(value, "\"yes\"");
+                assert_eq!(target_type, "Boolean");
+            }
+            other => panic!("expected ValueConversionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_context_turns_an_overflow_into_numeric_overflow() {
+        let values = [&serde_json::json!("123456")];
+        let err = ColumnConversionError::overflow(0, "too many digits").into_conversion_error(
+            0,
+            "AMOUNT",
+            &values,
+            &arrow::datatypes::DataType::Decimal128(5, 2),
+        );
+        assert!(matches!(
+            err,
+            ConversionError::NumericOverflow { row: 0, column: 0, ref column_name, ref value, ref target_type, ref message }
+                if column_name == "AMOUNT" && value == "\"123456\"" && target_type == "Decimal128(5, 2)"
+                    && message == "too many digits"
+        ));
+    }
+
+    #[test]
+    fn column_context_returns_a_carried_conversion_error_unchanged() {
+        let err = ColumnConversionError::from(ConversionError::ArrowError("bad precision".into()))
+            .into_conversion_error(0, "X", &[], &arrow::datatypes::DataType::Boolean);
+        assert_eq!(err.to_string(), "Arrow error: bad precision");
     }
 
     #[test]
@@ -434,9 +589,12 @@ mod tests {
                 ConversionError::ValueConversionFailed {
                     row: 3,
                     column: 4,
+                    column_name: "QTY".to_string(),
+                    value: "\"x\"".to_string(),
+                    target_type: "Int64".to_string(),
                     message: "not a number".to_string(),
                 },
-                "Failed to convert value at row 3, column 4: not a number",
+                "Failed to convert value at row 3, column 4 (QTY) to Int64: not a number; value: \"x\"",
             ),
             (
                 ConversionError::SchemaMismatch("column count".to_string()),
@@ -447,8 +605,15 @@ mod tests {
                 "Invalid data format: Empty decimal string",
             ),
             (
-                ConversionError::NumericOverflow { row: 1, column: 2 },
-                "Numeric overflow at row 1, column 2",
+                ConversionError::NumericOverflow {
+                    row: 1,
+                    column: 2,
+                    column_name: "AMOUNT".to_string(),
+                    value: "\"123456\"".to_string(),
+                    target_type: "Decimal128(5, 2)".to_string(),
+                    message: "6 significant digits exceed precision 5".to_string(),
+                },
+                "Numeric overflow at row 1, column 2 (AMOUNT) for Decimal128(5, 2): 6 significant digits exceed precision 5; value: \"123456\"",
             ),
             (
                 ConversionError::InvalidUtf8 { row: 5, column: 6 },

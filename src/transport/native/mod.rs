@@ -35,9 +35,10 @@ use self::constants::{
     ATTR_RANDOM_PHRASE, ATTR_RELEASE_VERSION, ATTR_SESSIONID, ATTR_TIMEZONE, CMD_CLOSE_PREPARED,
     CMD_CLOSE_RESULTSET, CMD_CREATE_PREPARED, CMD_DISCONNECT, CMD_EXECUTE, CMD_EXECUTE_PREPARED,
     CMD_FETCH2, CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
-    MAX_DATA_MESSAGE_SIZE, PROTOCOL_VERSION, SMALL_RESULTSET, TIMESTAMP_PARAM_PRECISION, T_BOOLEAN,
-    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR,
-    T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
+    MAX_DATA_MESSAGE_SIZE, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SMALL_RESULTSET,
+    TIMESTAMP_PARAM_PRECISION, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY,
+    T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ,
+    T_TIMESTAMP_UTC,
 };
 use self::encryption::ChaCha20Encryptor;
 use self::framing::{MessageHeader, SerialCounter};
@@ -886,6 +887,25 @@ fn attribute_integer(attrs: &AttributeSet, id: u16) -> Option<i64> {
     }
 }
 
+/// The login's protocol version, rejected below the minimum or outside the 32-bit
+/// `SessionInfo` field, so that a malformed value cannot truncate past the check.
+fn negotiated_protocol_version(reported: Option<i64>) -> Result<i32, TransportError> {
+    // A missing attribute keeps the client maximum: no evidence says which servers omit it.
+    let Some(version) = reported else {
+        return Ok(PROTOCOL_VERSION as i32);
+    };
+    if version < i64::from(MIN_PROTOCOL_VERSION) {
+        return Err(TransportError::ProtocolError(format!(
+            "unsupported server: native protocol version {version} is below the minimum supported version {MIN_PROTOCOL_VERSION}"
+        )));
+    }
+    i32::try_from(version).map_err(|_| {
+        TransportError::ProtocolError(format!(
+            "malformed login response: native protocol version {version} does not fit in 32 bits"
+        ))
+    })
+}
+
 /// The change a response's attributes make to the recorded current schema.
 ///
 /// `None` leaves the recorded value unchanged: a response to any command other
@@ -957,9 +977,8 @@ impl LifecycleSteps for NativeTcpTransport {
             .map(|id| id.to_string())
             .unwrap_or_else(|| "0".to_string());
 
-        let protocol_version = attribute_integer(&server_attrs, ATTR_PROTOCOL_VERSION)
-            .map(|version| version as i32)
-            .unwrap_or(PROTOCOL_VERSION as i32);
+        let protocol_version =
+            negotiated_protocol_version(attribute_integer(&server_attrs, ATTR_PROTOCOL_VERSION))?;
 
         let release_version =
             attribute_text(&server_attrs, ATTR_RELEASE_VERSION).unwrap_or_default();
@@ -1406,7 +1425,8 @@ mod tests {
     use crate::transport::lifecycle::{ConnectionLifecycle, ConnectionState};
     use crate::transport::test_support::{
         assert_names_the_termination, finish_within, silent_server_params, test_credentials,
-        SilentServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND, SILENT_SERVER_CONNECTION_TIMEOUT,
+        NativeLoginServer, SilentServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
+        SILENT_SERVER_CONNECTION_TIMEOUT,
     };
     use std::time::Instant;
 
@@ -1486,6 +1506,84 @@ mod tests {
             finish_within(DISCONNECT_BOUND, server.wait_for_disconnect()).await;
         })
         .await;
+    }
+
+    /// Scenario: Server protocol version below 14 is rejected before the password is sent
+    #[tokio::test]
+    async fn login_rejects_a_server_protocol_version_below_14_before_sending_the_password() {
+        for reported in [13, -1] {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                let server = NativeLoginServer::reporting_protocol_version(Some(reported)).await;
+                let mut transport = NativeTcpTransport::new();
+                transport
+                    .connect(&server.params())
+                    .await
+                    .expect("the TLS handshake completes");
+
+                let error = transport
+                    .authenticate(&test_credentials())
+                    .await
+                    .expect_err("a server below the minimum protocol version must be rejected");
+
+                match &error {
+                    TransportError::ProtocolError(message) => {
+                        assert!(message.starts_with("unsupported server"), "{message}");
+                        assert!(message.contains(&reported.to_string()), "{message}");
+                        assert!(message.contains("14"), "{message}");
+                    }
+                    other => panic!("expected a protocol error, got {other:?}"),
+                }
+                drop(transport);
+                let exchange = finish_within(DISCONNECT_BOUND, server.finish()).await;
+                assert!(
+                    exchange.after_login_packet.is_empty(),
+                    "the client sent {} bytes after the login packet",
+                    exchange.after_login_packet.len()
+                );
+            })
+            .await;
+        }
+    }
+
+    /// Scenario: Protocol version negotiation
+    #[tokio::test]
+    async fn login_accepts_server_protocol_versions_from_14_to_the_client_maximum() {
+        let accepted = [
+            Some(14),
+            Some(PROTOCOL_VERSION as i32),
+            Some(PROTOCOL_VERSION as i32 + 1),
+            None,
+        ];
+        for reported in accepted {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                let server = NativeLoginServer::reporting_protocol_version(reported).await;
+                let mut transport = NativeTcpTransport::new();
+                transport
+                    .connect(&server.params())
+                    .await
+                    .expect("the TLS handshake completes");
+
+                let error = transport
+                    .authenticate(&test_credentials())
+                    .await
+                    .expect_err("the server never answers the password message");
+
+                assert!(
+                    !error.to_string().contains("minimum supported version"),
+                    "{reported:?}: {error}"
+                );
+                drop(transport);
+                let exchange = finish_within(DISCONNECT_BOUND, server.finish()).await;
+                let packet = &exchange.login_packet;
+                assert_eq!(packet[0..4], constants::LOGIN_MAGIC.to_le_bytes());
+                assert_eq!(packet[8..12], PROTOCOL_VERSION.to_le_bytes());
+                assert!(
+                    !exchange.after_login_packet.is_empty(),
+                    "{reported:?}: the client must send the password message"
+                );
+            })
+            .await;
+        }
     }
 
     /// Scenario: Terminate a connection whose in-flight response is no longer trusted
@@ -1683,6 +1781,36 @@ mod tests {
         );
         assert_eq!(attribute_integer(&attrs, ATTR_TIMEZONE), None);
         assert_eq!(attribute_integer(&attrs, ATTR_DATA_MESSAGE_SIZE), None);
+    }
+
+    #[test]
+    fn negotiated_protocol_version_rejects_a_value_outside_the_i32_range() {
+        for reported in [(1_i64 << 32) + 13, i64::from(i32::MAX) + 1, i64::MAX] {
+            match negotiated_protocol_version(Some(reported)) {
+                Err(TransportError::ProtocolError(message)) => {
+                    assert!(message.contains("does not fit in 32 bits"), "{message}");
+                    assert!(message.contains(&reported.to_string()), "{message}");
+                }
+                other => panic!("{reported}: expected a protocol error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn negotiated_protocol_version_keeps_values_from_14_and_the_fallback() {
+        let cases = [
+            (Some(14), 14),
+            (Some(22), 22),
+            (Some(i64::from(i32::MAX)), i32::MAX),
+            (None, PROTOCOL_VERSION as i32),
+        ];
+        for (reported, expected) in cases {
+            assert_eq!(
+                negotiated_protocol_version(reported).expect("an accepted version"),
+                expected,
+                "{reported:?}"
+            );
+        }
     }
 
     // --- Rejecting server exceptions ---

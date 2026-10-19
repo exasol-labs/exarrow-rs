@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.25.0
+
+- Changed: a native login to a server that reports a protocol version below 14 fails before the driver sends the password. `Connection::from_params`, which `Database::connect` and `ConnectionBuilder::connect` call, returns `ConnectionError::AuthenticationFailed`, for example `Authentication failed: Protocol error: unsupported server: native protocol version 13 is below the minimum supported version 14`.
+- Added: `Session::supports_at_least(major, minor, patch)` tells whether the server release is at least a given version. It returns `false` when the release version cannot be parsed. `Connection` has no such method.
+- Breaking: `SessionConfig.enable_keepalive` and `SessionConfig.keepalive_interval` are removed. Neither field had any effect.
+- Breaking: `ConversionError::ValueConversionFailed` and `ConversionError::NumericOverflow` gain the fields `column_name`, `value`, and `target_type`, and `NumericOverflow` also gains the field `message`, which states why the value does not fit. Their messages now name the column, the row, the value, and the target type. `arrow_conversion::build_array` takes the column name as a new `&str` parameter.
+- Breaking: on the WebSocket transport, a DECIMAL value that fails to convert returns `ValueConversionFailed` or `NumericOverflow` instead of `InvalidFormat`.
+
 ## 0.24.0
 
 - Fix: CSV export to a file, a stream, or a callback (`export_csv_to_file`, `export_csv_to_stream`, `export_to_file`, `export_to_stream`, `export_to_callback`) passes data on in pieces of at most 64 KiB while the EXPORT statement runs. Memory use stays bounded, with at most 16 pieces waiting, instead of holding the complete result before the first byte reaches the consumer. `export_csv_to_list`, Arrow export, and Parquet export still hold the complete result. Fixes #59.
