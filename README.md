@@ -95,8 +95,6 @@ Community-supported. Licensed under [MIT](LICENSE).
 
 <div align="center">
 
-Build with Rust 🦀 and made with ❤️
-
-Based on a prototype by [marconae](https://github.com/marconae), now maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
+Built with Rust 🦀 and made with ❤️. Maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
 
 </div>

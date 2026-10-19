@@ -7,6 +7,7 @@
 
 - `specs/` holds functional and behavioral requirements only.
 - Integration and e2e testing have no specs. Their rules live in this file.
+- Feature specs never pin dependency, toolchain, or image versions. Those live in `Cargo.toml`, the toolchain file, and CI. Exasol and protocol version thresholds that change behavior stay.
 - A test implementing a spec scenario carries one `/// Scenario: <title>` line per scenario, quoting the title verbatim.
 
 ## Testing
@@ -43,4 +44,3 @@
 - Bump the version in `Cargo.toml` in every PR.
 - Update `CHANGELOG.md` in the same PR as any user-facing change. Entries are concise, user-facing, and sit under a `## X.Y.Z` header matching the new version.
 - Merging a PR makes the CI `release` job tag, release, and publish to crates.io.
-- The full procedure is in `CONTRIBUTING.md` under Releasing.
