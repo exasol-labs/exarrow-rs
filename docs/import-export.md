@@ -4,7 +4,7 @@
 
 # Import / Export
 
-High-performance bulk data transfer via HTTP transport. Supports streaming for large datasets.
+High-performance bulk data transfer via HTTP transport. CSV export to a file, a stream, or a callback passes data on in pieces while the export runs, so its memory use does not grow with the size of the export. `export_csv_to_list`, Arrow export, and Parquet export hold the complete result in memory.
 
 ## Which import path should I use?
 
@@ -294,6 +294,8 @@ let options = CsvExportOptions::default().with_column_names(true);
 let rows = connection.export_csv_to_file(source, Path::new("/tmp/export.csv"), options).await?;
 ```
 
+Export to a file, a stream, or a callback passes the data on in pieces of at most 64 KiB while the EXPORT statement runs. At most 16 pieces wait for your writer or callback. When they are all waiting, the driver stops reading from Exasol, so a slow writer or callback slows the export on the server instead of growing memory. `export_to_callback` hands your callback the pieces as Exasol sent them, so with compression set they are still compressed. The file and stream paths decompress each piece for you. A piece boundary can fall inside a CSV record, so a record can span two pieces. When the export fails after data started to flow, the file, writer, or callback can hold partial output.
+
 ### Export Timeout
 
 By default, `CsvExportOptions::default()` arms no client-side timer. The export runs for as long as the EXPORT statement takes on the server, and completes even if that takes longer than five minutes.
@@ -307,7 +309,7 @@ let options = CsvExportOptions::default().timeout_ms(30_000); // 30-second clien
 When the timeout elapses, the export returns `ExportError::Timeout { timeout_ms, transport_terminated }`. `transport_terminated` tells you whether the connection is still usable:
 
 - `transport_terminated: true` — the timeout fired before the driver had read the EXPORT response. The driver can no longer match that response to a later one, so it terminates the transport. Reconnect before issuing another statement on this connection. A statement issued on that connection afterwards fails with `Transport was terminated after an export gave up on an in-flight response; reconnect before the next operation`.
-- `transport_terminated: false` — the timeout fired later, for example while your callback was still processing data already received. The EXPORT response was already read, so the connection remains usable for the next statement.
+- `transport_terminated: false` — the timeout fired only after the server finished the transfer and answered the EXPORT statement, for example while your callback was still processing data already received. The EXPORT response was already read, so the connection remains usable for the next statement. A timeout during a slow write or callback that stalls the transfer reports `transport_terminated: true`, because the server has not answered yet.
 
 In both cases, treat any output already written to your file, stream, or callback as an incomplete CSV document and discard it. The driver gives no guarantee that a timed-out export left a complete file behind.
 

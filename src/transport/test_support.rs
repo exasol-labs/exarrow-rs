@@ -7,19 +7,22 @@
 //! to eliminate. It is declared out of line from `transport::mod`, which also
 //! keeps every line here out of the production coverage denominator.
 //!
-//! Doubles here: `MockTransport` and `StalledQueryTransport` for the
-//! `TransportProtocol` trait with `transport_session_info` as the session a
-//! mocked login reports, `FakeExasolServer` for the HTTP-tunnel wire
-//! format (answering, requesting an import, silent before or after its
-//! handshake, or starting, stalling, or refusing the TLS handshake that Exasol
-//! runs as the client) with `ChunkedBody` to split what it received,
+//! Doubles here: `MockTransport`, `StalledQueryTransport`, and
+//! `GatedQueryTransport` for the `TransportProtocol` trait with
+//! `transport_session_info` as the session a mocked login reports,
+//! `FakeExasolServer` for the HTTP-tunnel wire format (answering, requesting an
+//! import, streaming a chunked EXPORT body behind a gate or breaking off after
+//! its first chunk, silent before or after its handshake, or starting,
+//! stalling, or refusing the TLS handshake that Exasol runs as the client)
+//! with `ChunkedBody` to split what it received,
 //! `SilentServer` for a peer that accepts and then never answers (plain,
 //! after TLS, or after the WebSocket upgrade), and `FakeWebSocketServer`
 //! (`websocket` feature) for scripted WebSocket API exchanges.
 
 use crate::error::TransportError;
 use crate::transport::http_transport::{
-    generate_magic_packet, TlsCertificate, EXA_MAGIC_PACKET_SIZE, EXA_RESPONSE_PACKET_SIZE,
+    encode_chunk, generate_magic_packet, TlsCertificate, EXA_MAGIC_PACKET_SIZE,
+    EXA_RESPONSE_PACKET_SIZE,
 };
 use crate::transport::messages::{ResultData, ResultSetHandle, SessionInfo};
 use crate::transport::protocol::{
@@ -84,25 +87,50 @@ pub(crate) fn exa_response_packet(ip: &str, port: i32) -> [u8; EXA_RESPONSE_PACK
     packet
 }
 
-/// A transport whose `execute_query` never resolves, delegating every other
-/// call to the wrapped mock.
+/// A transport whose `execute_query` is held back, delegating every other call
+/// to the wrapped mock. It either never resolves ([`Self::stalled`]) or
+/// resolves with a preset result once a signal fires ([`Self::new`]).
 ///
 /// `mockall` hands back an already-ready future, so a mock on its own cannot
-/// represent a SQL response that is still outstanding — the one state a
+/// represent a SQL response that is still outstanding, the one state a
 /// client-side deadline exists to interrupt. Delegating the rest keeps
 /// expectations and their verification with the inner mock.
-pub(crate) struct StalledQueryTransport {
+///
+/// Exasol answers an EXPORT statement only after the tunnel transfer ended, so
+/// a loopback test of the export order has to decide when the response
+/// arrives, which a mock's ready future cannot. A dropped signal never fires.
+pub(crate) struct GatedQueryTransport {
     inner: MockTransport,
+    answer: Option<Answer>,
 }
 
-impl StalledQueryTransport {
-    pub(crate) fn new(inner: MockTransport) -> Self {
-        Self { inner }
+struct Answer {
+    release: oneshot::Receiver<()>,
+    result: Result<QueryResult, TransportError>,
+}
+
+impl GatedQueryTransport {
+    pub(crate) fn new(
+        inner: MockTransport,
+        release: oneshot::Receiver<()>,
+        result: Result<QueryResult, TransportError>,
+    ) -> Self {
+        Self {
+            inner,
+            answer: Some(Answer { release, result }),
+        }
+    }
+
+    pub(crate) fn stalled(inner: MockTransport) -> Self {
+        Self {
+            inner,
+            answer: None,
+        }
     }
 }
 
 #[async_trait]
-impl TransportProtocol for StalledQueryTransport {
+impl TransportProtocol for GatedQueryTransport {
     async fn connect(&mut self, params: &ConnectionParams) -> Result<(), TransportError> {
         self.inner.connect(params).await
     }
@@ -115,7 +143,13 @@ impl TransportProtocol for StalledQueryTransport {
     }
 
     async fn execute_query(&mut self, _sql: &str) -> Result<QueryResult, TransportError> {
-        std::future::pending().await
+        let Some(answer) = self.answer.take() else {
+            return std::future::pending().await;
+        };
+        if answer.release.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        answer.result
     }
 
     async fn fetch_results(
@@ -233,6 +267,67 @@ impl FakeExasolServer {
             read_until_end_of_stream(&mut stream).await
         })
         .await
+    }
+
+    /// Answers the handshake and sends a chunked `PUT` whose first chunk is
+    /// `chunks[0]`, then waits for `gate` before it sends the remaining chunks
+    /// and the terminator, as Exasol streams an EXPORT body while the statement
+    /// runs. The returned receiver fires once the peer has read the driver's
+    /// 200 OK, which a test can make the EXPORT response wait for.
+    ///
+    /// A dropped gate never opens. A driver that closes the tunnel while the
+    /// peer waits at the gate ends the peer, as `wait_for_disconnect` observes,
+    /// and the receiver never fires. `wait_for_disconnect` returns the bytes
+    /// the peer read after its last chunk.
+    pub(crate) async fn serving_chunked_put(
+        chunks: Vec<Vec<u8>>,
+        gate: oneshot::Receiver<()>,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (report_response, response_received) = oneshot::channel();
+        let server = Self::spawn(|listener| async move {
+            let mut stream = accept_and_handshake(&listener).await;
+            let mut chunks = chunks.into_iter();
+            write_chunked_put_head(&mut stream).await;
+            if let Some(first) = chunks.next() {
+                write_and_flush(&mut stream, &encode_chunk(&first)).await;
+            }
+            if !gate_opens_before_disconnect(gate, &mut stream).await {
+                return Vec::new();
+            }
+            for chunk in chunks {
+                write_and_flush(&mut stream, &encode_chunk(&chunk)).await;
+            }
+            write_and_flush(&mut stream, &encode_chunk(&[])).await;
+
+            let mut received = read_response_head(&mut stream).await;
+            if received.ends_with(b"\r\n\r\n") {
+                let _ = report_response.send(());
+            }
+            received.extend(read_until_end_of_stream(&mut stream).await);
+            received
+        })
+        .await;
+        (server, response_received)
+    }
+
+    /// Answers the handshake, sends a chunked `PUT` with `first_chunk`, and
+    /// then closes its sending side without a terminator, as a tunnel that
+    /// breaks in the middle of the body. The returned receiver fires once the
+    /// peer has closed.
+    pub(crate) async fn closing_after_first_chunk(
+        first_chunk: Vec<u8>,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (report_close, closed) = oneshot::channel();
+        let server = Self::spawn(|listener| async move {
+            let mut stream = accept_and_handshake(&listener).await;
+            write_chunked_put_head(&mut stream).await;
+            write_and_flush(&mut stream, &encode_chunk(&first_chunk)).await;
+            stream.shutdown().await.expect("close the sending side");
+            let _ = report_close.send(());
+            read_until_end_of_stream(&mut stream).await
+        })
+        .await;
+        (server, closed)
     }
 
     /// Answers the handshake and then sends nothing, leaving the export's
@@ -644,6 +739,49 @@ async fn accept_and_handshake(listener: &TcpListener) -> TcpStream {
         .expect("write the response packet");
     stream.flush().await.expect("flush the response packet");
     stream
+}
+
+async fn write_and_flush(stream: &mut TcpStream, bytes: &[u8]) {
+    stream.write_all(bytes).await.expect("write to the driver");
+    stream.flush().await.expect("flush to the driver");
+}
+
+async fn write_chunked_put_head(stream: &mut TcpStream) {
+    write_and_flush(
+        stream,
+        b"PUT /000.csv HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .await;
+}
+
+/// Reports whether `gate` opened before the driver closed the tunnel. The
+/// driver sends nothing before its 200 OK, so a read that completes means the
+/// tunnel closed.
+async fn gate_opens_before_disconnect(gate: oneshot::Receiver<()>, stream: &mut TcpStream) -> bool {
+    let opened = async {
+        if gate.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        () = opened => true,
+        _ = stream.read(&mut probe) => false,
+    }
+}
+
+/// Reads up to and including the blank line that ends an HTTP response head,
+/// or until the driver closes the tunnel.
+async fn read_response_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte).await {
+            Ok(1) => head.push(byte[0]),
+            _ => break,
+        }
+    }
+    head
 }
 
 /// A loopback WebSocket peer that answers each request with the next scripted

@@ -51,8 +51,10 @@ mod common;
 use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow::util::display::array_value_to_string;
 use common::{
-    disable_query_cache, generate_test_schema_name, get_test_connection, long_running_count_query,
+    disable_query_cache, generate_test_schema_name, get_test_connection, large_export_query,
+    large_export_rows, long_running_count_query, PieceStats,
 };
 use exarrow_rs::adbc::Connection;
 use exarrow_rs::export::arrow::ArrowExportOptions;
@@ -62,10 +64,14 @@ use exarrow_rs::import::arrow::ArrowImportOptions;
 use exarrow_rs::import::csv::CsvImportOptions;
 use exarrow_rs::import::parquet::ParquetImportOptions;
 use exarrow_rs::import::ImportError;
-use exarrow_rs::query::export::ExportSource;
+use exarrow_rs::query::export::{Compression, ExportSource};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
 // Helper Functions
 
@@ -353,6 +359,8 @@ async fn test_csv_import_from_stream() {
 // Section 2: CSV Export Integration Tests
 
 /// 11.2.1 Test export table to CSV file
+///
+/// Scenario: Export table to CSV file
 #[tokio::test]
 async fn test_csv_export_table_to_file() {
     skip_if_no_exasol!();
@@ -398,6 +406,8 @@ async fn test_csv_export_table_to_file() {
 }
 
 /// 11.2.2 Test export query result to CSV
+///
+/// Scenario: Export query to CSV file
 #[tokio::test]
 async fn test_csv_export_query_to_file() {
     skip_if_no_exasol!();
@@ -441,6 +451,8 @@ async fn test_csv_export_query_to_file() {
 }
 
 /// 11.2.3 Test export with column headers
+///
+/// Scenario: Export with column headers
 #[tokio::test]
 async fn test_csv_export_with_headers() {
     skip_if_no_exasol!();
@@ -503,6 +515,8 @@ async fn test_csv_export_with_headers() {
 /// from Exasol, but the library decompresses the data before writing to the output file.
 /// The resulting file is NOT gzip compressed - it contains plain CSV data.
 /// This test verifies that gzip transfer encoding works correctly for data transfer.
+///
+/// Scenario: Export with compression
 #[tokio::test]
 async fn test_csv_export_with_gzip_transfer() {
     skip_if_no_exasol!();
@@ -551,6 +565,8 @@ async fn test_csv_export_with_gzip_transfer() {
 }
 
 /// 11.2.5 Test export to in-memory list (callback-style)
+///
+/// Scenario: Export to in-memory list
 #[tokio::test]
 async fn test_csv_export_to_list() {
     skip_if_no_exasol!();
@@ -589,6 +605,8 @@ async fn test_csv_export_to_list() {
 }
 
 /// 11.2.6 Test export to async stream
+///
+/// Scenario: Export to async stream
 #[tokio::test]
 async fn test_csv_export_to_stream() {
     skip_if_no_exasol!();
@@ -622,6 +640,294 @@ async fn test_csv_export_to_stream() {
 
     // Cleanup
     cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// The longest a streaming export test waits for an export, so a deadlock
+/// fails the test instead of hanging it.
+const STREAMING_EXPORT_LIMIT: Duration = Duration::from_secs(120);
+
+async fn within_streaming_export_limit<T>(operation: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(STREAMING_EXPORT_LIMIT, operation)
+        .await
+        .unwrap_or_else(|_| panic!("the export did not finish within {STREAMING_EXPORT_LIMIT:?}"))
+}
+
+/// Records each write in `PieceStats`, each write completing only after
+/// `delay`, so the export meets a slow consumer.
+struct RecordingWriter {
+    stats: PieceStats,
+    delay: Duration,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl RecordingWriter {
+    fn delaying_each_write(delay: Duration) -> Self {
+        Self {
+            stats: PieceStats::default(),
+            delay,
+            sleep: None,
+        }
+    }
+}
+
+impl AsyncWrite for RecordingWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let delay = self.delay;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+        if sleep.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        self.sleep = None;
+        self.stats.record(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Fails its third write, as a full disk would.
+struct FailingOnThirdWrite {
+    writes: usize,
+}
+
+impl AsyncWrite for FailingOnThirdWrite {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.writes += 1;
+        if self.writes == 3 {
+            return Poll::Ready(Err(std::io::Error::other("disk full")));
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn large_export_source(rows: u32) -> ExportSource {
+    ExportSource::Query {
+        sql: large_export_query(rows),
+    }
+}
+
+async fn assert_select_1_succeeds(conn: &mut Connection) {
+    let batches = conn
+        .query("SELECT 1")
+        .await
+        .expect("the export connection must stay usable");
+    assert_eq!(batches[0].num_rows(), 1);
+}
+
+/// A writer delayed by 1 ms per write still receives every row, in more than 16 writes of at most 64 KiB each.
+///
+/// Scenario: Export to async stream
+/// Scenario: Export applies backpressure to a slow consumer
+#[tokio::test]
+async fn test_csv_export_to_stream_writes_a_large_query_in_pieces() {
+    skip_if_no_exasol!();
+
+    let rows = large_export_rows();
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let mut writer = RecordingWriter::delaying_each_write(Duration::from_millis(1));
+
+    let rows_exported = within_streaming_export_limit(conn.export_csv_to_stream(
+        large_export_source(rows),
+        &mut writer,
+        CsvExportOptions::default().use_tls(false),
+    ))
+    .await
+    .expect("a large CSV export to a slow writer must succeed");
+
+    let stats = &writer.stats;
+    assert_eq!(rows_exported, u64::from(rows));
+    assert_eq!(stats.line_feeds, rows as usize);
+    assert!(stats.pieces > 16, "expected more than 16 writes: {stats:?}");
+    assert!(
+        stats.largest <= 65_536,
+        "a write exceeded 64 KiB: {stats:?}"
+    );
+    assert!(stats
+        .last
+        .as_ref()
+        .is_some_and(|last| last.ends_with(b"\n")));
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+fn sorted_lines(csv: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = csv.split(|&byte| byte == b'\n').collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// Scenario: Export with compression
+#[tokio::test]
+async fn test_csv_export_gzip_and_bzip2_match_the_uncompressed_export() {
+    skip_if_no_exasol!();
+
+    let rows = large_export_rows();
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let mut exports = Vec::new();
+
+    for compression in [Compression::None, Compression::Gzip, Compression::Bzip2] {
+        let mut csv = Vec::new();
+        let rows_exported = within_streaming_export_limit(
+            conn.export_csv_to_stream(
+                large_export_source(rows),
+                &mut csv,
+                CsvExportOptions::default()
+                    .use_tls(false)
+                    .compression(compression),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the {compression:?} export must succeed: {e}"));
+        assert_eq!(rows_exported, u64::from(rows), "{compression:?}");
+        exports.push(csv);
+    }
+
+    let uncompressed = sorted_lines(&exports[0]);
+    assert_eq!(sorted_lines(&exports[1]), uncompressed, "gzip");
+    assert_eq!(sorted_lines(&exports[2]), uncompressed, "bzip2");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+async fn current_session(conn: &mut Connection) -> String {
+    let batches = conn
+        .query("SELECT CURRENT_SESSION")
+        .await
+        .expect("SELECT CURRENT_SESSION should succeed");
+    array_value_to_string(batches[0].column(0), 0).expect("the session id displays")
+}
+
+/// How often a test looks for a statement in another session.
+const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How many looks a test takes before it gives up, 30 seconds in all.
+const SESSION_POLL_ATTEMPTS: usize = 300;
+
+/// Waits until `observer` sees `session` executing a statement named `command`.
+async fn wait_until_session_executes(observer: &mut Connection, session: &str, command: &str) {
+    for _ in 0..SESSION_POLL_ATTEMPTS {
+        let batches = observer
+            .query(format!(
+                "SELECT COUNT(*) FROM EXA_DBA_SESSIONS WHERE SESSION_ID = {session} \
+                 AND STATUS = 'EXECUTE SQL' AND COMMAND_NAME = '{command}'"
+            ))
+            .await
+            .expect("the session lookup should succeed");
+        if array_value_to_string(batches[0].column(0), 0).expect("COUNT(*) displays") == "1" {
+            return;
+        }
+        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+    }
+    panic!("session {session} never executed {command}");
+}
+
+/// The writer holds the transfer after its first byte arrives, and a second
+/// session kills the statement. A kill that reaches a stalled transfer takes
+/// effect only once the transfer moves again, so the test drains the writer
+/// once the server shows the kill running.
+///
+/// Scenario: Export statement fails while data streams
+#[tokio::test]
+async fn test_csv_export_stream_returns_the_sql_error_when_the_statement_is_killed_mid_transfer() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let session = current_session(&mut conn).await;
+    let mut killer = get_test_connection()
+        .await
+        .expect("Failed to open the second connection");
+    let killer_session = current_session(&mut killer).await;
+    let mut observer = get_test_connection()
+        .await
+        .expect("Failed to open the third connection");
+    let (writer, mut held_output) = tokio::io::duplex(1024);
+    let kill_sql = format!("KILL STATEMENT IN SESSION {session}");
+
+    let (outcome, killed) = within_streaming_export_limit(async {
+        tokio::join!(
+            conn.export_csv_to_stream(
+                large_export_source(large_export_rows()),
+                writer,
+                CsvExportOptions::default().use_tls(false),
+            ),
+            async {
+                let mut first_byte = [0u8; 1];
+                held_output
+                    .read_exact(&mut first_byte)
+                    .await
+                    .expect("the first piece reaches the writer");
+                let kill = killer.execute_update(&kill_sql);
+                tokio::pin!(kill);
+                tokio::select! {
+                    killed = &mut kill => killed,
+                    () = wait_until_session_executes(&mut observer, &killer_session, "KILL") => {
+                        let mut rest = Vec::new();
+                        let (killed, _) = tokio::join!(&mut kill, held_output.read_to_end(&mut rest));
+                        killed
+                    }
+                }
+            }
+        )
+    })
+    .await;
+
+    killed.expect("KILL STATEMENT should succeed");
+    match outcome {
+        Err(ExportError::SqlExecutionError { .. }) => {}
+        other => panic!("expected the killed statement's SqlExecutionError, got {other:?}"),
+    }
+    assert_select_1_succeeds(&mut conn).await;
+
+    observer.close().await.expect("Failed to close connection");
+    killer.close().await.expect("Failed to close connection");
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Export consumer fails while data streams
+#[tokio::test]
+async fn test_csv_export_stream_returns_the_writer_error_and_keeps_the_connection_usable() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let outcome = within_streaming_export_limit(conn.export_csv_to_stream(
+        large_export_source(large_export_rows()),
+        FailingOnThirdWrite { writes: 0 },
+        CsvExportOptions::default().use_tls(false),
+    ))
+    .await;
+
+    match outcome {
+        Err(ExportError::IoError(error)) => assert_eq!(error.to_string(), "disk full"),
+        other => panic!("expected the writer's IoError, got {other:?}"),
+    }
+    assert_select_1_succeeds(&mut conn).await;
+
     conn.close().await.expect("Failed to close connection");
 }
 

@@ -111,8 +111,9 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *GIVEN* an HTTP tunnel is established for an export operation
 * *WHEN* EXPORT SQL is executed
 * *THEN* Exasol SHALL send HTTP PUT request through tunnel with data
-* *AND* client SHALL receive PUT request with chunked transfer encoding
-* *AND* client SHALL read data chunks until zero-length terminator
+* *AND* client SHALL receive PUT request with chunked transfer encoding, or with a Content-Length header
+* *AND* client SHALL read data chunks until zero-length terminator, or read exactly the Content-Length bytes
+* *AND* client SHALL send HTTP 200 OK after it has forwarded the last piece of the body
 
 ### Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
 
@@ -160,3 +161,11 @@ The client establishes an outbound TCP connection to Exasol and performs a magic
 * *AND* when Exasol starts the TLS handshake within the bound, the client SHALL complete it and serve the HTTP request
 * *AND* when the peer closes the tunnel connection before it sends a TLS byte, that read or write SHALL fail with an error before the bound elapses
 * *AND* when the IMPORT statement returns an error during the wait, the system SHALL stop serving the tunnel and SHALL return the Exasol error to the caller
+
+### Scenario: Export body is forwarded in bounded pieces
+
+* *GIVEN* the client reads the body of an EXPORT PUT request
+* *WHEN* body bytes arrive through the tunnel
+* *THEN* client SHALL forward them to the caller's bounded channel as it reads them, in pieces of at most 64 KiB (65536 bytes), and MUST NOT collect the complete body first
+* *AND* while the caller's channel is full, client SHALL NOT read further body bytes from the tunnel
+* *AND* IF the caller has closed its channel, client SHALL read and discard the rest of the body without forwarding it, and SHALL then send HTTP 200 OK
