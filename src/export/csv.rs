@@ -18,7 +18,7 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bzip2::read::BzDecoder;
 use flate2::read::MultiGzDecoder;
@@ -774,7 +774,7 @@ struct PieceFeed(Arc<Mutex<FeedState>>);
 
 impl io::Read for PieceFeed {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let len = out.len().min(state.data.len() - state.position);
         if len == 0 {
             return match state.ended || out.is_empty() {
@@ -814,7 +814,7 @@ impl PieceDecoder {
     }
 
     fn feed_state(&self) -> std::sync::MutexGuard<'_, FeedState> {
-        self.feed.lock().unwrap_or_else(|e| e.into_inner())
+        self.feed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Adds the next piece of the body. Call [`Self::next_block`] until it
