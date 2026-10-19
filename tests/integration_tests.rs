@@ -3010,61 +3010,52 @@ async fn test_build_sql_scanner_end_to_end_via_execute_statement() {
     conn.close().await.expect("Failed to close connection");
 }
 
+/// Scenario: Arrow and Parquet dependencies resolve to version 59 or above with one version of each Arrow sub-crate
 #[test]
-fn test_arrow_parquet_resolve_to_58_or_above_with_unified_sub_crates() {
+fn test_arrow_parquet_resolve_to_59_or_above_with_unified_sub_crates() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let lockfile = std::fs::read_to_string(format!("{manifest_dir}/Cargo.lock"))
         .expect("Cargo.lock must be readable");
 
-    let arrow_version = lockfile
-        .lines()
-        .skip_while(|l| !l.contains("name = \"arrow\""))
-        .nth(1)
-        .and_then(|l| l.strip_prefix("version = \""))
-        .and_then(|l| l.strip_suffix('"'))
-        .expect("arrow version not found in Cargo.lock");
+    let versions_of = |name: &str| -> Vec<String> {
+        let name_line = format!("name = \"{name}\"");
+        let lines: Vec<&str> = lockfile.lines().collect();
+        lines
+            .windows(2)
+            .filter(|w| w[0] == name_line)
+            .filter_map(|w| w[1].strip_prefix("version = \""))
+            .filter_map(|v| v.strip_suffix('"'))
+            .map(str::to_owned)
+            .collect()
+    };
+    let major = |version: &str| -> u32 {
+        version
+            .split('.')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .expect("major version must be numeric")
+    };
 
-    let parquet_version = lockfile
-        .lines()
-        .skip_while(|l| !l.contains("name = \"parquet\""))
-        .nth(1)
-        .and_then(|l| l.strip_prefix("version = \""))
-        .and_then(|l| l.strip_suffix('"'))
-        .expect("parquet version not found in Cargo.lock");
+    for name in ["arrow", "parquet"] {
+        let versions = versions_of(name);
+        assert!(!versions.is_empty(), "{name} not found in Cargo.lock");
+        for version in &versions {
+            assert!(
+                major(version) >= 59,
+                "{name} must resolve to >= 59.x, got {version}"
+            );
+        }
+    }
 
-    let arrow_major: u32 = arrow_version
-        .split('.')
-        .next()
-        .unwrap()
-        .parse()
-        .expect("arrow major version must be numeric");
-    let parquet_major: u32 = parquet_version
-        .split('.')
-        .next()
-        .unwrap()
-        .parse()
-        .expect("parquet major version must be numeric");
-
-    assert!(
-        arrow_major >= 58,
-        "arrow must resolve to >= 58.x, got {arrow_version}"
-    );
-    assert!(
-        parquet_major >= 58,
-        "parquet must resolve to >= 58.x, got {parquet_version}"
-    );
-
-    // Verify no duplicate arrow-array at both 57.x and 58.x (adbc_core unification).
-    let arrow_array_57_count = lockfile
-        .lines()
-        .skip_while(|l| !l.contains("name = \"arrow-array\""))
-        .take_while(|l| !l.is_empty())
-        .filter(|l| l.contains("version = \"57."))
-        .count();
-    assert_eq!(
-        arrow_array_57_count, 0,
-        "arrow-array must not appear at a 57.x version alongside 58.x"
-    );
+    // adbc_core traits take arrow-array/arrow-schema types, so a second version breaks the FFI build.
+    for name in ["arrow-array", "arrow-schema"] {
+        let versions = versions_of(name);
+        assert_eq!(
+            versions.len(),
+            1,
+            "{name} must resolve to exactly one version, got {versions:?}"
+        );
+    }
 }
 
 // Section 11: Batch Prepared Statement Integration Tests

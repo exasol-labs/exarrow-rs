@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.23.0
+
+- Breaking: exarrow-rs uses `arrow` and `parquet` 59. Rust code that passes Arrow types such as `RecordBatch` or `Schema` to or from exarrow-rs must move to `arrow` 59. Callers that load the driver through an ADBC driver manager are not affected. `adbc_core` and `adbc_ffi` stay at 0.24. Refs #98.
+- Security: `thrift` is no longer a dependency, so GHSA-2f9f-gq7v-9h6m (CVE-2026-43868) no longer applies. The `deny.toml` suppressions for this advisory and for the unmaintained `paste` crate (RUSTSEC-2024-0436) are removed.
+
 ## 0.22.1
 
 - Fix: the CSV path of `import_from_parquet`, `import_from_parquet_stream`, and `import_parquet_from_files` sends a Parquet file as CSV one RecordBatch at a time. It used to convert the whole file to one CSV buffer before it sent any byte, and `import_parquet_from_files` held the CSV of every file at once. Memory now stays at a few RecordBatches of CSV per file. A value that cannot convert in a later RecordBatch fails the import with `ImportError::ConversionError` after the IMPORT starts, and Exasol imports no rows from that file. A file that is not Parquet and a path that cannot be opened still fail before any SQL runs. Refs #69.

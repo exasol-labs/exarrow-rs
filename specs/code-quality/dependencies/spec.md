@@ -48,12 +48,3 @@ Patch-level version bumps (`cargo update`) MAY be applied without a breaking-cha
 * *THEN* the CI step MUST exit with a non-zero exit code
 * *AND* the build MUST be marked as failed
 * *AND* the pull request MUST NOT be mergeable until the advisory is patched or suppressed with rationale
-
-### Scenario: GHSA-2f9f-gq7v-9h6m suppression for Apache Thrift
-
-* *GIVEN* `parquet 58.x` pulls in `thrift 0.17.0` as a transitive dependency
-* *AND* the `parquet` semver constraint `^0.17` prevents an update to a `thrift` release that fixes GHSA-2f9f-gq7v-9h6m, and `parquet 59.x`, which drops `thrift`, needs `arrow 59` that the downstream users of exarrow-rs do not use yet
-* *WHEN* `cargo deny --all-features check advisories` is run
-* *THEN* the check MUST exit with code 0
-* *AND* the suppression MUST reference `GHSA-2f9f-gq7v-9h6m`
-* *AND* the suppression `reason` MUST state that `parquet 58.x` requires `thrift ^0.17`, that the fix is in `parquet 59.x`, and that re-evaluation is triggered when exarrow-rs and its downstream users move to `arrow 59`
