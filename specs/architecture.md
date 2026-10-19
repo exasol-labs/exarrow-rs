@@ -71,7 +71,7 @@
 
 ## Constraints
 
-- Rust edition 2021, and CI pins the stable toolchain 1.92.0
+- Rust edition 2021, and CI pins the stable toolchain
 - Cargo feature `native` is the default transport, `websocket` is optional, `ffi` enables `native`, and a build without either transport rejects every connection
 - TLS and server certificate validation are on by default
 - Connection timeout defaults to 30 seconds and cannot exceed 300 seconds, and the driver has no idle timeout
@@ -89,7 +89,7 @@
 - CI rejects clippy warnings, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, a failing library unit test with the default features, the `websocket` feature, or the `ffi` feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
 - Library unit tests run in CI without a database server, so a unit test uses a test double, such as a mock transport or a local fake server, and never connects to Exasol
 - The `ffi` unit tests run in CI outside the coverage run, because cargo-llvm-cov with the `ffi` feature deadlocks
-- Integration tests require a running Exasol instance on port 8563, CI uses the image `exasol/docker-db:2025.2.1`, and the CI integration job runs every integration test target under `tests/`
+- Integration tests require a running Exasol instance on port 8563, CI uses the `exasol/docker-db` image, and the CI integration job runs every integration test target under `tests/`
 - DATE and TIMESTAMP values convert between Exasol and Arrow by the year, month, and day that Exasol reports, counted in the proleptic Gregorian calendar, on every read and write path
 
 ## External Dependencies

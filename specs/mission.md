@@ -16,22 +16,22 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 
 ## Core Capabilities
 
-1. **ADBC-compatible database connectivity** — standard Driver/Database/Connection/Statement hierarchy over Exasol's native TCP protocol (default) or WebSocket protocol (opt-in fallback)
-2. **Bulk import/export via HTTP tunneling** — high-throughput data transfer for CSV, Parquet, and Arrow RecordBatch formats with parallel file support and optional automatic creation of the target table on import
-3. **Arrow-native type conversion** — bidirectional mapping between Exasol and Arrow type systems with precision preservation
-4. **FFI export for driver manager integration** — cdylib build target enabling any ADBC driver manager to load and use the driver
-5. **Prepared statement support** — type-safe parameter binding, single and batch execution over the native TCP protocol (default) or the WebSocket protocol
-6. **Metadata lookup** — ADBC catalog, schema, and column discovery through GetObjects, table schema lookup, and parameter schema lookup after prepare
-7. **Transaction control** — autocommit on or off, commit, and rollback on a Connection
-8. **ADBC bulk ingestion** — ingest Arrow data into a target table through the standard Statement with IngestMode Append, Create, CreateAppend, or Replace, generating table DDL from the Arrow schema
-9. **Authentication and session setup** — username and password login (RSA-encrypted password on the native protocol), no credential logging, and a default schema from the URI or connection parameters that must exist, set as a session attribute on connect
-10. **Query execution and server version gating** — SQL execution with placeholder parsing that skips literals, comments, and quoted identifiers, and feature gating on the server release version
+1. **ADBC-compatible database connectivity**: standard Driver/Database/Connection/Statement hierarchy over Exasol's native TCP protocol (default) or WebSocket protocol (opt-in fallback)
+2. **Bulk import/export via HTTP tunneling**: high-throughput data transfer for CSV, Parquet, and Arrow RecordBatch formats with parallel file support and optional automatic creation of the target table on import
+3. **Arrow-native type conversion**: bidirectional mapping between Exasol and Arrow type systems with precision preservation
+4. **FFI export for driver manager integration**: cdylib build target enabling any ADBC driver manager to load and use the driver
+5. **Prepared statement support**: type-safe parameter binding, single and batch execution over the native TCP protocol (default) or the WebSocket protocol
+6. **Metadata lookup**: ADBC catalog, schema, and column discovery through GetObjects, table schema lookup, and parameter schema lookup after prepare
+7. **Transaction control**: autocommit on or off, commit, and rollback on a Connection
+8. **ADBC bulk ingestion**: ingest Arrow data into a target table through the standard Statement with IngestMode Append, Create, CreateAppend, or Replace, generating table DDL from the Arrow schema
+9. **Authentication and session setup**: username and password login (RSA-encrypted password on the native protocol), no credential logging, and a default schema from the URI or connection parameters that must exist, set as a session attribute on connect
+10. **Query execution and server version gating**: SQL execution with placeholder parsing that skips literals, comments, and quoted identifiers, and feature gating on the server release version
 
 ## Out of Scope
 
-- **Connection pooling** — left to the application layer
-- **ORM / query builder** — raw SQL only, no abstraction layer
-- **ETL/ELT transformations** — data is transferred as-is, transformations are the caller's responsibility
+- **Connection pooling**: left to the application layer
+- **ORM / query builder**: raw SQL only, no abstraction layer
+- **ETL/ELT transformations**: data is transferred as-is, transformations are the caller's responsibility
 
 Architecture: see specs/architecture.md.
 
@@ -39,7 +39,7 @@ Architecture: see specs/architecture.md.
 
 | Term | Definition |
 |------|------------|
-| ADBC | Arrow Database Connectivity — standard API for database access using Apache Arrow |
+| ADBC | Arrow Database Connectivity: standard API for database access using Apache Arrow |
 | Arrow | Apache Arrow columnar memory format for efficient analytical data processing |
 | RecordBatch | Arrow's unit of columnar data: a collection of equal-length arrays with a shared schema |
 | EXA protocol | Exasol's command and query protocol, carried as JSON over WebSocket or as binary frames over native TCP (default port 8563) |
@@ -58,15 +58,15 @@ Architecture: see specs/architecture.md.
 | Layer | Technology | Purpose |
 |-------|------------|---------|
 | Language | Rust (2021 edition) | Systems-level performance, memory safety |
-| Async runtime | Tokio 1.42 | Multi-threaded async I/O |
-| WebSocket | tokio-tungstenite 0.28 (optional) | Exasol WebSocket transport with TLS (opt-in fallback) |
-| Arrow | arrow 59 / parquet 59 | Columnar data format and Parquet I/O |
-| TLS | rustls 0.23 / rcgen 0.13 | Connection encryption and ad-hoc certificate generation for HTTP tunnels |
-| Crypto | aws-lc-rs 1 | RSA encryption for Exasol password authentication |
-| Stream cipher | chacha20 0.9 / cipher 0.4 | ChaCha20 encryption for native TCP protocol |
+| Async runtime | Tokio | Multi-threaded async I/O |
+| WebSocket | tokio-tungstenite (optional) | Exasol WebSocket transport with TLS (opt-in fallback) |
+| Arrow | arrow / parquet | Columnar data format and Parquet I/O |
+| TLS | rustls / rcgen | Connection encryption and ad-hoc certificate generation for HTTP tunnels |
+| Crypto | aws-lc-rs | RSA encryption for Exasol password authentication |
+| Stream cipher | chacha20 / cipher | ChaCha20 encryption for native TCP protocol |
 | Serialization | serde / serde_json | Exasol WebSocket JSON protocol |
-| ADBC FFI | adbc_core / adbc_ffi 0.24 (optional) | C FFI bindings for driver manager integration |
-| Testing | cargo test / mockall 0.14 | Unit and integration testing with mocking |
+| ADBC FFI | adbc_core / adbc_ffi (optional) | C FFI bindings for driver manager integration |
+| Testing | cargo test / mockall | Unit and integration testing with mocking |
 
 ## Commands
 
