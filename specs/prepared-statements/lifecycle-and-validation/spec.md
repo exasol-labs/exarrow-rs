@@ -20,8 +20,8 @@ Prepared statements consume resources on both the client and the Exasol server, 
 
 * *GIVEN* a prepared statement has been created
 * *WHEN* a connection is closed with active prepared statements
-* *THEN* it SHALL close all associated prepared statements
-* *AND* it SHALL release server-side resources
+* *THEN* it SHALL close the session
+* *AND* the server SHALL release the prepared statements of that session
 
 ### Scenario: Prepared statement timeout
 

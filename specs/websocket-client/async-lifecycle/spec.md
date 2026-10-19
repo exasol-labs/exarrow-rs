@@ -43,10 +43,3 @@ All WebSocket communication is asynchronous on tokio. The connection states are 
 * *THEN* it SHALL detect the disconnection
 * *AND* it SHALL provide error information to the caller
 * *AND* it SHALL NOT automatically reconnect (explicit reconnection required)
-
-### Scenario: Heartbeat and keepalive
-
-* *GIVEN* a WebSocket connection is active
-* *WHEN* a connection is idle
-* *THEN* it SHALL send keepalive messages if required by the protocol
-* *AND* it SHALL detect connection failures via missing heartbeat responses

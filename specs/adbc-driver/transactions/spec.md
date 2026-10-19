@@ -30,7 +30,7 @@ Autocommit is on by default and set at login, so each statement commits immediat
 * *WHEN* `commit()` is called on the connection
 * *THEN* the driver SHALL execute a `COMMIT` statement
 * *AND* all pending changes SHALL become visible to other sessions
-* *AND* the driver SHALL send a `setAttributes` command to re-enable autocommit on the server
+* *AND* the driver SHALL NOT re-enable autocommit on the server
 
 ### Scenario: Rollback transaction
 
@@ -39,7 +39,7 @@ Autocommit is on by default and set at login, so each statement commits immediat
 * *WHEN* `rollback()` is called on the connection
 * *THEN* the driver SHALL execute a `ROLLBACK` statement
 * *AND* all pending changes SHALL be discarded
-* *AND* the driver SHALL send a `setAttributes` command to re-enable autocommit on the server
+* *AND* the driver SHALL NOT re-enable autocommit on the server
 
 ### Scenario: Toggle autocommit
 

@@ -16,13 +16,6 @@ Conversions prefer lossless transformations and warn or error on lossy conversio
 * *AND* it SHALL warn or error on lossy conversions
 * *AND* February 29 of a Julian-only leap year, which `type-mapping/exasol-to-arrow-dates` maps to March 1, SHALL follow that scenario without a warning or an error
 
-### Scenario: String length validation
-
-* *GIVEN* a type conversion is being performed
-* *WHEN* binding string values
-* *THEN* it SHALL validate length against Exasol VARCHAR limits
-* *AND* it SHALL truncate or error as appropriate based on configuration
-
 ### Scenario: Timestamp timezone handling
 
 * *GIVEN* a type conversion is being performed
@@ -30,35 +23,6 @@ Conversions prefer lossless transformations and warn or error on lossy conversio
 * *THEN* it SHALL handle timezone-aware and timezone-naive timestamps correctly
 * *AND* it SHALL preserve or convert timezones as specified
 * *AND* it SHALL document timezone handling behavior
-
-### Scenario: VARCHAR type boundaries
-
-* *GIVEN* DDL generation is requested for a table
-* *WHEN* mapping to Exasol VARCHAR
-* *THEN* the maximum length SHALL be 2,000,000 characters
-* *AND* values exceeding this limit SHALL be truncated or rejected based on configuration
-
-### Scenario: CHAR type boundaries
-
-* *GIVEN* DDL generation is requested for a table
-* *WHEN* mapping to Exasol CHAR
-* *THEN* the maximum length SHALL be 2,000 characters
-* *AND* CHAR SHALL be fixed-width with space padding
-
-### Scenario: DECIMAL type boundaries
-
-* *GIVEN* DDL generation is requested for a table
-* *WHEN* mapping to Exasol DECIMAL(p, s)
-* *THEN* precision SHALL be in range 1-36
-* *AND* scale SHALL be in range 0-36
-* *AND* scale SHALL NOT exceed precision
-
-### Scenario: TIMESTAMP type boundaries
-
-* *GIVEN* DDL generation is requested for a table
-* *WHEN* mapping to Exasol TIMESTAMP
-* *THEN* fractional seconds precision SHALL be in range 0-9
-* *AND* TIMESTAMP WITH LOCAL TIME ZONE SHALL be used for timezone-aware timestamps
 
 ### Scenario: Integer type mappings for DDL generation
 
@@ -74,10 +38,3 @@ Conversions prefer lossless transformations and warn or error on lossy conversio
 * *GIVEN* DDL generation is requested for a table
 * *WHEN* mapping Arrow floating point types to Exasol DDL
 * *THEN* Float32 and Float64 SHALL map to DOUBLE
-
-### Scenario: INTERVAL type boundaries
-
-* *GIVEN* DDL generation is requested for a table
-* *WHEN* mapping to Exasol INTERVAL types
-* *THEN* INTERVAL DAY TO SECOND fractional precision SHALL be in range 0-9
-* *AND* both INTERVAL types SHALL use fixed 8-byte storage
