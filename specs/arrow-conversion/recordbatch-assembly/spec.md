@@ -82,8 +82,9 @@ JSON result data is type-converted to Arrow arrays before assembly into RecordBa
 
 ### Scenario: Conversion error reporting
 
-* *GIVEN* JSON result data has been type-converted to Arrow arrays
-* *WHEN* a data conversion fails
-* *THEN* it SHALL report the column name and row number
-* *AND* it SHALL include the problematic value
-* *AND* it SHALL explain what conversion was attempted
+* *GIVEN* row-major JSON result data and a schema that names each result column
+* *WHEN* converting a JSON value to the Arrow type of its column fails
+* *THEN* the error MUST name the column by its schema name and by its zero-based column index
+* *AND* the error MUST give the zero-based index of the row within the converted batch
+* *AND* the error MUST include the JSON value that failed to convert
+* *AND* the error MUST name the Arrow data type of the column and the reason the conversion failed
