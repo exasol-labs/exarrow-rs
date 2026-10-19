@@ -1,6 +1,6 @@
 # Feature: Session and Lifecycle
 
-Specifies the session lifecycle of a connection: establishment, attributes, termination, reuse, and health checking.
+Specifies the session lifecycle of a connection: establishment, attributes, termination, and health checking.
 
 ## Background
 
@@ -30,13 +30,6 @@ The driver closes a connection only when the caller closes it or the driver term
 * *WHEN* a session is closed
 * *THEN* the server SHALL be notified of session termination
 * *AND* it SHALL release server-side resources
-
-### Scenario: Connection reusability
-
-* *GIVEN* a connection has been used and released
-* *WHEN* a connection is closed by the application
-* *THEN* its implementation SHALL support clean state reset
-* *AND* it SHALL be designed to allow reuse in future pooling implementations
 
 ### Scenario: Connection health checking
 

@@ -55,18 +55,3 @@ Transaction management supports explicit begin/commit/rollback operations as wel
 * *WHEN* auto-commit is enabled (default)
 * *THEN* each statement SHALL be automatically committed
 * *AND* explicit transaction commands SHALL override auto-commit temporarily
-
-### Scenario: Execution statistics
-
-* *GIVEN* a query has been executed
-* *WHEN* a query completes
-* *THEN* it SHALL provide execution time
-* *AND* it SHALL provide rows affected/returned
-* *AND* it SHALL provide any warnings from the database
-
-### Scenario: Query plan information
-
-* *GIVEN* a query has been executed
-* *WHEN* EXPLAIN is used
-* *THEN* it SHALL return query execution plan information
-* *AND* it SHALL format plan data appropriately for display

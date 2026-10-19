@@ -45,13 +45,6 @@ JSON result data is type-converted to Arrow arrays before assembly into RecordBa
 * *THEN* it SHALL create an empty RecordBatch with correct schema
 * *AND* it SHALL have zero rows but valid column definitions
 
-### Scenario: Large batch handling
-
-* *GIVEN* JSON result data has been type-converted to Arrow arrays
-* *WHEN* result sets exceed batch size limits
-* *THEN* it SHALL split data into multiple RecordBatches
-* *AND* it SHALL maintain consistent schema across batches
-
 ### Scenario: NULL bitmap construction
 
 * *GIVEN* a schema is available for the result set
@@ -94,10 +87,3 @@ JSON result data is type-converted to Arrow arrays before assembly into RecordBa
 * *THEN* it SHALL report the column name and row number
 * *AND* it SHALL include the problematic value
 * *AND* it SHALL explain what conversion was attempted
-
-### Scenario: Partial conversion handling
-
-* *GIVEN* JSON result data has been type-converted to Arrow arrays
-* *WHEN* some rows fail conversion in a batch
-* *THEN* it SHALL have configurable behavior (fail-fast or collect errors)
-* *AND* it SHALL provide all error details for debugging

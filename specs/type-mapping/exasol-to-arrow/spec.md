@@ -29,7 +29,7 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 * *WHEN* mapping Exasol string types
 * *THEN* VARCHAR(n) SHALL map to Arrow Utf8
 * *AND* CHAR(n) SHALL map to Arrow Utf8 with padding handling
-* *AND* CLOB SHALL map to Arrow LargeUtf8
+* *AND* CLOB SHALL map to Arrow Utf8
 
 ### Scenario: Boolean type mapping
 
@@ -57,13 +57,6 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 * *WHEN* encountering Exasol GEOMETRY types
 * *THEN* it SHALL map to Arrow Binary or Utf8 (WKT/WKB format)
 * *AND* it SHALL document the encoding used
-
-### Scenario: Array type handling
-
-* *GIVEN* Exasol returns a result set with typed columns
-* *WHEN* Exasol array types are encountered (if supported)
-* *THEN* it SHALL map to Arrow List types
-* *AND* it SHALL handle nested type mappings recursively
 
 ### Scenario: Unsupported types
 

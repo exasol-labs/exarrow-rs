@@ -1,6 +1,6 @@
 # Feature: Arrow Conversion Optimization
 
-Specifies streaming deserialization, null-free fast paths, string buffer pre-allocation, and validation gates for Arrow conversion.
+Specifies streaming deserialization, string buffer pre-allocation, and validation gates for Arrow conversion.
 
 ## Background
 
@@ -37,21 +37,6 @@ Exasol returns column-major JSON data, which the client transposes to row-major 
 * *THEN* each row SHALL contain exactly one value
 * *AND* the format SHALL be consistent with multi-column results
 
-### Scenario: All-values-present detection
-
-* *GIVEN* a column's null statistics are available
-* *WHEN* a column contains no NULL values
-* *THEN* it SHALL detect this condition before building the array
-* *AND* it SHALL skip null bitmap construction for the column
-* *AND* it SHALL use direct array construction without validity buffer
-
-### Scenario: Null-presence hint
-
-* *GIVEN* a column's null statistics are available
-* *WHEN* result metadata indicates null presence or absence
-* *THEN* it SHALL use this hint to select optimal conversion path
-* *AND* it SHALL fall back to null-safe path when hint is unavailable
-
 ### Scenario: Large string pre-allocation
 
 * *GIVEN* large VARCHAR columns are being converted
@@ -72,7 +57,6 @@ Exasol returns column-major JSON data, which the client transposes to row-major 
 * *WHEN* arrow conversion optimization is complete
 * *THEN* `cargo test` MUST pass with zero failures
 * *AND* DECIMAL overflow tests MUST be present and passing
-* *AND* null handling fast path tests MUST be present and passing
 
 ### Scenario: Performance validation
 

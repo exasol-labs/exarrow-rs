@@ -62,13 +62,6 @@ Exasol returns JSON result data with typed columns. The Exasol WebSocket API nam
 * *THEN* it SHALL use Arrow's string array builders efficiently
 * *AND* it SHALL handle variable-length strings correctly
 
-### Scenario: Large strings
-
-* *GIVEN* Exasol returns JSON result data with typed columns
-* *WHEN* strings exceed standard string array limits
-* *THEN* it SHALL use Arrow LargeUtf8 arrays
-* *AND* it SHALL handle offset calculations correctly
-
 ### Scenario: Date conversion
 
 * *GIVEN* Exasol returns JSON result data with typed columns

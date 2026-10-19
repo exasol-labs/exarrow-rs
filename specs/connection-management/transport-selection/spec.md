@@ -33,7 +33,7 @@ Each connection uses one transport. When both features are enabled, native is th
 
 * *GIVEN* neither `native` nor `websocket` feature flag is enabled
 * *WHEN* attempting to create a connection
-* *THEN* the system SHALL fail at compile time with a clear error message indicating that at least one transport feature MUST be enabled
+* *THEN* the system SHALL fail to connect with an `InvalidParameter` error indicating that at least one transport feature MUST be enabled
 
 ### Scenario: Native transport uses TLS exclusively against Exasol 7.1+ and Exasol 8
 
