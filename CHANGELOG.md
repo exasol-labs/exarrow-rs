@@ -1,12 +1,17 @@
 # Changelog
 
-## 0.23.0
+## 0.24.0
 
 - Fix: CSV export to a file, a stream, or a callback (`export_csv_to_file`, `export_csv_to_stream`, `export_to_file`, `export_to_stream`, `export_to_callback`) passes data on in pieces of at most 64 KiB while the EXPORT statement runs. Memory use stays bounded, with at most 16 pieces waiting, instead of holding the complete result before the first byte reaches the consumer. `export_csv_to_list`, Arrow export, and Parquet export still hold the complete result. Fixes #59.
 - Fix: gzip and bz2 compressed CSV exports decompress each piece as it arrives, in output blocks of at most 64 KiB, instead of holding the compressed and the decompressed body in memory together. A truncated compressed stream fails with `ExportError::DecompressionError`.
 - Changed: an `export_to_callback` callback receives many chunks of at most 64 KiB instead of one, and a CSV record can span two chunks. With compression set, the chunks stay compressed.
 - Changed: a slow writer or callback slows the EXPORT statement on the server. A timeout during such a stall reports `transport_terminated: true`, and output already written can be partial when the export fails.
 - Breaking: `HttpTransportClient::read_chunked_body` and `HttpTransportClient::handle_export_request` take a `&tokio::sync::mpsc::Sender<Vec<u8>>` and send the body pieces to it. `read_chunked_body` returns `()`, and `handle_export_request` returns only the `HttpRequest`.
+
+## 0.23.0
+
+- Breaking: exarrow-rs uses `arrow` and `parquet` 59. Rust code that passes Arrow types such as `RecordBatch` or `Schema` to or from exarrow-rs must move to `arrow` 59. Callers that load the driver through an ADBC driver manager are not affected. `adbc_core` and `adbc_ffi` stay at 0.24. Refs #98.
+- Security: `thrift` is no longer a dependency, so GHSA-2f9f-gq7v-9h6m (CVE-2026-43868) no longer applies. The `deny.toml` suppressions for this advisory and for the unmaintained `paste` crate (RUSTSEC-2024-0436) are removed.
 
 ## 0.22.1
 

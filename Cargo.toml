@@ -1,6 +1,6 @@
 [package]
 name = "exarrow-rs"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 license = "MIT"
 authors = ["Exasol Labs <labs@exasol.com>"]
@@ -22,7 +22,7 @@ doctest = false
 
 [dependencies]
 # Apache Arrow support (arrow re-exports arrow-array, arrow-schema, etc.)
-arrow = "58"
+arrow = "59"
 
 # Async runtime
 tokio = { version = "1.42", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
@@ -72,7 +72,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 # Parquet file support
-parquet = { version = "58", features = ["async"] }
+parquet = { version = "59", features = ["async"] }
 
 # Compression support for CSV import/export
 flate2 = "1.1"
@@ -112,7 +112,7 @@ adbc_core = "0.24"
 # C ABI test of the exported driver (tests/driver_manager_tests.rs)
 adbc_ffi = "0.24"
 libloading = "0.8"
-arrow = { version = "58", features = ["ffi"] }
+arrow = { version = "59", features = ["ffi"] }
 tempfile = "3.24.0"
 # Environment variable loading for examples
 dotenvy = "0.15"
