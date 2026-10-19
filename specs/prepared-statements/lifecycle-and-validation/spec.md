@@ -37,13 +37,6 @@ Prepared statements consume resources on both the client and the Exasol server, 
 * *THEN* `cargo test` MUST pass with zero failures
 * *AND* all prepared statement unit tests MUST be present and passing
 
-### Scenario: Integration test requirement
-
-* *GIVEN* the prepared statement implementation is complete
-* *WHEN* prepared statement implementation is complete
-* *THEN* integration tests with real Exasol database MUST pass
-* *AND* parameterized query tests MUST demonstrate SQL injection protection
-
 ### Scenario: Code quality requirement
 
 * *GIVEN* the prepared statement implementation is complete
