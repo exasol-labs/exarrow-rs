@@ -13,12 +13,6 @@ use tokio::sync::RwLock;
 /// Session configuration.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// Enable automatic session keepalive
-    pub enable_keepalive: bool,
-
-    /// Keepalive interval
-    pub keepalive_interval: Duration,
-
     /// Maximum number of retries for failed operations
     pub max_retries: u32,
 
@@ -38,8 +32,6 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            enable_keepalive: true,
-            keepalive_interval: Duration::from_secs(60),
             max_retries: 3,
             auto_commit: true,
             default_fetch_size: 1000,
@@ -94,8 +86,8 @@ pub struct Session {
     /// Transaction active flag
     in_transaction: AtomicBool,
 
-    /// Memoized native-Parquet-import capability, derived from `server_info.release_version`.
-    native_parquet_cache: OnceLock<bool>,
+    /// Memoized parse of `server_info.release_version`; `None` when it does not parse.
+    release_version: OnceLock<Option<(u32, u32, u32)>>,
 }
 
 impl Session {
@@ -108,20 +100,31 @@ impl Session {
             state: Arc::new(RwLock::new(SessionState::Ready)),
             query_count: AtomicU64::new(0),
             in_transaction: AtomicBool::new(false),
-            native_parquet_cache: OnceLock::new(),
+            release_version: OnceLock::new(),
         }
     }
 
     /// Whether the connected Exasol server supports native Parquet IMPORT
-    /// (added in Exasol 2025.1.11). The result is parsed from
-    /// `server_info.release_version` and memoized for the session lifetime;
-    /// unparseable versions are treated as unsupported.
+    /// (added in Exasol 2025.1.11). An unparsable release version counts as
+    /// unsupported.
     pub fn supports_native_parquet_import(&self) -> bool {
-        *self.native_parquet_cache.get_or_init(|| {
-            parse_release_version(&self.server_info.release_version)
-                .map(crate::connection::version::supports_native_parquet_import)
-                .unwrap_or(false)
-        })
+        self.parsed_release_version()
+            .is_some_and(crate::connection::version::supports_native_parquet_import)
+    }
+
+    /// Whether the server release is at least `(major, minor, patch)`, compared
+    /// lexicographically. An unparsable release version is below every threshold,
+    /// so callers fall back to the legacy path. Issues no SQL: the release version
+    /// comes from login and is parsed once per session.
+    pub fn supports_at_least(&self, major: u32, minor: u32, patch: u32) -> bool {
+        self.parsed_release_version()
+            .is_some_and(|version| version >= (major, minor, patch))
+    }
+
+    fn parsed_release_version(&self) -> Option<(u32, u32, u32)> {
+        *self
+            .release_version
+            .get_or_init(|| parse_release_version(&self.server_info.release_version))
     }
 
     /// Get the session ID.
@@ -519,5 +522,50 @@ mod tests {
         let first = session_2025_1_11.supports_native_parquet_import();
         let second = session_2025_1_11.supports_native_parquet_import();
         assert_eq!(first, second);
+    }
+
+    /// Scenario: Compare the server version against a caller-supplied threshold
+    #[test]
+    fn supports_at_least_compares_major_minor_and_patch() {
+        let session = Session::new(
+            "s".to_string(),
+            mock_server_info_with_version("8.27.1"),
+            SessionConfig::default(),
+        );
+
+        let cases = [
+            ((8, 27, 1), true),
+            ((8, 27, 2), false),
+            ((8, 28, 0), false),
+            ((8, 26, 99), true),
+            ((7, 99, 99), true),
+            ((9, 0, 0), false),
+        ];
+        for ((major, minor, patch), expected) in cases {
+            assert_eq!(
+                session.supports_at_least(major, minor, patch),
+                expected,
+                "8.27.1 against ({major}, {minor}, {patch})"
+            );
+        }
+    }
+
+    /// Scenario: Reject an unparsable release_version
+    #[test]
+    fn supports_at_least_is_false_for_an_unparsable_release_version() {
+        for release in ["", "unknown", "v1"] {
+            let session = Session::new(
+                "s".to_string(),
+                mock_server_info_with_version(release),
+                SessionConfig::default(),
+            );
+
+            for (major, minor, patch) in [(0, 0, 0), (9, 0, 0)] {
+                assert!(
+                    !session.supports_at_least(major, minor, patch),
+                    "release {release:?} must count as below ({major}, {minor}, {patch})"
+                );
+            }
+        }
     }
 }

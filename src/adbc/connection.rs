@@ -2467,6 +2467,23 @@ mod tests {
             .expect("mock transport must connect")
     }
 
+    /// Scenario: Capability check is in-process and round-trip-free
+    #[tokio::test]
+    async fn capability_checks_issue_no_sql() {
+        let log = new_sql_log();
+        let conn = connected(&log).await;
+
+        conn.supports_native_parquet_import();
+        for (major, minor, patch) in [(0, 0, 0), (8, 27, 1), (2025, 1, 11), (u32::MAX, 0, 0)] {
+            conn.session.supports_at_least(major, minor, patch);
+        }
+
+        assert!(
+            recorded(&log).is_empty(),
+            "capability checks must answer from the login release version"
+        );
+    }
+
     // ------------------------------------------------------------------------
     // Metadata SQL builders
     // ------------------------------------------------------------------------
