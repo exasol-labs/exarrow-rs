@@ -31,7 +31,7 @@ Native Parquet import from files on disk serves Exasol's HTTP range requests by 
 - The file must stay unchanged while a native import runs, because the driver reads it while Exasol requests ranges. Before this change, the driver served the copy it read at the start. A file that becomes shorter now fails the import. A file whose content changes delivers the changed bytes.
 - Error text: a native multi-file import that cannot open a file reports "failed to open" instead of "failed to read". A failure while the driver serves a file names the file's index and path.
 - `import_from_parquet_stream` and the CSV conversion path do not change.
-- Version 0.25.0.
+- Version 0.26.0.
 
 ## Implementation Tasks
 
@@ -49,7 +49,7 @@ Native Parquet import from files on disk serves Exasol's HTTP range requests by 
 3. Documentation and release notes
    - [ ] 3.1 Update the rustdoc that says the native path reads whole files: `Connection::import_parquet_from_files` (`src/adbc/connection.rs:1544-1550`) and `import_from_parquet_files` (`src/import/parquet.rs:606-613`). In the "Bounding memory" text of `import_from_parquet_stream` (`src/import/parquet.rs:541-547`, `src/adbc/connection.rs:1490-1500`, `src/adbc/connection.rs:1952`), name `import_from_parquet` with a file path as a bounded alternative.
    - [ ] 3.2 In `docs/import-export.md` § Memory Use, change the native-path entries of `import_from_parquet` and `import_parquet_from_files` to "one 64 KiB piece of the file per file, read when Exasol requests a range", and update the paragraph after the table. In § Native Parquet Import, state that the file must stay unchanged while the import runs.
-   - [ ] 3.3 Bump `Cargo.toml` (and `Cargo.lock`) to 0.25.0. Add a `## 0.25.0` entry to `CHANGELOG.md` with three items: a Fix item for the memory bound (Refs #69), a Breaking item for the signature of `handle_parquet_import_requests`, and a Changed item for the unchanged-file requirement and the new error text.
+   - [ ] 3.3 Bump `Cargo.toml` (and `Cargo.lock`) to 0.26.0. Add a `## 0.26.0` entry to `CHANGELOG.md` with three items: a Fix item for the memory bound (Refs #69), a Breaking item for the signature of `handle_parquet_import_requests`, and a Changed item for the unchanged-file requirement and the new error text.
 
 ## Parallelization
 
