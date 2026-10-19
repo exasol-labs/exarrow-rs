@@ -21,7 +21,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::file::reader::ChunkReader;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
 use crate::query::import::{ImportFileEntry, ImportFormat, ImportQuery, RowSeparator};
 use crate::transport::HttpTransportClient;
@@ -226,6 +226,11 @@ impl ParquetImportOptions {
 /// This function reads a Parquet file, converts each RecordBatch to CSV format,
 /// and streams the data to Exasol via HTTP transport.
 ///
+/// On the native Parquet path (`use_native`), the function opens the file and
+/// reads each range that Exasol requests in pieces of at most 64 KiB, so
+/// memory does not grow with the file size. The file must stay unchanged until
+/// the import ends, and a file that becomes shorter fails the import.
+///
 /// # Protocol Flow
 ///
 ///
@@ -267,16 +272,12 @@ where
     }
 
     if use_native {
-        // Native Parquet path: read raw file bytes and serve them via HTTP
-        // range requests. The server parses the Parquet directly, so all
-        // CSV-specific options (encoding, separator, delimiter, null_value)
-        // are skipped.
-        let file_bytes = tokio::fs::read(file_path).await?;
-        return serve_parquet_bytes(execute_sql, table, &options, file_bytes).await;
+        let file = open_parquet_file(file_path).await?;
+        return serve_parquet_file(execute_sql, table, &options, file).await;
     }
 
     let source = open_parquet_csv_reader(
-        tokio::fs::File::open(file_path).await?.into_std().await,
+        open_parquet_file(file_path).await?.into_std().await,
         &options,
     )?;
     if source.row_count == 0 {
@@ -284,6 +285,15 @@ where
     }
 
     serve_parquet_csv(execute_sql, table, &options, source.reader).await
+}
+
+async fn open_parquet_file(file_path: &Path) -> Result<tokio::fs::File, ImportError> {
+    tokio::fs::File::open(file_path).await.map_err(|e| {
+        ImportError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("failed to open Parquet file '{}': {e}", file_path.display()),
+        ))
+    })
 }
 
 /// Execute a CREATE TABLE statement, treating an "already exists" failure as success.
@@ -421,19 +431,21 @@ pub(crate) async fn stream_parquet_csv(
         .map_err(ImportError::TransportError)
 }
 
-/// Serve raw Parquet bytes to the server over the native HEAD/GET-Range protocol.
+/// Serve a seekable Parquet source to the server over the native HEAD/GET-Range protocol.
 ///
 /// The server parses the Parquet payload itself, so the IMPORT statement carries
-/// no CSV format options.
-async fn serve_parquet_bytes<F, Fut>(
+/// no CSV format options. The tunnel reads `source` only when the server asks
+/// for a range.
+async fn serve_parquet_file<F, Fut, R>(
     execute_sql: F,
     table: &str,
     options: &ParquetImportOptions,
-    file_bytes: Vec<u8>,
+    source: R,
 ) -> Result<u64, ImportError>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<u64, String>>,
+    R: AsyncRead + AsyncSeek + Unpin + Send + 'static,
 {
     let mut client = connect_transport(options).await?;
 
@@ -448,7 +460,7 @@ where
 
     let stream_handle = tokio::spawn(async move {
         client
-            .handle_parquet_import_requests(&file_bytes)
+            .handle_parquet_import_requests(source)
             .await
             .map_err(ImportError::TransportError)
     });
@@ -540,8 +552,9 @@ fn apply_csv_format(query: ImportQuery, options: &ParquetImportOptions) -> Impor
 ///
 /// The function buffers the whole stream in memory on both import paths,
 /// because Parquet keeps its metadata at the end of the file. To bound memory,
-/// decode the Parquet data yourself and pass the RecordBatches in groups to
-/// `import_from_record_batches`. Each call is one IMPORT statement and holds
+/// import from a file path with `import_from_parquet`, which streams the file
+/// instead of buffering it. Or decode the Parquet data yourself and pass the
+/// RecordBatches in groups to `import_from_record_batches`. Each call is one IMPORT statement and holds
 /// the CSV of its own batches more than once. Each call commits separately
 /// unless autocommit is off, so a failure in a later group leaves the earlier
 /// groups in the table. `import_from_arrow_ipc` also reads its whole input.
@@ -592,7 +605,8 @@ where
     if use_native {
         // Native Parquet path: forward buffered bytes directly to the server
         // via HTTP range requests. Skip CSV conversion entirely.
-        return serve_parquet_bytes(execute_sql, table, &options, buffer).await;
+        return serve_parquet_file(execute_sql, table, &options, std::io::Cursor::new(buffer))
+            .await;
     }
 
     let source = open_parquet_csv_reader(Bytes::from(buffer), &options)?;
@@ -607,7 +621,11 @@ where
 ///
 /// On the CSV conversion path, each file converts in its own spawn_blocking
 /// task while its CSV streams through that file's HTTP transport connection,
-/// so memory holds a few RecordBatches of CSV per file, not whole files.
+/// so memory holds a few RecordBatches of CSV per file, not whole files. On the
+/// native Parquet path, each file is opened and read one 64 KiB piece at a time
+/// when Exasol requests a range, so memory does not grow with the file size.
+/// Each file must stay unchanged until the import ends, and a file that
+/// becomes shorter fails the import.
 ///
 /// For a single file, this function delegates to `import_from_parquet` for
 /// optimal single-file performance.
@@ -2243,6 +2261,33 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+        assert!(err.to_string().contains("missing.parquet"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_import_from_parquet_native_path_fails_on_a_missing_file_before_any_sql() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sql_calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&sql_calls);
+        let execute_sql = move |_sql: String| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<u64, String>(1) }
+        };
+
+        let err = import_from_parquet(
+            execute_sql,
+            "t",
+            std::path::Path::new("/nonexistent/dir/missing.parquet"),
+            ParquetImportOptions::default(),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::IoError(_)), "got: {err}");
+        assert!(err.to_string().contains("missing.parquet"), "got: {err}");
+        assert_eq!(sql_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2817,7 +2862,7 @@ mod tests {
 
     /// Scenario: Failed IMPORT statement returns its error without waiting for the tunnel
     #[tokio::test]
-    async fn test_serve_parquet_bytes_returns_statement_error_and_closes_a_silent_tunnel() {
+    async fn test_serve_parquet_file_returns_statement_error_and_closes_a_silent_tunnel() {
         let hang_limit = std::time::Duration::from_secs(5);
         let mut server = FakeExasolServer::silent_after_handshake().await;
         let options = ParquetImportOptions::default()
@@ -2827,11 +2872,11 @@ mod tests {
 
         let result = tokio::time::timeout(
             hang_limit,
-            serve_parquet_bytes(
+            serve_parquet_file(
                 |_sql: String| async { Err::<u64, String>("object T not found".to_string()) },
                 "t",
                 &options,
-                b"PAR1".to_vec(),
+                std::io::Cursor::new(b"PAR1".to_vec()),
             ),
         )
         .await

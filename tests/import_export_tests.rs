@@ -2771,47 +2771,42 @@ async fn test_parquet_import_forced_csv_path_works() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test the native Parquet import path. Fails on a server without native
-/// Parquet import, because it needs Exasol 2025.2.1 or later.
+/// Scenario: Native Parquet import on Exasol 2025.1.11+
 #[tokio::test]
-async fn test_parquet_import_native_path_when_supported() {
-    skip_if_no_exasol!();
+async fn test_parquet_import_native_path_serves_multi_row_group_file() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
-
     assert!(
         conn.supports_native_parquet_import(),
         "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
     );
-
     let schema_name = generate_test_schema_name();
-    setup_id_name_table(&mut conn, &schema_name).await;
-
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(36,0), PAYLOAD VARCHAR(100)",
+    )
+    .await;
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let parquet_path = write_small_parquet(temp_dir.path(), "test.parquet");
+    let path = temp_dir.path().join("large.parquet");
+    write_id_payload_parquet(&path, 0..400_000, 10_000);
+    let table = format!("{schema_name}.T");
 
-    let options = ParquetImportOptions::default().with_native_parquet(Some(true));
+    let rows = within_import_hang_limit(conn.import_from_parquet(
+        &table,
+        &path,
+        ParquetImportOptions::default().with_native_parquet(Some(true)),
+    ))
+    .await
+    .expect("Native Parquet import should succeed");
 
-    let rows = conn
-        .import_from_parquet(
-            &format!("{}.test_data", schema_name),
-            &parquet_path,
-            options,
-        )
-        .await
-        .expect("Native Parquet import should succeed");
-
-    assert_eq!(rows, 3, "Should import 3 rows via native path");
-
-    let batches = conn
-        .query(&format!(
-            "SELECT id, name FROM {}.test_data ORDER BY id",
-            schema_name
-        ))
-        .await
-        .expect("SELECT should succeed");
-    assert!(!batches.is_empty());
-    assert_eq!(batches[0].num_rows(), 3, "Should have 3 rows in result");
+    assert_eq!(rows, 400_000);
+    assert_id_count_and_sum(&mut conn, &table, 0..400_000).await;
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
@@ -2865,44 +2860,44 @@ async fn test_parquet_stream_import_native_path() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Test parallel native Parquet import from multiple files. Fails on a server
-/// without native Parquet import, because it needs Exasol 2025.2.1 or later.
+/// Scenario: Native parallel Parquet import on Exasol 2025.1.11+
 #[tokio::test]
-async fn test_parallel_parquet_import_native_path() {
-    skip_if_no_exasol!();
+async fn test_parallel_parquet_import_native_path_serves_multi_row_group_files() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
 
     let mut conn = get_test_connection().await.expect("Failed to connect");
-
     assert!(
         conn.supports_native_parquet_import(),
         "this test needs native Parquet import, which Exasol 2025.2.1 or later provides"
     );
-
     let schema_name = generate_test_schema_name();
-    setup_id_name_table(&mut conn, &schema_name).await;
-
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(36,0), PAYLOAD VARCHAR(100)",
+    )
+    .await;
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let path1 = write_small_parquet_offset(temp_dir.path(), "part1.parquet", 1);
-    let path2 = write_small_parquet_offset(temp_dir.path(), "part2.parquet", 10);
+    let first = temp_dir.path().join("part1.parquet");
+    let second = temp_dir.path().join("part2.parquet");
+    write_id_payload_parquet(&first, 0..400_000, 10_000);
+    write_id_payload_parquet(&second, 400_000..800_000, 10_000);
+    let table = format!("{schema_name}.T");
 
-    let options = ParquetImportOptions::default().with_native_parquet(Some(true));
+    let rows = within_import_hang_limit(conn.import_parquet_from_files(
+        &table,
+        vec![first, second],
+        ParquetImportOptions::default().with_native_parquet(Some(true)),
+    ))
+    .await
+    .expect("Parallel native Parquet import should succeed");
 
-    let rows = conn
-        .import_parquet_from_files(
-            &format!("{}.test_data", schema_name),
-            vec![path1, path2],
-            options,
-        )
-        .await
-        .expect("Parallel native Parquet import should succeed");
-
-    assert_eq!(rows, 4, "Should import 4 rows total (2 per file)");
-
-    let batches = conn
-        .query(&format!("SELECT COUNT(*) FROM {}.test_data", schema_name))
-        .await
-        .expect("SELECT COUNT should succeed");
-    assert!(!batches.is_empty());
+    assert_eq!(rows, 800_000);
+    assert_id_count_and_sum(&mut conn, &table, 0..800_000).await;
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");

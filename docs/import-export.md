@@ -94,15 +94,15 @@ Each import function holds a different amount of data in memory. A "piece" is at
 
 | Function | Held in memory |
 |----------|----------------|
-| `import_from_parquet` | Native path: the whole file, read once. CSV path: a few batches of CSV and the Parquet row group being decoded, whatever the file size. |
+| `import_from_parquet` | Native path: one 64 KiB piece of the file, read when Exasol requests a range. CSV path: a few batches of CSV and the Parquet row group being decoded, whatever the file size. |
 | `import_from_parquet_stream` | Both paths: the whole stream, because Parquet keeps its metadata at the end of the file. On the CSV path, a few batches of CSV come on top. |
-| `import_parquet_from_files` | One file: as `import_from_parquet`. Several files, native path: every whole file at once, one per connection. Several files, CSV path: a few batches of CSV and one row group per file. |
+| `import_parquet_from_files` | One file: as `import_from_parquet`. Several files, native path: one 64 KiB piece of the file per file, read when Exasol requests a range. Several files, CSV path: a few batches of CSV and one row group per file. |
 | `import_csv_from_file` | The whole file, plus a compressed copy when compression is set. |
 | `import_csv_from_files` | One file: as `import_csv_from_file`. Several files: one 64 KiB piece per file. When compression is set, each file also holds its encoder state: an estimated few hundred KB for gzip and an estimated 5 MB for bzip2 at its default level 6 (libbzip2 documents 400 KB plus 8 times the 600 KB block). A file whose extension marks it as compressed is sent as stored and has no encoder. |
 | `import_from_record_batches` | The CSV of all batches, held more than once, plus the batches the caller holds. |
 | `import_from_arrow_ipc` | The whole input, plus the CSV of all batches, held more than once. |
 
-To bound memory for Parquet or Arrow data, decode the data yourself and pass the RecordBatches in groups to `import_from_record_batches`. Each call is one IMPORT statement and holds the CSV of its own batches more than once. Each call commits separately unless autocommit is off, so a failure in a later group leaves the earlier groups in the table.
+To bound memory for Parquet data, import from file paths with `import_from_parquet` or `import_parquet_from_files`, which read each file in pieces instead of buffering it. `import_from_parquet_stream` buffers the whole stream. To bound memory for Arrow data or a Parquet stream, decode the data yourself and pass the RecordBatches in groups to `import_from_record_batches`. Each call is one IMPORT statement and holds the CSV of its own batches more than once. Each call commits separately unless autocommit is off, so a failure in a later group leaves the earlier groups in the table.
 
 ## CSV Import
 
@@ -216,6 +216,8 @@ Type widening rules when fields differ across files:
 When connected to Exasol 2025.1.11 or newer, the driver automatically uses **native Parquet import**: raw Parquet bytes are served to the server over HTTP range requests, and the SQL uses `IMPORT INTO ... FROM PARQUET AT '...;MaxConcurrentReads=1' FILE 'NNN.parquet'` with no CSV format clauses. This eliminates client-side decoding and re-encoding cost and reduces wire-bytes by 5–30x for typed columnar data. On older Exasol versions (7.x, 8.x) the driver continues to convert Parquet to CSV transparently — no change in behavior for existing deployments.
 
 Exasol 2025.2.0 is not supported for native Parquet import. It accepts only S3 URLs as Parquet sources and rejects the driver's HTTP source with `ETL-2210: AWS URL is invalid`, so a Parquet import on 2025.2.0 returns that error. Users on 2025.2.0 upgrade to Exasol 2025.2.1 or later, or force the CSV conversion path with `with_native_parquet(Some(false))`.
+
+On the native path, the driver does not read the file into memory. It opens the file and copies the ranges that Exasol requests, in pieces of at most 64 KiB. The file must stay unchanged while the import runs: a file that becomes shorter fails the import with an I/O error, and other changes to the file can import wrong data.
 
 The server version is detected automatically at connection time. To override the auto-detected behavior, use `ParquetImportOptions::with_native_parquet`:
 

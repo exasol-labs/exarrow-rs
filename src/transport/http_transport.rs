@@ -29,7 +29,7 @@ use rcgen::{CertifiedKey, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::{server, TlsAcceptor};
@@ -764,20 +764,33 @@ impl HttpTransportClient {
     /// `TransportError::ProtocolError`. A malformed `Range` header yields
     /// a `400 Bad Request` and the loop continues.
     ///
+    /// The handler takes the file size once, by a seek to the end of `source`,
+    /// before it reads the first request, and answers `HEAD` and clamps every
+    /// range against that size. It copies each requested range to the tunnel in
+    /// pieces of at most 64 KiB through one reused buffer, so memory does not
+    /// depend on the range sizes that Exasol chooses. A source that ends before
+    /// the end of a requested range, for example a file that became shorter
+    /// during the import, fails the call with `TransportError::IoError`.
+    ///
     /// # Arguments
     ///
-    /// * `file_bytes` - The complete Parquet file bytes to serve.
+    /// * `source` - The Parquet file to serve: a `tokio::fs::File`, or a
+    ///   `std::io::Cursor` over bytes that are already in memory.
     ///
     /// # Errors
     ///
     /// Returns `TransportError` only on unrecoverable conditions: a failed TLS
-    /// handshake, an unexpected method, or a write failure. Connection close
-    /// after the handshake is treated as successful completion.
-    pub async fn handle_parquet_import_requests(
+    /// handshake, an unexpected method, a write failure, or a failed or short
+    /// read of `source`. Connection close after the handshake is treated as
+    /// successful completion.
+    pub async fn handle_parquet_import_requests<R>(
         &mut self,
-        file_bytes: &[u8],
-    ) -> Result<(), TransportError> {
-        serve_parquet_range_requests(self.open_stream().await?, file_bytes).await
+        source: R,
+    ) -> Result<(), TransportError>
+    where
+        R: AsyncRead + AsyncSeek + Unpin,
+    {
+        serve_parquet_range_requests(self.open_stream().await?, source).await
     }
 
     /// Handles the EXPORT request from Exasol: reads the HTTP PUT, forwards
@@ -1061,15 +1074,21 @@ async fn forward_sized_body<S: AsyncRead + Unpin>(
 /// exercised in unit tests via `tokio::io::duplex` without spinning up a
 /// real TCP/TLS connection.
 ///
+/// The file size is probed once, by a seek to the end of `source`, before the
+/// first request is read; the `HEAD` reply and the range clamping use that
+/// one size. Each requested span is copied from `source` to `stream` in pieces
+/// of at most [`HTTP_CHUNK_SIZE`] bytes through one reused buffer, so memory
+/// does not depend on the range sizes that Exasol asks for. A source that ends
+/// before the span it declared fails with `TransportError::IoError`.
+///
 /// See [`HttpTransportClient::handle_parquet_import_requests`] for the
 /// full protocol description.
-async fn serve_parquet_range_requests<S>(
-    stream: &mut S,
-    file_bytes: &[u8],
-) -> Result<(), TransportError>
+async fn serve_parquet_range_requests<S, R>(stream: &mut S, source: R) -> Result<(), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncSeek + Unpin,
 {
+    let mut file = SeekableFile::open(source).await?;
     loop {
         let request = match parse_http_request(stream).await {
             Ok(req) => req,
@@ -1081,11 +1100,11 @@ where
         };
 
         match request.method {
-            HttpMethod::Head => write_file_size_response(stream, file_bytes.len()).await?,
+            HttpMethod::Head => write_file_size_response(stream, file.len).await?,
             HttpMethod::Get => match request.headers.get("range") {
-                Some(range_header) => serve_byte_range(stream, file_bytes, range_header).await?,
+                Some(range_header) => file.serve_byte_range(stream, range_header).await?,
                 // Full GET without Range header — rare but legal.
-                None => write_whole_file_response(stream, file_bytes).await?,
+                None => file.serve_whole_file(stream).await?,
             },
             HttpMethod::Put => {
                 let _ = stream
@@ -1100,49 +1119,134 @@ where
     }
 }
 
-/// Answers one `Range` request: `206 Partial Content` with the requested slice,
-/// or `400 Bad Request` for any range this file cannot satisfy.
-///
-/// A rejected range is not an error for the caller — Exasol may retry with a
-/// different range or just close the connection — so both outcomes return `Ok`.
-async fn serve_byte_range<S>(
-    stream: &mut S,
-    file_bytes: &[u8],
-    range_header: &str,
-) -> Result<(), TransportError>
+/// A seekable file source with its size, probed once, and the one buffer
+/// that every response copies through.
+struct SeekableFile<R> {
+    source: R,
+    len: u64,
+    piece: Vec<u8>,
+}
+
+impl<R> SeekableFile<R>
 where
-    S: AsyncWrite + Unpin,
+    R: AsyncRead + AsyncSeek + Unpin,
 {
-    let Some((start, end)) = parse_byte_range(range_header) else {
-        return write_bad_request_response(stream).await;
-    };
-
-    if file_bytes.is_empty() || start >= file_bytes.len() {
-        return write_bad_request_response(stream).await;
+    async fn open(mut source: R) -> Result<Self, TransportError> {
+        let len = source.seek(io::SeekFrom::End(0)).await.map_err(|e| {
+            TransportError::IoError(format!("Failed to determine the Parquet file size: {e}"))
+        })?;
+        Ok(Self {
+            source,
+            len,
+            piece: vec![0u8; HTTP_CHUNK_SIZE],
+        })
     }
 
-    let clamped_end = end.min(file_bytes.len().saturating_sub(1));
-    if clamped_end < start {
-        return write_bad_request_response(stream).await;
+    /// Answers one `Range` request: `206 Partial Content` with the requested
+    /// span, or `400 Bad Request` for any range this file cannot satisfy.
+    ///
+    /// A rejected range is not an error for the caller — Exasol may retry with a
+    /// different range or just close the connection — so both outcomes return `Ok`.
+    async fn serve_byte_range<S>(
+        &mut self,
+        stream: &mut S,
+        range_header: &str,
+    ) -> Result<(), TransportError>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let Some((start, end)) = parse_byte_range(range_header) else {
+            return write_bad_request_response(stream).await;
+        };
+
+        if self.len == 0 || start >= self.len {
+            return write_bad_request_response(stream).await;
+        }
+
+        let clamped_end = end.min(self.len - 1);
+        if clamped_end < start {
+            return write_bad_request_response(stream).await;
+        }
+
+        let span_len = clamped_end - start + 1;
+        let head = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {span_len}\r\nContent-Range: bytes {start}-{clamped_end}/{}\r\n\r\n",
+            self.len
+        );
+        self.write_span_response(stream, &head, start..clamped_end + 1)
+            .await
     }
 
-    write_partial_content_response(stream, file_bytes, start, clamped_end).await
+    /// Answers a `GET` without a `Range` header: `200 OK` with the whole file.
+    async fn serve_whole_file<S>(&mut self, stream: &mut S) -> Result<(), TransportError>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", self.len);
+        self.write_span_response(stream, &head, 0..self.len).await
+    }
+
+    /// Writes `head`, then copies the bytes in `span` of the source to `stream`
+    /// in pieces of at most [`HTTP_CHUNK_SIZE`].
+    async fn write_span_response<S>(
+        &mut self,
+        stream: &mut S,
+        head: &str,
+        span: std::ops::Range<u64>,
+    ) -> Result<(), TransportError>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let start = span.start;
+        let span_len = span.end - span.start;
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .map_err(|e| TransportError::IoError(format!("Failed to write response head: {e}")))?;
+        self.source
+            .seek(io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| {
+                TransportError::IoError(format!(
+                    "Failed to seek to byte {start} of the Parquet file: {e}"
+                ))
+            })?;
+
+        let mut remaining = span_len;
+        while remaining > 0 {
+            let piece_len = remaining.min(self.piece.len() as u64) as usize;
+            let piece = &mut self.piece[..piece_len];
+            self.source.read_exact(piece).await.map_err(|e| {
+                TransportError::IoError(format!(
+                    "Failed to read the Parquet file: {remaining} of {span_len} bytes from byte {start} still expected: {e}"
+                ))
+            })?;
+            stream.write_all(piece).await.map_err(|e| {
+                TransportError::IoError(format!("Failed to write response body: {e}"))
+            })?;
+            remaining -= piece_len as u64;
+        }
+        stream
+            .flush()
+            .await
+            .map_err(|e| TransportError::IoError(format!("Failed to flush response: {e}")))
+    }
 }
 
 /// Parses a `Range: bytes=<start>-<end>` header value into inclusive bounds.
 ///
 /// Returns `None` for anything malformed: a missing `bytes=` prefix, a missing
 /// dash, or a non-numeric bound.
-fn parse_byte_range(range_header: &str) -> Option<(usize, usize)> {
+fn parse_byte_range(range_header: &str) -> Option<(u64, u64)> {
     let (start_str, end_str) = range_header.strip_prefix("bytes=")?.split_once('-')?;
-    let start = start_str.trim().parse::<usize>().ok()?;
-    let end = end_str.trim().parse::<usize>().ok()?;
+    let start = start_str.trim().parse::<u64>().ok()?;
+    let end = end_str.trim().parse::<u64>().ok()?;
     Some((start, end))
 }
 
 /// Writes `200 OK` with a `Content-Length` and no body, answering a `HEAD`
 /// probe for the file size.
-async fn write_file_size_response<S>(stream: &mut S, file_len: usize) -> Result<(), TransportError>
+async fn write_file_size_response<S>(stream: &mut S, file_len: u64) -> Result<(), TransportError>
 where
     S: AsyncWrite + Unpin,
 {
@@ -1155,64 +1259,6 @@ where
         .flush()
         .await
         .map_err(|e| TransportError::IoError(format!("Failed to flush HEAD response: {e}")))
-}
-
-/// Writes `200 OK` followed by the complete file body.
-async fn write_whole_file_response<S>(
-    stream: &mut S,
-    file_bytes: &[u8],
-) -> Result<(), TransportError>
-where
-    S: AsyncWrite + Unpin,
-{
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-        file_bytes.len()
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|e| TransportError::IoError(format!("Failed to write GET headers: {e}")))?;
-    stream
-        .write_all(file_bytes)
-        .await
-        .map_err(|e| TransportError::IoError(format!("Failed to write GET body: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| TransportError::IoError(format!("Failed to flush GET response: {e}")))
-}
-
-/// Writes `206 Partial Content` followed by `file_bytes[start..=end]`.
-async fn write_partial_content_response<S>(
-    stream: &mut S,
-    file_bytes: &[u8],
-    start: usize,
-    end: usize,
-) -> Result<(), TransportError>
-where
-    S: AsyncWrite + Unpin,
-{
-    let slice = &file_bytes[start..=end];
-    let response = format!(
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
-        slice.len(),
-        start,
-        end,
-        file_bytes.len()
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|e| TransportError::IoError(format!("Failed to write 206 headers: {e}")))?;
-    stream
-        .write_all(slice)
-        .await
-        .map_err(|e| TransportError::IoError(format!("Failed to write 206 body: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| TransportError::IoError(format!("Failed to flush 206 response: {e}")))
 }
 
 /// Writes a bare `400 Bad Request` with no body.
@@ -2218,7 +2264,11 @@ mod tests {
 
         let file_bytes_for_handler = file_bytes.clone();
         let handler = tokio::spawn(async move {
-            serve_parquet_range_requests(&mut server_side, &file_bytes_for_handler).await
+            serve_parquet_range_requests(
+                &mut server_side,
+                std::io::Cursor::new(file_bytes_for_handler),
+            )
+            .await
         });
 
         // 1. HEAD request — expect "HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n"
@@ -2360,7 +2410,7 @@ mod tests {
     ) {
         let (mut server_side, client_side) = tokio::io::duplex(4096);
         let handler = tokio::spawn(async move {
-            serve_parquet_range_requests(&mut server_side, &file_bytes).await
+            serve_parquet_range_requests(&mut server_side, std::io::Cursor::new(file_bytes)).await
         });
         (client_side, handler)
     }
@@ -2814,6 +2864,175 @@ mod tests {
         assert!(handler.await.expect("handler task panicked").is_ok());
     }
 
+    /// A source that counts what the handler reads from it.
+    struct RecordingSource {
+        inner: std::io::Cursor<Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+        largest_read: Arc<AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for RecordingSource {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = poll {
+                let read = buf.filled().len() - before;
+                self.bytes_read.fetch_add(read, Ordering::SeqCst);
+                self.largest_read.fetch_max(read, Ordering::SeqCst);
+            }
+            poll
+        }
+    }
+
+    impl tokio::io::AsyncSeek for RecordingSource {
+        fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+            Pin::new(&mut self.inner).start_seek(position)
+        }
+
+        fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+            Pin::new(&mut self.inner).poll_complete(cx)
+        }
+    }
+
+    /// Scenario: Native Parquet import on Exasol 2025.1.11+
+    #[tokio::test(start_paused = true)]
+    async fn test_serve_parquet_range_requests_reads_only_the_requested_range_in_pieces() {
+        const FILE_LEN: usize = 2 * 1024 * 1024;
+        const RANGE_LEN: usize = 1024 * 1024;
+
+        let file_bytes: Vec<u8> = (0..FILE_LEN).map(|i| (i % 251) as u8).collect();
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let largest_read = Arc::new(AtomicUsize::new(0));
+        let source = RecordingSource {
+            inner: std::io::Cursor::new(file_bytes.clone()),
+            bytes_read: Arc::clone(&bytes_read),
+            largest_read: Arc::clone(&largest_read),
+        };
+        let (mut server_side, mut client) = tokio::io::duplex(4096);
+        let handler =
+            tokio::spawn(
+                async move { serve_parquet_range_requests(&mut server_side, source).await },
+            );
+
+        client
+            .write_all(b"HEAD /001.parquet HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let (head_response, _) = read_response_with_body(&mut client, 0).await;
+        assert!(
+            head_response.contains("Content-Length: 2097152\r\n"),
+            "{head_response:?}"
+        );
+
+        client
+            .write_all(b"GET /001.parquet HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1048575\r\n\r\n")
+            .await
+            .unwrap();
+        read_response_with_body(&mut client, 0).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            bytes_read.load(Ordering::SeqCst) <= 2 * HTTP_CHUNK_SIZE,
+            "a peer that has read only the head holds back the rest of the range"
+        );
+
+        let body = read_exactly(&mut client, RANGE_LEN).await;
+
+        assert_eq!(body, file_bytes[..RANGE_LEN]);
+        assert!(largest_read.load(Ordering::SeqCst) <= HTTP_CHUNK_SIZE);
+        assert_eq!(bytes_read.load(Ordering::SeqCst), RANGE_LEN);
+        drop(client);
+        assert!(handler.await.expect("handler task panicked").is_ok());
+    }
+
+    struct RefusingSeekSource;
+
+    impl tokio::io::AsyncRead for RefusingSeekSource {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncSeek for RefusingSeekSource {
+        fn start_seek(self: Pin<&mut Self>, _position: io::SeekFrom) -> io::Result<()> {
+            Err(io::Error::other("seek refused"))
+        }
+
+        fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_fails_when_the_size_probe_fails() {
+        let (mut server_side, _client) = tokio::io::duplex(4096);
+
+        let result = serve_parquet_range_requests(&mut server_side, RefusingSeekSource).await;
+
+        match result {
+            Err(TransportError::IoError(message)) => {
+                assert!(
+                    message.contains("Failed to determine the Parquet file size"),
+                    "{message}"
+                );
+                assert!(message.contains("seek refused"), "{message}");
+            }
+            other => panic!("expected an IoError, got {other:?}"),
+        }
+    }
+
+    /// Scenario: Native Parquet import fails when the file becomes shorter during the import
+    #[tokio::test]
+    async fn test_serve_parquet_range_requests_fails_when_the_file_ends_inside_a_range() {
+        use tokio::io::AsyncReadExt;
+
+        const FILE_LEN: usize = 200 * 1024;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut file, &vec![7u8; FILE_LEN]).unwrap();
+        let source = tokio::fs::File::open(file.path()).await.unwrap();
+        let (mut server_side, mut client) = tokio::io::duplex(4096);
+        let handler =
+            tokio::spawn(
+                async move { serve_parquet_range_requests(&mut server_side, source).await },
+            );
+
+        client
+            .write_all(b"HEAD /001.parquet HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let (head_response, _) = read_response_with_body(&mut client, 0).await;
+        assert!(
+            head_response.contains("Content-Length: 204800\r\n"),
+            "{head_response:?}"
+        );
+        file.as_file().set_len(100 * 1024).unwrap();
+        client
+            .write_all(b"GET /001.parquet HTTP/1.1\r\nHost: x\r\nRange: bytes=0-204799\r\n\r\n")
+            .await
+            .unwrap();
+        read_response_with_body(&mut client, 0).await;
+        let mut body = Vec::new();
+        client.read_to_end(&mut body).await.unwrap();
+
+        assert!(body.len() < FILE_LEN, "the body stops where the file ends");
+        let error = handler
+            .await
+            .expect("handler task panicked")
+            .expect_err("a file that ends inside a range must fail the handler");
+        assert!(
+            matches!(error, TransportError::IoError(_)),
+            "expected IoError, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_serve_parquet_range_requests_answers_a_put_with_405_and_an_error() {
         use tokio::io::AsyncWriteExt;
@@ -3089,7 +3308,7 @@ mod tests {
 
         let error = finish_within(
             LOOPBACK_TEST_BOUND,
-            client.handle_parquet_import_requests(b"PAR1"),
+            client.handle_parquet_import_requests(std::io::Cursor::new(b"PAR1".to_vec())),
         )
         .await
         .expect_err("a stalled TLS handshake must fail the Parquet tunnel, not end it as a close");
