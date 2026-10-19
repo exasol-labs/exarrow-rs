@@ -1,10 +1,10 @@
 # Feature: Statement Schema Lookup
 
-Implements the ADBC Statement methods `get_parameter_schema` and `execute_schema`. They return the Arrow Schema of a statement's parameters and of its result set from the metadata that Exasol reports when it prepares the statement, so a caller learns both schemas without executing the statement. The feature also owns the rule that setting different SQL discards an earlier prepare for every Statement method, including `execute` and `execute_update` with bound parameters.
+Implements the ADBC Statement methods `get_parameter_schema` and `execute_schema`, which return the Arrow Schema of a statement's parameters and of its result set from the metadata Exasol reports at prepare, without executing the statement. Setting different SQL discards an earlier prepare for every Statement method, including `execute` and `execute_update` with bound parameters.
 
 ## Background
 
-When Exasol prepares a statement, it reports the type of each parameter and, for a statement that returns a result set, the name and type of each result-set column, as `prepared-statements/result-columns` specifies. A statement that returns an affected-row count, such as INSERT, UPDATE, or DELETE, has no result-set columns. The driver converts this metadata to an Arrow `Schema`. The metadata of a prepare belongs to the SQL text that was set when the prepare ran.
+Exasol reports the type of each parameter at prepare and, for a statement that returns a result set, the name and type of each result-set column, as `prepared-statements/result-columns` specifies. A statement that returns an affected-row count, such as INSERT, UPDATE, or DELETE, has no result-set columns. The metadata of a prepare belongs to the SQL text that was set when the prepare ran.
 
 ## Scenarios
 

@@ -1,10 +1,10 @@
 # Feature: Arrow Conversion Optimization
 
-Specifies performance optimizations for arrow conversion including streaming deserialization, null-free fast paths, string buffer optimization, and validation gates.
+Specifies streaming deserialization, null-free fast paths, string buffer pre-allocation, and validation gates for Arrow conversion.
 
 ## Background
 
-Exasol returns column-major JSON data that must be transposed to row-major format for Arrow conversion. Columns may or may not contain NULL values, and null statistics are available to guide optimization. Large VARCHAR columns require buffer pre-allocation for efficient conversion. ALL changes to arrow conversion MUST pass comprehensive testing, including DECIMAL overflow tests, null handling fast path tests, clippy with zero warnings, and performance benchmarks demonstrating no regression.
+Exasol returns column-major JSON data, which the client transposes to row-major before Arrow conversion. Null statistics for a column guide the choice of conversion path.
 
 ## Scenarios
 

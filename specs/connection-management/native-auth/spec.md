@@ -1,10 +1,10 @@
 # Feature: Native Auth
 
-Defines the authentication mechanisms specific to the Exasol native TCP protocol, including key exchange and password encryption for the native login handshake.
+Defines password encryption and the ChaCha20 key exchange in the native TCP login handshake.
 
 ## Background
 
-The native TCP protocol uses a distinct authentication flow from the WebSocket protocol. Passwords are encrypted using Exasol's raw RSA modular exponentiation scheme (without PKCS#1 padding). A ChaCha20 session key pair is established only when TLS is NOT active on the transport (legacy-encryption mode for pre-7.1 Exasol servers); when TLS is active, ChaCha20 keys are never generated or sent and all subsequent messages travel in plaintext inside the TLS tunnel.
+The native login encrypts the password with Exasol's raw RSA modular exponentiation (no PKCS#1 padding). The driver generates and sends ChaCha20 session keys only when TLS is not active (legacy mode for pre-7.1 servers). With TLS active, messages travel in plaintext inside the TLS tunnel.
 
 ## Scenarios
 

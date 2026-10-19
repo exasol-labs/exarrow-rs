@@ -1,10 +1,10 @@
 # Feature: Zero-copy fetch optimization
 
-The native TCP transport eliminates intermediate data structures between wire bytes and Arrow RecordBatch. Instead of parsing wire data into a ColumnData intermediate (Vec<Option<T>>) and then copying into Arrow builders, the parser writes directly into Arrow array buffers during the parse pass, achieving single-copy data transfer from network to Arrow.
+The native TCP parser writes wire data directly into Arrow array buffers, with no `ColumnData` intermediate.
 
 ## Background
 
-The column-major binary wire format from Exasol aligns with Arrow's columnar memory layout. Each column's data arrives as a stream of [null_marker][value] pairs. By writing values directly into Arrow buffers (value buffer + validity bitmap) during parsing, we eliminate the ColumnData intermediate and halve allocations for variable-length types (strings, binaries).
+Each column arrives as a stream of [null_marker][value] pairs, so the parser writes values and the validity bitmap directly into Arrow buffers.
 
 ## Scenarios
 

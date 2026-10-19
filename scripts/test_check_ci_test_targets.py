@@ -55,13 +55,13 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         return code, out.getvalue()
 
     def test_every_target_present_exits_zero(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         code, output = self.run_check()
         self.assertEqual(code, 0)
         self.assertEqual(output, "")
 
     def test_missing_target_exits_one_and_names_the_target(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         (self.tests_dir / "gamma_tests.rs").write_text("")
         code, output = self.run_check()
         self.assertEqual(code, 1)
@@ -69,7 +69,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertNotIn("alpha_tests", output)
 
     def test_target_with_longer_name_does_not_count(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.workflow.write_text(
             workflow(
                 "- run: cargo test --test alpha_tests_extra",
@@ -82,7 +82,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertNotIn("beta_tests", output)
 
     def test_target_at_end_of_file_without_newline_counts(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.workflow.write_text(
             workflow(
                 "- run: cargo test --test alpha_tests --x",
@@ -100,7 +100,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertNotIn("beta_tests", output)
 
     def test_commented_out_invocation_does_not_count(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.assert_alpha_not_run(
             workflow(
                 "# - run: cargo test --test alpha_tests",
@@ -111,7 +111,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         )
 
     def test_trailing_comment_does_not_count(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.assert_alpha_not_run(
             workflow(
                 "- run: cargo test --test beta_tests # --test alpha_tests",
@@ -119,7 +119,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         )
 
     def test_echoed_invocation_does_not_count(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.assert_alpha_not_run(
             workflow(
                 "- run: echo cargo test --test alpha_tests",
@@ -130,7 +130,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         )
 
     def test_invocation_in_another_job_does_not_count(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.assert_alpha_not_run(
             workflow(
                 "- run: cargo test --test beta_tests",
@@ -139,7 +139,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         )
 
     def test_multiline_run_block_counts(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.workflow.write_text(
             workflow(
                 "- name: Run both",
@@ -152,7 +152,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_missing_integration_job_reports_every_target(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         self.workflow.write_text("jobs:\n  lint:\n    steps:\n      - run: cargo test --test alpha_tests\n")
         code, output = self.run_check()
         self.assertEqual(code, 1)
@@ -160,7 +160,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertIn("beta_tests", output)
 
     def test_bare_ignore_exits_one_and_names_file_and_line(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         path = self.tests_dir / "alpha_tests.rs"
         path.write_text("#[test]\n    #[ignore]\nfn a() {}\n")
         code, output = self.run_check()
@@ -168,7 +168,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertIn(f"{path}:2", output)
 
     def test_bare_ignore_in_subdirectory_is_found(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         sub = self.tests_dir / "common"
         sub.mkdir()
         (sub / "mod.rs").write_text("#[ignore]\n")
@@ -177,7 +177,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertIn(f"{sub / 'mod.rs'}:1", output)
 
     def test_subdirectory_file_is_not_a_test_target(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         sub = self.tests_dir / "common"
         sub.mkdir()
         (sub / "mod.rs").write_text("")
@@ -185,7 +185,7 @@ class CheckCiTestTargetsTest(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_ignore_with_reason_exits_zero(self):
-        """Scenario: CI rejects an integration test target that the integration job does not run"""
+        """CI rejects an integration test target that the integration job does not run"""
         (self.tests_dir / "alpha_tests.rs").write_text(
             '#[test]\n#[ignore = "needs a long run"]\nfn a() {}\n'
         )

@@ -1,10 +1,10 @@
 # Feature: Statement and Results
 
-Specifies statement execution, session identity, and result set handling for the ADBC driver, ensuring queries execute through connection-mediated transport and return Arrow-formatted results.
+Specifies statement execution, session identity, and result handling for the ADBC driver. Queries run through the Connection and return Arrow results.
 
 ## Background
 
-Statements are pure data objects created via `Connection::create_statement()` and executed via `Connection::execute_statement()`. Statements do not hold transport references; all execution goes through the Connection. Multiple statements created from the same connection share a single database session. Query results are returned in Arrow format per the ADBC specification.
+A Statement is pure data and holds no transport reference. Statements created from one connection share a single database session.
 
 ## Scenarios
 
@@ -19,7 +19,7 @@ Statements are pure data objects created via `Connection::create_statement()` an
 
 * *GIVEN* an active database connection exists
 * *WHEN* a Statement is executed via `Connection::execute_statement()`
-* *THEN* it SHALL send the query via WebSocket protocol
+* *THEN* it SHALL send the query over the connection's transport
 * *AND* it SHALL return results as Arrow RecordBatch
 * *AND* it SHALL include result metadata (schema, row count)
 
@@ -41,8 +41,8 @@ Statements are pure data objects created via `Connection::create_statement()` an
 
 * *GIVEN* an active database connection exists
 * *WHEN* a statement is executed
-* *THEN* it SHALL use the connection's existing WebSocket transport
-* *AND* it SHALL NOT open a new WebSocket connection
+* *THEN* it SHALL use the connection's existing transport
+* *AND* it SHALL NOT open a new transport connection
 * *AND* it SHALL NOT perform a new TLS handshake or authentication
 
 ### Scenario: Arrow RecordBatch results

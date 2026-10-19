@@ -4,7 +4,7 @@ The system establishes a native TCP session with Exasol before any command is ex
 
 ## Background
 
-The native TCP protocol connects to the same Exasol port (8563) as the WebSocket protocol. The server dispatches based on the first bytes received: `LOGIN_MAGIC` (0x01121201) for native TCP, `GET ` for WebSocket. Protocol version 14 is the minimum supported version, which requires ChaCha20 encryption and deprecates RC4. Once the handshake completes, ordinary command traffic is specified in `native-client/protocol`.
+The server selects the native protocol when the first bytes received are `LOGIN_MAGIC` (0x01121201).
 
 ## Scenarios
 

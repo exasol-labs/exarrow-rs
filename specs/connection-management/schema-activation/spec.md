@@ -1,10 +1,10 @@
 # Feature: Schema Activation
 
-Specifies how the session's current schema is set from the connection URI or `ConnectionParams` during connect, how a caller sets and reads it through the Rust API and the ADBC `adbc.connection.db_schema` connection option, and how the driver keeps the reported value in step with schema changes that SQL statements make.
+Specifies how the session's current schema is set on connect, set and read at runtime through the Rust API and the ADBC `adbc.connection.db_schema` option, and kept in step with schema changes that SQL statements make.
 
 ## Background
 
-The current schema is an Exasol session attribute. The driver sets it with the protocol's set-attributes command and never with an `OPEN SCHEMA` statement, so the driver passes the schema name as a plain string and does not quote it. The server resolves the name in two steps: it opens the schema whose name matches exactly, and otherwise the schema whose name matches the upper-case form of the name. When neither schema exists, the server rejects the change with a `schema ... not found` error and the session keeps its previous current schema. The server reports the current schema in the response to a get-attributes request and in the response to any statement that changes it, such as `OPEN SCHEMA`, `CREATE SCHEMA`, `CLOSE SCHEMA`, or `DROP SCHEMA` of the current schema. An empty reported value means the session has no current schema. A schema named in the connection URI or in `ConnectionParams` must exist on the server, so a rejected schema fails the connect.
+The driver sets the schema with the set-attributes command, never with an `OPEN SCHEMA` statement, and passes the name as a plain string without quoting it. The server opens the schema whose name matches exactly, otherwise the schema whose name matches the upper-case form. When neither exists, the server rejects the change and the session keeps its previous schema. The server reports the current schema in the response to a get-attributes request and to any statement that changes it, and an empty value means no current schema.
 
 ## Scenarios
 

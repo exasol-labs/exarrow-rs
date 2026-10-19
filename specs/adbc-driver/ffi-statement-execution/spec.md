@@ -1,10 +1,10 @@
 # Feature: FFI Statement Execution
 
-Specifies how the ADBC Statement of the FFI driver executes SQL with a bound RecordBatch: how many prepared-statement executions reach Exasol, what `execute` and `execute_update` return, what a failed batch leaves in the database, and which affected-row count a driver manager reads after `execute`.
+Specifies how the FFI driver's ADBC Statement executes SQL with a bound RecordBatch: how many prepared-statement executions reach Exasol, what `execute` and `execute_update` return, what a failed batch leaves in the database, and which affected-row count a driver manager reads after `execute`.
 
 ## Background
 
-A statement returns either an affected-row count, as INSERT, UPDATE, DELETE, and MERGE do, or a result set, as SELECT does. Exasol accepts a multi-row parameter set in one prepared-statement execution for a statement that returns an affected-row count. Exasol rejects a multi-row parameter set for a statement that returns a result set. A data message is the protocol message that carries the parameter values of one execution. Exasol reports a maximum data message size at login. Over the native protocol, a bound batch whose data message would exceed that size runs as consecutive prepared-statement executions, as `prepared-statements/batch-execution` specifies.
+A statement returns either an affected-row count, as INSERT, UPDATE, DELETE, and MERGE do, or a result set, as SELECT does. Exasol accepts a multi-row parameter set in one prepared-statement execution for a statement that returns an affected-row count, and rejects it for a statement that returns a result set. A data message is the protocol message that carries the parameter values of one execution. Exasol reports a maximum data message size at login. Over the native protocol, a bound batch whose data message would exceed that size runs as consecutive prepared-statement executions, as `prepared-statements/batch-execution` specifies.
 
 ## Scenarios
 

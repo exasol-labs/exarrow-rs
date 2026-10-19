@@ -1,10 +1,10 @@
 # Feature: Native TCP Protocol
 
-The system implements Exasol's native binary TCP protocol as a high-performance alternative to the WebSocket JSON protocol. Once a session is established (see `native-client/handshake`), commands are serialized as binary attribute sets and responses are parsed from binary frames into structured Rust types.
+The system serializes native TCP commands as binary attribute sets and parses responses from binary frames into Rust types.
 
 ## Background
 
-Native protocol commands share a common binary message envelope: a 21-byte header followed by an attribute set. The server responds with one of a fixed set of result types (`R_ResultSet`, `R_RowCount`, `R_Empty`, `R_Exception`, `R_StillExecuting`), each parsed into its own Rust representation. Prepared-statement command handling is specified separately in `native-client/prepared-statement-protocol`.
+Every command is a binary message: a 21-byte header followed by an attribute set.
 
 ## Scenarios
 

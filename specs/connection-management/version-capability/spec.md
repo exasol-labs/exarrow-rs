@@ -1,12 +1,10 @@
 # Feature: Server Version Capability Detection
 
-Provides a small utility that parses Exasol's `release_version` string captured during login and answers feature-availability questions (e.g. "does this server accept native Parquet import?") so that higher-level code paths can branch without issuing extra round-trips.
+A utility parses Exasol's `release_version` string from login and answers feature-availability questions, such as whether the server accepts native Parquet import, without extra round-trips.
 
 ## Background
 
-Every successful login, over both native TCP and WebSocket, populates `Session::server_info().release_version` with a dotted string such as `"7.1.0"`, `"8.27.1"`, or `"2025.1.11"`. The driver SHALL parse this string into a comparable `(major, minor, patch)` tuple at first use and cache it, then expose `supports_native_parquet_import()` and a generic `supports_at_least(major, minor, patch)` predicate. Parsing is lenient: trailing build/qualifier suffixes are ignored, and any string that fails to parse SHALL be treated as "below every threshold" so that the driver falls back to the legacy code path on unknown versions.
-
-The driver selects native Parquet import from Exasol 2025.1.11 onward (matching the JDBC driver's `exaVersionInt >= 20250111` test gate). The threshold predicate uses lexicographic `(major, minor, patch)` comparison against the constant `(2025, 1, 11)`.
+Every successful login populates `Session::server_info().release_version` with a dotted string such as `"7.1.0"`, `"8.27.1"`, or `"2025.1.11"`. The driver parses it into a comparable `(major, minor, patch)` tuple at first use, caches it, and exposes `supports_native_parquet_import()` and `supports_at_least(major, minor, patch)`. Parsing ignores trailing build or qualifier suffixes. A string that fails to parse counts as below every threshold, so the driver uses the legacy code path. Native Parquet import needs Exasol 2025.1.11 or later, compared lexicographically against `(2025, 1, 11)`.
 
 ## Scenarios
 

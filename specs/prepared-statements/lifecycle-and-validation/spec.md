@@ -1,10 +1,10 @@
 # Feature: Lifecycle and Validation
 
-Specifies the prepared statement lifecycle management and test validation requirements, ensuring proper resource cleanup on both client and server, and comprehensive test coverage for all prepared statement functionality.
+Specifies prepared statement cleanup on the client and the server, and the test and quality gates for prepared statement functionality.
 
 ## Background
 
-Prepared statements consume resources on both the client and Exasol server. The system must properly manage these resources throughout the statement lifecycle, including explicit cleanup, connection-scoped cleanup, and graceful handling of server-side expiration. All changes to prepared statement functionality must pass comprehensive unit, integration, and code quality gates before completion.
+Prepared statements consume resources on both the client and the Exasol server, so they need explicit cleanup, connection-scoped cleanup, and graceful handling of server-side expiration.
 
 ## Scenarios
 
@@ -36,13 +36,6 @@ Prepared statements consume resources on both the client and Exasol server. The 
 * *WHEN* prepared statement implementation is complete
 * *THEN* `cargo test` MUST pass with zero failures
 * *AND* all prepared statement unit tests MUST be present and passing
-
-### Scenario: Integration test requirement
-
-* *GIVEN* the prepared statement implementation is complete
-* *WHEN* prepared statement implementation is complete
-* *THEN* integration tests with real Exasol database MUST pass
-* *AND* parameterized query tests MUST demonstrate SQL injection protection
 
 ### Scenario: Code quality requirement
 

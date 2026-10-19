@@ -4,7 +4,7 @@ The native TCP protocol returns query results as column-major binary data, which
 
 ## Background
 
-Native protocol result sets contain: a result type marker (1 byte), result set handle (4 bytes), column count (4 bytes), total rows (8 bytes), rows in this message (8 bytes), column metadata (variable), and column-major row data with per-column null masks. Each column's data is contiguous in the binary stream, matching Arrow's memory layout.
+A result set holds a type marker (1 byte), handle (4), column count (4), total rows (8), rows in this message (8), column metadata, and column-major row data with per-column null masks.
 
 ## Scenarios
 

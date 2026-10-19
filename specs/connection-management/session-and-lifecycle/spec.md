@@ -1,10 +1,10 @@
 # Feature: Session and Lifecycle
 
-Specifies session management, connection pooling foundation, and timeout configuration for Exasol database connections.
+Specifies the session lifecycle of a connection: establishment, attributes, termination, reuse, and health checking.
 
 ## Background
 
-The system SHALL manage database session lifecycle from establishment through termination. Connections SHALL support clean state reset to enable future pooling implementations. Configurable timeouts SHALL govern connection and query operations, and the query timeout and the deprecated idle timeout are specified in `connection-management/query-timeout`. The connection timeout, which bounds opening a connection, is specified in `connection-management/connection-timeout`. The driver has no idle timeout and never closes a connection because the connection is idle, so the `idle_timeout` connection-string parameter is deprecated and has no effect. The query-execution timeout SHALL be a server-enforced session setting and default to unset: when a caller configures a query timeout, the driver SHALL forward it to Exasol as the `queryTimeout` session attribute so the server aborts an over-running query and reports the abort through the normal response cycle, and the driver SHALL NOT wrap query execution through `Connection::execute_statement()` in a client-side timer. A client-side bound on a CSV export is a separate, export-scoped setting specified in `import-export/csv-export-timeout`. Absent an explicit query timeout, the driver SHALL set no `queryTimeout` attribute and the server-side `QUERY_TIMEOUT` setting SHALL govern. If the driver ever gives up on a running query client-side, it MUST terminate the connection rather than abandon the in-flight request and leave the session open server-side. Default-schema activation on connect is specified in the `connection-management/schema-activation` feature. The client-side session states and the rules for operations in each state are specified in `connection-management/session-state`.
+The driver closes a connection only when the caller closes it or the driver terminates it because it no longer trusts an in-flight response. If the driver gives up on a running query client-side, it MUST terminate the connection and not leave the in-flight request running with the session open server-side.
 
 ## Scenarios
 

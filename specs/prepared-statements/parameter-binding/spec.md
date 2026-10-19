@@ -1,6 +1,6 @@
 # Feature: Parameter Binding
 
-Specifies type-safe, positional parameter binding for Exasol prepared statements: counting placeholders, validating and converting bound values, and encoding them onto the wire. Statement creation and execution are specified in `prepared-statements/binding-and-execution`.
+Specifies positional parameter binding for Exasol prepared statements: counting placeholders, validating and converting bound values, and encoding them onto the wire.
 
 ## Background
 

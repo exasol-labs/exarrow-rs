@@ -1,10 +1,10 @@
 # Feature: ChaCha20 Session Encryption
 
-The native TCP protocol supports ChaCha20 stream encryption as a legacy message-encryption mode for connections that do not use TLS. When TLS is active (the default for Exasol 7.1+ and mandatory on Exasol 8), ChaCha20 is NOT used — TLS provides all transport and message confidentiality. When TLS is disabled (e.g. `tls=false` against pre-7.1 Exasol servers, matching the C++ reference driver's "legacy encryption" mode), the client generates random send and receive ChaCha20 keys, encrypts them with the server's RSA public key, transmits them during login, and encrypts all subsequent message payloads with ChaCha20.
+The native TCP protocol encrypts message payloads with ChaCha20 only when TLS is not active.
 
 ## Background
 
-ChaCha20 and TLS are MUTUALLY EXCLUSIVE in the native TCP protocol, matching the Exasol C++ reference driver (`useLegacyEncryption` mode in `dwaSocket.cpp`): when both are requested, SSL is disabled and ChaCha20 takes over; when TLS is active, ChaCha20 is never negotiated. Protocol version 14 replaced the older RC4 cipher with ChaCha20 in the non-TLS (legacy) encryption path — it did NOT mandate ChaCha20 for TLS connections. Protocol version 18+ (Exasol 7.1+) uses TLS exclusively and never exchanges ChaCha20 keys. When ChaCha20 is used, keys are 32 bytes, the key exchange happens during the login phase via `CMD_SET_ATTRIBUTES` with `ATTR_CLIENT_SEND_KEY`, `ATTR_CLIENT_RECEIVE_KEY`, and `ATTR_CLIENT_KEYS_LEN`, and all message payloads after the handshake are ChaCha20-encrypted (headers remain plaintext for framing).
+ChaCha20 and TLS are mutually exclusive. TLS is the default on Exasol 7.1+ and mandatory on Exasol 8. `tls=false` selects ChaCha20, the legacy encryption mode for pre-7.1 servers.
 
 ## Scenarios
 

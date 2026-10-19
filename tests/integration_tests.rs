@@ -3020,7 +3020,7 @@ async fn test_build_sql_scanner_end_to_end_via_execute_statement() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Scenario: Arrow and Parquet dependencies resolve to version 59 or above with one version of each Arrow sub-crate
+/// Scenario: Arrow and Parquet dependencies resolve to one version of each Arrow sub-crate
 #[test]
 fn test_arrow_parquet_resolve_to_59_or_above_with_unified_sub_crates() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

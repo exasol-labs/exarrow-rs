@@ -4,7 +4,7 @@ Specifies how `createPreparedStatement` responses are deserialized over the WebS
 
 ## Background
 
-A `createPreparedStatement` response carries `responseData.parameterData` and, for a result-set-producing statement, a `responseData.results` entry whose `resultType` is `"resultSet"`. `prepared-statements/result-columns` specifies the transport-agnostic requirements this metadata must satisfy.
+A `createPreparedStatement` response carries `responseData.parameterData` and, for a result-set-producing statement, a `responseData.results` entry whose `resultType` is `"resultSet"`.
 
 ## Scenarios
 

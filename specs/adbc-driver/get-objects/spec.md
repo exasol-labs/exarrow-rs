@@ -1,10 +1,10 @@
 # Feature: GetObjects
 
-Implements the ADBC `Connection::get_objects` method, returning database metadata at varying depths (catalogs, schemas, tables, columns) in the ADBC-standard nested Arrow format.
+Implements the ADBC `Connection::get_objects` method, which returns catalogs, schemas, tables, and columns in the ADBC nested Arrow format.
 
 ## Background
 
-Exasol uses a single synthetic catalog named "EXA" since it has no multi-catalog concept. Schema metadata is queried from `SYS.EXA_ALL_SCHEMAS`, table metadata from `SYS.EXA_ALL_OBJECTS` (filtered by `OBJECT_TYPE`), and column metadata from `SYS.EXA_ALL_COLUMNS`. Results are returned as Arrow RecordBatches using the ADBC-defined nested schema with `List` and `Struct` types. The `ObjectDepth` parameter controls how deep the metadata tree is populated. Optional filter parameters (catalog, db_schema, table_name, table_type, column_name) restrict the returned results.
+Exasol has a single synthetic catalog named "EXA".
 
 ## Scenarios
 

@@ -11,7 +11,7 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 ### Scenario: Clippy validation
 
 * *GIVEN* code changes have been made to the codebase
-* *WHEN* running `cargo clippy --all-targets --all-features -- -W clippy::all`
+* *WHEN* running `cargo clippy --all-targets --all-features -- -D warnings`
 * *THEN* it SHALL produce zero warnings
 * *AND* it SHALL pass all lint checks
 
@@ -29,40 +29,10 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 * *THEN* `cargo test` MUST pass with zero failures
 * *AND* no existing functionality SHALL be broken
 
-### Scenario: Integration test validation
-
-* *GIVEN* clippy fixes have been applied to the codebase
-* *WHEN* clippy fixes are applied
-* *THEN* integration tests against Exasol database MUST pass
-* *AND* driver functionality SHALL remain intact
-
-### Scenario: Tests do not mutate shared process environment
-
-* *GIVEN* the test suite under `tests/`
-* *WHEN* any test exercises environment-derived configuration (e.g. the `EXASOL_HOST`/`EXASOL_PORT`/`EXASOL_USER`/`EXASOL_PASSWORD` connection parameters)
-* *THEN* it SHALL NOT call `std::env::set_var` or `std::env::remove_var`
-* *AND* logic that depends on those values SHALL be exercised through pure helpers that take the values as arguments (e.g. `common::connection_string`)
-* *AND* the integration suite MUST produce identical results regardless of test execution order or `--test-threads` count
-
-### Scenario: Arrow and Parquet dependencies resolve to version 59 or above with one version of each Arrow sub-crate
+### Scenario: Arrow and Parquet dependencies resolve to one version of each Arrow sub-crate
 
 * *GIVEN* the resolved dependency tree in `Cargo.lock`
 * *WHEN* inspecting the `[[package]]` entries
-* *THEN* the `arrow` crate MUST resolve to a version `>= 59.0.0`
-* *AND* the `parquet` crate MUST resolve to a version `>= 59.0.0`
+* *THEN* the `arrow` crate MUST resolve to the release line that `Cargo.toml` requires
+* *AND* the `parquet` crate MUST resolve to the release line that `Cargo.toml` requires
 * *AND* the `arrow-array` and `arrow-schema` sub-crates MUST each appear at exactly one version (unified resolution required by `adbc_core`)
-
-### Scenario: Every integration test target runs in the CI integration job
-
-* *GIVEN* a top-level `.rs` file under `tests/` defines a Rust integration test target
-* *WHEN* the CI `integration-tests` job runs against the Exasol container
-* *THEN* the job SHALL run that target with `REQUIRE_EXASOL=1` and `--test-threads=1`
-* *AND* every test in that target SHALL run, except a test whose `#[ignore = "<reason>"]` attribute states why it cannot run in CI
-* *AND* a test that needs Exasol MUST fail, not skip, when Exasol is unavailable
-
-### Scenario: CI rejects an integration test target that the integration job does not run
-
-* *GIVEN* a top-level `.rs` file under `tests/` has no `--test <file stem>` invocation in `.github/workflows/ci.yml`, or a test under `tests/` carries an `#[ignore]` attribute without a reason
-* *WHEN* CI runs `python3 scripts/check_ci_test_targets.py`
-* *THEN* the check MUST exit with a non-zero exit code
-* *AND* the output MUST name each missing test target and each `#[ignore]` without a reason

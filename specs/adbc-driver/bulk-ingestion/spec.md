@@ -1,10 +1,10 @@
 # Feature: Bulk Ingestion
 
-Enables ADBC-standard bulk data ingestion into Exasol tables from Arrow RecordBatches, supporting create, append, replace, and schema-targeting modes via the existing HTTP transport import pipeline.
+Ingests Arrow RecordBatches into Exasol tables through the ADBC Statement, in create, append, replace, and schema-targeting modes.
 
 ## Background
 
-Bulk ingestion is triggered through the ADBC Statement interface by setting `IngestTargetTable` and `IngestMode` options before calling `execute()` with bound Arrow data. The driver converts the Arrow RecordBatch to the internal import format and uses the HTTP tunneling transport to load data into Exasol. Table DDL is generated from the Arrow schema when creating tables, with Exasol types derived from the existing Arrow-to-Exasol type mapping. Exasol does not support catalogs (a single synthetic catalog "EXA" is used) or `CREATE TEMPORARY TABLE`.
+Exasol does not support `CREATE TEMPORARY TABLE`.
 
 ## Scenarios
 

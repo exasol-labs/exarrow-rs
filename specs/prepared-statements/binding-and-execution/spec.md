@@ -1,10 +1,10 @@
 # Feature: Binding and Execution
 
-Specifies prepared statement creation and execution behavior for Exasol: creating a statement over the active transport and running it once or repeatedly. Parameter counting, type validation, and wire encoding are specified in `prepared-statements/parameter-binding`; result-set column metadata is specified in `prepared-statements/result-columns`; execution of a RecordBatch bound through the ADBC FFI is specified in `adbc-driver/ffi-statement-execution`.
+Specifies prepared statement creation over the active transport and execution, once or repeatedly.
 
 ## Background
 
-The system implements Exasol's native prepared statement protocol for secure parameterized query execution. Parameters are sent separately from SQL text via the wire protocol, preventing SQL injection by design. Prepared statements can be reused across multiple executions with different parameter values without re-parsing SQL.
+Parameters travel separately from the SQL text. A prepared statement is reused across executions without re-parsing the SQL.
 
 ## Scenarios
 

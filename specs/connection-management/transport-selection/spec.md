@@ -1,10 +1,10 @@
 # Feature: Transport Selection via Feature Flags
 
-The system uses Cargo feature flags to select the transport implementation. The `native` feature (enabled by default) provides the high-performance native TCP transport. The `websocket` feature provides the existing WebSocket JSON transport as a fallback. The connection layer dispatches to the appropriate transport based on enabled features and optional connection string overrides.
+Cargo feature flags select the transport. The `native` feature (default) provides the native TCP transport, and the `websocket` feature provides the WebSocket JSON transport. The connection layer dispatches to a transport based on the enabled features and an optional connection-string override.
 
 ## Background
 
-Both transports connect to the same Exasol port (8563). The server auto-detects the protocol based on the first bytes received. Only one transport is used per connection. When both features are enabled, native is preferred unless explicitly overridden. On Exasol 7.1+ (native protocol version 18 or later, including Exasol 8) TLS is required on port 8563, and ChaCha20 message encryption is NOT used — TLS alone provides confidentiality. On pre-7.1 servers the driver MAY use the legacy non-TLS path with ChaCha20 message encryption.
+Each connection uses one transport. When both features are enabled, native is the default. Exasol 7.1 and later (native protocol version 18 or later, including Exasol 8) require TLS on port 8563 and use no ChaCha20 message encryption. Older servers may use the legacy non-TLS path with ChaCha20 encryption.
 
 ## Scenarios
 

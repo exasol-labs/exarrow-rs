@@ -2,7 +2,7 @@
 
 <!-- One fragment per plan. Add one ## ADR block per promoted decision below. -->
 <!-- ID is a kebab-case slug, unique across every file in specs/_decision. -->
-<!-- Supersedes is optional — set it only when this ADR replaces an earlier one. -->
+<!-- Supersedes is optional, set it only when this ADR replaces an earlier one. -->
 
 ## ADR-004: Zero-row result sets carry their column schema
 

@@ -1,10 +1,10 @@
 # Feature: Arrow to Exasol
 
-Defines the mapping from Apache Arrow data types to Exasol data types for parameter binding, with precision and scale handling.
+Defines the mapping from Arrow data types to Exasol data types for parameter binding and DDL generation, with precision and scale handling.
 
 ## Background
 
-The system defines mappings from Arrow types to Exasol types for parameter binding and DDL generation. Arrow Decimal128 preserves precision (1-36) and scale for Exasol DECIMAL types; Decimal256 is never used for Exasol-originated types since Exasol precision does not exceed 36. Values that exceed Arrow type capacity during conversion produce type conversion errors with column and value details.
+Arrow Decimal128 preserves precision (1-36) and scale for Exasol DECIMAL types. Decimal256 is never used for Exasol-originated types because Exasol precision does not exceed 36.
 
 ## Scenarios
 

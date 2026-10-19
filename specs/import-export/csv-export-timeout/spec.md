@@ -1,10 +1,10 @@
 # Feature: CSV Export Timeout
 
-Specifies the timeout behavior that governs a CSV export once its HTTP tunnel has completed the TCP connect and the EXA handshake: the absence of a client-side timer by default, how a server-enforced `query_timeout` interacts with an export, and how an explicit `CsvExportOptions::timeout_ms` stops an export, including while the TLS handshake of a TLS tunnel is pending. The bounds on the tunnel setup itself are specified in `import-export/http-transport`.
+Specifies when a CSV export times out: no client-side timer by default, and `CsvExportOptions::timeout_ms` as an explicit bound. Tunnel setup bounds are specified in `import-export/http-transport`.
 
 ## Background
 
-`CsvExportOptions::timeout_ms` is an `Option<u64>` defaulting to `None`. It covers SQL execution, data transfer, and the callback, which all follow the TCP connect and the EXA handshake of the tunnel. With TLS, it also covers the TLS handshake of the tunnel, which runs concurrently with the EXPORT statement. The tunnel setup bounds specified in `import-export/http-transport` apply whether or not `timeout_ms` is set: one deadline bounds the TCP connect and the EXA handshake, and with TLS a separate bound covers the TLS handshake. A `timeout_ms` shorter than the TLS handshake bound can therefore elapse first while the TLS handshake is pending. When `timeout_ms` is unset, the driver arms no client-side timer around SQL execution, data transfer, or the callback, and the export runs until the server finishes the EXPORT statement or a server-enforced `query_timeout` aborts it. When set, the driver returns `ExportError::Timeout` if that bound elapses first. `ArrowExportOptions` and `ParquetExportOptions` carry no timeout field of their own; the driver builds their underlying `CsvExportOptions` from defaults, so Arrow and Parquet exports inherit the same no-timeout-by-default behavior.
+`CsvExportOptions::timeout_ms` is an `Option<u64>` defaulting to `None`. It covers SQL execution, data transfer, and the callback, which follow the TCP connect and the EXA handshake of the tunnel. With TLS, it also covers the TLS handshake, which runs concurrently with the EXPORT statement.
 
 ## Scenarios
 
@@ -54,4 +54,4 @@ Specifies the timeout behavior that governs a CSV export once its HTTP tunnel ha
 
 ## See Also
 
-Export mechanics — file, stream, list, and callback destinations; formatting and compression options — are specified in `import-export/csv-export`.
+The export destinations (file, stream, list, and callback) and the formatting and compression options are specified in `import-export/csv-export`.

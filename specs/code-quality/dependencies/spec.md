@@ -1,16 +1,14 @@
 # Feature: Dependency Security Policy
 
-The project SHALL maintain a documented, auditable policy for dependency advisories
-and version management so that every known vulnerability is either patched or
-formally suppressed with a traceable rationale.
+The project keeps a documented, auditable policy for dependency advisories and version bumps, so every known vulnerability is either patched or suppressed with a traceable rationale.
 
 ## Background
 
-All advisory suppressions in `deny.toml` MUST include a structured rationale comment stating: the affected advisory ID, the upstream fix status, the blocker preventing an immediate fix, and the re-evaluation trigger.
+Each advisory suppression in `deny.toml` MUST include a structured `reason` field stating the advisory ID, the upstream fix status, the blocker preventing an immediate fix, and the re-evaluation trigger.
 
 Patch-level version bumps (`cargo update`) MAY be applied without a breaking-change review cycle. Minor or major version bumps MUST go through explicit evaluation before merging.
 
-`cargo deny --all-features check advisories` MUST be a required gate in CI and MUST run on every pull request and push to `main`. The gate covers the dependencies of every Cargo feature, including optional features such as `benchmark` and `ffi`.
+`cargo deny --all-features check advisories` MUST be a required CI gate on every pull request and push to `main`. The gate covers the dependencies of every Cargo feature, including optional features such as `benchmark` and `ffi`.
 
 ## Scenarios
 

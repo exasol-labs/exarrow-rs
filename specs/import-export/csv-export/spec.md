@@ -1,10 +1,10 @@
 # Feature: CSV Export
 
-Specifies CSV data export capabilities from Exasol tables and queries to files, streams, and callbacks.
+Specifies CSV export from Exasol tables and queries to files, streams, lists, and callbacks.
 
 ## Background
 
-CSV export operations receive data from Exasol through the HTTP transport tunnel via PUT requests. The system supports exporting to file paths, async writers, in-memory collections, and callbacks. Export operations support custom CSV formatting, column headers, and compression options.
+CSV export receives data from Exasol through PUT requests on the HTTP transport tunnel.
 
 The export consumer is the callback passed to `export_to_callback`, or the file, writer, or row list that `export_to_file`, `export_to_stream`, and `export_to_list` fill. A piece is a run of at most 64 KiB (65536 bytes) of the PUT request body, in the order the tunnel delivers it. The driver passes pieces to the export consumer while the EXPORT statement runs, through a channel that holds at most 16 pieces. Piece boundaries follow the tunnel transfer, not CSV records.
 
@@ -101,4 +101,4 @@ The export consumer is the callback passed to `export_to_callback`, or the file,
 
 ## See Also
 
-Export timeout behavior — client-side timers, server-enforced timeouts, and `CsvExportOptions::timeout_ms` — is specified in `import-export/csv-export-timeout`.
+Export timeout behavior (client-side timers, server-enforced timeouts, and `CsvExportOptions::timeout_ms`) is specified in `import-export/csv-export-timeout`.

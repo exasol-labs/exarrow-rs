@@ -1,10 +1,10 @@
 # Feature: Type Converters
 
-Specifies type-specific conversion logic from Exasol JSON responses to Arrow arrays, covering numeric, string, temporal, and binary data types.
+Specifies type-specific conversion from Exasol JSON responses to Arrow arrays for numeric, string, temporal, and binary types.
 
 ## Background
 
-Exasol returns JSON result data with typed columns. All conversions SHALL produce appropriate Arrow array types with correct precision, encoding, and overflow detection. Numeric conversions SHALL detect out-of-range values. String conversions SHALL validate UTF-8 encoding. Temporal conversions SHALL handle Exasol date, timestamp, and interval formats. Binary conversions SHALL decode Base64 and hexadecimal encodings. The Exasol WebSocket API defines `TIMESTAMP WITH LOCAL TIME ZONE` as a distinct type name separate from `TIMESTAMP`.
+Exasol returns JSON result data with typed columns. The Exasol WebSocket API names `TIMESTAMP WITH LOCAL TIME ZONE` as a type distinct from `TIMESTAMP`.
 
 ## Scenarios
 
@@ -12,7 +12,7 @@ Exasol returns JSON result data with typed columns. All conversions SHALL produc
 
 * *GIVEN* Exasol returns JSON result data with typed columns
 * *WHEN* converting JSON integers
-* *THEN* it SHALL parse to appropriate Arrow integer types
+* *THEN* it SHALL parse to Arrow Decimal128 values at the column scale
 * *AND* it SHALL detect overflow conditions
 * *AND* it SHALL return errors for out-of-range values
 
@@ -29,8 +29,8 @@ Exasol returns JSON result data with typed columns. All conversions SHALL produc
 * *GIVEN* Exasol returns JSON result data with typed columns
 * *WHEN* converting Exasol DECIMAL values from JSON
 * *THEN* it SHALL parse string representations of decimals
-* *AND* it SHALL construct Arrow Decimal128/256 values with correct precision and scale
-* *AND* it SHALL validate precision fits within Decimal128 (38 digits) or Decimal256 (76 digits) limits
+* *AND* it SHALL construct Arrow Decimal128 values with correct precision and scale
+* *AND* it SHALL validate precision fits within the declared column precision, which Exasol caps at 36 digits
 
 ### Scenario: Decimal validation errors
 
@@ -95,8 +95,8 @@ Exasol returns JSON result data with typed columns. All conversions SHALL produc
 
 * *GIVEN* Exasol returns JSON result data with typed columns
 * *WHEN* binary data is encoded as Base64 in JSON
-* *THEN* it SHALL decode Base64 strings to binary
-* *AND* it SHALL handle padding and invalid characters
+* *THEN* it SHALL decode hex strings to binary
+* *AND* it SHALL return an error for an odd length or an invalid hex character
 
 ### Scenario: Hexadecimal decoding
 
