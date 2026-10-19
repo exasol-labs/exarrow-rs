@@ -1,10 +1,10 @@
 # Feature: Type Converters
 
-Specifies type-specific conversion logic from Exasol JSON responses to Arrow arrays, covering numeric, string, temporal, and binary data types.
+Specifies type-specific conversion from Exasol JSON responses to Arrow arrays for numeric, string, temporal, and binary types.
 
 ## Background
 
-Exasol returns JSON result data with typed columns. All conversions SHALL produce appropriate Arrow array types with correct precision, encoding, and overflow detection. Numeric conversions SHALL detect out-of-range values. String conversions SHALL validate UTF-8 encoding. Temporal conversions SHALL handle Exasol date, timestamp, and interval formats. Binary conversions SHALL decode Base64 and hexadecimal encodings. The Exasol WebSocket API defines `TIMESTAMP WITH LOCAL TIME ZONE` as a distinct type name separate from `TIMESTAMP`.
+Exasol returns JSON result data with typed columns. The Exasol WebSocket API names `TIMESTAMP WITH LOCAL TIME ZONE` as a type distinct from `TIMESTAMP`.
 
 ## Scenarios
 

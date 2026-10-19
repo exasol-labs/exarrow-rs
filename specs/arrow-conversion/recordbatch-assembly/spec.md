@@ -1,10 +1,10 @@
 # Feature: RecordBatch Assembly
 
-Specifies the assembly of Arrow RecordBatches from converted data, including JSON-to-Arrow conversion, null handling, schema consistency, and error recovery.
+Specifies how row-major JSON result data becomes Arrow RecordBatches, including null handling, schema consistency, and error reporting.
 
 ## Background
 
-JSON result data is type-converted to Arrow arrays before assembly into RecordBatches. A schema is available for each result set, either provided upfront or inferred from JSON metadata. The system SHALL convert Exasol WebSocket API JSON responses to Apache Arrow RecordBatch format using row-major input data, construct valid RecordBatch instances, correctly represent NULL values, ensure schema consistency throughout conversion, and provide detailed error information when conversion fails.
+JSON result data is type-converted to Arrow arrays before assembly into RecordBatches. A schema is available for each result set, either provided upfront or inferred from JSON metadata.
 
 ## Scenarios
 

@@ -1,10 +1,10 @@
 # Feature: Connection Timeout
 
-The connection timeout limits how long opening a connection to Exasol may take. A server, proxy, or load balancer that accepts the TCP connection and then stops answering fails the connection within that limit instead of blocking the caller. The connection timeout does not bound query execution, whose timeout `connection-management/query-timeout` specifies.
+The connection timeout limits how long opening a connection to Exasol may take. A server that accepts the TCP connection and then stops answering fails the connection within that limit instead of blocking the caller.
 
 ## Background
 
-The caller sets the connection timeout in seconds with the `timeout` or `connection_timeout` connection-string parameter, or as a `Duration` with `ConnectionBuilder::connection_timeout()`. The driver hands it to the transport in milliseconds. Opening a connection runs these steps in order: the TCP connect, the TLS handshake when TLS is enabled, the WebSocket upgrade on the WebSocket transport, and the login. With TLS disabled, the native transport starts the login directly after the TCP connect.
+The caller sets the connection timeout in seconds with the `timeout` or `connection_timeout` connection-string parameter, or as a `Duration` with `ConnectionBuilder::connection_timeout()`. Opening a connection runs these steps in order: the TCP connect, the TLS handshake when TLS is enabled, the WebSocket upgrade on the WebSocket transport, and the login.
 
 ## Scenarios
 

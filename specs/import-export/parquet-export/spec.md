@@ -1,19 +1,13 @@
 # Feature: Parquet Export
 
-Specifies the transport Parquet export (`Connection::export_to_parquet` and `export_to_parquet_via_transport`). It takes column names and types from the export source and writes a Parquet file from the CSV that Exasol sends.
+Specifies the transport Parquet export (`Connection::export_to_parquet` and `export_to_parquet_via_transport`). It reads column names and types from the export source and writes a Parquet file from the CSV that Exasol sends.
 
 ## Background
 
-Export receives CSV from Exasol, converts it to Parquet locally, and writes to files or streams. It has two kinds of entry point. The CSV-bytes entry points are specified in `import-export/parquet-csv-bytes`:
-
-- The transport export (`Connection::export_to_parquet` and `export_to_parquet_via_transport`) reads the column names and Exasol types of the export source before it runs the EXPORT statement. It prepares the SELECT statement that the source describes (`SELECT <columns or *> FROM [schema.]table` for a table source, the query text for a query source), reads the result-set column metadata specified in `prepared-statements/result-columns`, and closes the prepared statement.
-- The CSV-bytes entry points (`export_to_parquet`, `export_to_parquet_stream`, and `csv_to_record_batches` in `export::parquet`) parse caller-supplied CSV against a caller-supplied Arrow schema. A quoted field can contain the column separator, the column delimiter, and line breaks.
-
-The transport export maps BOOLEAN, CHAR, VARCHAR, DECIMAL, DOUBLE, DATE, and TIMESTAMP columns as `type-mapping/exasol-to-arrow` specifies. It maps TIMESTAMP WITH LOCAL TIME ZONE columns to `Timestamp(Microsecond, None)`, a timestamp without a time zone that holds the wall-clock value in the session time zone. It maps INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, GEOMETRY, and HASHTYPE columns to Utf8 holding the CSV text Exasol writes for the value. `exasol_types_to_arrow_schema` applies the same mapping.
-
-Exasol writes NULL as an empty field, and Exasol stores an empty string as NULL. The transport export therefore reads an empty field as NULL and keeps every other field verbatim. It does not apply `ParquetExportOptions::null_value`, because the driver passes no NULL clause to the EXPORT statement. The CSV-bytes entry points keep every field verbatim as well: an empty field is NULL when `null_value` is unset, and a field equal to `null_value` is NULL. Neither kind of entry point trims whitespace. Typed values are parsed in the text form of Exasol's default session formats, for example `YYYY-MM-DD` for `NLS_DATE_FORMAT`.
-
-The HTTP-transport TLS knob is exposed as `use_tls(bool)` on both option builders.
+- The transport export prepares the SELECT statement that the source describes (`SELECT <columns or *> FROM [schema.]table` for a table source, the query text for a query source), reads the result-set column metadata specified in `prepared-statements/result-columns`, and closes the prepared statement before it runs the EXPORT statement.
+- BOOLEAN, CHAR, VARCHAR, DECIMAL, DOUBLE, DATE, and TIMESTAMP columns map as `type-mapping/exasol-to-arrow` specifies. TIMESTAMP WITH LOCAL TIME ZONE maps to `Timestamp(Microsecond, None)`, which holds the wall-clock value in the session time zone. `exasol_types_to_arrow_schema` applies the same mapping.
+- Exasol writes NULL as an empty field and stores an empty string as NULL, so the transport export reads an empty field as NULL and keeps every other field verbatim. It does not apply `ParquetExportOptions::null_value`, because the driver passes no NULL clause to the EXPORT statement.
+- Typed values are parsed in the text form of Exasol's default session formats, for example `YYYY-MM-DD` for `NLS_DATE_FORMAT`.
 
 ## Scenarios
 

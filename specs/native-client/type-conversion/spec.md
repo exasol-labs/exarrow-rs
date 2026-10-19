@@ -4,7 +4,7 @@ Specifies the per-type binary-to-Arrow conversion rules the native TCP protocol 
 
 ## Background
 
-Each column's data is contiguous in the binary stream, matching Arrow's memory layout, so conversion is a direct read into the matching Arrow array type rather than an intermediate representation. Null handling is specified in `native-client/result-sets`.
+Each column's data is contiguous and matches Arrow's memory layout, so conversion reads directly into the matching Arrow array type.
 
 ## Scenarios
 

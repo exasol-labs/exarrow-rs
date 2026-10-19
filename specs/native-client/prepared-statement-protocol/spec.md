@@ -1,10 +1,10 @@
 # Feature: Native Prepared Statement Protocol
 
-The system implements the `CMD_CREATE_PREPARED` / `CMD_EXECUTE_PREPARED` / `CMD_CLOSE_PREPARED` command lifecycle over the native TCP protocol, including how a prepare reply's `R_HANDLE` part is classified into parameter and result-set column descriptions, how parameter column headers are encoded on the wire, and how DATE and TIMESTAMP parameter text is encoded as binary field values.
+The system implements the `CMD_CREATE_PREPARED`, `CMD_EXECUTE_PREPARED`, and `CMD_CLOSE_PREPARED` lifecycle over native TCP: how a prepare reply's `R_HANDLE` part is classified into parameter and result-set column descriptions, how parameter column headers are encoded, and how DATE and TIMESTAMP parameter text is encoded as binary field values.
 
 ## Background
 
-A `CMD_CREATE_PREPARED` reply carries an `R_HANDLE` (2) part followed by zero or more result-set sub-results: one with handle `PARAMETER_DESCRIPTION` (-5) describing the statement's parameters, and — for a result-set-producing statement — one describing the result-set columns. Both descriptions are parsed by the same column-metadata routine `native-client/result-sets` uses for ordinary result sets.
+A `CMD_CREATE_PREPARED` reply carries an `R_HANDLE` (2) part followed by zero or more result-set sub-results: one with handle `PARAMETER_DESCRIPTION` (-5) describing the parameters and, for a statement that returns a result set, one describing the result-set columns.
 
 ## Scenarios
 

@@ -1,10 +1,10 @@
 # Feature: Session Integration
 
-Specifies the integration of import/export operations with the Session API, enabling data transfer through established session connections.
+Specifies import and export methods on the Session API, including a blocking wrapper.
 
 ## Background
 
-Import and export methods are available directly on the Session object. The session's WebSocket connection is used for SQL execution during data transfer. A blocking API wrapper is provided for users who prefer synchronous APIs, using the tokio runtime internally.
+The session's WebSocket connection runs the SQL during data transfer.
 
 ## Scenarios
 

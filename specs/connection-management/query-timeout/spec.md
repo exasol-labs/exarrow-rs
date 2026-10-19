@@ -1,10 +1,10 @@
 # Feature: Query Timeout
 
-Specifies the query-execution timeout and the deprecated idle timeout for Exasol database connections.
+Specifies the server-enforced query timeout and the deprecated idle timeout.
 
 ## Background
 
-The query-execution timeout SHALL be a server-enforced session setting and default to unset: when a caller configures a query timeout, the driver SHALL forward it to Exasol as the `queryTimeout` session attribute, and the driver SHALL NOT wrap query execution through `Connection::execute_statement()` in a client-side timer. The driver has no idle timeout, so the `idle_timeout` connection-string parameter is deprecated and has no effect. The connection timeout is specified in `connection-management/connection-timeout`, and the session lifecycle in `connection-management/session-and-lifecycle`.
+The query timeout is a server-enforced session setting and defaults to unset. The driver has no idle timeout, so the `idle_timeout` connection-string parameter is deprecated and has no effect.
 
 ## Scenarios
 

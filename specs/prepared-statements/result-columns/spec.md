@@ -1,10 +1,10 @@
 # Feature: Prepared Statement Result-Set Columns
 
-Specifies the result-set column metadata a prepared statement handle reports alongside its parameter metadata: which statements get columns, what those columns are named and typed, and how the two transports must agree.
+Specifies the result-set column metadata a prepared statement handle reports alongside its parameter metadata, and how the two transports must agree.
 
 ## Background
 
-Exasol classifies a statement at prepare time as result-set-producing (`SELECT`, `DESCRIBE`) or row-count-producing (every other statement). Only the former carries a result-set description in the `createPreparedStatement` / `CMD_CREATE_PREPARED` reply; see `prepared-statements/binding-and-execution` for how that reply is received and stored, and `native-client/prepared-statement-protocol` / `websocket-client/prepared-statements` for the per-transport wire format.
+Exasol classifies a statement at prepare time as result-set-producing (`SELECT`, `DESCRIBE`) or row-count-producing (every other statement). Only the former carries a result-set description in the `createPreparedStatement` / `CMD_CREATE_PREPARED` reply.
 
 ## Scenarios
 

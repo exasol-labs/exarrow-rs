@@ -1,10 +1,10 @@
 # Feature: Protocol
 
-Specifies command execution, message serialization, and error handling for the Exasol WebSocket API, once a session has been established (see `websocket-client/handshake`).
+Specifies command execution, message serialization, and error handling for the Exasol WebSocket API once a session is established.
 
 ## Background
 
-The system implements the Exasol WebSocket API protocol as defined in https://github.com/exasol/websocket-api. All commands are serialized to JSON format with required fields (command type, attributes) and responses are deserialized to structured objects with validation. Error responses from Exasol are parsed into appropriate Rust error types with error codes and messages. `createPreparedStatement` request/response handling is specified separately in `websocket-client/prepared-statements`.
+The protocol is the Exasol WebSocket API defined in https://github.com/exasol/websocket-api.
 
 ## Scenarios
 

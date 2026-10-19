@@ -1,10 +1,10 @@
 # Feature: Auto Table Creation
 
-Specifies automatic table creation from Parquet file schemas, including Arrow schema inference, Exasol DDL generation, and the auto-create workflow for Parquet imports.
+Specifies automatic table creation from Parquet file schemas: Arrow schema inference, Exasol DDL generation, and the auto-create workflow.
 
 ## Background
 
-Auto table creation infers Arrow schemas from Parquet file metadata without reading the full data. When multiple files have different schemas, a union schema is computed with type widening rules: identical types remain unchanged, DECIMAL types widen to max(precision, scale), VARCHAR types widen to max(size), DECIMAL + DOUBLE widens to DOUBLE, and incompatible types fall back to VARCHAR(2000000). Column names are handled via Quoted mode (preserving names exactly with escaped double quotes) or Sanitize mode (uppercase, invalid chars replaced with underscore, digit-prefixed names get underscore prefix, reserved words get quoted).
+When multiple files have different schemas, the union schema widens types: identical types stay unchanged, DECIMAL widens to max(precision, scale), VARCHAR widens to max(size), DECIMAL and DOUBLE widen to DOUBLE, and incompatible types fall back to VARCHAR(2000000). Column names follow Quoted mode (names kept exactly, double quotes escaped) or Sanitize mode (uppercase, invalid characters replaced with underscore, digit-prefixed names get an underscore prefix, reserved words quoted).
 
 ## Scenarios
 

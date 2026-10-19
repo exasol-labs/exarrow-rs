@@ -4,7 +4,7 @@ Specifies WebSocket connection establishment, the Exasol-specific protocol hands
 
 ## Background
 
-The system implements the Exasol WebSocket API protocol as defined in https://github.com/exasol/websocket-api. Connections use secure WebSocket (wss://) when TLS is enabled. Once the handshake and login complete, ordinary command traffic is specified in `websocket-client/protocol`.
+The protocol is the Exasol WebSocket API defined in https://github.com/exasol/websocket-api. Connections use wss:// when TLS is enabled.
 
 ## Scenarios
 

@@ -1,6 +1,6 @@
 # Feature: HTTP Transport
 
-Specifies the HTTP transport layer for bulk data transfer using the EXA tunneling protocol, enabling firewall-friendly import and export operations through reverse-connection HTTP tunneling.
+Specifies the HTTP transport for bulk import and export, which tunnels HTTP over one outbound connection using the EXA protocol.
 
 ## Architecture
 
@@ -11,14 +11,14 @@ TCP connection that is "hijacked" into a bidirectional HTTP tunnel.
 #### Components
 
 **Client side (exarrow-rs):**
-- **User Code / Callback Thread** — the application thread that produces (import) or consumes (export) data
-- **HTTP Transport Thread** — starts an internal HTTP server, generates a temporary TLS certificate,
+- **User Code / Callback Thread**: the application thread that produces (import) or consumes (export) data
+- **HTTP Transport Thread**: starts an internal HTTP server, generates a temporary TLS certificate,
   and manages the tunnel. Communicates with User Code via an OS pipe.
-- **WebSocket Connection** — the persistent control channel to Exasol for sending SQL commands
+- **WebSocket Connection**: the persistent control channel to Exasol for sending SQL commands
 
 **Database side (Exasol):**
-- **SQLProcess** — executes the IMPORT/EXPORT statement
-- **Internal Port** (e.g. 35353) — the tunnel endpoint inside the Exasol cluster
+- **SQLProcess**: executes the IMPORT/EXPORT statement
+- **Internal Port** (e.g. 35353): the tunnel endpoint inside the Exasol cluster
 
 #### Data Flow
 
@@ -65,7 +65,7 @@ TCP connection that is "hijacked" into a bidirectional HTTP tunnel.
 
 ## Background
 
-The client establishes an outbound TCP connection to Exasol and performs a magic packet handshake to create a bidirectional HTTP tunnel. All data transfer occurs through this single established connection, enabling firewall-friendly operation requiring only outbound connections. With TLS, the IMPORT or EXPORT SQL names the tunnel certificate in a PUBLIC KEY clause.
+The client opens an outbound TCP connection to Exasol, performs the magic packet handshake, and uses that single connection as a bidirectional HTTP tunnel. With TLS, the IMPORT or EXPORT SQL names the tunnel certificate in a PUBLIC KEY clause.
 
 ## Scenarios
 

@@ -4,7 +4,7 @@ Defines the mapping from Exasol data types to Apache Arrow data types, including
 
 ## Background
 
-The system defines a complete mapping from Exasol data types to Apache Arrow data types. Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient. All Arrow fields are marked nullable when the source Exasol column allows NULL values. Type metadata from Exasol (precision, scale, original type names) is preserved in Arrow field metadata for round-trip fidelity. Unsupported or complex types produce clear error messages with guidance on workarounds.
+Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient. Exasol precision, scale, and original type names are preserved in Arrow field metadata.
 
 ## Scenarios
 

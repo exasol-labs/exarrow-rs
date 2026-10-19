@@ -1,10 +1,10 @@
 # Feature: Get Table Schema
 
-Implements the ADBC `Connection::get_table_schema` method, returning the Arrow Schema for a given Exasol table by querying column metadata from system views.
+Implements the ADBC `Connection::get_table_schema` method, which returns the Arrow Schema of an Exasol table.
 
 ## Background
 
-Table schema is retrieved by querying `SYS.EXA_ALL_COLUMNS` for the specified table and converting Exasol column types to Arrow data types using the existing type mapping in `src/types/mapping.rs`. The catalog parameter is accepted but only the synthetic "EXA" value is valid. The returned Arrow `Schema` includes field names, data types, and nullability.
+Column types and nullability come from `SYS.EXA_ALL_COLUMNS`.
 
 ## Scenarios
 

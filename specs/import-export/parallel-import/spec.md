@@ -1,10 +1,10 @@
 # Feature: Parallel Import
 
-Specifies parallel file import capabilities for CSV and Parquet formats, leveraging Exasol's native IMPORT parallelization with multiple HTTP transport connections.
+Specifies parallel import of multiple CSV or Parquet files, with one HTTP transport connection per file.
 
 ## Background
 
-Parallel import establishes N parallel HTTP transport connections (one per file), each with its own EXA tunneling handshake to obtain a unique internal address. The generated IMPORT SQL uses multiple `AT '...' FILE '...'` clauses referencing each internal address. For Parquet, the wire model follows the same dual-path rule as single-file Parquet import: on Exasol 2025.1.11+ the driver serves each file's raw Parquet bytes from memory via HTTP range requests on its own connection and emits `FROM PARQUET AT 'addr;MaxConcurrentReads=1' [PUBLIC KEY '...'] FILE 'NNN.parquet'` (no CSV format clauses, no `MULTIPLE LOCAL FILES` tag); on older servers the driver converts each file to CSV in parallel and emits `FROM CSV ... FILE 'NNN.csv'` with the usual format options. Single-file imports delegate to the existing optimized single-file path for backward compatibility. The system accepts both single paths and collections via the IntoFileSources trait. Error handling follows a fail-fast strategy, aborting all operations immediately upon first failure.
+Each connection performs its own EXA tunneling handshake to obtain a unique internal address. Parquet import follows the dual-path rule of `import-export/parquet-io`: native range-request serving on Exasol 2025.1.11 and newer, CSV conversion on older servers.
 
 ## Scenarios
 

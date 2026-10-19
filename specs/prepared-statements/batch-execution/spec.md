@@ -1,10 +1,10 @@
 # Feature: Batch Execution
 
-Specifies multi-row batch execution of prepared statements, including column-major parameter assembly, batch update and query methods, arity validation, and edge-case behavior for empty batches and closed statements.
+Specifies multi-row batch execution of prepared statements: column-major parameter assembly, batch update and query methods, arity validation, and empty-batch and closed-statement behavior.
 
 ## Background
 
-A batch of rows (each row a list of positional parameters) is assembled into column-major parameter data and executed as one prepared-statement call, which avoids one round trip per row for bulk DML. Exasol accepts a multi-row parameter set only for a statement that returns an affected-row count. For a statement that returns a result set, Exasol rejects a parameter set of two or more rows. A data message is the protocol message that carries the parameter values of one execution. Exasol reports a maximum data message size at login. Over the native protocol, the transport runs a batch update whose data message would exceed that size as consecutive executions. Over the WebSocket protocol, a batch update runs as one execution whatever its size.
+A batch is a list of rows, each a list of positional parameters. It is assembled into column-major parameter data and executed as one prepared-statement call. Exasol accepts a multi-row parameter set only for a statement that returns an affected-row count, and rejects two or more rows for a statement that returns a result set. A data message is the protocol message that carries the parameter values of one execution. Exasol reports a maximum data message size at login. Over the native protocol, a batch update whose data message would exceed that size runs as consecutive executions. Over the WebSocket protocol, a batch update runs as one execution whatever its size.
 
 ## Scenarios
 

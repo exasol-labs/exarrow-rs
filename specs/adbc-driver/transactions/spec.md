@@ -1,10 +1,10 @@
 # Feature: Transactions (ADBC)
 
-Implements proper ADBC transaction support by controlling autocommit via the Exasol WebSocket `setAttributes` command, ensuring that begin/commit/rollback operations correctly control transaction boundaries at the server level.
+Controls ADBC transactions by setting the Exasol `autocommit` session attribute with the `setAttributes` command.
 
 ## Background
 
-Exasol supports transactions through the `autocommit` session attribute. When autocommit is `true` (the default, set at login time), each statement is immediately committed. When autocommit is `false` (toggled via the `setAttributes` WebSocket command), statements accumulate in an open transaction until an explicit `COMMIT` or `ROLLBACK` is issued. The ADBC specification exposes transactions through `Connection::commit()` and `Connection::rollback()` methods, with autocommit controlled via the `AutoCommit` connection option.
+Autocommit is on by default and set at login, so each statement commits immediately. With autocommit off, statements accumulate in an open transaction until `COMMIT` or `ROLLBACK`.
 
 ## Scenarios
 

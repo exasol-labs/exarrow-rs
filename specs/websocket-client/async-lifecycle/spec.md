@@ -4,7 +4,7 @@ Specifies the asynchronous communication model and connection lifecycle manageme
 
 ## Background
 
-All WebSocket communication is asynchronous using tokio. Send and receive operations are non-blocking, returning Futures that support cancellation via tokio task cancellation. The system tracks connection state throughout the lifecycle (connecting, authenticated, idle, closed) and prevents invalid operations in wrong states. Disconnections are detected and reported to the caller but automatic reconnection is not performed -- explicit reconnection is required.
+All WebSocket communication is asynchronous on tokio. The connection states are connecting, authenticated, idle, and closed. Automatic reconnection is not performed.
 
 ## Scenarios
 

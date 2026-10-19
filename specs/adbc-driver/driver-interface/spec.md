@@ -1,10 +1,10 @@
 # Feature: Driver Interface
 
-Defines the ADBC driver interface for exarrow-rs, covering driver registration, database connection management, and error handling through ADBC-compliant interfaces.
+Defines driver registration, connection management, and error handling for the ADBC driver.
 
 ## Background
 
-The system implements the ADBC (Arrow Database Connectivity) driver interface to provide standardized database connectivity for Exasol. All connections use WebSocket transport and authenticate with provided credentials. Connection strings follow the format `exasol://host:port`. Errors are propagated through ADBC-compliant error interfaces with detailed messages, error codes, and SQL state where applicable.
+Connections authenticate with the provided credentials. The default transport is native TCP, and WebSocket is the opt-in alternative. Connection strings use the format `exasol://host:port`.
 
 ## Scenarios
 
