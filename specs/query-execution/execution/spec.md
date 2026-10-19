@@ -4,7 +4,7 @@ Specifies SQL query execution capabilities including direct queries, prepared st
 
 ## Background
 
-All SQL execution occurs through Connection-owned transport via the WebSocket protocol. The system supports direct query execution (SELECT, DDL, DML), prepared statements with parameter binding, and batch execution of multiple queries. Results are returned as Arrow RecordBatch. Execution goes through Connection methods such as `execute_statement()`, `execute_statement_update()`, `prepare()`, and `execute_prepared()`.
+All SQL execution occurs through the Connection-owned transport, which is native TCP by default and WebSocket when opted in. The system supports direct query execution (SELECT, DDL, DML), prepared statements with parameter binding, and batch execution of multiple queries. Results are returned as Arrow RecordBatch. Execution goes through Connection methods such as `execute_statement()`, `execute_statement_update()`, `prepare()`, and `execute_prepared()`.
 
 ## Scenarios
 
@@ -12,7 +12,7 @@ All SQL execution occurs through Connection-owned transport via the WebSocket pr
 
 * *GIVEN* an authenticated connection exists to Exasol
 * *WHEN* executing a simple SELECT statement via `Connection::execute_statement()`
-* *THEN* it SHALL send the query to Exasol via WebSocket
+* *THEN* it SHALL send the query to Exasol over the connection's transport
 * *AND* it SHALL retrieve the complete result set
 * *AND* it SHALL return results as Arrow RecordBatch
 

@@ -12,7 +12,7 @@ Exasol returns JSON result data with typed columns. The Exasol WebSocket API nam
 
 * *GIVEN* Exasol returns JSON result data with typed columns
 * *WHEN* converting JSON integers
-* *THEN* it SHALL parse to appropriate Arrow integer types
+* *THEN* it SHALL parse to Arrow Decimal128 values at the column scale
 * *AND* it SHALL detect overflow conditions
 * *AND* it SHALL return errors for out-of-range values
 
@@ -29,8 +29,8 @@ Exasol returns JSON result data with typed columns. The Exasol WebSocket API nam
 * *GIVEN* Exasol returns JSON result data with typed columns
 * *WHEN* converting Exasol DECIMAL values from JSON
 * *THEN* it SHALL parse string representations of decimals
-* *AND* it SHALL construct Arrow Decimal128/256 values with correct precision and scale
-* *AND* it SHALL validate precision fits within Decimal128 (38 digits) or Decimal256 (76 digits) limits
+* *AND* it SHALL construct Arrow Decimal128 values with correct precision and scale
+* *AND* it SHALL validate precision fits within the declared column precision, which Exasol caps at 36 digits
 
 ### Scenario: Decimal validation errors
 
@@ -95,8 +95,8 @@ Exasol returns JSON result data with typed columns. The Exasol WebSocket API nam
 
 * *GIVEN* Exasol returns JSON result data with typed columns
 * *WHEN* binary data is encoded as Base64 in JSON
-* *THEN* it SHALL decode Base64 strings to binary
-* *AND* it SHALL handle padding and invalid characters
+* *THEN* it SHALL decode hex strings to binary
+* *AND* it SHALL return an error for an odd length or an invalid hex character
 
 ### Scenario: Hexadecimal decoding
 

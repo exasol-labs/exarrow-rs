@@ -4,7 +4,7 @@ The project keeps a documented, auditable policy for dependency advisories and v
 
 ## Background
 
-Each advisory suppression in `deny.toml` MUST include a structured rationale comment stating the advisory ID, the upstream fix status, the blocker preventing an immediate fix, and the re-evaluation trigger.
+Each advisory suppression in `deny.toml` MUST include a structured `reason` field stating the advisory ID, the upstream fix status, the blocker preventing an immediate fix, and the re-evaluation trigger.
 
 Patch-level version bumps (`cargo update`) MAY be applied without a breaking-change review cycle. Minor or major version bumps MUST go through explicit evaluation before merging.
 

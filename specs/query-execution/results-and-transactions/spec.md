@@ -12,7 +12,7 @@ Transaction management supports explicit begin/commit/rollback operations as wel
 
 * *GIVEN* an authenticated connection exists to Exasol
 * *WHEN* beginning a transaction explicitly
-* *THEN* it SHALL execute BEGIN or START TRANSACTION
+* *THEN* it SHALL disable autocommit on the server
 * *AND* it SHALL track transaction state
 
 ### Scenario: Transaction commit

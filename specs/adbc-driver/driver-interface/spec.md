@@ -13,7 +13,7 @@ Connections authenticate with the provided credentials. The default transport is
 * *GIVEN* an ADBC driver manager is ready to load drivers
 * *WHEN* the driver is loaded by an ADBC driver manager
 * *THEN* it SHALL expose driver metadata including name, version, and vendor information
-* *AND* it SHALL be compatible with ADBC driver manager version 0.24
+* *AND* it SHALL be compatible with ADBC driver managers
 
 ### Scenario: Driver initialization
 
@@ -26,7 +26,7 @@ Connections authenticate with the provided credentials. The default transport is
 
 * *GIVEN* a database connection is configured with valid credentials
 * *WHEN* a connection is requested with valid credentials
-* *THEN* it SHALL establish a WebSocket connection to Exasol
+* *THEN* it SHALL establish a connection to Exasol over the configured transport
 * *AND* it SHALL authenticate using provided credentials
 * *AND* it SHALL return a usable connection handle
 
@@ -40,7 +40,7 @@ Connections authenticate with the provided credentials. The default transport is
 
 * *GIVEN* an active database connection exists
 * *WHEN* a connection is closed
-* *THEN* it SHALL gracefully terminate the WebSocket connection
+* *THEN* it SHALL gracefully terminate the connection
 * *AND* it SHALL release all associated resources
 
 ### Scenario: Connection errors

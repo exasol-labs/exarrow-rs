@@ -11,7 +11,7 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 ### Scenario: Clippy validation
 
 * *GIVEN* code changes have been made to the codebase
-* *WHEN* running `cargo clippy --all-targets --all-features -- -W clippy::all`
+* *WHEN* running `cargo clippy --all-targets --all-features -- -D warnings`
 * *THEN* it SHALL produce zero warnings
 * *AND* it SHALL pass all lint checks
 
@@ -48,8 +48,8 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 
 * *GIVEN* the resolved dependency tree in `Cargo.lock`
 * *WHEN* inspecting the `[[package]]` entries
-* *THEN* the `arrow` crate MUST resolve to a version `>= 59.0.0`
-* *AND* the `parquet` crate MUST resolve to a version `>= 59.0.0`
+* *THEN* the `arrow` crate MUST resolve to the release line that `Cargo.toml` requires
+* *AND* the `parquet` crate MUST resolve to the release line that `Cargo.toml` requires
 * *AND* the `arrow-array` and `arrow-schema` sub-crates MUST each appear at exactly one version (unified resolution required by `adbc_core`)
 
 ### Scenario: Every integration test target runs in the CI integration job

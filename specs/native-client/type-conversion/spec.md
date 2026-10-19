@@ -12,7 +12,7 @@ Each column's data is contiguous and matches Arrow's memory layout, so conversio
 
 * *GIVEN* a result set contains columns of type `T_double` (8), `T_decimal` (6), `T_integer` (5), `T_smallint` (4), or `T_real` (7)
 * *WHEN* parsing column data
-* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128, `T_integer` → Int64, `T_smallint` → Int32)
+* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128, `T_integer` → Int64, `T_smallint` → Int32, while the reported Exasol type for both is DECIMAL with precision 18 and 9 respectively and scale 0)
 * *AND* the system SHALL handle little-endian to native byte order conversion
 * *AND* decimal values SHALL preserve precision and scale
 

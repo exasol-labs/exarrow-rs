@@ -1,6 +1,6 @@
 # Feature: Async Lifecycle
 
-Specifies the asynchronous communication model and connection lifecycle management for the Exasol WebSocket client, including non-blocking I/O via tokio and connection state tracking.
+Specifies the asynchronous communication model and connection lifecycle management for the Exasol WebSocket client, including non-blocking I/O on the Tokio runtime and connection state tracking.
 
 ## Background
 

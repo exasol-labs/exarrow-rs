@@ -19,7 +19,7 @@ A Statement is pure data and holds no transport reference. Statements created fr
 
 * *GIVEN* an active database connection exists
 * *WHEN* a Statement is executed via `Connection::execute_statement()`
-* *THEN* it SHALL send the query via WebSocket protocol
+* *THEN* it SHALL send the query over the connection's transport
 * *AND* it SHALL return results as Arrow RecordBatch
 * *AND* it SHALL include result metadata (schema, row count)
 
@@ -41,8 +41,8 @@ A Statement is pure data and holds no transport reference. Statements created fr
 
 * *GIVEN* an active database connection exists
 * *WHEN* a statement is executed
-* *THEN* it SHALL use the connection's existing WebSocket transport
-* *AND* it SHALL NOT open a new WebSocket connection
+* *THEN* it SHALL use the connection's existing transport
+* *AND* it SHALL NOT open a new transport connection
 * *AND* it SHALL NOT perform a new TLS handshake or authentication
 
 ### Scenario: Arrow RecordBatch results
