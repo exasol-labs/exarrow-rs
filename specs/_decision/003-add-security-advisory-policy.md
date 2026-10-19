@@ -8,7 +8,7 @@
 
 **ID:** suppress-ghsa-2f9f-gq7v-9h6m-via-deny-toml
 **Plan:** add-security-advisory-policy
-**Status:** Accepted
+**Status:** Deprecated
 
 ### Context
 
