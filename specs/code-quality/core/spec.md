@@ -44,7 +44,7 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 * *AND* logic that depends on those values SHALL be exercised through pure helpers that take the values as arguments (e.g. `common::connection_string`)
 * *AND* the integration suite MUST produce identical results regardless of test execution order or `--test-threads` count
 
-### Scenario: Arrow and Parquet dependencies resolve to version 59 or above with one version of each Arrow sub-crate
+### Scenario: Arrow and Parquet dependencies resolve to one version of each Arrow sub-crate
 
 * *GIVEN* the resolved dependency tree in `Cargo.lock`
 * *WHEN* inspecting the `[[package]]` entries
