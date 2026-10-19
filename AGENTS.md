@@ -40,7 +40,7 @@
 
 ## Changelog
 
-- Update `CHANGELOG.md` in the same PR as any user-facing change. Entries are concise and user-facing.
-- A PR without a version bump adds entries under `## [Unreleased]`. Merging it does not release.
-- A PR that bumps the `Cargo.toml` version puts entries under a `## X.Y.Z` header matching the version and folds in `[Unreleased]`. Merging it makes the CI `release` job tag, release, and publish to crates.io.
+- Bump the version in `Cargo.toml` in every PR.
+- Update `CHANGELOG.md` in the same PR as any user-facing change. Entries are concise, user-facing, and sit under a `## X.Y.Z` header matching the new version.
+- Merging a PR makes the CI `release` job tag, release, and publish to crates.io.
 - The full procedure is in `CONTRIBUTING.md` under Releasing.
