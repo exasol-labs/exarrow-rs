@@ -1,0 +1,27 @@
+# Decision Log: fix-result-set-schema-metadata
+
+## Design Decisions
+
+### [1] The result set puts field metadata on native batches and keeps their data types
+
+- **Decision:** `ResultSet` copies the field metadata of each result-set schema field onto the field at the same position of every Arrow batch that the native transport returns. Each batch field keeps its name, Arrow data type, and nullability, and the batch keeps its column arrays.
+- **Rationale:** Every batch of both transports passes through `ResultSet`: the execute response, each fetch page, and the zero-row batch. The function that resolves a transport column description to an `ExasolType` (`exasol_type_of`) lives in query, and query depends on transport, so the native transport cannot call it without a dependency cycle.
+- **Alternatives:** Replace the schema of each native batch with the result-set schema: rejected, because the Arrow data types differ for INTERVAL, GEOMETRY, and HASHTYPE columns (Utf8 from the native transport, Interval or Binary from `TypeMapper`), so the batch cannot be built. Attach the metadata in the native transport: rejected, because of the dependency cycle and because the key format would then have two owners.
+- **Consequences:** On the native transport, the result-set metadata schema and the batches still differ in Arrow data type for INTERVAL, GEOMETRY, and HASHTYPE columns. This plan aligns their field metadata only.
+- **Promotes to ADR:** no
+
+### [2] Every result-set field stays nullable
+
+- **Decision:** The driver marks every result-set field nullable and performs no nullability lookup.
+- **Rationale:** Issue #102 asks to set nullability when the server reports it. Neither protocol reports it. The WebSocket `execute` response describes a column with `name` and `dataType` only (`dataType` holds type, precision, scale, size, characterSet, withLocalTimeZone, fraction, and srid). The native column metadata that `parse_column_meta` reads holds the name, the type ID, and type-specific fields. The spec states this fact so that the nullable fields are a specified result.
+- **Alternatives:** Read NOT NULL constraints from `EXA_ALL_COLUMNS`: rejected, because it adds a query to every result set, and a derived column has no catalog entry.
+- **Promotes to ADR:** no
+
+### [3] A new key `exasol:type_name` holds the type name, and `exasol:type` keeps its JSON value
+
+- **Decision:** `TypeMapper::create_field_metadata` adds the key `exasol:type_name` with the Exasol type name without parameters, such as `DECIMAL` or `TIMESTAMP WITH LOCAL TIME ZONE`. The key `exasol:type` keeps the serialized `ExasolType` value.
+- **Rationale:** Issue #102 asks for the original Exasol type name. The value of `exasol:type` is a JSON object that the public function `TypeMapper::from_field_metadata` parses. A type name without parameters, next to separate precision, scale, and size keys, follows the JDBC `getColumnTypeName` convention.
+- **Alternatives:** Store the type name in `exasol:type`: rejected, because `TypeMapper::from_field_metadata` could no longer restore the `ExasolType`. Store the DDL form, such as `DECIMAL(10,2)`: rejected, because it repeats the precision and scale keys and differs from the type name that Exasol reports in result set metadata.
+- **Promotes to ADR:** no
+
+## Review Findings
