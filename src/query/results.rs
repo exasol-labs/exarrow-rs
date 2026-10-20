@@ -3,7 +3,7 @@
 //! This module provides types for handling query results, including
 //! streaming result sets and metadata.
 
-use crate::error::{ConversionError, QueryError};
+use crate::error::{ColumnConversionError, ConversionError, QueryError};
 use crate::transport::messages::{ColumnInfo, ResultData, ResultPayload, ResultSetHandle};
 use crate::transport::protocol::QueryResult as TransportQueryResult;
 use crate::transport::TransportProtocol;
@@ -17,6 +17,7 @@ use arrow::datatypes::{
     TimestampMicrosecondType,
 };
 use serde_json::Value;
+use std::num::{IntErrorKind, ParseIntError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -447,7 +448,14 @@ impl ResultSet {
             .enumerate()
             .map(|(column_index, field)| {
                 let values = Self::column_of(rows, column_index);
-                Self::json_column_to_array(field.data_type(), &values)
+                Self::json_column_to_array(field.data_type(), &values).map_err(|error| {
+                    error.into_conversion_error(
+                        column_index,
+                        field.name(),
+                        &values,
+                        field.data_type(),
+                    )
+                })
             })
             .collect::<Result<_, _>>()?;
 
@@ -473,7 +481,7 @@ impl ResultSet {
     fn json_column_to_array(
         data_type: &DataType,
         values: &[&Value],
-    ) -> Result<Arc<dyn Array>, ConversionError> {
+    ) -> Result<Arc<dyn Array>, ColumnConversionError> {
         Ok(match data_type {
             DataType::Boolean => Arc::new(Self::json_to_boolean_array(values)),
             DataType::Int32 => Arc::new(Self::json_to_primitive_array::<Int32Type, _>(
@@ -570,13 +578,20 @@ impl ResultSet {
         values: &[&Value],
         precision: u8,
         scale: i8,
-    ) -> Result<Decimal128Array, ConversionError> {
+    ) -> Result<Decimal128Array, ColumnConversionError> {
         let mut builder = Decimal128Builder::new()
             .with_precision_and_scale(precision, scale)
             .map_err(|e| ConversionError::ArrowError(e.to_string()))?;
 
-        for value in values {
-            builder.append_option(Self::scale_to_decimal(value, scale)?);
+        for (row, value) in values.iter().enumerate() {
+            let scaled = Self::scale_to_decimal(value, scale).map_err(|failure| {
+                ColumnConversionError::Value {
+                    row,
+                    reason: failure.reason,
+                    overflow: failure.overflow,
+                }
+            })?;
+            builder.append_option(scaled);
         }
 
         Ok(builder.finish())
@@ -587,7 +602,7 @@ impl ResultSet {
     /// Exasol sends decimals as strings when they exceed the JSON number range
     /// and as numbers otherwise, so all three shapes are accepted; a value of
     /// any other shape becomes NULL.
-    fn scale_to_decimal(value: &Value, scale: i8) -> Result<Option<i128>, ConversionError> {
+    fn scale_to_decimal(value: &Value, scale: i8) -> Result<Option<i128>, DecimalParseFailure> {
         if let Some(text) = value.as_str() {
             return Self::parse_string_to_decimal(text, scale).map(Some);
         }
@@ -603,46 +618,45 @@ impl ResultSet {
     /// Parse a decimal string to i128 scaled value.
     ///
     /// Handles formats like "123", "123.45", "-123.45"
-    fn parse_string_to_decimal(s: &str, scale: i8) -> Result<i128, ConversionError> {
-        // Handle empty string
+    fn parse_string_to_decimal(s: &str, scale: i8) -> Result<i128, DecimalParseFailure> {
         if s.is_empty() {
-            return Err(ConversionError::InvalidFormat(
-                "Empty decimal string".to_string(),
-            ));
+            return Err(DecimalParseFailure::invalid("Empty decimal string"));
         }
 
-        // Split on decimal point
         let parts: Vec<&str> = s.split('.').collect();
 
         let (integer_part, decimal_part) = match parts.len() {
             1 => (parts[0], ""),
             2 => (parts[0], parts[1]),
             _ => {
-                return Err(ConversionError::InvalidFormat(format!(
+                return Err(DecimalParseFailure::invalid(format!(
                     "Invalid decimal format: {}",
                     s
                 )));
             }
         };
 
-        // Parse the integer part
-        let mut result: i128 = integer_part.parse().map_err(|_| {
-            ConversionError::InvalidFormat(format!("Invalid integer part: {}", integer_part))
-        })?;
+        let mut result: i128 = integer_part
+            .parse()
+            .map_err(|e: ParseIntError| match e.kind() {
+                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
+                    DecimalParseFailure::overflow(format!(
+                        "integer part {integer_part} exceeds the 128-bit range"
+                    ))
+                }
+                _ => DecimalParseFailure::invalid(format!("Invalid integer part: {integer_part}")),
+            })?;
 
-        // Scale up by 10^scale
         result = result
             .checked_mul(10_i128.pow(scale as u32))
-            .ok_or_else(|| ConversionError::InvalidFormat("Decimal overflow".to_string()))?;
+            .ok_or_else(|| DecimalParseFailure::overflow("Decimal overflow"))?;
 
-        // Add the decimal part
         if !decimal_part.is_empty() {
             let decimal_digits = decimal_part.len().min(scale as usize);
             let decimal_value: i128 = decimal_part[..decimal_digits].parse().map_err(|_| {
-                ConversionError::InvalidFormat(format!("Invalid decimal part: {}", decimal_part))
+                DecimalParseFailure::invalid(format!("Invalid decimal part: {}", decimal_part))
             })?;
 
-            // Scale the decimal part appropriately
             let scale_diff = scale as usize - decimal_digits;
             let scaled_decimal = decimal_value * 10_i128.pow(scale_diff as u32);
 
@@ -652,10 +666,33 @@ impl ResultSet {
                 } else {
                     scaled_decimal
                 })
-                .ok_or_else(|| ConversionError::InvalidFormat("Decimal overflow".to_string()))?;
+                .ok_or_else(|| DecimalParseFailure::overflow("Decimal overflow"))?;
         }
 
         Ok(result)
+    }
+}
+
+/// Why a DECIMAL string did not scale to an i128, before the column context is known.
+#[derive(Debug)]
+struct DecimalParseFailure {
+    reason: String,
+    overflow: bool,
+}
+
+impl DecimalParseFailure {
+    fn invalid(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            overflow: false,
+        }
+    }
+
+    fn overflow(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            overflow: true,
+        }
     }
 }
 
@@ -2744,11 +2781,82 @@ mod tests {
     fn test_parse_string_to_decimal_rejects_a_non_numeric_fractional_part() {
         let err = ResultSet::parse_string_to_decimal("1.ab", 2).unwrap_err();
 
-        assert!(matches!(err, ConversionError::InvalidFormat(_)));
+        assert_eq!(err.reason, "Invalid decimal part: ab");
+        assert!(!err.overflow);
+    }
+
+    #[test]
+    fn test_parse_string_to_decimal_flags_an_i128_overflow() {
+        let scaled_overflow =
+            ResultSet::parse_string_to_decimal("99999999999999999999999999999999999999", 2)
+                .unwrap_err();
+        let integer_overflow = ResultSet::parse_string_to_decimal(&"9".repeat(40), 0).unwrap_err();
+
+        assert!(scaled_overflow.overflow);
+        assert!(integer_overflow.overflow);
         assert_eq!(
-            err.to_string(),
-            "Invalid data format: Invalid decimal part: ab"
+            integer_overflow.reason,
+            format!("integer part {} exceeds the 128-bit range", "9".repeat(40))
         );
+    }
+
+    /// Scenario: Conversion error reporting
+    #[test]
+    fn json_decimal_conversion_error_names_the_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "AMOUNT",
+            arrow::datatypes::DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Json(vec![vec![json!("1.50")], vec![json!("1.2.3")]]),
+            total_rows: 2,
+        };
+
+        let err = ResultSet::column_major_to_record_batch(&data, &schema).unwrap_err();
+
+        match err {
+            ConversionError::ValueConversionFailed {
+                row,
+                column,
+                column_name,
+                value,
+                target_type,
+                message,
+            } => {
+                assert_eq!((row, column, column_name.as_str()), (1, 0, "AMOUNT"));
+                assert_eq!(value, "\"1.2.3\"");
+                assert_eq!(
+                    target_type,
+                    arrow::datatypes::DataType::Decimal128(10, 2).to_string()
+                );
+                assert_eq!(message, "Invalid decimal format: 1.2.3");
+            }
+            other => panic!("expected ValueConversionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_decimal_overflow_is_reported_as_numeric_overflow() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "AMOUNT",
+            arrow::datatypes::DataType::Decimal128(38, 2),
+            true,
+        )]));
+        let data = ResultData {
+            columns: vec![],
+            data: ResultPayload::Json(vec![vec![json!("99999999999999999999999999999999999999")]]),
+            total_rows: 1,
+        };
+
+        let err = ResultSet::column_major_to_record_batch(&data, &schema).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionError::NumericOverflow { row: 0, column: 0, ref column_name, .. }
+                if column_name == "AMOUNT"
+        ));
     }
 
     #[test]

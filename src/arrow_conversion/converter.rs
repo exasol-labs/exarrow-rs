@@ -201,7 +201,12 @@ impl ArrowConverter {
             .iter()
             .enumerate()
             .map(|(col_idx, exasol_type)| {
-                build_array(exasol_type, &column_values[col_idx], col_idx)
+                build_array(
+                    exasol_type,
+                    &column_values[col_idx],
+                    col_idx,
+                    self.schema.field(col_idx).name(),
+                )
             })
             .collect();
 
@@ -1001,5 +1006,69 @@ mod tests {
                 with_local_time_zone: true
             }
         );
+    }
+
+    /// Scenario: Conversion error reporting
+    #[test]
+    fn conversion_errors_name_the_column_row_value_and_target_type() {
+        let columns = [
+            column("ID", scalar_type("DOUBLE")),
+            column("FLAG", scalar_type("BOOLEAN")),
+        ];
+        let converter = ArrowConverter::new(&columns).unwrap();
+        let rows = vec![
+            vec![json!(1.0), json!(true)],
+            vec![json!(2.0), json!("yes")],
+        ];
+
+        let error = converter
+            .convert_to_record_batch(&json_result(&columns, rows))
+            .unwrap_err();
+
+        match error {
+            ConversionError::ValueConversionFailed {
+                row,
+                column,
+                column_name,
+                value,
+                target_type,
+                message,
+            } => {
+                assert_eq!((row, column, column_name.as_str()), (1, 1, "FLAG"));
+                assert_eq!(value, "\"yes\"");
+                assert_eq!(target_type, ArrowDataType::Boolean.to_string());
+                assert!(message.contains("Expected boolean"), "{message}");
+            }
+            other => panic!("expected ValueConversionFailed, got {other:?}"),
+        }
+    }
+
+    /// Scenario: Decimal overflow detection
+    #[test]
+    fn decimal_overflow_reports_the_column_row_value_and_precision() {
+        let columns = [column("AMOUNT", decimal_type(5, 2))];
+        let converter = ArrowConverter::new(&columns).unwrap();
+        let rows = vec![vec![json!("123.45")], vec![json!("12345.678")]];
+
+        let error = converter
+            .convert_to_record_batch_owned(json_result(&columns, rows))
+            .unwrap_err();
+
+        match error {
+            ConversionError::NumericOverflow {
+                row,
+                column,
+                column_name,
+                value,
+                target_type,
+                message,
+            } => {
+                assert_eq!((row, column, column_name.as_str()), (1, 0, "AMOUNT"));
+                assert_eq!(value, "\"12345.678\"");
+                assert_eq!(target_type, ArrowDataType::Decimal128(5, 2).to_string());
+                assert!(message.contains("exceed precision 5"), "{message}");
+            }
+            other => panic!("expected NumericOverflow, got {other:?}"),
+        }
     }
 }

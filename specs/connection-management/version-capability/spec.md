@@ -37,3 +37,10 @@ Every successful login populates `Session::server_info().release_version` with a
 * *WHEN* any caller invokes `supports_native_parquet_import()` or `supports_at_least(major, minor, patch)`
 * *THEN* the call MUST be synchronous and MUST NOT issue any network I/O
 * *AND* the call MUST be safe to invoke repeatedly without measurable cost (parse result MAY be memoized)
+
+### Scenario: Compare the server version against a caller-supplied threshold
+
+* *GIVEN* a connected session whose `server_info().release_version` is `"8.27.1"`
+* *WHEN* a caller invokes `supports_at_least(major, minor, patch)` on the session
+* *THEN* the call MUST return `true` if and only if `(8, 27, 1) >= (major, minor, patch)` lexicographically
+* *AND* the boundary cases MUST hold: `(8,27,1)` yields `true`, `(8,27,2)` yields `false`, `(8,28,0)` yields `false`, `(8,26,99)` yields `true`, `(7,99,99)` yields `true`, and `(9,0,0)` yields `false`

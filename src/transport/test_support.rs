@@ -16,8 +16,12 @@
 //! stalling, or refusing the TLS handshake that Exasol runs as the client)
 //! with `ChunkedBody` to split what it received,
 //! `SilentServer` for a peer that accepts and then never answers (plain,
-//! after TLS, or after the WebSocket upgrade), and `FakeWebSocketServer`
-//! (`websocket` feature) for scripted WebSocket API exchanges.
+//! after TLS, or after the WebSocket upgrade), `NativeLoginServer` (`native`
+//! feature) for a peer that completes TLS, answers one native login packet with
+//! a chosen protocol version, and records in `LoginExchange` what the client
+//! sends after it, with `raw_public_key` and `test_phrase` as its login
+//! fixtures, and `FakeWebSocketServer` (`websocket` feature) for scripted
+//! WebSocket API exchanges.
 
 use crate::error::TransportError;
 use crate::transport::http_transport::{
@@ -522,7 +526,11 @@ pub(crate) fn test_credentials() -> Credentials {
 
 /// TLS on without certificate validation, and a 300 ms connection timeout.
 pub(crate) fn silent_server_params(server: &SilentServer) -> ConnectionParams {
-    ConnectionParams::new(server.host.clone(), server.port)
+    loopback_params(&server.host, server.port)
+}
+
+fn loopback_params(host: &str, port: u16) -> ConnectionParams {
+    ConnectionParams::new(host.to_owned(), port)
         .with_validate_server_certificate(false)
         .with_timeout(SILENT_SERVER_CONNECTION_TIMEOUT.as_millis() as u64)
 }
@@ -565,11 +573,7 @@ impl SilentServer {
     /// Completes a server-side TLS handshake with a self-signed certificate
     /// for `localhost`, then reads until end of stream without writing.
     pub(crate) async fn after_tls() -> Self {
-        let certificate = TlsCertificate::generate().expect("generate a test certificate");
-        let server_config = certificate
-            .to_server_config()
-            .expect("build the test server config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let (acceptor, certificate_der) = tls_acceptor();
         let (listener, host, port) = bind_loopback().await;
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept the connection");
@@ -581,7 +585,7 @@ impl SilentServer {
         Self {
             host,
             port,
-            certificate_der: Some(certificate.certificate_der),
+            certificate_der: Some(certificate_der),
             peer,
         }
     }
@@ -628,6 +632,150 @@ impl Drop for SilentServer {
     fn drop(&mut self) {
         self.peer.abort();
     }
+}
+
+/// A TLS acceptor over a fresh self-signed certificate for `localhost`, and
+/// that certificate's DER bytes.
+fn tls_acceptor() -> (tokio_rustls::TlsAcceptor, Vec<u8>) {
+    let certificate = TlsCertificate::generate().expect("generate a test certificate");
+    let server_config = certificate
+        .to_server_config()
+        .expect("build the test server config");
+    (
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config)),
+        certificate.certificate_der,
+    )
+}
+
+/// Number of bytes in each half of a raw Exasol public key.
+#[cfg(feature = "native")]
+pub(crate) const RAW_KEY_HALF: usize = 128;
+
+/// A raw Exasol-format public key: `[exponent 128B BE][modulus 128B BE]`.
+#[cfg(feature = "native")]
+pub(crate) fn raw_public_key() -> Vec<u8> {
+    let mut key = vec![0u8; RAW_KEY_HALF];
+    key[RAW_KEY_HALF - 3] = 0x01;
+    key[RAW_KEY_HALF - 1] = 0x01;
+    key.extend_from_slice(&[0xFFu8; RAW_KEY_HALF]);
+    key
+}
+
+/// A deterministic random phrase of `len` bytes, none of them zero.
+#[cfg(feature = "native")]
+pub(crate) fn test_phrase(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251 + 1) as u8).collect()
+}
+
+/// What a [`NativeLoginServer`] received from the client.
+#[cfg(feature = "native")]
+pub(crate) struct LoginExchange {
+    /// The login packet: magic, length, protocol version, change date, attributes.
+    pub(crate) login_packet: Vec<u8>,
+    /// Every byte the client sent after the login packet, until end of stream.
+    pub(crate) after_login_packet: Vec<u8>,
+}
+
+/// A loopback peer that completes TLS, answers one native login packet with a
+/// public key, a random phrase, and a chosen protocol version, and then never
+/// answers again, so a test can see whether the client sends its password.
+#[cfg(feature = "native")]
+pub(crate) struct NativeLoginServer {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    peer: JoinHandle<LoginExchange>,
+}
+
+#[cfg(feature = "native")]
+impl NativeLoginServer {
+    /// Reports `protocol_version` in the login response, or no protocol
+    /// version attribute when it is `None`.
+    pub(crate) async fn reporting_protocol_version(protocol_version: Option<i32>) -> Self {
+        let (acceptor, _) = tls_acceptor();
+        let (listener, host, port) = bind_loopback().await;
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept the connection");
+            let mut tls_stream = acceptor
+                .accept(stream)
+                .await
+                .expect("accept the TLS handshake");
+
+            let login_packet = read_login_packet(&mut tls_stream).await;
+            tls_stream
+                .write_all(&login_response(protocol_version))
+                .await
+                .expect("write the login response");
+            tls_stream.flush().await.expect("flush the login response");
+
+            let after_login_packet = read_until_end_of_stream(&mut tls_stream).await;
+            LoginExchange {
+                login_packet,
+                after_login_packet,
+            }
+        });
+        Self { host, port, peer }
+    }
+
+    /// Connection parameters with the `silent_server_params` settings.
+    pub(crate) fn params(&self) -> ConnectionParams {
+        loopback_params(&self.host, self.port)
+    }
+
+    /// Waits until the client released its socket and returns what it sent.
+    pub(crate) async fn finish(self) -> LoginExchange {
+        self.peer.await.expect("the login peer must not panic")
+    }
+}
+
+/// Magic and length fields that precede the length-counted body of a native login packet.
+#[cfg(feature = "native")]
+const LOGIN_PACKET_PREFIX_LEN: usize = 8;
+
+#[cfg(feature = "native")]
+async fn read_login_packet(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    let mut prefix = [0u8; LOGIN_PACKET_PREFIX_LEN];
+    stream
+        .read_exact(&mut prefix)
+        .await
+        .expect("read the login packet prefix");
+    let body_len = u32::from_le_bytes(
+        prefix[4..LOGIN_PACKET_PREFIX_LEN]
+            .try_into()
+            .expect("four length bytes"),
+    );
+    let mut login_packet = prefix.to_vec();
+    login_packet.resize(LOGIN_PACKET_PREFIX_LEN + body_len as usize, 0);
+    stream
+        .read_exact(&mut login_packet[LOGIN_PACKET_PREFIX_LEN..])
+        .await
+        .expect("read the login packet");
+    login_packet
+}
+
+#[cfg(feature = "native")]
+fn login_response(protocol_version: Option<i32>) -> Vec<u8> {
+    use crate::transport::native::attributes::{AttributeSet, AttributeValue};
+    use crate::transport::native::constants::{
+        ATTR_PROTOCOL_VERSION, ATTR_PUBLIC_KEY, ATTR_RANDOM_PHRASE, CMD_SET_ATTRIBUTES,
+    };
+    use crate::transport::native::framing::MessageHeader;
+
+    let mut attributes = AttributeSet::new();
+    attributes.add(ATTR_PUBLIC_KEY, AttributeValue::Binary(raw_public_key()));
+    attributes.add(ATTR_RANDOM_PHRASE, AttributeValue::Binary(test_phrase(16)));
+    if let Some(version) = protocol_version {
+        attributes.add(ATTR_PROTOCOL_VERSION, AttributeValue::Int32(version));
+    }
+    let header = MessageHeader::new(
+        CMD_SET_ATTRIBUTES,
+        0,
+        attributes.num_attributes(),
+        attributes.data_len(),
+        0,
+    );
+    let mut response = header.serialize().to_vec();
+    response.extend_from_slice(&attributes.serialize());
+    response
 }
 
 /// A TLS read fails when the driver closes without `close_notify`, so any

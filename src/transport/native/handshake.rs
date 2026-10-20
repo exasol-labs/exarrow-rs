@@ -342,6 +342,7 @@ fn exasol_encode_pwd(
 mod tests {
     use super::super::attributes::parse_attributes;
     use super::*;
+    use crate::transport::test_support::{raw_public_key, test_phrase, RAW_KEY_HALF};
 
     #[test]
     fn login_packet_starts_with_magic() {
@@ -362,18 +363,6 @@ mod tests {
         let packet = build_login_packet(&Credentials::new("sys".to_string(), "pw".to_string()));
         let date = u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]);
         assert_eq!(date, CHANGE_DATE);
-    }
-
-    /// Number of bytes in each half of a raw Exasol public key.
-    const RAW_KEY_HALF: usize = 128;
-
-    /// A raw Exasol-format public key: `[exponent 128B BE][modulus 128B BE]`.
-    fn raw_public_key() -> Vec<u8> {
-        let mut key = vec![0u8; RAW_KEY_HALF];
-        key[RAW_KEY_HALF - 3] = 0x01;
-        key[RAW_KEY_HALF - 1] = 0x01;
-        key.extend_from_slice(&[0xFFu8; RAW_KEY_HALF]);
-        key
     }
 
     #[test]
@@ -673,10 +662,6 @@ mod tests {
     }
 
     // --- Auth message ---
-
-    fn test_phrase(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251 + 1) as u8).collect()
-    }
 
     fn auth_attributes(auth: &AuthMessage) -> (super::MessageHeader, AttributeSet) {
         let header_bytes: &[u8; HEADER_SIZE] =

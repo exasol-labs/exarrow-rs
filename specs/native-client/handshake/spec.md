@@ -23,7 +23,7 @@ The server selects the native protocol when the first bytes received are `LOGIN_
 * *THEN* the system SHALL send a login packet starting with `LOGIN_MAGIC` (0x01121201)
 * *AND* the login packet SHALL include the client's maximum supported protocol version
 * *AND* the system SHALL accept any server-negotiated version between 14 and the client's maximum
-* *AND* the system SHALL reject protocol versions below 14 with a clear error
+* *AND* the system SHALL accept a server-negotiated version above the client's maximum and continue the login
 
 ### Scenario: Login handshake
 
@@ -52,3 +52,10 @@ The server selects the native protocol when the first bytes received are `LOGIN_
 * *THEN* key parsing MUST return a `TransportError` that describes the defect
 * *WHEN* the server supplies an attribute payload truncated before its declared length
 * *THEN* attribute parsing MUST return a `TransportError` that names the required and the available byte counts
+
+### Scenario: Server protocol version below 14 is rejected before the password is sent
+
+* *GIVEN* a TCP connection is established and TLS negotiation is complete
+* *WHEN* the server's login response carries a protocol version below 14
+* *THEN* the login MUST fail with a `TransportError` whose message names the server's protocol version and the minimum supported version 14
+* *AND* the system MUST NOT send the password message to that server
