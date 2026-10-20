@@ -20,10 +20,10 @@ Query results are retrieved efficiently with support for both small single-fetch
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:NEW -->
-### Scenario: Every batch carries the field metadata of the result set schema
+### Scenario: Every batch carries the field metadata of the result set metadata schema
 
 * *GIVEN* a query over the native or the WebSocket transport returns a result set that needs more than one fetch request
 * *WHEN* the caller reads every batch with `fetch_all` or with the result set iterator
-* *THEN* each field of each batch SHALL carry the same Arrow field metadata as the field at the same position in the schema of the result set metadata
-* *AND* each field of each batch SHALL carry the key `exasol:type_name`
+* *THEN* each field of the batch schema of each batch SHALL carry the same Arrow field metadata as the field at the same position in the result set metadata schema
+* *AND* each field of the batch schema of each batch SHALL carry the key `exasol:type_name`
 <!-- /DELTA:NEW -->
