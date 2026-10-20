@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.26.0
+
+- Fix: the native Parquet path of `import_from_parquet` and `import_parquet_from_files` opens each file and reads one 64 KiB piece at a time when Exasol requests a range. It used to read each whole file into memory, and `import_parquet_from_files` held every file at once. Memory no longer grows with the file size. `import_from_parquet_stream` still buffers the whole stream. Refs #69.
+- Breaking: `HttpTransportClient::handle_parquet_import_requests` takes a source that implements `tokio::io::AsyncRead + AsyncSeek + Unpin`, such as a `tokio::fs::File` or a `std::io::Cursor`, instead of `&[u8]`.
+- Changed: on the native Parquet path, a file must stay unchanged until the import ends. A file that becomes shorter fails the import with an I/O error. A file that cannot be opened in `import_parquet_from_files` fails with `ParallelImportError`, and the message now says "failed to open" and names the file index and path. A failure while serving a file names its index and path too.
+
 ## 0.25.0
 
 - Changed: a native login to a server that reports a protocol version below 14 fails before the driver sends the password. `Connection::from_params`, which `Database::connect` and `ConnectionBuilder::connect` call, returns `ConnectionError::AuthenticationFailed`, for example `Authentication failed: Protocol error: unsupported server: native protocol version 13 is below the minimum supported version 14`.

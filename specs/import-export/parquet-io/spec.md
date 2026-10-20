@@ -22,8 +22,8 @@ Specifies Parquet file import through the HTTP tunnel, natively on Exasol 2025.1
 * *GIVEN* a Parquet file exists on disk
 * *AND* the connected Exasol server's `release_version` is at or above `2025.1.11`
 * *WHEN* user calls import_from_parquet with table name and file path
-* *THEN* the system MUST buffer the entire file's raw Parquet bytes in memory and MUST NOT invoke any CSV conversion path
-* *AND* the system MUST serve the bytes via the range-request handler: replying to `HEAD /<file>` with `200 OK` plus `Content-Length: <total bytes>` and to `GET /<file>` with `Range: bytes=<start>-<end>` headers using `206 Partial Content` carrying the requested byte slice, looping until Exasol closes the connection
+* *THEN* the system MUST serve the raw Parquet bytes from the open file through the range-request handler, MUST read only the requested bytes of each range from the file, in pieces of at most 64 KiB, without holding the whole file or a whole requested range in memory at once, and MUST NOT invoke any CSV conversion path
+* *AND* the range-request handler MUST take the file size from the file once, before it answers the first request, and MUST reply to `HEAD /<file>` with `200 OK` plus `Content-Length: <file size>` and to `GET /<file>` with `Range: bytes=<start>-<end>` headers using `206 Partial Content` carrying the requested byte slice, looping until Exasol closes the connection
 * *AND* the generated IMPORT SQL MUST use the `FROM PARQUET AT 'http(s)://addr;MaxConcurrentReads=1' [PUBLIC KEY '...'] FILE 'NNN.parquet'` form, with the `.parquet` extension and without any CSV format option clauses or the `MULTIPLE LOCAL FILES` tag
 
 ### Scenario: Import Parquet from stream

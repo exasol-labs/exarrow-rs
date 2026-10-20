@@ -370,9 +370,12 @@ impl Drop for AbortOnDrop {
 /// Streams multiple Parquet files through HTTP connections in parallel using
 /// the native Parquet HEAD/GET-Range protocol.
 ///
-/// Each file is read into memory and served by `handle_parquet_import_requests`
-/// which responds to repeated HEAD and ranged GET requests issued by the
-/// server. Tasks run concurrently and use fail-fast semantics.
+/// Each file is opened and served by `handle_parquet_import_requests`, which
+/// responds to the repeated HEAD and ranged GET requests that the server
+/// issues. Memory holds one 64 KiB piece of each file at a time, not the
+/// files. The files must stay unchanged until the import ends, and a file that
+/// becomes shorter fails the import. Tasks run concurrently and use fail-fast
+/// semantics.
 ///
 /// # Arguments
 ///
@@ -387,7 +390,8 @@ impl Drop for AbortOnDrop {
 ///
 /// Returns `ImportError::InvalidConfig` when the connection count does not
 /// match the file count, or `ImportError::ParallelImportError` on the first
-/// streaming or task failure.
+/// streaming or task failure. A file that cannot be opened, and a handler
+/// that fails while serving a file, each name the file index and path.
 pub async fn stream_parquet_files_parallel(
     connections: Vec<HttpTransportClient>,
     file_paths: Vec<PathBuf>,
@@ -397,21 +401,22 @@ pub async fn stream_parquet_files_parallel(
         connections,
         indexed_paths,
         |mut client, (idx, path)| async move {
-            let file_bytes = tokio::fs::read(&path).await.map_err(|e| {
+            let file = tokio::fs::File::open(&path).await.map_err(|e| {
                 ImportError::ParallelImportError(format!(
-                    "File {}: failed to read '{}': {e}",
+                    "File {}: failed to open '{}': {e}",
                     idx,
                     path.display()
                 ))
             })?;
 
             client
-                .handle_parquet_import_requests(&file_bytes)
+                .handle_parquet_import_requests(file)
                 .await
                 .map_err(|e| {
                     ImportError::ParallelImportError(format!(
-                        "File {}: parquet range-request handler failed: {e}",
-                        idx
+                        "File {}: serving '{}' failed: {e}",
+                        idx,
+                        path.display()
                     ))
                 })
         },
@@ -590,6 +595,68 @@ mod tests {
 
         let result = stream_parquet_files_parallel(connections, file_paths).await;
         assert!(result.is_ok());
+    }
+
+    /// Scenario: Fail-fast on Parquet conversion error
+    #[tokio::test]
+    async fn test_stream_parquet_files_parallel_names_the_file_that_cannot_be_opened() {
+        let existing = tempfile::NamedTempFile::new().unwrap();
+        let missing = existing.path().with_file_name("missing-file.parquet");
+        let mut servers = Vec::new();
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let server = FakeExasolServer::silent_after_handshake().await;
+            connections.push(server.connect_tunnel().await);
+            servers.push(server);
+        }
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_files_parallel(
+                connections,
+                vec![existing.path().to_path_buf(), missing.clone()],
+            ),
+        )
+        .await
+        .expect_err("a file that cannot be opened fails the import");
+
+        let message = err.to_string();
+        assert!(
+            matches!(err, ImportError::ParallelImportError(_)),
+            "got: {message}"
+        );
+        assert!(message.contains("File 1"), "got: {message}");
+        assert!(message.contains("failed to open"), "got: {message}");
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "got: {message}"
+        );
+    }
+
+    /// Scenario: Fail-fast on Parquet conversion error
+    #[tokio::test]
+    async fn test_stream_parquet_files_parallel_names_the_file_whose_serving_fails() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let server = FakeExasolServer::serving_csv("1,a\n").await;
+        let connection = server.connect_tunnel().await;
+
+        let err = finish_within(
+            LOOPBACK_TEST_BOUND,
+            stream_parquet_files_parallel(vec![connection], vec![file.path().to_path_buf()]),
+        )
+        .await
+        .expect_err("a PUT where a range request belongs fails the import");
+
+        let message = err.to_string();
+        assert!(
+            matches!(err, ImportError::ParallelImportError(_)),
+            "got: {message}"
+        );
+        assert!(message.contains("File 0"), "got: {message}");
+        assert!(
+            message.contains(&file.path().display().to_string()),
+            "got: {message}"
+        );
     }
 
     fn pool_with_entries(entries: Vec<ImportFileEntry>) -> ParallelTransportPool {

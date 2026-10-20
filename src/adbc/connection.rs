@@ -1444,6 +1444,10 @@ impl Connection {
     /// and imports it into the target table using Exasol's HTTP transport layer.
     /// When the connected server supports native Parquet import (Exasol 2025.1.11+),
     /// the raw Parquet bytes are streamed directly without CSV conversion.
+    /// On that native path, the driver opens the file and reads each range that
+    /// Exasol requests in pieces of at most 64 KiB, so memory does not grow with
+    /// the file size. The file must stay unchanged until the import ends, and a
+    /// file that becomes shorter fails the import.
     ///
     /// # Arguments
     ///
@@ -1495,8 +1499,10 @@ impl Connection {
     ///
     /// # Bounding memory
     ///
-    /// To bound memory, decode the Parquet data yourself and pass the
-    /// RecordBatches in groups to
+    /// To bound memory, import from a file path with
+    /// [`import_from_parquet`](Self::import_from_parquet), which streams the
+    /// file instead of buffering it. Or decode the Parquet data yourself and
+    /// pass the RecordBatches in groups to
     /// [`import_from_record_batches`](Self::import_from_record_batches). Each
     /// call is one IMPORT statement and holds the CSV of its own batches more
     /// than once. Each call commits separately unless autocommit is off, so a
@@ -1547,7 +1553,10 @@ impl Connection {
     /// On the CSV conversion path, each file converts to CSV while its CSV
     /// streams through its own HTTP transport connection, so memory holds a few
     /// RecordBatches of CSV per file, not whole files. The native Parquet path
-    /// reads each whole file into memory.
+    /// opens each file and reads one 64 KiB piece at a time when Exasol requests
+    /// a range, so memory does not grow with the file size. Each file must stay
+    /// unchanged until the import ends, and a file that becomes shorter fails
+    /// the import.
     ///
     /// For a single file, this method delegates to `import_from_parquet`.
     ///
@@ -1955,8 +1964,10 @@ impl Connection {
     ///
     /// # Bounding memory
     ///
-    /// To bound memory, decode the Parquet data yourself and import the
-    /// RecordBatches in groups with
+    /// To bound memory, import from a file path with
+    /// [`blocking_import_from_parquet`](Self::blocking_import_from_parquet),
+    /// which streams the file instead of buffering it. Or decode the Parquet
+    /// data yourself and import the RecordBatches in groups with
     /// [`blocking_import_from_record_batch`](Self::blocking_import_from_record_batch),
     /// which imports one RecordBatch per call. Each call is one IMPORT
     /// statement and holds the CSV of its batch more than once. Each call
