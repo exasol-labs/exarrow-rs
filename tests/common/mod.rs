@@ -54,10 +54,10 @@
 
 use arrow::array::{Array, Int64Array};
 use arrow::compute::cast;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use exarrow_rs::adbc::{Connection, Driver};
-use exarrow_rs::ResultSetIterator;
+use exarrow_rs::{ExasolType, ResultSetIterator, TypeMapper};
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::str::FromStr;
@@ -196,6 +196,18 @@ pub async fn get_test_connection() -> Result<Connection, exarrow_rs::error::Exas
     Err(exarrow_rs::error::ExasolError::Connection(
         last_error.unwrap(),
     ))
+}
+
+/// The type that the default transport reports for a `TIMESTAMP WITH LOCAL TIME ZONE` column.
+///
+/// The default transport is the one that `get_test_connection` selects: native when the `native`
+/// feature is enabled, websocket otherwise. The native protocol sends one wire type for `TIMESTAMP`
+/// and for `TIMESTAMP WITH LOCAL TIME ZONE`, so it reports a plain `TIMESTAMP`.
+#[allow(dead_code)]
+pub fn default_transport_local_time_zone_timestamp() -> ExasolType {
+    ExasolType::Timestamp {
+        with_local_time_zone: !cfg!(feature = "native"),
+    }
 }
 
 /// Establish a test connection using a specific transport.
@@ -548,6 +560,169 @@ pub fn assert_partly_inline(batches: &[RecordBatch]) {
         (1..PARTIAL_INLINE_ROWS).contains(&first),
         "the execute response should deliver some but not all rows, got {first}"
     );
+}
+
+/// DDL of table `M` in `schema_name`, which holds one column per Exasol type
+/// that the result set field metadata tests check. `AMOUNT` is `NOT NULL`.
+#[allow(dead_code)]
+pub fn column_metadata_table_ddl(schema_name: &str) -> String {
+    format!(
+        "CREATE TABLE {schema_name}.M (AMOUNT DECIMAL(10,2) NOT NULL, NAME VARCHAR(50), \
+         CODE CHAR(3), RATE DOUBLE, ACTIVE BOOLEAN, D DATE, TS TIMESTAMP, \
+         TSL TIMESTAMP WITH LOCAL TIME ZONE)"
+    )
+}
+
+/// The INSERT that fills table `M` in `schema_name` with its one row.
+#[allow(dead_code)]
+pub fn column_metadata_table_insert(schema_name: &str) -> String {
+    format!(
+        "INSERT INTO {schema_name}.M VALUES (1.50, 'abc', 'xyz', 2.5, TRUE, DATE '2024-01-02', \
+         TIMESTAMP '2024-01-02 03:04:05', TIMESTAMP '2024-01-02 03:04:05')"
+    )
+}
+
+struct ExpectedField {
+    name: &'static str,
+    type_name: &'static str,
+    exasol_type: ExasolType,
+    parameters: &'static [(&'static str, &'static str)],
+}
+
+/// Assert that every field of `schema`, a schema of `SELECT * FROM M`, carries
+/// the `exasol:` field metadata of its column and is nullable, and that
+/// `TypeMapper::from_field_metadata` restores the Exasol type of each field.
+///
+/// `local_time_zone_timestamp` is the type that the transport reports for the
+/// column `TSL`: the native protocol sends wire type 21 for `TIMESTAMP` and for
+/// `TIMESTAMP WITH LOCAL TIME ZONE` alike, so the native transport reports a
+/// plain `TIMESTAMP`.
+#[allow(dead_code)]
+pub fn assert_column_metadata_table_fields(schema: &Schema, local_time_zone_timestamp: ExasolType) {
+    let expected = [
+        ExpectedField {
+            name: "AMOUNT",
+            type_name: "DECIMAL",
+            exasol_type: ExasolType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            parameters: &[("exasol:precision", "10"), ("exasol:scale", "2")],
+        },
+        ExpectedField {
+            name: "NAME",
+            type_name: "VARCHAR",
+            exasol_type: ExasolType::Varchar { size: 50 },
+            parameters: &[("exasol:size", "50")],
+        },
+        ExpectedField {
+            name: "CODE",
+            type_name: "CHAR",
+            exasol_type: ExasolType::Char { size: 3 },
+            parameters: &[("exasol:size", "3")],
+        },
+        ExpectedField {
+            name: "RATE",
+            type_name: "DOUBLE",
+            exasol_type: ExasolType::Double,
+            parameters: &[],
+        },
+        ExpectedField {
+            name: "ACTIVE",
+            type_name: "BOOLEAN",
+            exasol_type: ExasolType::Boolean,
+            parameters: &[],
+        },
+        ExpectedField {
+            name: "D",
+            type_name: "DATE",
+            exasol_type: ExasolType::Date,
+            parameters: &[],
+        },
+        ExpectedField {
+            name: "TS",
+            type_name: "TIMESTAMP",
+            exasol_type: ExasolType::Timestamp {
+                with_local_time_zone: false,
+            },
+            parameters: &[],
+        },
+        ExpectedField {
+            name: "TSL",
+            type_name: local_time_zone_timestamp.type_name(),
+            exasol_type: local_time_zone_timestamp,
+            parameters: &[],
+        },
+    ];
+
+    assert_eq!(schema.fields().len(), expected.len(), "column count");
+    for (field, expected_field) in schema.fields().iter().zip(expected) {
+        let ExpectedField {
+            name,
+            type_name,
+            exasol_type,
+            parameters,
+        } = expected_field;
+        assert_eq!(field.name(), name);
+        assert!(
+            field.is_nullable(),
+            "{name} must be nullable, because Exasol reports no nullability"
+        );
+        let metadata = field.metadata();
+        assert_eq!(
+            metadata.get("exasol:type_name").map(String::as_str),
+            Some(type_name),
+            "{name} exasol:type_name"
+        );
+        for key in ["exasol:precision", "exasol:scale", "exasol:size"] {
+            let expected_value = parameters
+                .iter()
+                .find(|(parameter, _)| *parameter == key)
+                .map(|(_, value)| *value);
+            assert_eq!(
+                metadata.get(key).map(String::as_str),
+                expected_value,
+                "{name} {key}"
+            );
+        }
+        assert_eq!(
+            TypeMapper::from_field_metadata(metadata),
+            Some(exasol_type),
+            "{name} exasol:type"
+        );
+    }
+}
+
+/// Assert that `batches` span more than one fetch, and that every field of every
+/// batch schema carries the same field metadata as the field at the same position
+/// of `metadata_schema`, including the key `exasol:type_name`.
+#[allow(dead_code)]
+pub fn assert_every_batch_carries_field_metadata(
+    metadata_schema: &Schema,
+    batches: &[RecordBatch],
+) {
+    let non_empty = batches.iter().filter(|b| b.num_rows() > 0).count();
+    assert!(
+        non_empty >= 2,
+        "expected at least two non-empty batches, got {non_empty}"
+    );
+    for (batch_index, batch) in batches.iter().enumerate() {
+        let batch_schema = batch.schema();
+        assert_eq!(batch_schema.fields().len(), metadata_schema.fields().len());
+        for (field, expected) in batch_schema.fields().iter().zip(metadata_schema.fields()) {
+            assert!(
+                field.metadata().contains_key("exasol:type_name"),
+                "batch {batch_index} field {} has no exasol:type_name",
+                field.name()
+            );
+            assert_eq!(
+                field.metadata(),
+                expected.metadata(),
+                "batch {batch_index} field {}",
+                field.name()
+            );
+        }
+    }
 }
 
 /// Open a connection with `connect`, execute `sql`, and return its result as an

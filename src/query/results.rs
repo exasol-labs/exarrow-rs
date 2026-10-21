@@ -7,10 +7,10 @@ use crate::error::{ColumnConversionError, ConversionError, QueryError};
 use crate::transport::messages::{ColumnInfo, ResultData, ResultPayload, ResultSetHandle};
 use crate::transport::protocol::QueryResult as TransportQueryResult;
 use crate::transport::TransportProtocol;
-use crate::types::{ExasolType, TypeMapper};
+use crate::types::{ColumnMetadata, ExasolType, SchemaBuilder};
 use arrow::array::{
     new_empty_array, Array, BooleanArray, BooleanBuilder, Decimal128Array, Decimal128Builder,
-    PrimitiveArray, PrimitiveBuilder, RecordBatch, StringArray, StringBuilder,
+    PrimitiveArray, PrimitiveBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Field, Float64Type, Int32Type, Int64Type, Schema,
@@ -129,7 +129,7 @@ pub(crate) fn exasol_type_of(
             precision: data_type.fraction.unwrap_or(3) as u8,
         },
         "GEOMETRY" => ExasolType::Geometry { srid: None },
-        "HASHTYPE" => ExasolType::Hashtype { byte_size: 16 },
+        "HASHTYPE" => ExasolType::hashtype_from_reported_size(data_type.size),
         _ => {
             return Err(ConversionError::UnsupportedType {
                 exasol_type: data_type.type_name.clone(),
@@ -375,41 +375,80 @@ impl ResultSet {
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
-    /// Build Arrow schema from column information.
+    /// Build the result set metadata schema from column information.
     ///
     /// Query results and ADBC `execute_schema` must report the same column
-    /// types, so both build the schema with this function.
+    /// types, so both build the schema with this function. Every field is
+    /// nullable, because Exasol reports no column nullability, and carries the
+    /// `exasol:` field metadata of its column.
     pub(crate) fn build_schema(columns: &[ColumnInfo]) -> Result<Arc<Schema>, ConversionError> {
-        let fields: Result<Vec<Field>, ConversionError> = columns
+        let column_metadata = columns
             .iter()
             .map(|col| {
-                // Parse Exasol type from DataType
-                let arrow_type = Self::exasol_datatype_to_arrow(&col.data_type)?;
-
-                // All fields are nullable by default in Exasol
-                Ok(Field::new(&col.name, arrow_type, true))
+                Ok(ColumnMetadata {
+                    name: col.name.clone(),
+                    data_type: exasol_type_of(&col.data_type)?,
+                    nullable: true,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ConversionError>>()?;
 
-        Ok(Arc::new(Schema::new(fields?)))
-    }
-
-    /// Convert Exasol DataType to Arrow DataType.
-    fn exasol_datatype_to_arrow(
-        data_type: &crate::transport::messages::DataType,
-    ) -> Result<arrow::datatypes::DataType, ConversionError> {
-        TypeMapper::exasol_to_arrow(&exasol_type_of(data_type)?, true)
+        Ok(Arc::new(
+            SchemaBuilder::new().add_columns(column_metadata).build()?,
+        ))
     }
 
     /// Convert a ResultData payload to RecordBatch, handling both JSON and Arrow variants.
+    ///
+    /// An Arrow batch keeps its own column arrays, field names, Arrow data types,
+    /// and nullability, and takes the field metadata of the result set metadata
+    /// schema. The native transport decodes some columns to another Arrow type
+    /// than `TypeMapper` maps (INTERVAL, GEOMETRY, and HASHTYPE to Utf8), so the
+    /// metadata goes onto the batch's own fields.
     fn payload_to_record_batch(
         data: &ResultData,
         schema: &Arc<Schema>,
     ) -> Result<RecordBatch, ConversionError> {
         match &data.data {
-            ResultPayload::Arrow(batch) => Ok(batch.clone()),
-            ResultPayload::Json(_) => Self::column_major_to_record_batch(data, schema),
+            ResultPayload::Arrow(batch) => Self::with_field_metadata(batch, schema),
+            ResultPayload::Json(rows) => Self::column_major_to_record_batch(rows, schema),
         }
+    }
+
+    fn with_field_metadata(
+        batch: &RecordBatch,
+        schema: &Schema,
+    ) -> Result<RecordBatch, ConversionError> {
+        let batch_schema = batch.schema();
+        if batch_schema.fields().len() != schema.fields().len() {
+            return Err(ConversionError::SchemaMismatch(format!(
+                "Arrow batch has {} columns, but the result set metadata schema has {}",
+                batch_schema.fields().len(),
+                schema.fields().len()
+            )));
+        }
+
+        let fields: Vec<Field> = batch_schema
+            .fields()
+            .iter()
+            .zip(schema.fields())
+            .map(|(batch_field, schema_field)| {
+                batch_field
+                    .as_ref()
+                    .clone()
+                    .with_metadata(schema_field.metadata().clone())
+            })
+            .collect();
+        let schema_with_metadata =
+            Schema::new_with_metadata(fields, batch_schema.metadata().clone());
+
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        RecordBatch::try_new_with_options(
+            Arc::new(schema_with_metadata),
+            batch.columns().to_vec(),
+            &options,
+        )
+        .map_err(|e| ConversionError::ArrowError(e.to_string()))
     }
 
     /// Build a zero-row RecordBatch that carries the given schema.
@@ -430,14 +469,9 @@ impl ResultSet {
 
     /// Convert row-major JSON result data to RecordBatch.
     fn column_major_to_record_batch(
-        data: &ResultData,
+        rows: &[Vec<Value>],
         schema: &Arc<Schema>,
     ) -> Result<RecordBatch, ConversionError> {
-        let rows = match &data.data {
-            ResultPayload::Json(rows) => rows,
-            ResultPayload::Arrow(batch) => return Ok(batch.clone()),
-        };
-
         if rows.is_empty() {
             return Self::empty_record_batch(schema);
         }
@@ -821,6 +855,7 @@ mod tests {
     use crate::error::TransportError;
     use crate::transport::messages::{ColumnInfo, DataType, ResultPayload};
     use crate::transport::test_support::MockTransport;
+    use crate::types::TypeMapper;
     use arrow::array::Array;
     use mockall::predicate::eq;
     use serde_json::json;
@@ -840,6 +875,10 @@ mod tests {
             with_local_time_zone: None,
             fraction: None,
         }
+    }
+
+    fn arrow_type_of(data_type: &DataType) -> Result<arrow::datatypes::DataType, ConversionError> {
+        TypeMapper::exasol_to_arrow(&exasol_type_of(data_type)?, true)
     }
 
     fn decimal_column(name: &str) -> ColumnInfo {
@@ -1025,24 +1064,20 @@ mod tests {
         // Row-major data format:
         // Row 0: [1, "Alice", true]
         // Row 1: [2, "Bob", false]
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![
-                    serde_json::json!(1),
-                    serde_json::json!("Alice"),
-                    serde_json::json!(true),
-                ],
-                vec![
-                    serde_json::json!(2),
-                    serde_json::json!("Bob"),
-                    serde_json::json!(false),
-                ],
-            ]),
-            total_rows: 2,
-        };
+        let rows = vec![
+            vec![
+                serde_json::json!(1),
+                serde_json::json!("Alice"),
+                serde_json::json!(true),
+            ],
+            vec![
+                serde_json::json!(2),
+                serde_json::json!("Bob"),
+                serde_json::json!(false),
+            ],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
@@ -1058,15 +1093,11 @@ mod tests {
         )]));
 
         // Row-major: one row with one value
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(42)], // Row 0: [42]
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!(42)], // Row 0: [42]
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
         assert_eq!(batch.num_columns(), 1, "Should have exactly 1 column");
@@ -1085,15 +1116,11 @@ mod tests {
         ]));
 
         // Row-major: one row with two values
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(42), serde_json::json!("hello")], // Row 0: [42, "hello"]
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!(42), serde_json::json!("hello")], // Row 0: [42, "hello"]
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
         assert_eq!(batch.num_columns(), 2, "Should have exactly 2 columns");
@@ -1108,24 +1135,20 @@ mod tests {
         ]));
 
         // Row-major: ten rows, each with two values
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(1), serde_json::json!("Row 1")],
-                vec![serde_json::json!(2), serde_json::json!("Row 2")],
-                vec![serde_json::json!(3), serde_json::json!("Row 3")],
-                vec![serde_json::json!(4), serde_json::json!("Row 4")],
-                vec![serde_json::json!(5), serde_json::json!("Row 5")],
-                vec![serde_json::json!(6), serde_json::json!("Row 6")],
-                vec![serde_json::json!(7), serde_json::json!("Row 7")],
-                vec![serde_json::json!(8), serde_json::json!("Row 8")],
-                vec![serde_json::json!(9), serde_json::json!("Row 9")],
-                vec![serde_json::json!(10), serde_json::json!("Row 10")],
-            ]),
-            total_rows: 10,
-        };
+        let rows = vec![
+            vec![serde_json::json!(1), serde_json::json!("Row 1")],
+            vec![serde_json::json!(2), serde_json::json!("Row 2")],
+            vec![serde_json::json!(3), serde_json::json!("Row 3")],
+            vec![serde_json::json!(4), serde_json::json!("Row 4")],
+            vec![serde_json::json!(5), serde_json::json!("Row 5")],
+            vec![serde_json::json!(6), serde_json::json!("Row 6")],
+            vec![serde_json::json!(7), serde_json::json!("Row 7")],
+            vec![serde_json::json!(8), serde_json::json!("Row 8")],
+            vec![serde_json::json!(9), serde_json::json!("Row 9")],
+            vec![serde_json::json!(10), serde_json::json!("Row 10")],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 10, "Should have exactly 10 rows");
         assert_eq!(batch.num_columns(), 2, "Should have exactly 2 columns");
@@ -1283,99 +1306,99 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for ResultSet::exasol_datatype_to_arrow
+    // Tests for exasol_type_of
     // =========================================================================
 
     #[test]
-    fn test_exasol_datatype_to_arrow_boolean() {
+    fn test_exasol_type_of_boolean() {
         let data_type = plain_type("BOOLEAN");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Boolean);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_char() {
+    fn test_exasol_type_of_char() {
         let data_type = DataType {
             size: Some(10),
             ..plain_type("CHAR")
         };
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Utf8);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_char_default_size() {
+    fn test_exasol_type_of_char_default_size() {
         let data_type = plain_type("CHAR");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Utf8);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_varchar() {
+    fn test_exasol_type_of_varchar() {
         let data_type = DataType {
             size: Some(100),
             ..plain_type("VARCHAR")
         };
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Utf8);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_varchar_default_size() {
+    fn test_exasol_type_of_varchar_default_size() {
         let data_type = plain_type("VARCHAR");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Utf8);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_decimal() {
+    fn test_exasol_type_of_decimal() {
         let data_type = DataType {
             precision: Some(18),
             scale: Some(2),
             ..plain_type("DECIMAL")
         };
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Decimal128(18, 2));
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_decimal_default_precision_scale() {
+    fn test_exasol_type_of_decimal_default_precision_scale() {
         let data_type = plain_type("DECIMAL");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Decimal128(18, 0));
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_double() {
+    fn test_exasol_type_of_double() {
         let data_type = plain_type("DOUBLE");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Float64);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_date() {
+    fn test_exasol_type_of_date() {
         let data_type = plain_type("DATE");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Date32);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_timestamp_without_tz() {
+    fn test_exasol_type_of_timestamp_without_tz() {
         let data_type = DataType {
             with_local_time_zone: Some(false),
             ..plain_type("TIMESTAMP")
         };
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert!(matches!(
             result,
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
@@ -1383,13 +1406,13 @@ mod tests {
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_timestamp_with_tz() {
+    fn test_exasol_type_of_timestamp_with_tz() {
         let data_type = DataType {
             with_local_time_zone: Some(true),
             ..plain_type("TIMESTAMP")
         };
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert!(matches!(
             result,
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(_))
@@ -1397,10 +1420,10 @@ mod tests {
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_timestamp_default_tz() {
+    fn test_exasol_type_of_timestamp_default_tz() {
         let data_type = plain_type("TIMESTAMP");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert!(matches!(
             result,
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
@@ -1408,10 +1431,10 @@ mod tests {
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_interval_year_to_month() {
+    fn test_exasol_type_of_interval_year_to_month() {
         let data_type = plain_type("INTERVAL YEAR TO MONTH");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert!(matches!(
             result,
             arrow::datatypes::DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
@@ -1419,13 +1442,13 @@ mod tests {
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_interval_day_to_second() {
+    fn test_exasol_type_of_interval_day_to_second() {
         let data_type = DataType {
             fraction: Some(6),
             ..plain_type("INTERVAL DAY TO SECOND")
         };
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert!(matches!(
             result,
             arrow::datatypes::DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
@@ -1433,10 +1456,10 @@ mod tests {
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_interval_day_to_second_default_fraction() {
+    fn test_exasol_type_of_interval_day_to_second_default_fraction() {
         let data_type = plain_type("INTERVAL DAY TO SECOND");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert!(matches!(
             result,
             arrow::datatypes::DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
@@ -1444,26 +1467,43 @@ mod tests {
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_geometry() {
+    fn test_exasol_type_of_geometry() {
         let data_type = plain_type("GEOMETRY");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Binary);
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_hashtype() {
+    fn test_exasol_type_of_hashtype() {
         let data_type = plain_type("HASHTYPE");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let result = arrow_type_of(&data_type).unwrap();
         assert_eq!(result, arrow::datatypes::DataType::Binary);
+        assert_eq!(
+            exasol_type_of(&data_type).unwrap(),
+            ExasolType::Hashtype { byte_size: 16 }
+        );
     }
 
     #[test]
-    fn test_exasol_datatype_to_arrow_unsupported_type() {
+    fn test_exasol_type_of_hashtype_uses_reported_size() {
+        let data_type = DataType {
+            size: Some(64),
+            ..plain_type("HASHTYPE")
+        };
+
+        assert_eq!(
+            exasol_type_of(&data_type).unwrap(),
+            ExasolType::Hashtype { byte_size: 32 }
+        );
+    }
+
+    #[test]
+    fn test_exasol_type_of_unsupported_type() {
         let data_type = plain_type("UNKNOWN_TYPE");
 
-        let result = ResultSet::exasol_datatype_to_arrow(&data_type);
+        let result = arrow_type_of(&data_type);
         assert!(result.is_err());
     }
 
@@ -1479,18 +1519,14 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(1)],
-                vec![serde_json::json!(2)],
-                vec![serde_json::json!(null)],
-                vec![serde_json::json!(4)],
-            ]),
-            total_rows: 4,
-        };
+        let rows = vec![
+            vec![serde_json::json!(1)],
+            vec![serde_json::json!(2)],
+            vec![serde_json::json!(null)],
+            vec![serde_json::json!(4)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 4);
         assert_eq!(batch.num_columns(), 1);
@@ -1514,17 +1550,13 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(9223372036854775807_i64)], // Max i64
-                vec![serde_json::json!(-9223372036854775808_i64)], // Min i64
-                vec![serde_json::json!(null)],
-            ]),
-            total_rows: 3,
-        };
+        let rows = vec![
+            vec![serde_json::json!(9223372036854775807_i64)], // Max i64
+            vec![serde_json::json!(-9223372036854775808_i64)], // Min i64
+            vec![serde_json::json!(null)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
 
@@ -1546,18 +1578,14 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(1.23456)],
-                vec![serde_json::json!(-9.87654)],
-                vec![serde_json::json!(null)],
-                vec![serde_json::json!(0.0)],
-            ]),
-            total_rows: 4,
-        };
+        let rows = vec![
+            vec![serde_json::json!(1.23456)],
+            vec![serde_json::json!(-9.87654)],
+            vec![serde_json::json!(null)],
+            vec![serde_json::json!(0.0)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 4);
 
@@ -1580,17 +1608,13 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(true)],
-                vec![serde_json::json!(false)],
-                vec![serde_json::json!(null)],
-            ]),
-            total_rows: 3,
-        };
+        let rows = vec![
+            vec![serde_json::json!(true)],
+            vec![serde_json::json!(false)],
+            vec![serde_json::json!(null)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
 
@@ -1612,17 +1636,13 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("1970-01-01")],
-                vec![serde_json::json!("2000-01-01")],
-                vec![serde_json::json!(null)],
-            ]),
-            total_rows: 3,
-        };
+        let rows = vec![
+            vec![serde_json::json!("1970-01-01")],
+            vec![serde_json::json!("2000-01-01")],
+            vec![serde_json::json!(null)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
 
@@ -1651,22 +1671,18 @@ mod tests {
             ),
         ]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![
-                    serde_json::json!("1968-01-01"),
-                    serde_json::json!("1950-06-15 00:00:00"),
-                ],
-                vec![
-                    serde_json::json!("0001-01-01"),
-                    serde_json::json!("1969-12-31 23:59:59.999999"),
-                ],
-            ]),
-            total_rows: 2,
-        };
+        let rows = vec![
+            vec![
+                serde_json::json!("1968-01-01"),
+                serde_json::json!("1950-06-15 00:00:00"),
+            ],
+            vec![
+                serde_json::json!("0001-01-01"),
+                serde_json::json!("1969-12-31 23:59:59.999999"),
+            ],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let dates = batch
             .column(0)
@@ -1692,17 +1708,13 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("1970-01-01 00:00:00")],
-                vec![serde_json::json!("1970-01-01 01:00:00.123456")],
-                vec![serde_json::json!(null)],
-            ]),
-            total_rows: 3,
-        };
+        let rows = vec![
+            vec![serde_json::json!("1970-01-01 00:00:00")],
+            vec![serde_json::json!("1970-01-01 01:00:00.123456")],
+            vec![serde_json::json!(null)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
 
@@ -1724,13 +1736,9 @@ mod tests {
             Field::new("name", arrow::datatypes::DataType::Utf8, true),
         ]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![]),
-            total_rows: 0,
-        };
+        let rows = vec![];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 2);
@@ -1744,18 +1752,14 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("hello")],
-                vec![serde_json::json!("world")],
-                vec![serde_json::json!(null)],
-                vec![serde_json::json!("")], // Empty string
-            ]),
-            total_rows: 4,
-        };
+        let rows = vec![
+            vec![serde_json::json!("hello")],
+            vec![serde_json::json!("world")],
+            vec![serde_json::json!(null)],
+            vec![serde_json::json!("")], // Empty string
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 4);
 
@@ -1779,15 +1783,11 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(123)], // Number should be converted to "123"
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!(123)], // Number should be converted to "123"
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -1805,17 +1805,13 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("123.45")],
-                vec![serde_json::json!("-67.89")],
-                vec![serde_json::json!(null)],
-            ]),
-            total_rows: 3,
-        };
+        let rows = vec![
+            vec![serde_json::json!("123.45")],
+            vec![serde_json::json!("-67.89")],
+            vec![serde_json::json!(null)],
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
 
@@ -1837,15 +1833,11 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(100)], // Integer should be scaled
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!(100)], // Integer should be scaled
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -1863,15 +1855,11 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!(99.99)], // Float should be scaled
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!(99.99)], // Float should be scaled
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -1889,16 +1877,12 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("invalid-date")],
-                vec![serde_json::json!(123)], // Non-string should become null
-            ]),
-            total_rows: 2,
-        };
+        let rows = vec![
+            vec![serde_json::json!("invalid-date")],
+            vec![serde_json::json!(123)], // Non-string should become null
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -1918,16 +1902,12 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("not-a-timestamp")],
-                vec![serde_json::json!(12345)], // Non-string should become null
-            ]),
-            total_rows: 2,
-        };
+        let rows = vec![
+            vec![serde_json::json!("not-a-timestamp")],
+            vec![serde_json::json!(12345)], // Non-string should become null
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -1946,16 +1926,12 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("not-a-bool")], // String is not a bool
-                vec![serde_json::json!(123)],          // Number is not a bool
-            ]),
-            total_rows: 2,
-        };
+        let rows = vec![
+            vec![serde_json::json!("not-a-bool")], // String is not a bool
+            vec![serde_json::json!(123)],          // Number is not a bool
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -1975,15 +1951,11 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("not-an-int")], // String is not parseable as int
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!("not-an-int")], // String is not parseable as int
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -2001,15 +1973,11 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![serde_json::json!("not-a-float")], // String is not parseable as float
-            ]),
-            total_rows: 1,
-        };
+        let rows = vec![
+            vec![serde_json::json!("not-a-float")], // String is not parseable as float
+        ];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let array = batch
             .column(0)
@@ -2029,13 +1997,9 @@ mod tests {
             true,
         )]));
 
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![vec![serde_json::json!("test_data")]]),
-            total_rows: 1,
-        };
+        let rows = vec![vec![serde_json::json!("test_data")]];
 
-        let result = ResultSet::column_major_to_record_batch(&data, &schema);
+        let result = ResultSet::column_major_to_record_batch(&rows, &schema);
 
         // Unsupported types cause an error because the fallback creates a StringArray
         // which doesn't match the expected LargeUtf8 type in the schema
@@ -2673,33 +2637,221 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn test_column_major_to_record_batch_returns_arrow_payload_unchanged() {
-        let batch = int64_batch(vec![1, 2, 3]);
-        let data = ResultData {
+    fn arrow_payload(batch: RecordBatch) -> ResultData {
+        ResultData {
             columns: vec![],
-            data: ResultPayload::Arrow(batch.clone()),
-            total_rows: 3,
-        };
+            total_rows: batch.num_rows() as i64,
+            data: ResultPayload::Arrow(batch),
+        }
+    }
 
-        let converted = ResultSet::column_major_to_record_batch(&data, &batch.schema()).unwrap();
-
-        assert_eq!(converted.num_rows(), 3);
-        assert_eq!(converted.schema(), batch.schema());
+    fn metadata_schema_of(columns: &[ColumnInfo]) -> Arc<Schema> {
+        ResultSet::build_schema(columns).unwrap()
     }
 
     #[test]
-    fn test_payload_to_record_batch_returns_arrow_payload_unchanged() {
-        let batch = int64_batch(vec![7]);
+    fn test_build_schema_marks_fields_nullable_and_carries_exasol_metadata() {
+        let columns = vec![
+            ColumnInfo {
+                name: "AMOUNT".to_string(),
+                data_type: DataType {
+                    precision: Some(10),
+                    scale: Some(2),
+                    ..plain_type("DECIMAL")
+                },
+            },
+            ColumnInfo {
+                name: "NAME".to_string(),
+                data_type: DataType {
+                    size: Some(50),
+                    ..plain_type("VARCHAR")
+                },
+            },
+            ColumnInfo {
+                name: "CODE".to_string(),
+                data_type: DataType {
+                    size: Some(3),
+                    ..plain_type("CHAR")
+                },
+            },
+        ];
+
+        let schema = ResultSet::build_schema(&columns).unwrap();
+
+        assert!(schema.fields().iter().all(|field| field.is_nullable()));
+        let amount = schema.field(0);
+        assert_eq!(
+            amount.data_type(),
+            &arrow::datatypes::DataType::Decimal128(10, 2)
+        );
+        assert_eq!(
+            amount.metadata().get("exasol:type_name").unwrap(),
+            "DECIMAL"
+        );
+        assert_eq!(amount.metadata().get("exasol:precision").unwrap(), "10");
+        assert_eq!(amount.metadata().get("exasol:scale").unwrap(), "2");
+        let name = schema.field(1);
+        assert_eq!(name.metadata().get("exasol:type_name").unwrap(), "VARCHAR");
+        assert_eq!(name.metadata().get("exasol:size").unwrap(), "50");
+        let code = schema.field(2);
+        assert_eq!(code.metadata().get("exasol:type_name").unwrap(), "CHAR");
+        assert_eq!(code.metadata().get("exasol:size").unwrap(), "3");
+        for field in schema.fields() {
+            assert!(TypeMapper::from_field_metadata(field.metadata()).is_some());
+        }
+    }
+
+    #[test]
+    fn test_build_schema_fails_for_unsupported_column_type() {
+        let columns = vec![ColumnInfo {
+            name: "X".to_string(),
+            data_type: plain_type("UNKNOWN_TYPE"),
+        }];
+
+        assert!(ResultSet::build_schema(&columns).is_err());
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_keeps_arrow_columns_and_adds_field_metadata() {
+        let batch = int64_batch(vec![7, 8]);
+        let schema = metadata_schema_of(&[decimal_column("id")]);
+
+        let converted =
+            ResultSet::payload_to_record_batch(&arrow_payload(batch.clone()), &schema).unwrap();
+
+        assert_eq!(converted.num_rows(), 2);
+        let field = converted.schema().field(0).clone();
+        assert_eq!(field.name(), "id");
+        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Int64);
+        assert!(field.is_nullable());
+        assert_eq!(field.metadata().get("exasol:type_name").unwrap(), "DECIMAL");
+        assert_eq!(field.metadata().get("exasol:precision").unwrap(), "18");
+        assert_eq!(field.metadata().get("exasol:scale").unwrap(), "0");
+        assert!(Arc::ptr_eq(converted.column(0), batch.column(0)));
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_keeps_utf8_column_under_interval_schema_field() {
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "IV",
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![Arc::new(StringArray::from(vec!["3 04:05:06.789"]))],
+        )
+        .unwrap();
+        let schema = metadata_schema_of(&[ColumnInfo {
+            name: "IV".to_string(),
+            data_type: plain_type("INTERVAL DAY TO SECOND"),
+        }]);
+        assert!(matches!(
+            schema.field(0).data_type(),
+            arrow::datatypes::DataType::Interval(_)
+        ));
+
+        let converted =
+            ResultSet::payload_to_record_batch(&arrow_payload(batch.clone()), &schema).unwrap();
+
+        let field = converted.schema().field(0).clone();
+        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
+        assert_eq!(
+            field.metadata().get("exasol:type_name").unwrap(),
+            "INTERVAL DAY TO SECOND"
+        );
+        assert!(Arc::ptr_eq(converted.column(0), batch.column(0)));
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_keeps_batch_field_nullability() {
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let schema = metadata_schema_of(&[decimal_column("id")]);
+
+        let converted = ResultSet::payload_to_record_batch(&arrow_payload(batch), &schema).unwrap();
+
+        assert!(!converted.schema().field(0).is_nullable());
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_keeps_row_count_of_batch_without_columns() {
+        let options = RecordBatchOptions::new().with_row_count(Some(3));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
+        let schema = metadata_schema_of(&[]);
+
+        let converted = ResultSet::payload_to_record_batch(&arrow_payload(batch), &schema).unwrap();
+
+        assert_eq!(converted.num_rows(), 3);
+        assert_eq!(converted.num_columns(), 0);
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_fails_when_column_counts_differ() {
+        let batch = int64_batch(vec![1]);
+        let schema = metadata_schema_of(&[decimal_column("a"), varchar_column("b")]);
+
+        let error = ResultSet::payload_to_record_batch(&arrow_payload(batch), &schema).unwrap_err();
+
+        assert!(
+            matches!(error, ConversionError::SchemaMismatch(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetched_arrow_page_carries_the_result_set_field_metadata() {
+        let handle = ResultSetHandle::new(1);
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(arrow_payload(int64_batch(vec![2]))));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let batches = streaming_result_set(transport, &[1], 2, Some(handle))
+            .fetch_all()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        for batch in &batches {
+            let field = batch.schema().field(0).clone();
+            assert_eq!(field.metadata().get("exasol:type_name").unwrap(), "DECIMAL");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_row_batch_carries_the_field_metadata() {
+        let transport: Arc<Mutex<dyn TransportProtocol>> =
+            Arc::new(Mutex::new(MockTransport::new()));
         let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Arrow(batch.clone()),
-            total_rows: 1,
+            columns: vec![decimal_column("id")],
+            data: ResultPayload::Json(vec![]),
+            total_rows: 0,
         };
 
-        let converted = ResultSet::payload_to_record_batch(&data, &batch.schema()).unwrap();
+        let result_set = ResultSet::from_transport_result(
+            TransportQueryResult::ResultSet { handle: None, data },
+            transport,
+        )
+        .unwrap();
+        let batches = result_set.fetch_all().await.unwrap();
 
-        assert_eq!(converted.num_rows(), 1);
+        let field = batches[0].schema().field(0).clone();
+        assert_eq!(field.metadata().get("exasol:type_name").unwrap(), "DECIMAL");
     }
 
     // =========================================================================
@@ -2707,12 +2859,12 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_exasol_datatype_to_arrow_named_timestamp_with_local_time_zone() {
+    fn test_exasol_type_of_named_timestamp_with_local_time_zone() {
         // Exasol may spell the type out instead of setting the flag; both must
         // map to a timezone-carrying Arrow timestamp.
         let data_type = plain_type("TIMESTAMP WITH LOCAL TIME ZONE");
 
-        let arrow_type = ResultSet::exasol_datatype_to_arrow(&data_type).unwrap();
+        let arrow_type = arrow_type_of(&data_type).unwrap();
 
         assert!(matches!(
             arrow_type,
@@ -2730,13 +2882,9 @@ mod tests {
             ),
             true,
         )]));
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![vec![json!("1970-01-01 00:00:01")], vec![Value::Null]]),
-            total_rows: 2,
-        };
+        let rows = vec![vec![json!("1970-01-01 00:00:01")], vec![Value::Null]];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         let column = batch
             .column(0)
@@ -2761,17 +2909,9 @@ mod tests {
             arrow::datatypes::DataType::Decimal128(18, 2),
             true,
         )]));
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![
-                vec![Value::Null],
-                vec![json!(true)],
-                vec![json!([1, 2])],
-            ]),
-            total_rows: 3,
-        };
+        let rows = vec![vec![Value::Null], vec![json!(true)], vec![json!([1, 2])]];
 
-        let batch = ResultSet::column_major_to_record_batch(&data, &schema).unwrap();
+        let batch = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.column(0).null_count(), 3);
@@ -2808,13 +2948,9 @@ mod tests {
             arrow::datatypes::DataType::Decimal128(10, 2),
             true,
         )]));
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![vec![json!("1.50")], vec![json!("1.2.3")]]),
-            total_rows: 2,
-        };
+        let rows = vec![vec![json!("1.50")], vec![json!("1.2.3")]];
 
-        let err = ResultSet::column_major_to_record_batch(&data, &schema).unwrap_err();
+        let err = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap_err();
 
         match err {
             ConversionError::ValueConversionFailed {
@@ -2844,13 +2980,9 @@ mod tests {
             arrow::datatypes::DataType::Decimal128(38, 2),
             true,
         )]));
-        let data = ResultData {
-            columns: vec![],
-            data: ResultPayload::Json(vec![vec![json!("99999999999999999999999999999999999999")]]),
-            total_rows: 1,
-        };
+        let rows = vec![vec![json!("99999999999999999999999999999999999999")]];
 
-        let err = ResultSet::column_major_to_record_batch(&data, &schema).unwrap_err();
+        let err = ResultSet::column_major_to_record_batch(&rows, &schema).unwrap_err();
 
         assert!(matches!(
             err,

@@ -119,6 +119,63 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_builder_fields_carry_exasol_field_metadata() {
+        let schema = SchemaBuilder::new()
+            .add_column(ColumnMetadata {
+                name: "AMOUNT".to_string(),
+                data_type: ExasolType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: true,
+            })
+            .add_column(ColumnMetadata {
+                name: "NAME".to_string(),
+                data_type: ExasolType::Varchar { size: 50 },
+                nullable: true,
+            })
+            .add_column(ColumnMetadata {
+                name: "CODE".to_string(),
+                data_type: ExasolType::Char { size: 3 },
+                nullable: true,
+            })
+            .add_column(ColumnMetadata {
+                name: "TSL".to_string(),
+                data_type: ExasolType::Timestamp {
+                    with_local_time_zone: true,
+                },
+                nullable: true,
+            })
+            .build()
+            .unwrap();
+
+        let amount = schema.field(0).metadata();
+        assert_eq!(amount.get("exasol:type_name").unwrap(), "DECIMAL");
+        assert_eq!(amount.get("exasol:precision").unwrap(), "10");
+        assert_eq!(amount.get("exasol:scale").unwrap(), "2");
+        assert!(!amount.contains_key("exasol:size"));
+
+        let name = schema.field(1).metadata();
+        assert_eq!(name.get("exasol:type_name").unwrap(), "VARCHAR");
+        assert_eq!(name.get("exasol:size").unwrap(), "50");
+        assert!(!name.contains_key("exasol:precision"));
+        assert!(!name.contains_key("exasol:scale"));
+
+        let code = schema.field(2).metadata();
+        assert_eq!(code.get("exasol:type_name").unwrap(), "CHAR");
+        assert_eq!(code.get("exasol:size").unwrap(), "3");
+
+        let tsl = schema.field(3).metadata();
+        assert_eq!(
+            tsl.get("exasol:type_name").unwrap(),
+            "TIMESTAMP WITH LOCAL TIME ZONE"
+        );
+        assert!(!tsl.contains_key("exasol:precision"));
+        assert!(!tsl.contains_key("exasol:scale"));
+        assert!(!tsl.contains_key("exasol:size"));
+    }
+
+    #[test]
     fn test_schema_with_metadata() {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("source".to_string(), "exasol".to_string());

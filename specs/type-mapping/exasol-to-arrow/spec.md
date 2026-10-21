@@ -1,10 +1,10 @@
 # Feature: Exasol to Arrow
 
-Defines the mapping from Exasol data types to Apache Arrow data types, including complex types and metadata preservation.
+Defines the mapping from Exasol data types to Apache Arrow data types, including complex types and NULL handling.
 
 ## Background
 
-Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient. Exasol precision, scale, and original type names are preserved in Arrow field metadata.
+Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient. The field metadata that carries the Exasol type is specified in `type-mapping/exasol-to-arrow-field-metadata`.
 
 ## Scenarios
 
@@ -65,18 +65,3 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 * *THEN* it SHALL return a clear error message
 * *AND* it SHALL specify the unsupported type name
 * *AND* it SHALL provide guidance on workarounds if available
-
-### Scenario: Column metadata
-
-* *GIVEN* Exasol returns a result set with typed columns
-* *WHEN* creating Arrow schemas from Exasol result sets
-* *THEN* it SHALL include Exasol type information in Arrow field metadata
-* *AND* it SHALL preserve nullability information
-* *AND* it SHALL include precision/scale for applicable types
-
-### Scenario: Schema documentation
-
-* *GIVEN* Exasol returns a result set with typed columns
-* *WHEN* schema is inspected
-* *THEN* it SHALL provide access to original Exasol type names
-* *AND* it SHALL expose type mapping used for each column

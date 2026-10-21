@@ -19,13 +19,16 @@ mod schema_activation;
 use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    assert_every_key_once, assert_partly_inline, connection_error_from_a_silent_server,
-    drain_iterator, end_of_stream_query, generate_test_schema_name, get_host, get_password,
-    get_port, get_user, multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS,
-    MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
+    assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
+    assert_every_key_once, assert_partly_inline, column_metadata_table_ddl,
+    column_metadata_table_insert, connection_error_from_a_silent_server, drain_iterator,
+    end_of_stream_query, generate_test_schema_name, get_host, get_password, get_port, get_user,
+    multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
+    PARTIAL_INLINE_ROWS,
 };
 use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::transport::{ConnectionParams, Credentials, TransportProtocol, WebSocketTransport};
+use exarrow_rs::{ExasolType, TypeMapper};
 
 // Helper: build a connection string that forces the WebSocket transport.
 fn ws_connection_string() -> String {
@@ -2356,5 +2359,146 @@ async fn test_client_name_and_version_identify_the_session_websocket() {
         .value(0);
 
     assert_eq!(client, "dbt 9.9");
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// The type that the WebSocket transport reports for the column `TSL` of table `M`.
+const WS_TSL_TYPE: ExasolType = ExasolType::Timestamp {
+    with_local_time_zone: true,
+};
+
+async fn ws_create_column_metadata_table(conn: &mut Connection, schema_name: &str) {
+    conn.execute_update(&format!("CREATE SCHEMA {schema_name}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    conn.execute_update(&column_metadata_table_ddl(schema_name))
+        .await
+        .expect("CREATE TABLE M should succeed");
+    conn.execute_update(&column_metadata_table_insert(schema_name))
+        .await
+        .expect("INSERT into M should succeed");
+}
+
+/// Scenario: Column metadata
+/// Scenario: Result set fields are nullable when Exasol reports no nullability
+/// Scenario: Schema documentation
+#[tokio::test]
+async fn test_ws_result_set_fields_carry_exasol_column_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    ws_create_column_metadata_table(&mut conn, &schema_name).await;
+
+    let result_set = conn
+        .execute(format!("SELECT * FROM {schema_name}.M"))
+        .await
+        .expect("SELECT from M should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    assert_column_metadata_table_fields(&metadata_schema, WS_TSL_TYPE);
+    assert_column_metadata_table_fields(&batches[0].schema(), WS_TSL_TYPE);
+
+    ws_cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Zero-row result set preserves schema
+#[tokio::test]
+async fn test_ws_zero_row_result_batch_carries_field_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    ws_create_column_metadata_table(&mut conn, &schema_name).await;
+
+    let batches = conn
+        .query(format!("SELECT * FROM {schema_name}.M WHERE FALSE"))
+        .await
+        .expect("zero-row SELECT should succeed");
+
+    assert_eq!(batches.len(), 1, "a zero-row result yields one batch");
+    assert_eq!(batches[0].num_rows(), 0);
+    assert_column_metadata_table_fields(&batches[0].schema(), WS_TSL_TYPE);
+
+    ws_cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Every batch carries the field metadata of the result set metadata schema
+#[tokio::test]
+async fn test_ws_every_fetched_batch_carries_the_result_set_field_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+    let result_set = conn
+        .execute(multi_fetch_query())
+        .await
+        .expect("multi-fetch query should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    assert_every_batch_carries_field_metadata(&metadata_schema, &batches);
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Every batch carries the field metadata of the result set metadata schema
+#[test]
+fn test_ws_every_iterated_batch_carries_the_result_set_field_metadata() {
+    skip_if_no_exasol!();
+
+    let (runtime, conn, mut iterator) = open_iterator(get_ws_connection(), multi_fetch_query());
+    let metadata_schema = iterator.metadata().schema.clone();
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_every_batch_carries_field_metadata(&metadata_schema, &batches);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+// Zero rows, because the WebSocket row conversion of HASHTYPE values fails (issue #107).
+#[tokio::test]
+async fn test_ws_hashtype_field_metadata_carries_the_declared_byte_size() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let result_set = conn
+        .execute(
+            "SELECT CAST('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+             AS HASHTYPE(32 BYTE)) AS H FROM DUAL WHERE FALSE",
+        )
+        .await
+        .expect("HASHTYPE query should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+
+    let field = metadata_schema.field_with_name("H").expect("field H");
+    assert_eq!(
+        TypeMapper::from_field_metadata(field.metadata()),
+        Some(ExasolType::Hashtype { byte_size: 32 })
+    );
+
     conn.close().await.expect("Failed to close connection");
 }

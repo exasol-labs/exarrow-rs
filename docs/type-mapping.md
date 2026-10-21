@@ -80,6 +80,37 @@ Hash values (MD5, SHA-1, SHA-256, etc.) are returned as hex-encoded `Utf8` strin
 
 All types support NULL values. Arrow represents nulls via validity bitmaps, which is compatible with Exasol's NULL semantics.
 
+## Field Metadata
+
+Every field of a result set carries the Exasol type of its column as Arrow field metadata. This applies to `ResultSet::metadata().schema`, to the schema of every RecordBatch, to a zero-row result, and to the schema that ADBC returns, on the native and the WebSocket transport. Arrow data types and values do not change.
+
+| Key | Carried by | Example value |
+|-----|------------|---------------|
+| `exasol:type_name` | every column | `DECIMAL`, `TIMESTAMP WITH LOCAL TIME ZONE` |
+| `exasol:type` | every column | `{"type":"DECIMAL","precision":10,"scale":2}` |
+| `exasol:precision` | `DECIMAL` | `10` |
+| `exasol:scale` | `DECIMAL` | `2` |
+| `exasol:size` | `CHAR`, `VARCHAR` | `50` |
+| `exasol:srid` | `GEOMETRY` with a known SRID | `4326` |
+
+`exasol:type_name` is the Exasol type name without parameters, which follows the JDBC `getColumnTypeName` convention. `exasol:type` holds the serialized `ExasolType`. To restore the `ExasolType` of a field, pass its metadata to `TypeMapper::from_field_metadata`:
+
+```rust
+let exasol_type = TypeMapper::from_field_metadata(field.metadata());
+```
+
+Every result set field is nullable, even when the column is declared `NOT NULL`, because Exasol reports no column nullability on either protocol.
+
+Some metadata values do not reflect the declared column type:
+
+- `GEOMETRY` carries no SRID, so the key `exasol:srid` is absent.
+- On the native transport, `INTERVAL DAY TO SECOND` always reports the fractional precision 3.
+- On the native transport, `INTEGER` and `SMALLINT` columns report `DECIMAL` with precision 18 and 9, and scale 0.
+- On the native transport, `TIMESTAMP WITH LOCAL TIME ZONE` reports `TIMESTAMP`, because the protocol sends the same wire type for both.
+- For `HASHTYPE`, `exasol:type` holds the byte size as half the size that Exasol reports, because Exasol reports the number of hex characters, which assumes the default session format `HASHTYPE_FORMAT=HEX`. With `UUID` or `BASE64`, Exasol reports another size, and the byte size is wrong. Without a reported size, the byte size is 16.
+
+On the native transport, a field keeps the Arrow data type of its decoded values, so an `INTERVAL`, `GEOMETRY`, or `HASHTYPE` field is `Utf8` and still carries the metadata of its Exasol type.
+
 ## WebSocket Transport Differences
 
 When using `transport=websocket`, the following types map differently from the native protocol:

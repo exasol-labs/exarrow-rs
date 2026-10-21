@@ -28,8 +28,8 @@ Exasol reports the type of each parameter at prepare and, for a statement that r
 * *GIVEN* an ADBC statement, prepared or not, whose SQL is a query that returns a result set, such as a SELECT
 * *WHEN* `execute_schema` is called
 * *THEN* the driver SHALL prepare the statement if it is not prepared yet
-* *AND* the driver SHALL return an Arrow `Schema` with one nullable field per result-set column, in select-list order, named with the column name that Exasol reports, which is the alias of an aliased column and the name Exasol assigned to an unaliased derived column
-* *AND* the returned schema SHALL equal the schema of the RecordBatchReader that `execute` returns for the same query when that query returns zero rows
+* *AND* the driver SHALL return an Arrow `Schema` with one nullable field per result-set column, in select-list order, named with the column name that Exasol reports, which is the alias of an aliased column and the name Exasol assigned to an unaliased derived column, and each field SHALL carry the Arrow field metadata that `type-mapping/exasol-to-arrow` specifies for its column
+* *AND* the returned schema SHALL equal the schema of the RecordBatchReader that `execute` returns for the same query when that query returns zero rows, including the field metadata
 * *AND* the driver MUST NOT send an execution request for the query, so a query that fails at run time, such as a cast of non-numeric text to DECIMAL, SHALL still return its schema
 
 ### Scenario: Execute schema of a parameterized query needs no bound parameters

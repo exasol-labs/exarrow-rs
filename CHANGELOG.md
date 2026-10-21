@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.27.0
+
+- Added: every field of the result set metadata schema, of every RecordBatch from `fetch_all`, the result set iterator, and `Connection::query`, of the ADBC RecordBatchReader, and of ADBC `execute_schema` carries `exasol:` field metadata, on the native and the WebSocket transport. A Python or Polars user of the ADBC driver can read the Exasol type of a column. Arrow data types and values do not change. On the native transport, the field metadata of a TIMESTAMP WITH LOCAL TIME ZONE column states `TIMESTAMP`, because the server sends the same wire type for both.
+- Added: the field metadata key `exasol:type_name` holds the Exasol type name without parameters, for example `DECIMAL`, `VARCHAR`, or `TIMESTAMP WITH LOCAL TIME ZONE`. `SchemaBuilder` writes it too.
+- Fix: the HASHTYPE byte size in `exasol:type` (`byte_size`) comes from the size that the server reports, as half of it with the default HEX format, instead of a fixed 16. The `arrow_conversion` converter applies the same rule.
+- Breaking: arrow-rs compares field metadata when it compares a `Field` or a `Schema`. A comparison of a batch schema or of the result set metadata schema with a hand-built schema without metadata now fails.
+
 ## 0.26.0
 
 - Fix: the native Parquet path of `import_from_parquet` and `import_parquet_from_files` opens each file and reads one 64 KiB piece at a time when Exasol requests a range. It used to read each whole file into memory, and `import_parquet_from_files` held every file at once. Memory no longer grows with the file size. `import_from_parquet_stream` still buffers the whole stream. Refs #69.

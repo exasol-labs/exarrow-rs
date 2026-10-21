@@ -4792,11 +4792,37 @@ mod tests {
 
         let schema = stmt.execute_schema().expect("execute_schema");
 
-        let expected = Schema::new(vec![
-            Field::new("N", DataType::Decimal128(18, 0), true),
-            Field::new("NAME", DataType::Utf8, true),
-        ]);
-        assert_eq!(schema, expected);
+        let n = schema.field(0);
+        assert_eq!(n.name(), "N");
+        assert_eq!(n.data_type(), &DataType::Decimal128(18, 0));
+        assert!(n.is_nullable());
+        assert_eq!(
+            n.metadata().get("exasol:type_name").map(String::as_str),
+            Some("DECIMAL")
+        );
+        assert!(n.metadata().contains_key("exasol:type"));
+        assert_eq!(
+            n.metadata().get("exasol:precision").map(String::as_str),
+            Some("18")
+        );
+        assert_eq!(
+            n.metadata().get("exasol:scale").map(String::as_str),
+            Some("0")
+        );
+        let name = schema.field(1);
+        assert_eq!(name.name(), "NAME");
+        assert_eq!(name.data_type(), &DataType::Utf8);
+        assert!(name.is_nullable());
+        assert_eq!(
+            name.metadata().get("exasol:type_name").map(String::as_str),
+            Some("VARCHAR")
+        );
+        assert!(name.metadata().contains_key("exasol:type"));
+        assert_eq!(
+            name.metadata().get("exasol:size").map(String::as_str),
+            Some("50")
+        );
+        assert_eq!(schema.fields().len(), 2);
     }
 
     /// Scenario: Execute schema of a statement without a result set returns an empty schema

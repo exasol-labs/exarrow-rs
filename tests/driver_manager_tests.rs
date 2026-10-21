@@ -4056,6 +4056,17 @@ fn assert_execute_schema_reports_columns_without_running(uri: String) {
     executed.set_sql_query(&zero_row_sql).unwrap();
     let reader = executed.execute().expect("execute");
     assert_eq!(schema, *reader.schema());
+    let amount = schema.field(2);
+    assert_eq!(amount.name(), "AMOUNT");
+    assert_eq!(field_metadata(amount, "exasol:precision"), "10");
+    assert_eq!(field_metadata(amount, "exasol:scale"), "2");
+    for field in schema.fields() {
+        assert!(
+            field.metadata().contains_key("exasol:type_name"),
+            "field {} carries no exasol:type_name",
+            field.name()
+        );
+    }
 
     drop(reader);
     drop(failing);
@@ -4081,6 +4092,67 @@ fn test_execute_schema_reports_columns_without_running_the_query_websocket() {
     skip_if_no_library!();
 
     assert_execute_schema_reports_columns_without_running(format!(
+        "{}&transport=websocket",
+        get_test_uri()
+    ));
+}
+
+fn field_metadata<'a>(field: &'a Field, key: &str) -> &'a str {
+    field
+        .metadata()
+        .get(key)
+        .unwrap_or_else(|| panic!("field {} carries no {key}", field.name()))
+}
+
+/// Check the schema of the reader that `execute` returns over the transport that `uri` selects:
+/// the fields carry the Exasol column metadata, and each batch carries the same metadata.
+fn assert_reader_schema_carries_exasol_field_metadata(uri: String) {
+    let (_driver, _db, mut conn) = open_connection(uri);
+    let mut stmt = conn.new_statement().unwrap();
+    stmt.set_sql_query(
+        "SELECT CAST(1.5 AS DECIMAL(10,2)) AS AMOUNT, CAST('x' AS VARCHAR(20)) AS NAME",
+    )
+    .unwrap();
+
+    let reader = stmt.execute().expect("execute");
+
+    let schema = reader.schema();
+    let amount = schema.field_with_name("AMOUNT").expect("AMOUNT");
+    assert_eq!(field_metadata(amount, "exasol:type_name"), "DECIMAL");
+    assert_eq!(field_metadata(amount, "exasol:precision"), "10");
+    assert_eq!(field_metadata(amount, "exasol:scale"), "2");
+    let name = schema.field_with_name("NAME").expect("NAME");
+    assert_eq!(field_metadata(name, "exasol:type_name"), "VARCHAR");
+    assert_eq!(field_metadata(name, "exasol:size"), "20");
+
+    let mut batch_count = 0;
+    for batch in reader {
+        let batch = batch.expect("batch");
+        assert_eq!(batch.schema().fields(), schema.fields());
+        batch_count += 1;
+    }
+    assert!(batch_count > 0, "the reader yielded no batch");
+}
+
+/// Scenario: RecordBatchReader schema carries Exasol field metadata
+#[test]
+fn test_reader_schema_carries_exasol_field_metadata() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_reader_schema_carries_exasol_field_metadata(get_test_uri());
+}
+
+/// Scenario: RecordBatchReader schema carries Exasol field metadata
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_reader_schema_carries_exasol_field_metadata_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_reader_schema_carries_exasol_field_metadata(format!(
         "{}&transport=websocket",
         get_test_uri()
     ));
