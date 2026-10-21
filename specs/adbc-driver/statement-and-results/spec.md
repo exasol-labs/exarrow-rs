@@ -72,10 +72,3 @@ A Statement is pure data and holds no transport reference. Statements created fr
 * *THEN* the returned Statement SHALL inherit that setting: the explicit timeout when the connection configures one, or no timeout when the connection configures none
 * *AND* the Statement SHALL NOT fall back to any hardcoded non-zero timeout independent of the connection's configuration
 * *AND* when the Statement carries an explicit timeout, `execute_statement()` SHALL forward that timeout to Exasol as the `queryTimeout` session attribute before executing, rather than enforce it with a client-side timer
-
-### Scenario: Empty result schema surfaced via RecordBatchReader
-
-* *GIVEN* an ADBC statement is executed whose query returns zero rows (for example a `SELECT ... WHERE FALSE LIMIT 0` schema probe)
-* *WHEN* the resulting RecordBatchReader's schema is read from its first batch
-* *THEN* the RecordBatchReader SHALL surface the full column schema (column names and Arrow data types)
-* *AND* it SHALL NOT fall back to an empty schema with zero columns
