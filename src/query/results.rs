@@ -10,7 +10,7 @@ use crate::transport::TransportProtocol;
 use crate::types::{ColumnMetadata, ExasolType, SchemaBuilder};
 use arrow::array::{
     new_empty_array, Array, BooleanArray, BooleanBuilder, Decimal128Array, Decimal128Builder,
-    PrimitiveArray, PrimitiveBuilder, RecordBatch, StringArray, StringBuilder,
+    PrimitiveArray, PrimitiveBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Field, Float64Type, Int32Type, Int64Type, Schema,
@@ -442,8 +442,13 @@ impl ResultSet {
         let schema_with_metadata =
             Schema::new_with_metadata(fields, batch_schema.metadata().clone());
 
-        RecordBatch::try_new(Arc::new(schema_with_metadata), batch.columns().to_vec())
-            .map_err(|e| ConversionError::ArrowError(e.to_string()))
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        RecordBatch::try_new_with_options(
+            Arc::new(schema_with_metadata),
+            batch.columns().to_vec(),
+            &options,
+        )
+        .map_err(|e| ConversionError::ArrowError(e.to_string()))
     }
 
     /// Build a zero-row RecordBatch that carries the given schema.
@@ -2775,6 +2780,19 @@ mod tests {
         let converted = ResultSet::payload_to_record_batch(&arrow_payload(batch), &schema).unwrap();
 
         assert!(!converted.schema().field(0).is_nullable());
+    }
+
+    #[test]
+    fn test_payload_to_record_batch_keeps_row_count_of_batch_without_columns() {
+        let options = RecordBatchOptions::new().with_row_count(Some(3));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
+        let schema = metadata_schema_of(&[]);
+
+        let converted = ResultSet::payload_to_record_batch(&arrow_payload(batch), &schema).unwrap();
+
+        assert_eq!(converted.num_rows(), 3);
+        assert_eq!(converted.num_columns(), 0);
     }
 
     #[test]

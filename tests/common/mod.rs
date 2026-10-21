@@ -198,6 +198,18 @@ pub async fn get_test_connection() -> Result<Connection, exarrow_rs::error::Exas
     ))
 }
 
+/// The type that the default transport reports for a `TIMESTAMP WITH LOCAL TIME ZONE` column.
+///
+/// The default transport is the one that `get_test_connection` selects: native when the `native`
+/// feature is enabled, websocket otherwise. The native protocol sends one wire type for `TIMESTAMP`
+/// and for `TIMESTAMP WITH LOCAL TIME ZONE`, so it reports a plain `TIMESTAMP`.
+#[allow(dead_code)]
+pub fn default_transport_local_time_zone_timestamp() -> ExasolType {
+    ExasolType::Timestamp {
+        with_local_time_zone: !cfg!(feature = "native"),
+    }
+}
+
 /// Establish a test connection using a specific transport.
 ///
 /// Creates a connection that explicitly uses the given transport type,

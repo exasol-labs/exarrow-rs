@@ -79,11 +79,12 @@ use arrow::datatypes::DataType;
 use common::{
     assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
     assert_every_key_once, assert_partly_inline, column_metadata_table_ddl,
-    column_metadata_table_insert, connection_error_from_a_silent_server, disable_query_cache,
-    drain_iterator, end_of_stream_query, generate_test_schema_name, get_host, get_port,
-    get_test_connection, get_test_connection_string, get_user, is_exasol_available,
-    long_running_count_query, multi_fetch_query, open_iterator, partial_inline_query,
-    END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
+    column_metadata_table_insert, connection_error_from_a_silent_server,
+    default_transport_local_time_zone_timestamp, disable_query_cache, drain_iterator,
+    end_of_stream_query, generate_test_schema_name, get_host, get_port, get_test_connection,
+    get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
+    multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
+    PARTIAL_INLINE_ROWS,
 };
 #[cfg(feature = "native")]
 use common::{
@@ -98,8 +99,8 @@ use exarrow_rs::query::export::ExportSource;
 #[cfg(feature = "native")]
 use exarrow_rs::transport::{ConnectionParams, Credentials, NativeTcpTransport, TransportProtocol};
 #[cfg(feature = "native")]
-use exarrow_rs::TypeMapper;
-use exarrow_rs::{ExasolType, Parameter, QueryError};
+use exarrow_rs::{ExasolType, TypeMapper};
+use exarrow_rs::{Parameter, QueryError};
 use std::future::Future;
 
 // Infrastructure Tests
@@ -4145,11 +4146,6 @@ async fn test_default_client_identification() {
     );
 }
 
-/// The type that the native protocol reports for the column `TSL` of table `M`.
-const NATIVE_TSL_TYPE: ExasolType = ExasolType::Timestamp {
-    with_local_time_zone: false,
-};
-
 async fn create_column_metadata_table(conn: &mut Connection, schema_name: &str) {
     conn.execute_update(&format!("CREATE SCHEMA {schema_name}"))
         .await
@@ -4187,8 +4183,14 @@ async fn test_result_set_fields_carry_exasol_column_metadata() {
         .await
         .expect("fetch_all should succeed");
 
-    assert_column_metadata_table_fields(&metadata_schema, NATIVE_TSL_TYPE);
-    assert_column_metadata_table_fields(&batches[0].schema(), NATIVE_TSL_TYPE);
+    assert_column_metadata_table_fields(
+        &metadata_schema,
+        default_transport_local_time_zone_timestamp(),
+    );
+    assert_column_metadata_table_fields(
+        &batches[0].schema(),
+        default_transport_local_time_zone_timestamp(),
+    );
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
@@ -4243,7 +4245,10 @@ async fn test_zero_row_result_batch_carries_field_metadata() {
 
     assert_eq!(batches.len(), 1, "a zero-row result yields one batch");
     assert_eq!(batches[0].num_rows(), 0);
-    assert_column_metadata_table_fields(&batches[0].schema(), NATIVE_TSL_TYPE);
+    assert_column_metadata_table_fields(
+        &batches[0].schema(),
+        default_transport_local_time_zone_timestamp(),
+    );
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
