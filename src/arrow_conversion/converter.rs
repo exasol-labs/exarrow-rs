@@ -301,10 +301,7 @@ fn parse_exasol_type(
 
         "GEOMETRY" => Ok(ExasolType::Geometry { srid: None }),
 
-        "HASHTYPE" => {
-            let byte_size = data_type.size.unwrap_or(16) as usize;
-            Ok(ExasolType::Hashtype { byte_size })
-        }
+        "HASHTYPE" => Ok(ExasolType::hashtype_from_reported_size(data_type.size)),
 
         unknown => Err(ConversionError::UnsupportedType {
             exasol_type: unknown.to_string(),
@@ -900,9 +897,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_exasol_type_hashtype_uses_declared_size() {
+    fn test_parse_exasol_type_hashtype_converts_reported_hex_characters_to_bytes() {
         assert_eq!(
-            parse_exasol_type(&sized_type("HASHTYPE", 32)).unwrap(),
+            parse_exasol_type(&sized_type("HASHTYPE", 64)).unwrap(),
             ExasolType::Hashtype { byte_size: 32 }
         );
     }

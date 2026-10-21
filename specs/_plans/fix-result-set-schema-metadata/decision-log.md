@@ -24,4 +24,11 @@
 - **Alternatives:** Store the type name in `exasol:type`: rejected, because `TypeMapper::from_field_metadata` could no longer restore the `ExasolType`. Store the DDL form, such as `DECIMAL(10,2)`: rejected, because it repeats the precision and scale keys and differs from the type name that Exasol reports in result set metadata.
 - **Promotes to ADR:** no
 
+### [4] A native TIMESTAMP WITH LOCAL TIME ZONE column reports `TIMESTAMP`
+
+- **Decision:** On the native transport, the field metadata of a TIMESTAMP WITH LOCAL TIME ZONE column states the type `TIMESTAMP`, with `with_local_time_zone` false. On the WebSocket transport, it states `TIMESTAMP WITH LOCAL TIME ZONE`.
+- **Rationale:** Over the native protocol, Exasol sends the wire type `T_TIMESTAMP` (21) with the same column metadata for both types, for a table column and for a CAST. A probe against Exasol 2025.2.1 confirms this, and `native-client/prepared-statement-protocol` states the same for parameters. The driver reports the type that the server sends.
+- **Alternatives:** Detect TIMESTAMP WITH LOCAL TIME ZONE on the native transport from another source: rejected, because the server does not report the type in the native result set metadata.
+- **Promotes to ADR:** no
+
 ## Review Findings

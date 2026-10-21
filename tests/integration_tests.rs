@@ -77,9 +77,11 @@ mod schema_activation;
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    assert_every_key_once, assert_partly_inline, connection_error_from_a_silent_server,
-    disable_query_cache, drain_iterator, end_of_stream_query, generate_test_schema_name, get_host,
-    get_port, get_test_connection, get_test_connection_string, get_user, is_exasol_available,
+    assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
+    assert_every_key_once, assert_partly_inline, column_metadata_table_ddl,
+    column_metadata_table_insert, connection_error_from_a_silent_server, disable_query_cache,
+    drain_iterator, end_of_stream_query, generate_test_schema_name, get_host, get_port,
+    get_test_connection, get_test_connection_string, get_user, is_exasol_available,
     long_running_count_query, multi_fetch_query, open_iterator, partial_inline_query,
     END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
@@ -95,7 +97,9 @@ use exarrow_rs::export::csv::{CsvExportOptions, ExportError};
 use exarrow_rs::query::export::ExportSource;
 #[cfg(feature = "native")]
 use exarrow_rs::transport::{ConnectionParams, Credentials, NativeTcpTransport, TransportProtocol};
-use exarrow_rs::{Parameter, QueryError};
+#[cfg(feature = "native")]
+use exarrow_rs::TypeMapper;
+use exarrow_rs::{ExasolType, Parameter, QueryError};
 use std::future::Future;
 
 // Infrastructure Tests
@@ -4139,4 +4143,191 @@ async fn test_default_client_identification() {
         session_client_column(&get_test_connection_string()).await,
         format!("exarrow-rs {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+/// The type that the native protocol reports for the column `TSL` of table `M`.
+const NATIVE_TSL_TYPE: ExasolType = ExasolType::Timestamp {
+    with_local_time_zone: false,
+};
+
+async fn create_column_metadata_table(conn: &mut Connection, schema_name: &str) {
+    conn.execute_update(&format!("CREATE SCHEMA {schema_name}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+    conn.execute_update(&column_metadata_table_ddl(schema_name))
+        .await
+        .expect("CREATE TABLE M should succeed");
+    conn.execute_update(&column_metadata_table_insert(schema_name))
+        .await
+        .expect("INSERT into M should succeed");
+}
+
+/// Scenario: Column metadata
+/// Scenario: Result set fields are nullable when Exasol reports no nullability
+/// Scenario: Schema documentation
+#[tokio::test]
+async fn test_result_set_fields_carry_exasol_column_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_column_metadata_table(&mut conn, &schema_name).await;
+
+    let result_set = conn
+        .execute(format!("SELECT * FROM {schema_name}.M"))
+        .await
+        .expect("SELECT from M should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    assert_column_metadata_table_fields(&metadata_schema, NATIVE_TSL_TYPE);
+    assert_column_metadata_table_fields(&batches[0].schema(), NATIVE_TSL_TYPE);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Field metadata on the native transport keeps the decoded Arrow data type
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_native_interval_field_keeps_utf8_and_carries_exasol_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection_with_transport("native")
+        .await
+        .expect("Failed to connect");
+
+    let batches = conn
+        .query("SELECT CAST('3 04:05:06.789' AS INTERVAL DAY TO SECOND) AS IV")
+        .await
+        .expect("INTERVAL query should succeed");
+
+    assert_eq!(batches[0].num_rows(), 1);
+    let batch_schema = batches[0].schema();
+    let field = batch_schema.field_with_name("IV").expect("field IV");
+    assert_eq!(field.data_type(), &DataType::Utf8);
+    assert_eq!(
+        field.metadata().get("exasol:type_name").map(String::as_str),
+        Some("INTERVAL DAY TO SECOND")
+    );
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("IV should be a string column");
+    assert!(!values.is_null(0));
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Zero-row result set preserves schema
+#[tokio::test]
+async fn test_zero_row_result_batch_carries_field_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_column_metadata_table(&mut conn, &schema_name).await;
+
+    let batches = conn
+        .query(format!("SELECT * FROM {schema_name}.M WHERE FALSE"))
+        .await
+        .expect("zero-row SELECT should succeed");
+
+    assert_eq!(batches.len(), 1, "a zero-row result yields one batch");
+    assert_eq!(batches[0].num_rows(), 0);
+    assert_column_metadata_table_fields(&batches[0].schema(), NATIVE_TSL_TYPE);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Every batch carries the field metadata of the result set metadata schema
+#[tokio::test]
+async fn test_every_fetched_batch_carries_the_result_set_field_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let result_set = conn
+        .execute(multi_fetch_query())
+        .await
+        .expect("multi-fetch query should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    assert_every_batch_carries_field_metadata(&metadata_schema, &batches);
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Every batch carries the field metadata of the result set metadata schema
+#[test]
+fn test_every_iterated_batch_carries_the_result_set_field_metadata() {
+    skip_if_no_exasol!();
+
+    let (runtime, conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query());
+    let metadata_schema = iterator.metadata().schema.clone();
+
+    let batches = drain_iterator(&runtime, &mut iterator);
+
+    assert_every_batch_carries_field_metadata(&metadata_schema, &batches);
+    runtime
+        .block_on(conn.close())
+        .expect("Failed to close connection");
+}
+
+/// Scenario: HASHTYPE field metadata carries the byte size of the column
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn test_hashtype_field_metadata_carries_the_declared_byte_size() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection_with_transport("native")
+        .await
+        .expect("Failed to connect");
+
+    let result_set = conn
+        .execute(
+            "SELECT CAST('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+             AS HASHTYPE(32 BYTE)) AS H",
+        )
+        .await
+        .expect("HASHTYPE query should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+
+    for schema in [metadata_schema, batches[0].schema()] {
+        let field = schema.field_with_name("H").expect("field H");
+        assert_eq!(
+            field.metadata().get("exasol:type_name").map(String::as_str),
+            Some("HASHTYPE")
+        );
+        assert_eq!(
+            TypeMapper::from_field_metadata(field.metadata()),
+            Some(ExasolType::Hashtype { byte_size: 32 })
+        );
+    }
+
+    conn.close().await.expect("Failed to close connection");
 }

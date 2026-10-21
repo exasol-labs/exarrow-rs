@@ -83,6 +83,49 @@ pub enum ExasolType {
 }
 
 impl ExasolType {
+    /// The HASHTYPE that a result column description reports.
+    ///
+    /// Both protocols report the size of a HASHTYPE column as the number of characters of
+    /// its rendered value, which is twice the byte size under the default `HASHTYPE_FORMAT`
+    /// of `HEX`. Another session format (`UUID`, `BASE64`) changes the reported size, and
+    /// no reported value is independent of the format, so the byte size assumes `HEX`.
+    /// Without a reported size the byte size is 16.
+    pub(crate) fn hashtype_from_reported_size(reported_size: Option<i64>) -> Self {
+        const DEFAULT_BYTE_SIZE: usize = 16;
+        const HEX_CHARACTERS_PER_BYTE: i64 = 2;
+        let byte_size = reported_size
+            .map(|size| (size / HEX_CHARACTERS_PER_BYTE) as usize)
+            .unwrap_or(DEFAULT_BYTE_SIZE);
+        ExasolType::Hashtype { byte_size }
+    }
+
+    /// The Exasol type name without parameters, such as `DECIMAL` or
+    /// `TIMESTAMP WITH LOCAL TIME ZONE`.
+    ///
+    /// Precision, scale, and size are separate field metadata keys, which follows the
+    /// JDBC `getColumnTypeName` convention.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ExasolType::Boolean => "BOOLEAN",
+            ExasolType::Char { .. } => "CHAR",
+            ExasolType::Varchar { .. } => "VARCHAR",
+            ExasolType::Decimal { .. } => "DECIMAL",
+            ExasolType::Double => "DOUBLE",
+            ExasolType::Date => "DATE",
+            ExasolType::Timestamp {
+                with_local_time_zone: true,
+            } => "TIMESTAMP WITH LOCAL TIME ZONE",
+            ExasolType::Timestamp {
+                with_local_time_zone: false,
+            } => "TIMESTAMP",
+            ExasolType::IntervalYearToMonth => "INTERVAL YEAR TO MONTH",
+            ExasolType::IntervalDayToSecond { .. } => "INTERVAL DAY TO SECOND",
+            ExasolType::Geometry { .. } => "GEOMETRY",
+            ExasolType::Hashtype { .. } => "HASHTYPE",
+        }
+    }
+
     /// Convert this Exasol type to a DDL type string suitable for CREATE TABLE statements.
     ///
     /// # Returns
@@ -274,6 +317,10 @@ impl TypeMapper {
             "exasol:type".to_string(),
             serde_json::to_string(exasol_type).unwrap_or_default(),
         );
+        metadata.insert(
+            "exasol:type_name".to_string(),
+            exasol_type.type_name().to_string(),
+        );
 
         match exasol_type {
             ExasolType::Char { size } => {
@@ -398,6 +445,117 @@ mod tests {
 
         let restored = TypeMapper::from_field_metadata(&metadata).unwrap();
         assert_eq!(restored, exasol_type);
+    }
+
+    #[test]
+    fn test_type_name_of_every_exasol_type_has_no_parameters() {
+        let cases = [
+            (ExasolType::Boolean, "BOOLEAN"),
+            (ExasolType::Char { size: 3 }, "CHAR"),
+            (ExasolType::Varchar { size: 50 }, "VARCHAR"),
+            (
+                ExasolType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                "DECIMAL",
+            ),
+            (ExasolType::Double, "DOUBLE"),
+            (ExasolType::Date, "DATE"),
+            (
+                ExasolType::Timestamp {
+                    with_local_time_zone: false,
+                },
+                "TIMESTAMP",
+            ),
+            (
+                ExasolType::Timestamp {
+                    with_local_time_zone: true,
+                },
+                "TIMESTAMP WITH LOCAL TIME ZONE",
+            ),
+            (ExasolType::IntervalYearToMonth, "INTERVAL YEAR TO MONTH"),
+            (
+                ExasolType::IntervalDayToSecond { precision: 3 },
+                "INTERVAL DAY TO SECOND",
+            ),
+            (ExasolType::Geometry { srid: Some(4326) }, "GEOMETRY"),
+            (ExasolType::Geometry { srid: None }, "GEOMETRY"),
+            (ExasolType::Hashtype { byte_size: 32 }, "HASHTYPE"),
+        ];
+
+        for (exasol_type, expected) in cases {
+            assert_eq!(exasol_type.type_name(), expected, "{exasol_type:?}");
+        }
+    }
+
+    fn every_exasol_type() -> Vec<ExasolType> {
+        vec![
+            ExasolType::Boolean,
+            ExasolType::Char { size: 3 },
+            ExasolType::Varchar { size: 50 },
+            ExasolType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            ExasolType::Double,
+            ExasolType::Date,
+            ExasolType::Timestamp {
+                with_local_time_zone: false,
+            },
+            ExasolType::Timestamp {
+                with_local_time_zone: true,
+            },
+            ExasolType::IntervalYearToMonth,
+            ExasolType::IntervalDayToSecond { precision: 3 },
+            ExasolType::Geometry { srid: Some(4326) },
+            ExasolType::Hashtype { byte_size: 32 },
+        ]
+    }
+
+    #[test]
+    fn test_create_field_metadata_writes_type_name_for_every_exasol_type() {
+        for exasol_type in every_exasol_type() {
+            let metadata = TypeMapper::create_field_metadata(&exasol_type);
+
+            assert_eq!(
+                metadata.get("exasol:type_name").map(String::as_str),
+                Some(exasol_type.type_name()),
+                "{exasol_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_field_metadata_restores_every_exasol_type() {
+        for exasol_type in every_exasol_type() {
+            let metadata = TypeMapper::create_field_metadata(&exasol_type);
+
+            assert_eq!(
+                TypeMapper::from_field_metadata(&metadata),
+                Some(exasol_type)
+            );
+        }
+    }
+
+    #[test]
+    fn test_hashtype_from_reported_size_halves_the_hex_character_count() {
+        assert_eq!(
+            ExasolType::hashtype_from_reported_size(Some(64)),
+            ExasolType::Hashtype { byte_size: 32 }
+        );
+        assert_eq!(
+            ExasolType::hashtype_from_reported_size(Some(32)),
+            ExasolType::Hashtype { byte_size: 16 }
+        );
+    }
+
+    #[test]
+    fn test_hashtype_from_reported_size_defaults_to_sixteen_bytes() {
+        assert_eq!(
+            ExasolType::hashtype_from_reported_size(None),
+            ExasolType::Hashtype { byte_size: 16 }
+        );
     }
 
     #[test]

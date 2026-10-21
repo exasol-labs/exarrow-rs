@@ -5,7 +5,7 @@ Defines the mapping from Exasol data types to Apache Arrow data types, including
 <!-- DELTA:CHANGED -->
 ## Background
 
-Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient. Every field of the result set metadata schema and of each batch schema carries the Exasol type of its column as Arrow field metadata, on the native and the WebSocket transport. The result set metadata schema is the schema that the result set metadata holds, and a batch schema is the schema of one RecordBatch. The result set column metadata of both protocols holds only the column name and the data type, so the driver receives no column nullability from Exasol.
+Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient. Every field of the result set metadata schema and of each batch schema carries the Exasol type that Exasol reports for its column as Arrow field metadata, on the native and the WebSocket transport. The result set metadata schema is the schema that the result set metadata holds, and a batch schema is the schema of one RecordBatch. The result set column metadata of both protocols holds only the column name and the data type, so the driver receives no column nullability from Exasol.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
@@ -15,9 +15,9 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 
 * *GIVEN* a table `M` with the columns `AMOUNT DECIMAL(10,2) NOT NULL`, `NAME VARCHAR(50)`, `CODE CHAR(3)`, `RATE DOUBLE`, `ACTIVE BOOLEAN`, `D DATE`, `TS TIMESTAMP`, and `TSL TIMESTAMP WITH LOCAL TIME ZONE` that holds one row
 * *WHEN* `SELECT * FROM M` runs over the native transport or the WebSocket transport and the caller reads the result set metadata schema and the batch schema of the first RecordBatch
-* *THEN* each field of both schemas SHALL carry the key `exasol:type_name` with the Exasol type name of its column: `DECIMAL`, `VARCHAR`, `CHAR`, `DOUBLE`, `BOOLEAN`, `DATE`, `TIMESTAMP`, and `TIMESTAMP WITH LOCAL TIME ZONE`
-* *AND* the field `AMOUNT` SHALL carry the key `exasol:precision` with the value `10` and the key `exasol:scale` with the value `2`
-* *AND* the fields `NAME` and `CODE` SHALL carry the key `exasol:size` with the values `50` and `3`
+* *THEN* the fields `AMOUNT`, `NAME`, `CODE`, `RATE`, `ACTIVE`, `D`, and `TS` of both schemas SHALL carry the key `exasol:type_name` with the values `DECIMAL`, `VARCHAR`, `CHAR`, `DOUBLE`, `BOOLEAN`, `DATE`, and `TIMESTAMP`
+* *AND* the field `TSL` of both schemas SHALL carry the key `exasol:type_name` with the value `TIMESTAMP WITH LOCAL TIME ZONE` over the WebSocket transport and the value `TIMESTAMP` over the native transport, because Exasol sends the native wire type `T_TIMESTAMP` (21) with the same column metadata for a `TIMESTAMP` column and a `TIMESTAMP WITH LOCAL TIME ZONE` column
+* *AND* the field `AMOUNT` SHALL carry the key `exasol:precision` with the value `10` and the key `exasol:scale` with the value `2`, and the fields `NAME` and `CODE` SHALL carry the key `exasol:size` with the values `50` and `3`
 * *AND* the fields `RATE`, `ACTIVE`, `D`, `TS`, and `TSL` SHALL NOT carry the keys `exasol:precision`, `exasol:scale`, or `exasol:size`
 <!-- /DELTA:CHANGED -->
 
@@ -36,7 +36,7 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 * *WHEN* the caller passes the field metadata of a field of the result set metadata schema to `TypeMapper::from_field_metadata`
 * *THEN* it SHALL return `ExasolType::Decimal` with precision `10` and scale `2` for the field `AMOUNT`
 * *AND* it SHALL return `ExasolType::Varchar` with size `50` for the field `NAME`
-* *AND* it SHALL return `ExasolType::Timestamp` with `with_local_time_zone` set to true for the field `TSL`
+* *AND* it SHALL return `ExasolType::Timestamp` for the field `TSL`, with `with_local_time_zone` set to true over the WebSocket transport and set to false over the native transport
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:NEW -->
@@ -52,7 +52,7 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 <!-- DELTA:NEW -->
 ### Scenario: HASHTYPE field metadata carries the byte size of the column
 
-* *GIVEN* an authenticated native TCP session exists
+* *GIVEN* an authenticated native TCP session exists that uses the default `HASHTYPE_FORMAT` (`HEX`)
 * *WHEN* the query `SELECT CAST('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' AS HASHTYPE(32 BYTE)) AS H` returns one row
 * *THEN* `TypeMapper::from_field_metadata` SHALL return `ExasolType::Hashtype` with `byte_size` `32` for the field `H` of the result set metadata schema and for the field `H` of the batch schema of the first RecordBatch
 * *AND* both fields SHALL carry the key `exasol:type_name` with the value `HASHTYPE`

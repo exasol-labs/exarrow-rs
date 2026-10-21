@@ -105,7 +105,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             type_name: "HASHTYPE".to_string(),
             precision: None,
             scale: None,
-            size: None,
+            size: meta.max_len.map(|l| l as i64),
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
@@ -167,6 +167,23 @@ mod tests {
                 with_local_time_zone: None,
             }
         }
+    }
+
+    #[test]
+    fn native_meta_to_data_type_reports_hashtype_size() {
+        let meta = NativeColumnMeta {
+            name: "H".to_string(),
+            type_id: T_HASHTYPE,
+            precision: None,
+            scale: None,
+            is_varchar: false,
+            max_len: Some(64),
+        };
+
+        let data_type = native_meta_to_data_type(&meta);
+
+        assert_eq!(data_type.type_name, "HASHTYPE");
+        assert_eq!(data_type.size, Some(64));
     }
 
     #[test]
