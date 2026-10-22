@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder,
-    Int32Builder, Int64Builder, IntervalMonthDayNanoBuilder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    IntervalMonthDayNanoBuilder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType as ArrowDataType, Field, IntervalUnit, Schema, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -12,11 +11,11 @@ use crate::error::TransportError;
 use crate::types::conversion::parse_interval;
 
 use super::constants::{
-    IS_VARCHAR, PARAMETER_DESCRIPTION, R_COLUMN_COUNT, R_EMPTY, R_EXCEPTION, R_HANDLE, R_MORE_ROWS,
-    R_RESULT_SET, R_ROW_COUNT, R_STILL_EXECUTING, R_WARNING, T_BIGDECIMAL, T_BINARY, T_BOOLEAN,
-    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTEGER, T_INTERVAL_DAY,
-    T_INTERVAL_YEAR, T_REAL, T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ,
-    T_TIMESTAMP_UTC,
+    INTEGER_DECIMAL_PRECISION, IS_VARCHAR, PARAMETER_DESCRIPTION, R_COLUMN_COUNT, R_EMPTY,
+    R_EXCEPTION, R_HANDLE, R_MORE_ROWS, R_RESULT_SET, R_ROW_COUNT, R_STILL_EXECUTING, R_WARNING,
+    SMALLINT_DECIMAL_PRECISION, T_BIGDECIMAL, T_BINARY, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL,
+    T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTEGER, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_REAL,
+    T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
 };
 
 /// One decoded column: the Arrow field describing it and the array holding its values.
@@ -590,8 +589,11 @@ fn decimal_precision_scale(meta: &NativeColumnMeta, default_precision: i32) -> (
 ///
 /// Types that Exasol sends as length-prefixed text convert to the Arrow type of
 /// `TypeMapper::exasol_to_arrow`: both INTERVAL kinds parse into Interval(MonthDayNano),
-/// and GEOMETRY and HASHTYPE keep their text bytes in Binary. CHAR and any type id this
-/// driver does not recognise decode as UTF-8 strings.
+/// and GEOMETRY and HASHTYPE keep their text bytes in Binary. The `T_INTEGER` and
+/// `T_SMALLINT` wire types decode to the Decimal128 type of the DECIMAL(18,0) and DECIMAL(9,0)
+/// that `native_meta_to_data_type` reports, and the wire type alone fixes the 8-byte or 4-byte
+/// value width and that Decimal128 type, whatever precision the column description carries.
+/// CHAR and any type id this driver does not recognise decode as UTF-8 strings.
 fn fill_column_builder(
     data: &[u8],
     offset: &mut usize,
@@ -601,8 +603,18 @@ fn fill_column_builder(
     match meta.type_id {
         T_DOUBLE => fill_double_column(data, offset, &meta.name, num_rows),
         T_REAL => fill_real_column(data, offset, &meta.name, num_rows),
-        T_INTEGER => fill_integer_column(data, offset, &meta.name, num_rows),
-        T_SMALLINT => fill_smallint_column(data, offset, &meta.name, num_rows),
+        T_INTEGER => fill_decimal_column(
+            data,
+            offset,
+            &whole_number_meta(meta, INTEGER_DECIMAL_PRECISION),
+            num_rows,
+        ),
+        T_SMALLINT => fill_smalldecimal_column(
+            data,
+            offset,
+            &whole_number_meta(meta, SMALLINT_DECIMAL_PRECISION),
+            num_rows,
+        ),
         T_BOOLEAN => fill_boolean_column(data, offset, &meta.name, num_rows),
         T_BINARY | T_GEOMETRY | T_HASHTYPE => {
             fill_binary_column(data, offset, &meta.name, num_rows)
@@ -618,6 +630,14 @@ fn fill_column_builder(
             fill_timestamp_column(data, offset, meta, num_rows)
         }
         _ => fill_string_builder(data, offset, &meta.name, num_rows),
+    }
+}
+
+fn whole_number_meta(meta: &NativeColumnMeta, precision: i32) -> NativeColumnMeta {
+    NativeColumnMeta {
+        precision: Some(precision),
+        scale: Some(0),
+        ..meta.clone()
     }
 }
 
@@ -657,46 +677,6 @@ fn fill_real_column(
     }
     Ok((
         Field::new(name, ArrowDataType::Float64, true),
-        Arc::new(builder.finish()),
-    ))
-}
-
-fn fill_integer_column(
-    data: &[u8],
-    offset: &mut usize,
-    name: &str,
-    num_rows: usize,
-) -> Result<BuiltColumn, TransportError> {
-    let mut builder = Int64Builder::with_capacity(num_rows);
-    for _ in 0..num_rows {
-        if read_u8(data, offset)? == 0 {
-            builder.append_null();
-        } else {
-            builder.append_value(read_i64(data, offset)?);
-        }
-    }
-    Ok((
-        Field::new(name, ArrowDataType::Int64, true),
-        Arc::new(builder.finish()),
-    ))
-}
-
-fn fill_smallint_column(
-    data: &[u8],
-    offset: &mut usize,
-    name: &str,
-    num_rows: usize,
-) -> Result<BuiltColumn, TransportError> {
-    let mut builder = Int32Builder::with_capacity(num_rows);
-    for _ in 0..num_rows {
-        if read_u8(data, offset)? == 0 {
-            builder.append_null();
-        } else {
-            builder.append_value(read_i32(data, offset)?);
-        }
-    }
-    Ok((
-        Field::new(name, ArrowDataType::Int32, true),
         Arc::new(builder.finish()),
     ))
 }
@@ -1743,7 +1723,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
 
-        use arrow::array::{Array, BooleanArray, Float64Array, Int64Array};
+        use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array};
         let f = batch
             .column(0)
             .as_any()
@@ -1757,7 +1737,7 @@ mod tests {
         let i = batch
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
 
         assert_eq!(f.value(0), 1.5);
@@ -1780,7 +1760,10 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 2);
         use arrow::datatypes::DataType;
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Decimal128(18, 0)
+        );
         assert_eq!(batch.schema().field(1).data_type(), &DataType::Utf8);
     }
 
@@ -1807,7 +1790,7 @@ mod tests {
 
     #[test]
     fn parse_fetch_to_record_batch_reads_row_count_prefix() {
-        use arrow::array::{Array, Int64Array};
+        use arrow::array::{Array, Decimal128Array};
         let columns = vec![meta("i", T_INTEGER, None, None)];
         let mut data = Vec::new();
         // rows_received prefix
@@ -1823,7 +1806,7 @@ mod tests {
         let arr = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
         assert_eq!(arr.value(0), 100);
         assert!(arr.is_null(1));
@@ -1955,28 +1938,124 @@ mod tests {
         assert_eq!(offset, data.len());
     }
 
+    /// Scenario: Direct binary to Arrow conversion for numeric types
     #[test]
-    fn single_pass_smallint_column_decodes_to_int32() {
-        use arrow::array::{Array, Int32Array};
+    fn single_pass_smallint_column_decodes_to_decimal128() {
+        use arrow::array::{Array, Decimal128Array};
         use arrow::datatypes::DataType;
 
         let columns = vec![meta("si", T_SMALLINT, None, None)];
         let mut data = Vec::new();
-        data.push(1u8);
-        data.extend_from_slice(&(-7i32).to_le_bytes());
+        for value in [-7i32, 999_999_999, -999_999_999] {
+            data.push(1u8);
+            data.extend_from_slice(&value.to_le_bytes());
+        }
         data.push(0u8);
 
         let mut offset = 0;
-        let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int32);
+        let batch = build_batch_from_wire(&data, &mut offset, &columns, 4).unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Decimal128(9, 0)
+        );
         let arr = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Int32Array>()
+            .downcast_ref::<Decimal128Array>()
             .unwrap();
         assert_eq!(arr.value(0), -7);
-        assert!(arr.is_null(1));
+        assert_eq!(arr.value(1), 999_999_999);
+        assert_eq!(arr.value(2), -999_999_999);
+        assert!(arr.is_null(3));
         assert_eq!(offset, data.len());
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for numeric types
+    #[test]
+    fn single_pass_integer_column_decodes_to_decimal128() {
+        use arrow::array::{Array, Decimal128Array};
+        use arrow::datatypes::DataType;
+
+        let columns = vec![meta("i", T_INTEGER, None, None)];
+        let mut data = Vec::new();
+        for value in [999_999_999_999_999_999i64, -999_999_999_999_999_999] {
+            data.push(1u8);
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.push(0u8);
+
+        let mut offset = 0;
+        let batch = build_batch_from_wire(&data, &mut offset, &columns, 3).unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &DataType::Decimal128(18, 0)
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 999_999_999_999_999_999);
+        assert_eq!(arr.value(1), -999_999_999_999_999_999);
+        assert!(arr.is_null(2));
+        assert_eq!(offset, data.len());
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for numeric types
+    #[test]
+    fn integer_wire_types_take_the_arrow_type_of_their_reported_decimal() {
+        use crate::query::results::exasol_type_of;
+        use crate::types::TypeMapper;
+
+        for type_id in [T_INTEGER, T_SMALLINT] {
+            let column = meta("n", type_id, None, None);
+            let exasol_type = exasol_type_of(&native_meta_to_data_type(&column)).unwrap();
+            let reported = TypeMapper::exasol_to_arrow(&exasol_type, true).unwrap();
+            let batch = build_batch_from_wire(&[], &mut 0, &[column], 0).unwrap();
+            assert_eq!(batch.schema().field(0).data_type(), &reported);
+        }
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for numeric types
+    #[test]
+    fn integer_wire_types_ignore_a_precision_in_the_column_description() {
+        use arrow::array::{Array, Decimal128Array};
+        use arrow::datatypes::DataType;
+
+        let mut integer_data = vec![1u8];
+        integer_data.extend_from_slice(&999_999_999_999_999_999i64.to_le_bytes());
+        integer_data.push(0u8);
+        let mut smallint_data = vec![1u8];
+        smallint_data.extend_from_slice(&999_999_999i32.to_le_bytes());
+        smallint_data.push(0u8);
+        let cases = [
+            (
+                meta("i", T_INTEGER, Some(9), Some(2)),
+                integer_data,
+                DataType::Decimal128(18, 0),
+                999_999_999_999_999_999i128,
+            ),
+            (
+                meta("s", T_SMALLINT, Some(4), Some(2)),
+                smallint_data,
+                DataType::Decimal128(9, 0),
+                999_999_999i128,
+            ),
+        ];
+
+        for (column, data, expected_type, expected_value) in cases {
+            let mut offset = 0;
+            let batch = build_batch_from_wire(&data, &mut offset, &[column], 2).unwrap();
+            assert_eq!(batch.schema().field(0).data_type(), &expected_type);
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap();
+            assert_eq!(arr.value(0), expected_value);
+            assert!(arr.is_null(1));
+            assert_eq!(offset, data.len());
+        }
     }
 
     #[test]

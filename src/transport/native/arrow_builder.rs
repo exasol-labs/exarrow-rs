@@ -1,7 +1,8 @@
 use super::constants::{
-    T_BIGDECIMAL, T_BINARY, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE,
-    T_INTEGER, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_REAL, T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP,
-    T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
+    INTEGER_DECIMAL_PRECISION, SMALLINT_DECIMAL_PRECISION, T_BIGDECIMAL, T_BINARY, T_BOOLEAN,
+    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTEGER, T_INTERVAL_DAY,
+    T_INTERVAL_YEAR, T_REAL, T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ,
+    T_TIMESTAMP_UTC,
 };
 use super::result_parser::NativeColumnMeta;
 
@@ -29,8 +30,8 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             fraction: None,
             srid: None,
         },
-        T_INTEGER => crate::transport::messages::DataType::decimal(18, 0),
-        T_SMALLINT => crate::transport::messages::DataType::decimal(9, 0),
+        T_INTEGER => crate::transport::messages::DataType::decimal(INTEGER_DECIMAL_PRECISION, 0),
+        T_SMALLINT => crate::transport::messages::DataType::decimal(SMALLINT_DECIMAL_PRECISION, 0),
         T_BOOLEAN => crate::transport::messages::DataType::boolean(),
         T_CHAR => {
             if meta.is_varchar {

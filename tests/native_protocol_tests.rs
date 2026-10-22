@@ -613,3 +613,40 @@ async fn test_native_geometry_and_hashtype_results_are_binary() {
 
     conn.close().await.expect("Failed to close");
 }
+
+/// Scenario: INTEGER and SMALLINT type mapping
+#[tokio::test]
+async fn test_native_integer_and_smallint_results_are_decimal128() {
+    skip_if_no_exasol!();
+
+    use arrow::array::Decimal128Array;
+    use arrow::datatypes::DataType;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    for (sql, name, expected_type, expected_value) in [
+        (
+            "SELECT CAST(-999999999999999999 AS INTEGER) AS I FROM DUAL",
+            "I",
+            DataType::Decimal128(18, 0),
+            -999_999_999_999_999_999i128,
+        ),
+        (
+            "SELECT CAST(999999999 AS SMALLINT) AS S FROM DUAL",
+            "S",
+            DataType::Decimal128(9, 0),
+            999_999_999i128,
+        ),
+    ] {
+        let batch = assert_data_type_in_all_three_schemas(&mut conn, sql, &expected_type).await;
+        let values = batch
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("a Decimal128 column");
+        assert_eq!(values.value(0), expected_value, "{name}");
+    }
+
+    conn.close().await.expect("Failed to close");
+}

@@ -407,9 +407,9 @@ impl ResultSet {
     /// An Arrow batch keeps its own column arrays, field names, Arrow data types,
     /// and nullability, and takes the field metadata of the result set metadata
     /// schema. The native transport decodes some columns to another Arrow type
-    /// than `TypeMapper` maps (the INTEGER and SMALLINT wire types decode to
-    /// Int64 and Int32 under Decimal128 fields), so the metadata goes onto the
-    /// batch's own fields.
+    /// than `TypeMapper` maps (the `T_TIMESTAMP_LOCAL_TZ` wire type decodes to
+    /// Timestamp(Microsecond, None) under a Timestamp(Microsecond, "UTC") field),
+    /// so the metadata goes onto the batch's own fields.
     fn payload_to_record_batch(
         data: &ResultData,
         schema: &Arc<Schema>,
@@ -2672,17 +2672,11 @@ mod tests {
     // Tests for Arrow payload pass-through
     // =========================================================================
 
-    fn int64_batch(values: Vec<i64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            arrow::datatypes::DataType::Int64,
-            true,
-        )]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(arrow::array::Int64Array::from(values))],
-        )
-        .unwrap()
+    fn decimal_batch(values: Vec<i128>) -> RecordBatch {
+        let data_type = arrow::datatypes::DataType::Decimal128(18, 0);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", data_type.clone(), true)]));
+        let column = arrow::array::Decimal128Array::from(values).with_data_type(data_type);
+        RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()
     }
 
     fn arrow_payload(batch: RecordBatch) -> ResultData {
@@ -2761,7 +2755,7 @@ mod tests {
 
     #[test]
     fn test_payload_to_record_batch_keeps_arrow_columns_and_adds_field_metadata() {
-        let batch = int64_batch(vec![7, 8]);
+        let batch = decimal_batch(vec![7, 8]);
         let schema = metadata_schema_of(&[decimal_column("id")]);
 
         let converted =
@@ -2770,7 +2764,10 @@ mod tests {
         assert_eq!(converted.num_rows(), 2);
         let field = converted.schema().field(0).clone();
         assert_eq!(field.name(), "id");
-        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Int64);
+        assert_eq!(
+            field.data_type(),
+            &arrow::datatypes::DataType::Decimal128(18, 0)
+        );
         assert!(field.is_nullable());
         assert_eq!(field.metadata().get("exasol:type_name").unwrap(), "DECIMAL");
         assert_eq!(field.metadata().get("exasol:precision").unwrap(), "18");
@@ -2779,32 +2776,39 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_to_record_batch_keeps_int64_column_under_decimal_schema_field() {
-        let batch_schema = Arc::new(Schema::new(vec![Field::new(
-            "N",
-            arrow::datatypes::DataType::Int64,
-            true,
-        )]));
+    fn test_payload_to_record_batch_keeps_timestamp_column_under_local_time_zone_schema_field() {
+        use arrow::datatypes::{DataType as ArrowType, TimeUnit};
+
+        let batch_type = ArrowType::Timestamp(TimeUnit::Microsecond, None);
+        let batch_schema = Arc::new(Schema::new(vec![Field::new("T", batch_type.clone(), true)]));
         let batch = RecordBatch::try_new(
             batch_schema,
-            vec![Arc::new(arrow::array::Int64Array::from(vec![42]))],
+            vec![Arc::new(arrow::array::TimestampMicrosecondArray::from(
+                vec![42],
+            ))],
         )
         .unwrap();
         let schema = metadata_schema_of(&[ColumnInfo {
-            name: "N".to_string(),
-            data_type: crate::transport::messages::DataType::decimal(18, 0),
+            name: "T".to_string(),
+            data_type: DataType {
+                with_local_time_zone: Some(true),
+                ..plain_type("TIMESTAMP")
+            },
         }]);
         assert_eq!(
             schema.field(0).data_type(),
-            &arrow::datatypes::DataType::Decimal128(18, 0)
+            &ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
 
         let converted =
             ResultSet::payload_to_record_batch(&arrow_payload(batch.clone()), &schema).unwrap();
 
         let field = converted.schema().field(0).clone();
-        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Int64);
-        assert_eq!(field.metadata().get("exasol:type_name").unwrap(), "DECIMAL");
+        assert_eq!(field.data_type(), &batch_type);
+        assert_eq!(
+            field.metadata().get("exasol:type_name").unwrap(),
+            "TIMESTAMP WITH LOCAL TIME ZONE"
+        );
         assert!(Arc::ptr_eq(converted.column(0), batch.column(0)));
     }
 
@@ -2938,7 +2942,7 @@ mod tests {
 
     #[test]
     fn test_payload_to_record_batch_fails_when_column_counts_differ() {
-        let batch = int64_batch(vec![1]);
+        let batch = decimal_batch(vec![1]);
         let schema = metadata_schema_of(&[decimal_column("a"), varchar_column("b")]);
 
         let error = ResultSet::payload_to_record_batch(&arrow_payload(batch), &schema).unwrap_err();
@@ -2956,7 +2960,7 @@ mod tests {
         transport
             .expect_fetch_results()
             .times(1)
-            .returning(|_| Ok(arrow_payload(int64_batch(vec![2]))));
+            .returning(|_| Ok(arrow_payload(decimal_batch(vec![2]))));
         transport
             .expect_close_result_set()
             .times(1)

@@ -15,11 +15,11 @@ Type mappings below apply to the **native TCP transport** (the default). See [We
 | `DECIMAL(p, s)`                  | `Decimal128(p, s)`                  | Precision 1–36                  |
 | `DOUBLE`                         | `Float64`                           |                                 |
 | `REAL`                           | `Float64`                           |                                 |
-| `INTEGER`                        | `Int64`                             |                                 |
-| `SMALLINT`                       | `Int32`                             |                                 |
+| `INTEGER`                        | `Decimal128(18, 0)`                 | Alias of `DECIMAL(18, 0)`       |
+| `SMALLINT`                       | `Decimal128(9, 0)`                  | Alias of `DECIMAL(9, 0)`        |
 | `DATE`                           | `Date32`                            |                                 |
 | `TIMESTAMP`                      | `Timestamp(Microsecond, None)`      | 0–9 fractional digits           |
-| `TIMESTAMP WITH LOCAL TIME ZONE` | `Timestamp(Microsecond, "UTC")`     |                                 |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `Timestamp(Microsecond, None)`      | `Timestamp(Microsecond, "UTC")` over WebSocket |
 | `INTERVAL YEAR TO MONTH`         | `Interval(MonthDayNano)`            | Months only                     |
 | `INTERVAL DAY TO SECOND`         | `Interval(MonthDayNano)`            | Days and nanoseconds            |
 | `BINARY`                         | `Binary`                            |                                 |
@@ -109,7 +109,6 @@ Every result set field is nullable, even when the column is declared `NOT NULL`,
 Some metadata values do not reflect the declared column type:
 
 - On the native transport, `GEOMETRY` carries no SRID, because the protocol sends none, so the key `exasol:srid` is absent. On the WebSocket transport, the key holds the SRID that Exasol reports, which is `0` for a column declared without one.
-- On the native transport, `INTEGER` and `SMALLINT` columns report `DECIMAL` with precision 18 and 9, and scale 0.
 - On the native transport, `TIMESTAMP WITH LOCAL TIME ZONE` reports `TIMESTAMP`, because the protocol sends the same wire type for both.
 - For `HASHTYPE`, `exasol:type` holds the byte size as half the size that Exasol reports, because Exasol reports the number of hex characters, which assumes the default session format `HASHTYPE_FORMAT=HEX`. With `UUID` or `BASE64`, Exasol reports another size, and the byte size is wrong. Without a reported size, the byte size is 16.
 
@@ -117,7 +116,6 @@ Some metadata values do not reflect the declared column type:
 
 When using `transport=websocket`, the following types map differently from the native protocol:
 
-| Exasol Type | Native (default) | WebSocket           |
-|-------------|------------------|---------------------|
-| `INTEGER`   | `Int64`          | `Decimal128(18, 0)` |
-| `SMALLINT`  | `Int32`          | `Decimal128(9, 0)`  |
+| Exasol Type                      | Native (default)               | WebSocket                       |
+|----------------------------------|--------------------------------|---------------------------------|
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `Timestamp(Microsecond, None)` | `Timestamp(Microsecond, "UTC")` |

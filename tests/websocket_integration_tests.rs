@@ -17,7 +17,8 @@ mod common;
 mod schema_activation;
 
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Float64Array, IntervalMonthDayNanoArray, StringArray,
+    Array, BinaryArray, BooleanArray, Decimal128Array, Float64Array, IntervalMonthDayNanoArray,
+    StringArray,
 };
 use arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit};
 use common::{
@@ -995,70 +996,6 @@ async fn test_ws_auto_commit_behavior() {
 
 // ── Section 7: Arrow Conversion ───────────────────────────────────────────────
 
-/// 7.1 INTEGER to Arrow Int64 over WebSocket.
-#[tokio::test]
-async fn test_ws_integer_to_arrow_int64() {
-    skip_if_no_exasol!();
-
-    let mut conn = get_ws_connection().await.expect("Failed to connect");
-
-    let schema_name = generate_test_schema_name();
-
-    conn.execute_update(&format!("CREATE SCHEMA {}", schema_name))
-        .await
-        .expect("CREATE SCHEMA should succeed");
-
-    conn.execute_update(&format!(
-        "CREATE TABLE {}.int_test (small_int INTEGER, big_int DECIMAL(18,0))",
-        schema_name
-    ))
-    .await
-    .expect("CREATE TABLE should succeed");
-
-    conn.execute_update(&format!(
-        r#"
-        INSERT INTO {}.int_test VALUES
-        (0, 0),
-        (1, 1),
-        (-1, -1),
-        (2147483647, 999999999999999999),
-        (-2147483648, -999999999999999999)
-        "#,
-        schema_name
-    ))
-    .await
-    .expect("INSERT should succeed");
-
-    let batches = conn
-        .query(&format!(
-            "SELECT small_int, big_int FROM {}.int_test ORDER BY small_int",
-            schema_name
-        ))
-        .await
-        .expect("SELECT should succeed");
-
-    assert!(!batches.is_empty(), "Should return results");
-
-    let batch = &batches[0];
-    assert_eq!(batch.num_rows(), 5, "Should have 5 rows");
-
-    let schema = batch.schema();
-    for field in schema.fields() {
-        let dt = field.data_type();
-        assert!(
-            matches!(
-                dt,
-                DataType::Int64 | DataType::Int32 | DataType::Decimal128(_, _) | DataType::Float64
-            ),
-            "Integer columns should be numeric Arrow type, got {:?}",
-            dt
-        );
-    }
-
-    ws_cleanup_schema(&mut conn, &schema_name).await;
-    conn.close().await.expect("Failed to close connection");
-}
-
 /// 7.2 VARCHAR to Arrow Utf8 over WebSocket.
 #[tokio::test]
 async fn test_ws_varchar_to_arrow_utf8() {
@@ -1403,6 +1340,8 @@ async fn test_ws_boolean_type_conversion() {
 }
 
 /// DOUBLE type conversion over WebSocket.
+///
+/// Scenario: Non-decimal numeric type mapping
 #[tokio::test]
 async fn test_ws_double_type_conversion() {
     skip_if_no_exasol!();
@@ -2601,6 +2540,16 @@ fn interval_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> Inter
         .value(row)
 }
 
+fn decimal_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> i128 {
+    batch
+        .column_by_name("V")
+        .expect("column V")
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("a decimal column")
+        .value(row)
+}
+
 fn binary_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> Vec<u8> {
     batch
         .column_by_name("V")
@@ -2710,6 +2659,46 @@ async fn test_ws_hashtype_result_equals_native() {
 
     let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Binary).await;
     assert_eq!(binary_value(&batch, 0), b"550e8400e29b11d4a716446655440000");
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: INTEGER and SMALLINT type mapping
+/// Scenario: WebSocket INTEGER and SMALLINT results equal native results
+#[tokio::test]
+async fn test_ws_integer_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST(-999999999999999999 AS INTEGER)",
+        type_sql: "INTEGER",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Decimal128(18, 0)).await;
+    assert_eq!(decimal_value(&batch, 0), -999_999_999_999_999_999);
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: INTEGER and SMALLINT type mapping
+/// Scenario: WebSocket INTEGER and SMALLINT results equal native results
+#[tokio::test]
+async fn test_ws_smallint_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST(999999999 AS SMALLINT)",
+        type_sql: "SMALLINT",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Decimal128(9, 0)).await;
+    assert_eq!(decimal_value(&batch, 0), 999_999_999);
     #[cfg(feature = "native")]
     assert_equals_native(&batch, &CASE).await;
 

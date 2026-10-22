@@ -133,20 +133,14 @@ fn drop_test_schema<C: AdbcConnection>(conn: &mut C, schema_name: &str) {
 
 // Column readers
 
-/// Read a whole-number column as `i64`, whichever numeric Arrow type Exasol
-/// chose to report it as.
+/// Read a whole-number column as `i64`. Exasol reports whole numbers as
+/// Decimal128, so any other column type reads as empty.
 fn integers_in(column: &dyn Array) -> Vec<i64> {
     if let Some(values) = column
         .as_any()
         .downcast_ref::<arrow::array::Decimal128Array>()
     {
         return (0..values.len()).map(|i| values.value(i) as i64).collect();
-    }
-    if let Some(values) = column.as_any().downcast_ref::<Int32Array>() {
-        return (0..values.len()).map(|i| values.value(i) as i64).collect();
-    }
-    if let Some(values) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
-        return (0..values.len()).map(|i| values.value(i)).collect();
     }
     Vec::new()
 }
@@ -2474,22 +2468,7 @@ fn test_bind_execute_query() {
         let mut results = Vec::new();
         for batch_result in reader.by_ref() {
             let batch = batch_result.expect("Failed to read batch");
-            let col = batch.column(0);
-
-            if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Decimal128Array>() {
-                for i in 0..arr.len() {
-                    let scale = arr.scale() as u32;
-                    results.push(arr.value(i) / 10i128.pow(scale));
-                }
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                for i in 0..arr.len() {
-                    results.push(arr.value(i) as i128);
-                }
-            } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                for i in 0..arr.len() {
-                    results.push(arr.value(i) as i128);
-                }
-            }
+            results.extend(integers_in(batch.column(0).as_ref()));
         }
 
         assert_eq!(results, vec![200], "Should return val=200 for id=2");

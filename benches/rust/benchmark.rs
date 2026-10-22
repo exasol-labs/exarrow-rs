@@ -395,17 +395,18 @@ async fn run_select_polars_benchmark_main(
             if batches.is_empty() || batches[0].num_rows() == 0 {
                 0i64
             } else {
-                use arrow::array::{Array, Decimal128Array, Int64Array};
+                use arrow::array::{Array, Decimal128Array};
                 let col = batches[0].column(0);
-                // Try Int64 first, then Decimal128 (COUNT(*) may return DECIMAL in Exasol)
-                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                    arr.value(0)
-                } else if let Some(arr) = col.as_any().downcast_ref::<Decimal128Array>() {
-                    // Decimal128 stores scaled value, but COUNT(*) has scale 0
-                    arr.value(0) as i64
-                } else {
-                    0
-                }
+                // COUNT(*) is Decimal128 with scale 0, so the stored value is the count
+                col.as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        format!(
+                            "COUNT(*) returned {:?}, expected Decimal128",
+                            col.data_type()
+                        )
+                    })?
+                    .value(0) as i64
             }
         }
         Err(_) => 0,

@@ -1278,76 +1278,6 @@ async fn test_auto_commit_behavior() {
 // Section 7: Arrow Conversion Validation
 // Tests for verifying correct conversion of Exasol types to Arrow types.
 
-/// 7.1 Test INTEGER type conversion to Arrow Int64
-#[tokio::test]
-async fn test_integer_to_arrow_int64() {
-    skip_if_no_exasol!();
-
-    let mut conn = get_test_connection().await.expect("Failed to connect");
-
-    let schema_name = generate_test_schema_name();
-
-    // Create schema and table
-    conn.execute_update(&format!("CREATE SCHEMA {}", schema_name))
-        .await
-        .expect("CREATE SCHEMA should succeed");
-
-    conn.execute_update(&format!(
-        "CREATE TABLE {}.int_test (small_int INTEGER, big_int DECIMAL(18,0))",
-        schema_name
-    ))
-    .await
-    .expect("CREATE TABLE should succeed");
-
-    // Insert test data including edge cases
-    // Note: DECIMAL(18,0) max is 999999999999999999 (18 digits), not INT64_MAX
-    conn.execute_update(&format!(
-        r#"
-        INSERT INTO {}.int_test VALUES
-        (0, 0),
-        (1, 1),
-        (-1, -1),
-        (2147483647, 999999999999999999),
-        (-2147483648, -999999999999999999)
-        "#,
-        schema_name
-    ))
-    .await
-    .expect("INSERT should succeed");
-
-    // Query and verify
-    let batches = conn
-        .query(&format!(
-            "SELECT small_int, big_int FROM {}.int_test ORDER BY small_int",
-            schema_name
-        ))
-        .await
-        .expect("SELECT should succeed");
-
-    assert!(!batches.is_empty(), "Should return results");
-
-    let batch = &batches[0];
-    assert_eq!(batch.num_rows(), 5, "Should have 5 rows");
-
-    // Verify data types are numeric
-    let schema = batch.schema();
-    for field in schema.fields() {
-        let dt = field.data_type();
-        assert!(
-            matches!(
-                dt,
-                DataType::Int64 | DataType::Int32 | DataType::Decimal128(_, _) | DataType::Float64
-            ),
-            "Integer columns should be numeric Arrow type, got {:?}",
-            dt
-        );
-    }
-
-    // Cleanup
-    cleanup_schema(&mut conn, &schema_name).await;
-    conn.close().await.expect("Failed to close connection");
-}
-
 /// 7.2 Test VARCHAR type conversion to Arrow Utf8
 #[tokio::test]
 async fn test_varchar_to_arrow_utf8() {
@@ -1714,6 +1644,8 @@ async fn test_boolean_type_conversion() {
 }
 
 /// Test DOUBLE type conversion
+///
+/// Scenario: Non-decimal numeric type mapping
 #[tokio::test]
 async fn test_double_type_conversion() {
     skip_if_no_exasol!();
