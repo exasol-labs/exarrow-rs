@@ -12,8 +12,9 @@ Each column's data is contiguous in the frame, so conversion reads it directly i
 
 * *GIVEN* a result set contains columns of type `T_double` (8), `T_decimal` (6), `T_integer` (5), `T_smallint` (4), or `T_real` (7)
 * *WHEN* parsing column data
-* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128, `T_integer` → Int64, `T_smallint` → Int32, while the reported Exasol type for both is DECIMAL with precision 18 and 9 respectively and scale 0)
-* *AND* the system SHALL handle little-endian to native byte order conversion
+* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128 with the precision and scale of the column description, `T_integer` → Decimal128(18, 0), `T_smallint` → Decimal128(9, 0)), converting each little-endian value to native byte order
+* *AND* the system SHALL read each `T_integer` value as an 8-byte integer and each `T_smallint` value as a 4-byte integer into the Decimal128 array, with no intermediate Int64 or Int32 array
+* *AND* the Arrow data type of a `T_integer` or `T_smallint` field SHALL equal the Arrow data type of the DECIMAL(18,0) or DECIMAL(9,0) that the driver reports for the column in the result set metadata, because the column description of these wire types carries no precision or scale
 * *AND* decimal values SHALL preserve precision and scale
 
 ### Scenario: Direct binary to Arrow conversion for string types
