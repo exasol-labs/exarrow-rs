@@ -53,10 +53,11 @@ Exasol DECIMAL precision does not exceed 36, so Decimal128 is always sufficient.
 
 ### Scenario: GEOMETRY type handling
 
-* *GIVEN* Exasol returns a result set with typed columns
-* *WHEN* encountering Exasol GEOMETRY types
-* *THEN* it SHALL map to Arrow Binary or Utf8 (WKT/WKB format)
-* *AND* it SHALL document the encoding used
+* *GIVEN* a query over the native or the WebSocket transport returns a GEOMETRY column, such as `SELECT CAST('POINT(1 2)' AS GEOMETRY) AS G`, whose values Exasol sends as WKT text, such as `POINT (1 2)`
+* *WHEN* the driver builds the result set metadata schema and the RecordBatches of the result set
+* *THEN* the field `G` SHALL have the Arrow data type Binary in the result set metadata schema, in the batch schema of every RecordBatch, and in the zero-row RecordBatch of the same query with `WHERE FALSE`
+* *AND* each value SHALL hold the bytes of the WKT text unchanged, such as the bytes of `POINT (1 2)`
+* *AND* `TypeMapper::exasol_to_arrow` SHALL map GEOMETRY to Arrow Binary
 
 ### Scenario: Unsupported types
 
