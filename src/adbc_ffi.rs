@@ -2640,6 +2640,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         };
         let exasol = transport_datatype_to_exasol(&dt).unwrap();
         assert_eq!(
@@ -2661,6 +2662,7 @@ mod tests {
             character_set: Some("UTF8".to_string()),
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         };
         let exasol = transport_datatype_to_exasol(&dt).unwrap();
         assert_eq!(exasol, ExasolType::Varchar { size: 100 });
@@ -4958,6 +4960,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         };
         expect_prepare_of(
             &mut transport,

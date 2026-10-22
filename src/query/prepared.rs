@@ -251,6 +251,7 @@ mod tests {
                     character_set: None,
                     with_local_time_zone: None,
                     fraction: None,
+                    srid: None,
                 },
                 DataType {
                     type_name: "VARCHAR".to_string(),
@@ -260,6 +261,7 @@ mod tests {
                     character_set: Some("UTF8".to_string()),
                     with_local_time_zone: None,
                     fraction: None,
+                    srid: None,
                 },
             ],
             vec![],

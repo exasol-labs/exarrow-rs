@@ -7,14 +7,16 @@ use crate::error::{ColumnConversionError, ConversionError, QueryError};
 use crate::transport::messages::{ColumnInfo, ResultData, ResultPayload, ResultSetHandle};
 use crate::transport::protocol::QueryResult as TransportQueryResult;
 use crate::transport::TransportProtocol;
+use crate::types::conversion::parse_interval;
 use crate::types::{ColumnMetadata, ExasolType, SchemaBuilder};
 use arrow::array::{
-    new_empty_array, Array, BooleanArray, BooleanBuilder, Decimal128Array, Decimal128Builder,
+    new_empty_array, Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder,
+    Decimal128Array, Decimal128Builder, IntervalMonthDayNanoArray, IntervalMonthDayNanoBuilder,
     PrimitiveArray, PrimitiveBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
 };
 use arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Date32Type, Field, Float64Type, Int32Type, Int64Type, Schema,
-    TimestampMicrosecondType,
+    ArrowPrimitiveType, DataType, Date32Type, Field, Float64Type, Int32Type, Int64Type,
+    IntervalUnit, Schema, TimestampMicrosecondType,
 };
 use serde_json::Value;
 use std::num::{IntErrorKind, ParseIntError};
@@ -128,7 +130,9 @@ pub(crate) fn exasol_type_of(
         "INTERVAL DAY TO SECOND" => ExasolType::IntervalDayToSecond {
             precision: data_type.fraction.unwrap_or(3) as u8,
         },
-        "GEOMETRY" => ExasolType::Geometry { srid: None },
+        "GEOMETRY" => ExasolType::Geometry {
+            srid: data_type.srid,
+        },
         "HASHTYPE" => ExasolType::hashtype_from_reported_size(data_type.size),
         _ => {
             return Err(ConversionError::UnsupportedType {
@@ -403,8 +407,9 @@ impl ResultSet {
     /// An Arrow batch keeps its own column arrays, field names, Arrow data types,
     /// and nullability, and takes the field metadata of the result set metadata
     /// schema. The native transport decodes some columns to another Arrow type
-    /// than `TypeMapper` maps (INTERVAL, GEOMETRY, and HASHTYPE to Utf8), so the
-    /// metadata goes onto the batch's own fields.
+    /// than `TypeMapper` maps (the INTEGER and SMALLINT wire types decode to
+    /// Int64 and Int32 under Decimal128 fields), so the metadata goes onto the
+    /// batch's own fields.
     fn payload_to_record_batch(
         data: &ResultData,
         schema: &Arc<Schema>,
@@ -482,7 +487,7 @@ impl ResultSet {
             .enumerate()
             .map(|(column_index, field)| {
                 let values = Self::column_of(rows, column_index);
-                Self::json_column_to_array(field.data_type(), &values).map_err(|error| {
+                Self::json_column_to_array(field, &values).map_err(|error| {
                     error.into_conversion_error(
                         column_index,
                         field.name(),
@@ -510,13 +515,16 @@ impl ResultSet {
     /// failing the batch: Exasol renders the same logical type differently
     /// depending on transport and column width, so a single unexpected shape
     /// must not discard an otherwise valid result set. Only a structurally
-    /// impossible column (an out-of-range DECIMAL precision/scale, or a decimal
-    /// string that cannot be scaled) is reported as an error.
+    /// impossible column is reported as an error: an out-of-range DECIMAL
+    /// precision/scale, a decimal string that cannot be scaled, an INTERVAL
+    /// value that is not a string `parse_interval` reads (including a year
+    /// to month value beyond the Arrow month range), or an Arrow type that no
+    /// result column maps to.
     fn json_column_to_array(
-        data_type: &DataType,
+        field: &Field,
         values: &[&Value],
     ) -> Result<Arc<dyn Array>, ColumnConversionError> {
-        Ok(match data_type {
+        Ok(match field.data_type() {
             DataType::Boolean => Arc::new(Self::json_to_boolean_array(values)),
             DataType::Int32 => Arc::new(Self::json_to_primitive_array::<Int32Type, _>(
                 values,
@@ -554,8 +562,17 @@ impl ResultSet {
                     None => Arc::new(array),
                 }
             }
-            // Every remaining Arrow type is rendered as its JSON text form.
-            _ => Arc::new(Self::json_to_string_array(values, Value::to_string)),
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                Arc::new(Self::json_to_interval_array(values)?)
+            }
+            DataType::Binary => Arc::new(Self::json_to_binary_array(values)),
+            other => {
+                return Err(ConversionError::SchemaMismatch(format!(
+                    "Column {} has Arrow type {other}, which no result set column maps to",
+                    field.name()
+                ))
+                .into())
+            }
         })
     }
 
@@ -577,6 +594,38 @@ impl ResultSet {
         let mut builder = BooleanBuilder::with_capacity(values.len());
         for value in values {
             builder.append_option(value.as_bool());
+        }
+        builder.finish()
+    }
+
+    /// Build an INTERVAL array from the text Exasol sends, failing on a value that is not an INTERVAL string.
+    fn json_to_interval_array(
+        values: &[&Value],
+    ) -> Result<IntervalMonthDayNanoArray, ColumnConversionError> {
+        let mut builder = IntervalMonthDayNanoBuilder::with_capacity(values.len());
+        for (row, value) in values.iter().enumerate() {
+            match value {
+                Value::Null => builder.append_null(),
+                Value::String(text) => builder.append_value(
+                    parse_interval(text)
+                        .map_err(|reason| ColumnConversionError::invalid_value(row, reason))?,
+                ),
+                other => {
+                    return Err(ColumnConversionError::invalid_value(
+                        row,
+                        format!("Expected an INTERVAL string, got {other}"),
+                    ))
+                }
+            }
+        }
+        Ok(builder.finish())
+    }
+
+    /// Build a Binary array from the text bytes of each JSON string, treating any other value as NULL.
+    fn json_to_binary_array(values: &[&Value]) -> BinaryArray {
+        let mut builder = BinaryBuilder::new();
+        for value in values {
+            builder.append_option(value.as_str().map(str::as_bytes));
         }
         builder.finish()
     }
@@ -874,6 +923,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 
@@ -1989,8 +2039,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_column_major_to_record_batch_unsupported_type_returns_error() {
-        // Test that unsupported types (like LargeUtf8) result in an ArrowError
-        // because the fallback creates a StringArray which doesn't match the schema
         let schema = Arc::new(Schema::new(vec![Field::new(
             "large_text",
             arrow::datatypes::DataType::LargeUtf8,
@@ -2001,9 +2049,9 @@ mod tests {
 
         let result = ResultSet::column_major_to_record_batch(&rows, &schema);
 
-        // Unsupported types cause an error because the fallback creates a StringArray
-        // which doesn't match the expected LargeUtf8 type in the schema
-        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("LargeUtf8"));
+        assert!(message.contains("large_text"));
     }
 
     // =========================================================================
@@ -2731,36 +2779,129 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_to_record_batch_keeps_utf8_column_under_interval_schema_field() {
+    fn test_payload_to_record_batch_keeps_int64_column_under_decimal_schema_field() {
         let batch_schema = Arc::new(Schema::new(vec![Field::new(
-            "IV",
-            arrow::datatypes::DataType::Utf8,
+            "N",
+            arrow::datatypes::DataType::Int64,
             true,
         )]));
         let batch = RecordBatch::try_new(
             batch_schema,
-            vec![Arc::new(StringArray::from(vec!["3 04:05:06.789"]))],
+            vec![Arc::new(arrow::array::Int64Array::from(vec![42]))],
         )
         .unwrap();
         let schema = metadata_schema_of(&[ColumnInfo {
-            name: "IV".to_string(),
-            data_type: plain_type("INTERVAL DAY TO SECOND"),
+            name: "N".to_string(),
+            data_type: crate::transport::messages::DataType::decimal(18, 0),
         }]);
-        assert!(matches!(
+        assert_eq!(
             schema.field(0).data_type(),
-            arrow::datatypes::DataType::Interval(_)
-        ));
+            &arrow::datatypes::DataType::Decimal128(18, 0)
+        );
 
         let converted =
             ResultSet::payload_to_record_batch(&arrow_payload(batch.clone()), &schema).unwrap();
 
         let field = converted.schema().field(0).clone();
-        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
-        assert_eq!(
-            field.metadata().get("exasol:type_name").unwrap(),
-            "INTERVAL DAY TO SECOND"
-        );
+        assert_eq!(field.data_type(), &arrow::datatypes::DataType::Int64);
+        assert_eq!(field.metadata().get("exasol:type_name").unwrap(), "DECIMAL");
         assert!(Arc::ptr_eq(converted.column(0), batch.column(0)));
+    }
+
+    fn json_batch_of(
+        type_name: &str,
+        values: Vec<serde_json::Value>,
+    ) -> Result<RecordBatch, ConversionError> {
+        let schema = metadata_schema_of(&[ColumnInfo {
+            name: "IV_COL".to_string(),
+            data_type: plain_type(type_name),
+        }]);
+        let rows: Vec<Vec<serde_json::Value>> = values.into_iter().map(|v| vec![v]).collect();
+        ResultSet::column_major_to_record_batch(&rows, &schema)
+    }
+
+    #[test]
+    fn test_json_interval_columns_convert_to_month_day_nano() {
+        use arrow::array::IntervalMonthDayNanoArray;
+        use arrow::datatypes::IntervalMonthDayNano as Imdn;
+
+        let year_to_month =
+            json_batch_of("INTERVAL YEAR TO MONTH", vec![json!("+01-02"), json!(null)]).unwrap();
+        let array = year_to_month
+            .column(0)
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .unwrap();
+        assert_eq!(array.value(0), Imdn::new(14, 0, 0));
+        assert!(array.is_null(1));
+
+        let day_to_second =
+            json_batch_of("INTERVAL DAY TO SECOND", vec![json!("-03 04:05:06.789")]).unwrap();
+        let array = day_to_second
+            .column(0)
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .unwrap();
+        assert_eq!(array.value(0), Imdn::new(0, -3, -14_706_789_000_000));
+    }
+
+    #[test]
+    fn test_json_interval_beyond_month_range_fails_naming_the_column() {
+        let error = json_batch_of("INTERVAL YEAR TO MONTH", vec![json!("+999999999-11")])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("IV_COL"), "{error}");
+        assert!(error.contains("+999999999-11"), "{error}");
+    }
+
+    #[test]
+    fn test_json_interval_that_is_not_a_string_fails() {
+        assert!(json_batch_of("INTERVAL DAY TO SECOND", vec![json!(5)]).is_err());
+    }
+
+    #[test]
+    fn test_json_geometry_and_hashtype_columns_keep_text_bytes_as_binary() {
+        use arrow::array::BinaryArray;
+
+        for (type_name, text) in [
+            ("GEOMETRY", "POINT (1 2)"),
+            ("HASHTYPE", "550e8400e29b11d4a716446655440000"),
+        ] {
+            let batch = json_batch_of(type_name, vec![json!(text), json!(null)]).unwrap();
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            assert_eq!(array.value(0), text.as_bytes());
+            assert!(array.is_null(1));
+        }
+    }
+
+    #[test]
+    fn test_exasol_type_of_reads_the_geometry_srid() {
+        let with_srid = crate::transport::messages::DataType {
+            srid: Some(4326),
+            ..plain_type("GEOMETRY")
+        };
+        assert_eq!(
+            exasol_type_of(&with_srid).unwrap(),
+            ExasolType::Geometry { srid: Some(4326) }
+        );
+        assert_eq!(
+            exasol_type_of(&plain_type("GEOMETRY")).unwrap(),
+            ExasolType::Geometry { srid: None }
+        );
+    }
+
+    #[test]
+    fn test_data_type_deserializes_the_geometry_srid() {
+        let data_type: crate::transport::messages::DataType =
+            serde_json::from_str(r#"{"type":"GEOMETRY","size":2000000,"srid":4326}"#).unwrap();
+
+        assert_eq!(data_type.srid, Some(4326));
+        assert_eq!(data_type.size, Some(2000000));
     }
 
     #[test]

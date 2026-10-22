@@ -4196,35 +4196,58 @@ async fn test_result_set_fields_carry_exasol_column_metadata() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// Scenario: Field metadata on the native transport keeps the decoded Arrow data type
+/// Scenario: INTERVAL DAY TO SECOND field metadata carries the fractional second precision
+/// Scenario: GEOMETRY field metadata carries the SRID that Exasol reports
 #[cfg(feature = "native")]
 #[tokio::test]
-async fn test_native_interval_field_keeps_utf8_and_carries_exasol_metadata() {
+async fn test_native_type_parameters_in_field_metadata() {
     skip_if_no_exasol!();
 
     let mut conn = get_test_connection_with_transport("native")
         .await
         .expect("Failed to connect");
 
-    let batches = conn
-        .query("SELECT CAST('3 04:05:06.789' AS INTERVAL DAY TO SECOND) AS IV")
-        .await
-        .expect("INTERVAL query should succeed");
+    for (sql, columns) in [
+        (
+            "SELECT CAST('3 04:05:06.789123' AS INTERVAL DAY(2) TO SECOND(6)) AS IV",
+            vec![(
+                "IV",
+                "INTERVAL DAY TO SECOND",
+                ExasolType::IntervalDayToSecond { precision: 6 },
+            )],
+        ),
+        (
+            "SELECT CAST('POINT(1 2)' AS GEOMETRY(4326)) AS G1, CAST('POINT(1 2)' AS GEOMETRY) AS G0",
+            vec![
+                ("G1", "GEOMETRY", ExasolType::Geometry { srid: None }),
+                ("G0", "GEOMETRY", ExasolType::Geometry { srid: None }),
+            ],
+        ),
+    ] {
+        let (metadata_schema, batches) = common::metadata_schema_and_batches(&mut conn, sql).await;
+        assert_eq!(batches[0].num_rows(), 1);
 
-    assert_eq!(batches[0].num_rows(), 1);
-    let batch_schema = batches[0].schema();
-    let field = batch_schema.field_with_name("IV").expect("field IV");
-    assert_eq!(field.data_type(), &DataType::Utf8);
-    assert_eq!(
-        field.metadata().get("exasol:type_name").map(String::as_str),
-        Some("INTERVAL DAY TO SECOND")
-    );
-    let values = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("IV should be a string column");
-    assert!(!values.is_null(0));
+        for schema in [metadata_schema, batches[0].schema()] {
+            for (name, type_name, expected) in &columns {
+                let field = schema.field_with_name(name).expect("field");
+                assert_eq!(
+                    field.metadata().get("exasol:type_name").map(String::as_str),
+                    Some(*type_name),
+                    "{name}"
+                );
+                assert_eq!(
+                    field.metadata().get("exasol:srid"),
+                    None,
+                    "the native protocol sends no SRID for {name}"
+                );
+                assert_eq!(
+                    TypeMapper::from_field_metadata(field.metadata()).as_ref(),
+                    Some(expected),
+                    "{name}"
+                );
+            }
+        }
+    }
 
     conn.close().await.expect("Failed to close connection");
 }

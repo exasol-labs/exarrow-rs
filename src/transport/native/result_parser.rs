@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder,
-    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    Int32Builder, Int64Builder, IntervalMonthDayNanoBuilder, StringBuilder,
+    TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType as ArrowDataType, Field, IntervalUnit, Schema, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::error::TransportError;
+use crate::types::conversion::parse_interval;
 
 use super::constants::{
     IS_VARCHAR, PARAMETER_DESCRIPTION, R_COLUMN_COUNT, R_EMPTY, R_EXCEPTION, R_HANDLE, R_MORE_ROWS,
@@ -29,6 +31,8 @@ pub struct NativeColumnMeta {
     pub scale: Option<i32>,
     pub is_varchar: bool,
     pub max_len: Option<i32>,
+    /// Declared fractional second precision of an INTERVAL DAY TO SECOND column.
+    pub interval_fraction: Option<i32>,
 }
 
 /// Parsed response from the native protocol.
@@ -425,6 +429,7 @@ fn parse_column_meta(data: &[u8], offset: &mut usize) -> Result<NativeColumnMeta
     let mut scale = None;
     let mut is_varchar = false;
     let mut max_len = None;
+    let mut interval_fraction = None;
 
     match type_id {
         T_DECIMAL | T_SMALLDECIMAL | T_BIGDECIMAL => {
@@ -474,7 +479,7 @@ fn parse_column_meta(data: &[u8], offset: &mut usize) -> Result<NativeColumnMeta
             let _octet_len = read_i32(data, offset)?;
             // Protocol v19+: datetimeIntervalPrecision(4) + datetimeIntervalFraction(4)
             let _interval_precision = read_i32(data, offset)?;
-            let _interval_fraction = read_i32(data, offset)?;
+            interval_fraction = Some(read_i32(data, offset)?);
         }
         T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC => {
             // Protocol v19+: precision(4)
@@ -490,6 +495,7 @@ fn parse_column_meta(data: &[u8], offset: &mut usize) -> Result<NativeColumnMeta
         scale,
         is_varchar,
         max_len,
+        interval_fraction,
     })
 }
 
@@ -582,9 +588,10 @@ fn decimal_precision_scale(meta: &NativeColumnMeta, default_precision: i32) -> (
 
 /// Parse one column worth of wire bytes directly into an Arrow array.
 ///
-/// Types with no binary wire representation of their own — CHAR, GEOMETRY, HASHTYPE,
-/// both INTERVAL kinds, and any type id this driver does not recognise — decode as
-/// length-prefixed UTF-8 strings.
+/// Types that Exasol sends as length-prefixed text convert to the Arrow type of
+/// `TypeMapper::exasol_to_arrow`: both INTERVAL kinds parse into Interval(MonthDayNano),
+/// and GEOMETRY and HASHTYPE keep their text bytes in Binary. CHAR and any type id this
+/// driver does not recognise decode as UTF-8 strings.
 fn fill_column_builder(
     data: &[u8],
     offset: &mut usize,
@@ -597,7 +604,12 @@ fn fill_column_builder(
         T_INTEGER => fill_integer_column(data, offset, &meta.name, num_rows),
         T_SMALLINT => fill_smallint_column(data, offset, &meta.name, num_rows),
         T_BOOLEAN => fill_boolean_column(data, offset, &meta.name, num_rows),
-        T_BINARY => fill_binary_column(data, offset, &meta.name, num_rows),
+        T_BINARY | T_GEOMETRY | T_HASHTYPE => {
+            fill_binary_column(data, offset, &meta.name, num_rows)
+        }
+        T_INTERVAL_YEAR | T_INTERVAL_DAY => {
+            fill_interval_column(data, offset, &meta.name, num_rows)
+        }
         T_SMALLDECIMAL => fill_smalldecimal_column(data, offset, meta, num_rows),
         T_DECIMAL => fill_decimal_column(data, offset, meta, num_rows),
         T_BIGDECIMAL => fill_bigdecimal_column(data, offset, meta, num_rows),
@@ -725,6 +737,41 @@ fn fill_binary_column(
     }
     Ok((
         Field::new(name, ArrowDataType::Binary, true),
+        Arc::new(builder.finish()),
+    ))
+}
+
+fn fill_interval_column(
+    data: &[u8],
+    offset: &mut usize,
+    name: &str,
+    num_rows: usize,
+) -> Result<BuiltColumn, TransportError> {
+    let mut builder = IntervalMonthDayNanoBuilder::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        if read_u8(data, offset)? == 0 {
+            builder.append_null();
+        } else {
+            let bytes = read_length_prefixed(data, offset, "Interval data truncated")?;
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                TransportError::ProtocolError(format!(
+                    "Invalid UTF-8 in INTERVAL column {name}: {e}"
+                ))
+            })?;
+            let interval = parse_interval(text).map_err(|reason| {
+                TransportError::ProtocolError(format!(
+                    "Invalid INTERVAL value '{text}' in column {name}: {reason}"
+                ))
+            })?;
+            builder.append_value(interval);
+        }
+    }
+    Ok((
+        Field::new(
+            name,
+            ArrowDataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        ),
         Arc::new(builder.finish()),
     ))
 }
@@ -1331,6 +1378,7 @@ mod tests {
                 assert_eq!(columns.len(), 1);
                 assert_eq!(columns[0].name, "interval_col");
                 assert_eq!(columns[0].type_id, T_INTERVAL_YEAR);
+                assert_eq!(columns[0].interval_fraction, None);
             }
             _ => panic!("Expected ResultSet"),
         }
@@ -1345,7 +1393,7 @@ mod tests {
         extra.extend_from_slice(&29i32.to_le_bytes()); // maxLen
         extra.extend_from_slice(&29i32.to_le_bytes()); // octetLen
         extra.extend_from_slice(&2i32.to_le_bytes()); // intervalPrecision
-        extra.extend_from_slice(&3i32.to_le_bytes()); // intervalFraction
+        extra.extend_from_slice(&6i32.to_le_bytes()); // intervalFraction
 
         let columns = vec![("interval_day_col", T_INTERVAL_DAY, extra)];
         let data = build_result_set_header(&columns);
@@ -1356,6 +1404,7 @@ mod tests {
                 assert_eq!(columns.len(), 1);
                 assert_eq!(columns[0].name, "interval_day_col");
                 assert_eq!(columns[0].type_id, T_INTERVAL_DAY);
+                assert_eq!(columns[0].interval_fraction, Some(6));
             }
             _ => panic!("Expected ResultSet"),
         }
@@ -1512,6 +1561,7 @@ mod tests {
             scale,
             is_varchar: false,
             max_len: None,
+            interval_fraction: None,
         }
     }
 
@@ -1953,19 +2003,12 @@ mod tests {
     }
 
     #[test]
-    fn single_pass_string_like_types_all_decode_as_utf8() {
+    fn single_pass_text_types_without_an_arrow_mapping_decode_as_utf8() {
         use arrow::array::StringArray;
         use arrow::datatypes::DataType;
 
         const UNKNOWN_TYPE_ID: u32 = 9_999;
-        let string_like = [
-            T_CHAR,
-            T_GEOMETRY,
-            T_HASHTYPE,
-            T_INTERVAL_YEAR,
-            T_INTERVAL_DAY,
-            UNKNOWN_TYPE_ID,
-        ];
+        let string_like = [T_CHAR, UNKNOWN_TYPE_ID];
 
         for type_id in string_like {
             let columns = vec![meta("s", type_id, None, None)];
@@ -1988,6 +2031,116 @@ mod tests {
                 .unwrap();
             assert_eq!(arr.value(0), "ok", "type_id {type_id}");
             assert_eq!(offset, data.len(), "type_id {type_id}");
+        }
+    }
+
+    fn length_prefixed_values(values: &[Option<&str>]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for value in values {
+            match value {
+                Some(text) => {
+                    data.push(1u8);
+                    data.extend_from_slice(&(text.len() as i32).to_le_bytes());
+                    data.extend_from_slice(text.as_bytes());
+                }
+                None => data.push(0u8),
+            }
+        }
+        data
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for interval types
+    #[test]
+    fn single_pass_interval_columns_decode_to_month_day_nano() {
+        use arrow::array::{Array, IntervalMonthDayNanoArray};
+        use arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit};
+
+        let expected = [
+            (
+                T_INTERVAL_YEAR,
+                "+01-02",
+                IntervalMonthDayNano::new(14, 0, 0),
+            ),
+            (
+                T_INTERVAL_DAY,
+                "-03 04:05:06.789",
+                IntervalMonthDayNano::new(0, -3, -14_706_789_000_000),
+            ),
+        ];
+        for (type_id, text, interval) in expected {
+            let columns = vec![meta("i", type_id, None, None)];
+            let data = length_prefixed_values(&[Some(text), None]);
+
+            let mut offset = 0;
+            let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
+
+            assert_eq!(
+                batch.schema().field(0).data_type(),
+                &DataType::Interval(IntervalUnit::MonthDayNano)
+            );
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .unwrap();
+            assert_eq!(values.value(0), interval, "{text}");
+            assert!(values.is_null(1));
+            assert_eq!(offset, data.len());
+        }
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for interval types
+    #[test]
+    fn single_pass_interval_month_count_outside_i32_names_the_column() {
+        let columns = vec![meta("BIG", T_INTERVAL_YEAR, None, None)];
+        let data = length_prefixed_values(&[Some("+999999999-11")]);
+
+        let mut offset = 0;
+        let error = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("BIG"), "{message}");
+        assert!(message.contains("+999999999-11"), "{message}");
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for interval types
+    #[test]
+    fn single_pass_interval_text_that_is_not_an_interval_names_the_column() {
+        let columns = vec![meta("IV", T_INTERVAL_DAY, None, None)];
+        let data = length_prefixed_values(&[Some("garbage")]);
+
+        let mut offset = 0;
+        let error = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        assert!(error.to_string().contains("IV"), "{error}");
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for binary and geometry types
+    #[test]
+    fn single_pass_geometry_and_hashtype_columns_keep_their_text_bytes_in_binary() {
+        use arrow::array::{Array, BinaryArray};
+        use arrow::datatypes::DataType;
+
+        let expected = [
+            (T_GEOMETRY, "POINT (1 2)"),
+            (T_HASHTYPE, "550e8400e29b11d4a716446655440000"),
+        ];
+        for (type_id, text) in expected {
+            let columns = vec![meta("b", type_id, None, None)];
+            let data = length_prefixed_values(&[Some(text), None]);
+
+            let mut offset = 0;
+            let batch = build_batch_from_wire(&data, &mut offset, &columns, 2).unwrap();
+
+            assert_eq!(batch.schema().field(0).data_type(), &DataType::Binary);
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            assert_eq!(values.value(0), text.as_bytes());
+            assert!(values.is_null(1));
+            assert_eq!(offset, data.len());
         }
     }
 
@@ -2691,6 +2844,37 @@ mod tests {
         let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
 
         assert_eq!(protocol_message(err), "Binary data truncated");
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for interval types
+    #[test]
+    fn interval_value_longer_than_the_buffer_is_rejected() {
+        let columns = vec![meta("IV", T_INTERVAL_DAY, None, None)];
+        let mut data = vec![1u8];
+        data.extend_from_slice(&10i32.to_le_bytes());
+        data.extend_from_slice(b"ab");
+
+        let mut offset = 0;
+        let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        assert_eq!(protocol_message(err), "Interval data truncated");
+    }
+
+    /// Scenario: Direct binary to Arrow conversion for interval types
+    #[test]
+    fn non_utf8_interval_value_is_rejected() {
+        let columns = vec![meta("IV", T_INTERVAL_DAY, None, None)];
+        let mut data = vec![1u8];
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]);
+
+        let mut offset = 0;
+        let err = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap_err();
+
+        assert!(
+            protocol_message(err).starts_with("Invalid UTF-8 in INTERVAL column IV: "),
+            "unexpected message"
+        );
     }
 
     #[test]

@@ -398,6 +398,9 @@ pub struct DataType {
     /// Fraction (for interval types)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fraction: Option<i32>,
+    /// Spatial reference identifier (for GEOMETRY types)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srid: Option<i32>,
 }
 
 impl DataType {
@@ -411,6 +414,7 @@ impl DataType {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 
@@ -424,6 +428,7 @@ impl DataType {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 
@@ -437,6 +442,7 @@ impl DataType {
             character_set: Some("UTF8".to_string()),
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 
@@ -450,6 +456,7 @@ impl DataType {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 
@@ -1568,6 +1575,7 @@ mod tests {
                 character_set: None,
                 with_local_time_zone: None,
                 fraction: None,
+                srid: None,
             },
         }];
         let data = vec![vec![serde_json::json!(1), serde_json::json!(2)]];

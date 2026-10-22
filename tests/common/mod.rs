@@ -198,6 +198,25 @@ pub async fn get_test_connection() -> Result<Connection, exarrow_rs::error::Exas
     ))
 }
 
+/// Runs `sql` and returns the result set metadata schema and its batches.
+#[allow(dead_code)]
+pub async fn metadata_schema_and_batches(
+    conn: &mut Connection,
+    sql: &str,
+) -> (arrow::datatypes::SchemaRef, Vec<RecordBatch>) {
+    let result_set = conn.execute(sql).await.expect("query should succeed");
+    let metadata_schema = result_set
+        .metadata()
+        .expect("a SELECT has metadata")
+        .schema
+        .clone();
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+    (metadata_schema, batches)
+}
+
 /// The type that the default transport reports for a `TIMESTAMP WITH LOCAL TIME ZONE` column.
 ///
 /// The default transport is the one that `get_test_connection` selects: native when the `native`

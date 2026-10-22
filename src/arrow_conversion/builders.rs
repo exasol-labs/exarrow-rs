@@ -6,8 +6,8 @@
 use crate::error::{ColumnConversionError, ConversionError};
 use crate::types::{
     conversion::{
-        fractional_seconds_to_nanos, parse_date_to_days as parse_date_to_days_impl,
-        parse_decimal_to_i128 as parse_decimal_to_i128_impl,
+        parse_date_to_days as parse_date_to_days_impl,
+        parse_decimal_to_i128 as parse_decimal_to_i128_impl, parse_interval,
         parse_timestamp_to_micros as parse_timestamp_to_micros_impl,
     },
     ExasolType, TypeMapper,
@@ -70,8 +70,9 @@ fn build_typed_array(
         ExasolType::Timestamp {
             with_local_time_zone,
         } => build_timestamp_array(values, *with_local_time_zone),
-        ExasolType::IntervalYearToMonth => build_interval_year_to_month_array(values),
-        ExasolType::IntervalDayToSecond { .. } => build_interval_day_to_second_array(values),
+        ExasolType::IntervalYearToMonth | ExasolType::IntervalDayToSecond { .. } => {
+            build_interval_array(values)
+        }
         ExasolType::Geometry { .. } | ExasolType::Hashtype { .. } => build_binary_array(values),
     }
 }
@@ -342,23 +343,15 @@ fn parse_timestamp_to_micros(
         .map_err(|e| ColumnConversionError::invalid_value(row, e))
 }
 
-fn build_interval_year_to_month_array(
-    values: &[&Value],
-) -> Result<ArrayRef, ColumnConversionError> {
+fn build_interval_array(values: &[&Value]) -> Result<ArrayRef, ColumnConversionError> {
     let mut builder = IntervalMonthDayNanoBuilder::with_capacity(values.len());
 
     for (row, value) in values.iter().enumerate() {
         if value.is_null() {
             builder.append_null();
         } else if let Some(s) = value.as_str() {
-            // Parse format "+YY-MM" or "-YY-MM"
-            let months = parse_interval_year_to_month(s, row)?;
-            // IntervalMonthDayNano stores months as i32, days as i32, nanoseconds as i64
-            let interval = arrow::datatypes::IntervalMonthDayNano {
-                months,
-                days: 0,
-                nanoseconds: 0,
-            };
+            let interval =
+                parse_interval(s).map_err(|e| ColumnConversionError::invalid_value(row, e))?;
             builder.append_value(interval);
         } else {
             return Err(ColumnConversionError::invalid_value(
@@ -369,138 +362,6 @@ fn build_interval_year_to_month_array(
     }
 
     Ok(Arc::new(builder.finish()))
-}
-
-/// Parse INTERVAL YEAR TO MONTH string to months.
-fn parse_interval_year_to_month(
-    interval_str: &str,
-    row: usize,
-) -> Result<i32, ColumnConversionError> {
-    // Format: "+YY-MM" or "-YY-MM"
-    let is_negative = interval_str.starts_with('-');
-    let parts: Vec<&str> = interval_str
-        .trim_start_matches(&['+', '-'][..])
-        .split('-')
-        .collect();
-
-    if parts.len() != 2 {
-        return Err(ColumnConversionError::invalid_value(
-            row,
-            format!("Invalid interval format: {}", interval_str),
-        ));
-    }
-
-    let years: i32 = parts[0].parse().map_err(|_| {
-        ColumnConversionError::invalid_value(row, format!("Invalid years: {}", parts[0]))
-    })?;
-
-    let months: i32 = parts[1].parse().map_err(|_| {
-        ColumnConversionError::invalid_value(row, format!("Invalid months: {}", parts[1]))
-    })?;
-
-    let total_months = years * 12 + months;
-    Ok(if is_negative {
-        -total_months
-    } else {
-        total_months
-    })
-}
-
-fn build_interval_day_to_second_array(
-    values: &[&Value],
-) -> Result<ArrayRef, ColumnConversionError> {
-    let mut builder = IntervalMonthDayNanoBuilder::with_capacity(values.len());
-
-    for (row, value) in values.iter().enumerate() {
-        if value.is_null() {
-            builder.append_null();
-        } else if let Some(s) = value.as_str() {
-            // Parse format "+DD HH:MM:SS.ffffff"
-            let (days, nanos) = parse_interval_day_to_second(s, row)?;
-            // IntervalMonthDayNano stores months as i32, days as i32, nanoseconds as i64
-            let interval = arrow::datatypes::IntervalMonthDayNano {
-                months: 0,
-                days,
-                nanoseconds: nanos,
-            };
-            builder.append_value(interval);
-        } else {
-            return Err(ColumnConversionError::invalid_value(
-                row,
-                format!("Expected interval string, got: {:?}", value),
-            ));
-        }
-    }
-
-    Ok(Arc::new(builder.finish()))
-}
-
-/// Parse INTERVAL DAY TO SECOND string to (days, nanoseconds).
-fn parse_interval_day_to_second(
-    interval_str: &str,
-    row: usize,
-) -> Result<(i32, i64), ColumnConversionError> {
-    // Format: "+DD HH:MM:SS.ffffff" or "-DD HH:MM:SS.ffffff"
-    let is_negative = interval_str.starts_with('-');
-    let trimmed = interval_str.trim_start_matches(&['+', '-'][..]);
-    let segments: Vec<&str> = trimmed.split(' ').collect();
-
-    let days: i32 = segments[0].parse().map_err(|_| {
-        ColumnConversionError::invalid_value(row, format!("Invalid days: {}", segments[0]))
-    })?;
-
-    let nanos = match segments.get(1) {
-        Some(time_str) => parse_interval_time_to_nanos(time_str, row)?,
-        None => 0,
-    };
-
-    Ok(if is_negative {
-        (-days, -nanos)
-    } else {
-        (days, nanos)
-    })
-}
-
-/// Parse the "HH:MM[:SS[.fffffffff]]" part of an INTERVAL DAY TO SECOND to nanoseconds.
-///
-/// A part with fewer than two colon-separated fields carries no recognizable
-/// time and contributes zero, matching Exasol's day-only interval literals.
-fn parse_interval_time_to_nanos(time_str: &str, row: usize) -> Result<i64, ColumnConversionError> {
-    let time_parts: Vec<&str> = time_str.split(':').collect();
-    if time_parts.len() < 2 {
-        return Ok(0);
-    }
-
-    let hours: i64 = time_parts[0].parse().map_err(|_| {
-        ColumnConversionError::invalid_value(row, format!("Invalid hours: {}", time_parts[0]))
-    })?;
-
-    let minutes: i64 = time_parts[1].parse().map_err(|_| {
-        ColumnConversionError::invalid_value(row, format!("Invalid minutes: {}", time_parts[1]))
-    })?;
-
-    let mut nanos = hours * 3600 * 1_000_000_000 + minutes * 60 * 1_000_000_000;
-    if let Some(seconds_field) = time_parts.get(2) {
-        nanos += parse_interval_seconds_to_nanos(seconds_field, row)?;
-    }
-    Ok(nanos)
-}
-
-/// Parse the "SS[.fffffffff]" seconds field of an INTERVAL DAY TO SECOND to nanoseconds.
-fn parse_interval_seconds_to_nanos(
-    seconds_field: &str,
-    row: usize,
-) -> Result<i64, ColumnConversionError> {
-    let sec_parts: Vec<&str> = seconds_field.split('.').collect();
-    let seconds: i64 = sec_parts[0].parse().map_err(|_| {
-        ColumnConversionError::invalid_value(row, format!("Invalid seconds: {}", sec_parts[0]))
-    })?;
-
-    let mut nanos = seconds * 1_000_000_000;
-    if let Some(fraction) = sec_parts.get(1) {
-        nanos += fractional_seconds_to_nanos(fraction);
-    }
-    Ok(nanos)
 }
 
 fn build_binary_array(values: &[&Value]) -> Result<ArrayRef, ColumnConversionError> {
@@ -645,25 +506,6 @@ mod tests {
         // 1970-01-01 00:00:01 should be 1,000,000 microseconds
         let micros = parse_timestamp_to_micros("1970-01-01 00:00:01", 0).unwrap();
         assert_eq!(micros, 1_000_000);
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month() {
-        let months = parse_interval_year_to_month("+01-06", 0).unwrap();
-        assert_eq!(months, 18); // 1 year + 6 months
-
-        let months = parse_interval_year_to_month("-02-03", 0).unwrap();
-        assert_eq!(months, -27); // -(2 years + 3 months)
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second() {
-        let (days, nanos) = parse_interval_day_to_second("+01 12:30:45.123456789", 0).unwrap();
-        assert_eq!(days, 1);
-        assert_eq!(
-            nanos,
-            12 * 3600 * 1_000_000_000 + 30 * 60 * 1_000_000_000 + 45 * 1_000_000_000 + 123_456_789
-        );
     }
 
     #[test]
@@ -1290,233 +1132,41 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ==========================================================================
-    // Tests for build_interval_year_to_month_array
-    // ==========================================================================
-
     #[test]
-    fn test_build_interval_year_to_month_array_positive() {
-        let values = vec![json!("+01-06"), json!("+00-03")];
-        let refs = to_refs(&values);
-        let result = build_interval_year_to_month_array(&refs).unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.null_count(), 0);
-    }
-
-    #[test]
-    fn test_build_interval_year_to_month_array_negative() {
-        let values = vec![json!("-02-03"), json!("-00-11")];
-        let refs = to_refs(&values);
-        let result = build_interval_year_to_month_array(&refs).unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.null_count(), 0);
-    }
-
-    #[test]
-    fn test_build_interval_year_to_month_array_with_nulls() {
-        let values = vec![json!("+01-06"), json!(null), json!("-02-03")];
-        let refs = to_refs(&values);
-        let result = build_interval_year_to_month_array(&refs).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result.null_count(), 1);
-    }
-
-    #[test]
-    fn test_build_interval_year_to_month_array_invalid_not_string() {
+    fn test_build_interval_array_rejects_a_value_that_is_not_a_string() {
         let values = vec![json!(12345)];
         let refs = to_refs(&values);
-        let message =
-            conversion_failure_message(build_interval_year_to_month_array(&refs).unwrap_err());
+        let message = conversion_failure_message(build_interval_array(&refs).unwrap_err());
         assert!(message.contains("Expected interval string"), "{}", message);
     }
 
-    // ==========================================================================
-    // Tests for parse_interval_year_to_month
-    // ==========================================================================
-
     #[test]
-    fn test_parse_interval_year_to_month_zero_years() {
-        let months = parse_interval_year_to_month("+00-06", 0).unwrap();
-        assert_eq!(months, 6);
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_zero_months() {
-        let months = parse_interval_year_to_month("+05-00", 0).unwrap();
-        assert_eq!(months, 60);
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_large_value() {
-        let months = parse_interval_year_to_month("+99-11", 0).unwrap();
-        assert_eq!(months, 99 * 12 + 11);
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_negative_large_value() {
-        let months = parse_interval_year_to_month("-99-11", 0).unwrap();
-        assert_eq!(months, -(99 * 12 + 11));
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_invalid_format() {
-        let result = parse_interval_year_to_month("01-06", 0); // Missing sign
-                                                               // This should still work since we trim the sign
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_invalid_format_missing_parts() {
-        let result = parse_interval_year_to_month("+01", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_invalid_years() {
-        let result = parse_interval_year_to_month("+XX-06", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_interval_year_to_month_invalid_months() {
-        let result = parse_interval_year_to_month("+01-XX", 0);
-        assert!(result.is_err());
-    }
-
-    // ==========================================================================
-    // Tests for build_interval_day_to_second_array
-    // ==========================================================================
-
-    #[test]
-    fn test_build_interval_day_to_second_array_with_fractional_seconds() {
-        let values = vec![json!("+01 12:30:45.123456789")];
+    fn test_build_interval_array_stores_month_day_nano_values() {
+        let values = vec![json!("+01-02"), json!("-03 04:05:06.789"), json!(null)];
         let refs = to_refs(&values);
-        let result = build_interval_day_to_second_array(&refs).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.null_count(), 0);
-    }
-
-    #[test]
-    fn test_build_interval_day_to_second_array_without_fractional_seconds() {
-        let values = vec![json!("+01 12:30:45")];
-        let refs = to_refs(&values);
-        let result = build_interval_day_to_second_array(&refs).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.null_count(), 0);
-    }
-
-    #[test]
-    fn test_build_interval_day_to_second_array_negative() {
-        let values = vec![json!("-02 08:15:30.500000000")];
-        let refs = to_refs(&values);
-        let result = build_interval_day_to_second_array(&refs).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.null_count(), 0);
-    }
-
-    #[test]
-    fn test_build_interval_day_to_second_array_with_nulls() {
-        let values = vec![json!("+01 12:30:45"), json!(null), json!("-02 08:15:30")];
-        let refs = to_refs(&values);
-        let result = build_interval_day_to_second_array(&refs).unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result.null_count(), 1);
-    }
-
-    #[test]
-    fn test_build_interval_day_to_second_array_invalid_not_string() {
-        let values = vec![json!(12345)];
-        let refs = to_refs(&values);
-        let message =
-            conversion_failure_message(build_interval_day_to_second_array(&refs).unwrap_err());
-        assert!(message.contains("Expected interval string"), "{}", message);
-    }
-
-    // ==========================================================================
-    // Tests for parse_interval_day_to_second
-    // ==========================================================================
-
-    #[test]
-    fn test_parse_interval_day_to_second_days_only() {
-        let (days, nanos) = parse_interval_day_to_second("+05", 0).unwrap();
-        assert_eq!(days, 5);
-        assert_eq!(nanos, 0);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_hours_minutes_only() {
-        let (days, nanos) = parse_interval_day_to_second("+01 12:30", 0).unwrap();
-        assert_eq!(days, 1);
-        assert_eq!(nanos, 12 * 3600 * 1_000_000_000 + 30 * 60 * 1_000_000_000);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_negative_values() {
-        let (days, nanos) = parse_interval_day_to_second("-03 06:15:30", 0).unwrap();
-        assert_eq!(days, -3);
+        let result = build_interval_array(&refs).unwrap();
+        let intervals = result
+            .as_any()
+            .downcast_ref::<arrow::array::IntervalMonthDayNanoArray>()
+            .unwrap();
         assert_eq!(
-            nanos,
-            -(6 * 3600 * 1_000_000_000 + 15 * 60 * 1_000_000_000 + 30 * 1_000_000_000)
+            intervals.value(0),
+            arrow::datatypes::IntervalMonthDayNano::new(14, 0, 0)
         );
+        assert_eq!(
+            intervals.value(1),
+            arrow::datatypes::IntervalMonthDayNano::new(0, -3, -14_706_789_000_000)
+        );
+        assert!(arrow::array::Array::is_null(intervals, 2));
     }
 
     #[test]
-    fn test_parse_interval_day_to_second_with_fractional_3_digits() {
-        let (days, nanos) = parse_interval_day_to_second("+00 00:00:00.123", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, 123_000_000);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_with_fractional_6_digits() {
-        let (days, nanos) = parse_interval_day_to_second("+00 00:00:00.123456", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, 123_456_000);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_with_fractional_9_digits() {
-        let (days, nanos) = parse_interval_day_to_second("+00 00:00:00.123456789", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, 123_456_789);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_with_fractional_12_digits() {
-        // Only first 9 digits should be used
-        let (days, nanos) = parse_interval_day_to_second("+00 00:00:00.123456789012", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, 123_456_789);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_empty_string() {
-        let result = parse_interval_day_to_second("", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_invalid_days() {
-        let result = parse_interval_day_to_second("+XX 12:30:45", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_invalid_hours() {
-        let result = parse_interval_day_to_second("+01 XX:30:45", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_invalid_minutes() {
-        let result = parse_interval_day_to_second("+01 12:XX:45", 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_invalid_seconds() {
-        let result = parse_interval_day_to_second("+01 12:30:XX", 0);
-        assert!(result.is_err());
+    fn test_build_interval_array_rejects_month_count_outside_i32_range() {
+        let values = vec![json!("+01-02"), json!("+999999999-11")];
+        let refs = to_refs(&values);
+        let (row, message) = value_conversion_failure(build_interval_array(&refs).unwrap_err());
+        assert_eq!(row, 1);
+        assert!(message.contains("out of range"), "{}", message);
     }
 
     // ==========================================================================
@@ -1695,73 +1345,6 @@ mod tests {
     fn test_validate_decimal_precision_allows_one_leading_zero() {
         // "0.12" carries 3 raw digits for precision 2, which is tolerated
         assert!(validate_decimal_precision("0.12", 2, 2, 0).is_ok());
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_time_without_colon_is_ignored() {
-        // A time segment with fewer than two colon-separated fields adds no nanoseconds
-        let (days, nanos) = parse_interval_day_to_second("+01 12", 0).unwrap();
-        assert_eq!(days, 1);
-        assert_eq!(nanos, 0);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_ignores_segments_after_the_time() {
-        let (days, nanos) = parse_interval_day_to_second("+01 01:00:00 extra", 0).unwrap();
-        assert_eq!(days, 1);
-        assert_eq!(nanos, 3600 * 1_000_000_000);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_ignores_fields_after_the_seconds() {
-        let (days, nanos) = parse_interval_day_to_second("+00 00:00:01:99", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, 1_000_000_000);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_empty_string_reports_invalid_days() {
-        let (row, message) =
-            value_conversion_failure(parse_interval_day_to_second("", 2).unwrap_err());
-        assert_eq!(row, 2);
-        assert_eq!(message, "Invalid days: ");
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_reports_invalid_hours() {
-        let message =
-            conversion_failure_message(parse_interval_day_to_second("+01 XX:30", 0).unwrap_err());
-        assert_eq!(message, "Invalid hours: XX");
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_reports_invalid_minutes() {
-        let message =
-            conversion_failure_message(parse_interval_day_to_second("+01 12:XX", 0).unwrap_err());
-        assert_eq!(message, "Invalid minutes: XX");
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_reports_invalid_seconds() {
-        let message = conversion_failure_message(
-            parse_interval_day_to_second("+01 12:30:XX", 0).unwrap_err(),
-        );
-        assert_eq!(message, "Invalid seconds: XX");
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_non_numeric_fraction_counts_as_zero() {
-        let (days, nanos) = parse_interval_day_to_second("+00 00:00:01.abc", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, 1_000_000_000);
-    }
-
-    #[test]
-    fn test_parse_interval_day_to_second_negative_nanos_only() {
-        // The sign applies to both components even when days are zero
-        let (days, nanos) = parse_interval_day_to_second("-00 01:00:00", 0).unwrap();
-        assert_eq!(days, 0);
-        assert_eq!(nanos, -3600 * 1_000_000_000);
     }
 
     #[test]
