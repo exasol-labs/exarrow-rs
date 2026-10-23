@@ -16,7 +16,7 @@
 
 ### Decision
 
-`Statement` scans SQL with a private linear-pass state machine, `scan_placeholders`. It tracks five states: `Normal`, `SingleQuoted`, `DoubleQuoted`, `LineComment`, and `BlockComment`. Only a `?` in the `Normal` state is a placeholder.
+The driver scans SQL once with a linear state machine. It counts a `?` as a placeholder only outside string literals, quoted identifiers, and comments.
 
 ### Options Considered
 
@@ -28,4 +28,4 @@
 
 ### Consequences
 
-The scanner handles `''` and `""` escapes and is safe on multi-byte UTF-8.
+- Quote escapes and multi-byte UTF-8 text scan correctly.

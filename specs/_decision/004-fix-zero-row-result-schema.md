@@ -12,11 +12,11 @@
 
 ### Context
 
-`ResultSet::from_transport_result` returned an empty `Vec<RecordBatch>` when the first payload had no rows, so the schema existed only on `QueryMetadata`. Consumers that read the schema from batches, such as the ADBC FFI `FfiStatement::execute`, saw an empty schema. dbt Fusion probes columns with `SELECT * FROM (...) WHERE FALSE LIMIT 0`, so it saw zero columns and failed snapshots, contracts, unit tests, and `get_columns_in_query`.
+A query that returns no rows produced no batches, so consumers that read the schema from batches saw zero columns. Column-probing tools such as dbt fail on this.
 
 ### Decision
 
-`from_transport_result` always emits at least one batch. When the payload has no rows, it builds a zero-row batch from the column schema with the `empty_record_batch` helper.
+A result set always holds at least one batch. When a result has no rows, the driver emits a zero-row batch that carries the column schema.
 
 ### Options Considered
 
