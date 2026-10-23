@@ -8,11 +8,11 @@
 
 ### Context
 
-This decision scopes `specs/_decision/008-remove-query-timeout.md` and does not supersede it. That ADR bans client-side timers for `ConnectionParams::query_timeout` and `Statement::timeout_ms`, which map to the server `queryTimeout` attribute. CSV export has no server attribute that bounds the caller's callback or a stalled tunnel. `src/transport/http_transport.rs` has no read timeout.
+This decision scopes `server-enforced-query-timeout` and does not supersede it. That ADR bans client-side timers for query and statement timeouts. CSV export has no server setting that bounds the caller's callback or a stalled tunnel.
 
 ### Decision
 
-`CsvExportOptions::timeout_ms` is `Option<u64>` milliseconds, default `None`, and the builder keeps its `u64` argument. `Some(ms)` arms a client-side `tokio::time::timeout` around SQL execution, tunnel transfer, and the callback. The `session-and-lifecycle` Background limits its timer prohibition to `Connection::execute_statement()` and points to the export setting in `import-export/csv-export`.
+CSV export keeps an optional client-side timeout, off by default. When set, it bounds SQL execution, tunnel transfer, and the callback together.
 
 ### Options Considered
 

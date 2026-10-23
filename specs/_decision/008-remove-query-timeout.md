@@ -12,7 +12,7 @@ A `Connection` owns one WebSocket transport with no request pooling. Wrapping `e
 
 ### Decision
 
-Exasol enforces the query timeout. The driver forwards a configured timeout as the `queryTimeout` session attribute, and the server reports an abort through the normal response. No client-side timer exists in `execute_statement`. `TransportProtocol::set_query_timeout` sets the attribute through `setAttributes`, as `set_autocommit` does. One mechanism serves the connection-level set and the per-statement reconcile.
+Exasol enforces the query timeout. The driver forwards a configured timeout to the server as a session attribute, and the server reports an abort as a normal error. The driver runs no client-side timer during statement execution.
 
 ### Options Considered
 
@@ -23,7 +23,9 @@ Exasol enforces the query timeout. The driver forwards a configured timeout as t
 
 ### Consequences
 
-The connection survives a query timeout. `ConnectionParams::query_timeout` is `Option<Duration>` and `Statement::timeout_ms` is `Option<u64>`. `Some` sets the attribute and `None` sets none. The type change from `Duration` is breaking and is noted in the CHANGELOG. `execute_statement` reconciles the statement timeout against the applied value in `SessionConfig::query_timeout` in both directions, rounds sub-second values up to 1s, and resets with `set_query_timeout(0)` for `None`, so a prior timeout never leaks onto a later untimed statement.
+- The connection survives a query timeout.
+- Statement execution has no client timer.
+- The timeout settings change type, which is breaking and is noted in the CHANGELOG.
 
 ## ADR: Client-side give-up on a running query MUST terminate the connection
 

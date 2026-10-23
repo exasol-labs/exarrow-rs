@@ -18,7 +18,7 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 
 1. **ADBC-compatible database connectivity**: standard Driver/Database/Connection/Statement hierarchy over Exasol's native TCP protocol (default) or WebSocket protocol (opt-in fallback)
 2. **Bulk import/export via HTTP tunneling**: high-throughput data transfer for CSV, Parquet, and Arrow RecordBatch formats with parallel file support and optional automatic creation of the target table on import
-3. **Arrow-native type conversion**: bidirectional mapping between Exasol and Arrow type systems with precision preservation
+3. **Arrow-native type conversion**: bidirectional mapping between Exasol and Arrow type systems with precision preservation, and an `exasol:` field-metadata contract on every result field that records the Exasol type
 4. **FFI export for driver manager integration**: cdylib build target enabling any ADBC driver manager to load and use the driver
 5. **Prepared statement support**: type-safe parameter binding, single and batch execution over the native TCP protocol (default) or the WebSocket protocol
 6. **Metadata lookup**: ADBC catalog, schema, and column discovery through GetObjects, table schema lookup, and parameter schema lookup after prepare
@@ -26,6 +26,7 @@ Exasol lacks an Arrow-native driver. Existing connectors require row-based data 
 8. **ADBC bulk ingestion**: ingest Arrow data into a target table through the standard Statement with IngestMode Append, Create, CreateAppend, or Replace, generating table DDL from the Arrow schema
 9. **Authentication and session setup**: username and password login (RSA-encrypted password on the native protocol), no credential logging, and a default schema from the URI or connection parameters that must exist, set as a session attribute on connect
 10. **Query execution and server version gating**: SQL execution with placeholder parsing that skips literals, comments, and quoted identifiers, and feature gating on the server release version
+11. **Connection security, timeouts, and session lifecycle**: TLS on by default with server certificate validation or a SHA-256 fingerprint match, one connection deadline that covers connect, TLS handshake, WebSocket upgrade, and login and names the step that ran out, a query timeout that Exasol enforces, and explicit session states (Ready, InTransaction, Closing, Closed) where a failed statement leaves the session usable
 
 ## Out of Scope
 
