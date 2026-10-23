@@ -1078,7 +1078,9 @@ fn read_i128(data: &[u8], offset: &mut usize) -> Result<i128, TransportError> {
 #[cfg(test)]
 mod tests {
     use super::super::arrow_builder::native_meta_to_data_type;
-    use super::super::constants::{IS_UTF8, SMALL_RESULTSET};
+    use super::super::constants::{
+        INTEGER_DECIMAL_PRECISION, IS_UTF8, SMALLINT_DECIMAL_PRECISION, SMALL_RESULTSET,
+    };
     use super::*;
 
     #[test]
@@ -1862,6 +1864,7 @@ mod tests {
         assert_eq!(arr.value_as_string(0), "123.45");
     }
 
+    /// Scenario: Direct binary to Arrow conversion for numeric types
     #[test]
     fn single_pass_smalldecimal_uses_i32_wire_and_decimal128() {
         use arrow::array::{Array, Decimal128Array};
@@ -2004,15 +2007,22 @@ mod tests {
     /// Scenario: Direct binary to Arrow conversion for numeric types
     #[test]
     fn integer_wire_types_take_the_arrow_type_of_their_reported_decimal() {
-        use crate::query::results::exasol_type_of;
-        use crate::types::TypeMapper;
+        use arrow::datatypes::DataType;
 
-        for type_id in [T_INTEGER, T_SMALLINT] {
+        for (type_id, precision) in [
+            (T_INTEGER, INTEGER_DECIMAL_PRECISION),
+            (T_SMALLINT, SMALLINT_DECIMAL_PRECISION),
+        ] {
             let column = meta("n", type_id, None, None);
-            let exasol_type = exasol_type_of(&native_meta_to_data_type(&column)).unwrap();
-            let reported = TypeMapper::exasol_to_arrow(&exasol_type, true).unwrap();
+            let reported = native_meta_to_data_type(&column);
+            assert_eq!(reported.type_name, "DECIMAL");
+            assert_eq!(reported.precision, Some(precision));
+            assert_eq!(reported.scale, Some(0));
             let batch = build_batch_from_wire(&[], &mut 0, &[column], 0).unwrap();
-            assert_eq!(batch.schema().field(0).data_type(), &reported);
+            assert_eq!(
+                batch.schema().field(0).data_type(),
+                &DataType::Decimal128(precision as u8, 0)
+            );
         }
     }
 
@@ -2223,6 +2233,7 @@ mod tests {
         }
     }
 
+    /// Scenario: Direct binary to Arrow conversion for numeric types
     #[test]
     fn single_pass_bigdecimal_preserves_i128() {
         use arrow::array::Decimal128Array;
