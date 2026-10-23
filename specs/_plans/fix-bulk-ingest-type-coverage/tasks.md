@@ -25,10 +25,10 @@
 - [x] 3.4 `CHANGELOG.md` 0.29.0 section
 
 ## Phase 3: Verification
-- [ ] 4.1 Build, unit tests (default, websocket, ffi), lint, format
-- [x] 4.2 Integration suites against Docker Exasol
-- [x] 4.3 Coverage floors
-- [x] 4.4 Manual scripts M1, M2
+- [x] 5.1 Build, unit tests (default, websocket, ffi), lint, format
+- [x] 5.2 Integration suites against Docker Exasol
+- [x] 5.3 Coverage floors
+- [x] 5.4 Manual scripts M1, M2
 
 ## Phase 4: Review Fixes
 - [x] 4.1 In `src/types/conversion.rs`, add the constants `MILLIS_PER_SECOND`, `MILLIS_PER_MINUTE`, `MILLIS_PER_HOUR`, `SECONDS_PER_MINUTE`, `MINUTES_PER_HOUR`, use them in `format_interval_day_to_second`, and use `MILLIS_PER_DAY` and `NANOS_PER_MILLISECOND` in the tests that repeat `86_400_000` and `1_000_000`
