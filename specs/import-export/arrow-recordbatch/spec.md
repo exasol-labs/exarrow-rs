@@ -4,7 +4,7 @@ Specifies Arrow RecordBatch import and export between applications and Exasol ta
 
 ## Background
 
-RecordBatch import converts data to CSV and streams it through the HTTP tunnel. Export converts the CSV from Exasol into RecordBatches whose schemas reflect Exasol column types.
+RecordBatch import converts data to CSV text with the import CSV conversion and streams it through the HTTP tunnel. Export converts the CSV from Exasol into RecordBatches whose schemas reflect Exasol column types.
 
 ## Scenarios
 
@@ -68,3 +68,12 @@ RecordBatch import converts data to CSV and streams it through the HTTP tunnel. 
 * *AND* the option builders MUST NOT expose `with_encryption()` (flag-style) or `use_encryption(bool)` aliases
 * *AND* the underlying option struct field SHALL be named `use_tls` (renamed from `use_encryption`) so that public field access uses the same vocabulary as the builder
 * *AND* the default value of `use_tls` SHALL remain `false`
+
+### Scenario: The import CSV conversion covers every Arrow type that has an Exasol column type
+
+* *GIVEN* a RecordBatch with one column of each of these Arrow types: Boolean, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Utf8, LargeUtf8, Utf8View, `Dictionary(Int8, Utf8)`, `Dictionary(UInt64, LargeUtf8)`, Binary, LargeBinary, BinaryView, `FixedSizeBinary(3)`, Date32, Date64, Timestamp of each time unit with and without a time zone, `Decimal128(36, 2)`, `Decimal256(36, 2)`, `Interval(YearMonth)`, `Interval(DayTime)`, and `Interval(MonthDayNano)`, plus the columns `Decimal128(38, 2)`, `Decimal128(38, -5)`, and `Decimal256(76, -10)`, which have no Exasol column type
+* *WHEN* the RecordBatch is converted to CSV for `import_from_record_batch`
+* *THEN* every column SHALL convert without an error, a Date64 value SHALL become the `YYYY-MM-DD` text of the day that holds it, so `1_577_836_800_000` ms becomes `2020-01-01`, and a Decimal256 value SHALL become its decimal text with the column's scale, so `-123456` at scale 2 becomes `-1234.56`
+* *AND* a decimal value with a negative scale SHALL become its integer digits followed by one zero per unit of negative scale, so `Decimal128(38, -5)` holding 10^37 becomes `1` followed by 42 zeros, and `Decimal256(76, -10)` holding 10^76 - 1 becomes 76 nines followed by 10 zeros
+* *AND* a Dictionary value SHALL become the text of the dictionary value its key refers to, a null key or a null dictionary value SHALL become the null marker, and a Utf8View value SHALL be written as the same Utf8 value is written, and a BinaryView or FixedSizeBinary value SHALL become the lowercase hexadecimal text of its bytes, as a Binary value does
+* *AND* a column whose Arrow type has no conversion, such as `Time32(Second)`, `Duration(Second)`, or `List(Int32)`, SHALL fail the import CSV conversion with `ImportError::ConversionError` that names the Arrow type

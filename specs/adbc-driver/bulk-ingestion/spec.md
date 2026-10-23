@@ -1,10 +1,10 @@
 # Feature: Bulk Ingestion
 
-Ingests Arrow RecordBatches into Exasol tables through the ADBC Statement, in create, append, replace, and schema-targeting modes.
+Ingests Arrow RecordBatches into Exasol tables through the ADBC Statement, in create, append, create-append, and replace modes, into a target schema of the single `EXA` catalog. The driver checks the target catalog and every bound column type before it sends the first SQL statement of an ingest, with the same column type rule in every mode.
 
 ## Background
 
-Exasol does not support `CREATE TEMPORARY TABLE`.
+Exasol does not support `CREATE TEMPORARY TABLE`. Exasol has one catalog, named `EXA`, and no binary column type. Exasol DECIMAL precision does not exceed 36, and Exasol INTERVAL DAY TO SECOND has no month component.
 
 ## Scenarios
 
@@ -81,3 +81,18 @@ Exasol does not support `CREATE TEMPORARY TABLE`.
 * *WHEN* the statement is executed
 * *THEN* the driver SHALL return an error with status `NotImplemented`
 * *AND* the error message SHALL indicate that Exasol does not support temporary tables
+
+### Scenario: Target catalog EXA is accepted in any letter case
+
+* *GIVEN* an ADBC statement with `IngestTargetTable` set to a table that does not exist, `IngestMode` `Create`, and Arrow data bound
+* *AND* the option `adbc.ingest.target_catalog` set to `EXA` or to `exa`
+* *WHEN* the statement is executed
+* *THEN* the driver SHALL create the table and ingest the bound rows, as it does without the option
+
+### Scenario: A target catalog other than EXA fails before any SQL statement
+
+* *GIVEN* an ADBC statement with `IngestTargetTable` set to a table that does not exist, `IngestMode` `Create`, and Arrow data bound
+* *AND* the option `adbc.ingest.target_catalog` set to `BOGUS`, to an empty string, or to a value that is not a string
+* *WHEN* the statement is executed
+* *THEN* the driver SHALL fail with `AdbcStatus::InvalidArguments`, and the error message SHALL state that Exasol has only the catalog `EXA`
+* *AND* the driver SHALL send no SQL statement to Exasol for the ingest, so no table SHALL exist afterwards
