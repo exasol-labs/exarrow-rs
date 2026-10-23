@@ -4,13 +4,17 @@
 //! values used across the codebase. The functions return simple `Result<T, String>`
 //! to allow callers to wrap errors into their specific error types.
 
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, IntervalMonthDayNano, TimeUnit};
 use chrono::Datelike;
 
 use crate::types::ExasolType;
 
 const MICROSECOND_DIGITS: usize = 6;
 const NANOSECOND_DIGITS: usize = 9;
+const MONTHS_PER_YEAR: i32 = 12;
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
+const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
 
 /// Parses a date string (YYYY-MM-DD) to days since Unix epoch (1970-01-01).
 ///
@@ -329,6 +333,102 @@ fn fractional_seconds_to_units(fraction: &str, unit_digits: usize) -> i64 {
     };
     let missing_digits = unit_digits - fraction.len();
     value.saturating_mul(10i64.pow(missing_digits as u32))
+}
+
+/// Parses the text of an Exasol INTERVAL value into an Arrow `IntervalMonthDayNano`.
+///
+/// Exasol sends YEAR TO MONTH as `+YY-MM` and DAY TO SECOND as
+/// `+DD HH:MM:SS.fff`, so the `-` between years and months, which only the
+/// first form holds after its sign, tells them apart. The sign applies to every
+/// component. A month count outside the `i32` range is an error rather than a
+/// wrapped value, because INTERVAL YEAR(9) reaches 999,999,999 years.
+pub fn parse_interval(text: &str) -> Result<IntervalMonthDayNano, String> {
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (months, days, nanoseconds) = if body.contains('-') {
+        (parse_interval_months(body, text)?, 0, 0)
+    } else {
+        let (days, nanoseconds) = parse_interval_days_and_nanos(body)?;
+        (0, days, nanoseconds)
+    };
+    Ok(if negative {
+        IntervalMonthDayNano::new(-months, -days, -nanoseconds)
+    } else {
+        IntervalMonthDayNano::new(months, days, nanoseconds)
+    })
+}
+
+fn parse_interval_months(body: &str, text: &str) -> Result<i32, String> {
+    let parts: Vec<&str> = body.split('-').collect();
+    if parts.len() != 2 {
+        return Err(format!("Invalid interval format: {text}"));
+    }
+    let years: i32 = parts[0]
+        .parse()
+        .map_err(|_| format!("Invalid years: {}", parts[0]))?;
+    let months: i32 = parts[1]
+        .parse()
+        .map_err(|_| format!("Invalid months: {}", parts[1]))?;
+    years
+        .checked_mul(MONTHS_PER_YEAR)
+        .and_then(|total| total.checked_add(months))
+        .ok_or_else(|| format!("Interval month count out of range: {text}"))
+}
+
+fn parse_interval_days_and_nanos(body: &str) -> Result<(i32, i64), String> {
+    let mut segments = body.split(' ');
+    let days_text = segments.next().unwrap_or_default();
+    let days: i32 = days_text
+        .parse()
+        .map_err(|_| format!("Invalid days: {days_text}"))?;
+    let nanos = match segments.next() {
+        Some(time_text) => parse_interval_time_to_nanos(time_text)?,
+        None => 0,
+    };
+    Ok((days, nanos))
+}
+
+/// A time part with fewer than two colon-separated fields carries no
+/// recognizable time and contributes zero, matching Exasol's day-only literals.
+fn parse_interval_time_to_nanos(time_text: &str) -> Result<i64, String> {
+    let fields: Vec<&str> = time_text.split(':').collect();
+    if fields.len() < 2 {
+        return Ok(0);
+    }
+    let hours: i64 = fields[0]
+        .parse()
+        .map_err(|_| format!("Invalid hours: {}", fields[0]))?;
+    let minutes: i64 = fields[1]
+        .parse()
+        .map_err(|_| format!("Invalid minutes: {}", fields[1]))?;
+    let mut nanos = hours
+        .checked_mul(NANOS_PER_HOUR)
+        .zip(minutes.checked_mul(NANOS_PER_MINUTE))
+        .and_then(|(h, m)| h.checked_add(m))
+        .ok_or_else(|| format!("Interval time out of range: {time_text}"))?;
+    if let Some(seconds_text) = fields.get(2) {
+        nanos = nanos
+            .checked_add(parse_interval_seconds_to_nanos(seconds_text)?)
+            .ok_or_else(|| format!("Interval time out of range: {time_text}"))?;
+    }
+    Ok(nanos)
+}
+
+fn parse_interval_seconds_to_nanos(seconds_text: &str) -> Result<i64, String> {
+    let mut parts = seconds_text.split('.');
+    let whole_text = parts.next().unwrap_or_default();
+    let seconds: i64 = whole_text
+        .parse()
+        .map_err(|_| format!("Invalid seconds: {whole_text}"))?;
+    let whole_nanos = seconds
+        .checked_mul(NANOS_PER_SECOND)
+        .ok_or_else(|| format!("Interval seconds out of range: {seconds_text}"))?;
+    whole_nanos
+        .checked_add(parts.next().map_or(0, fractional_seconds_to_nanos))
+        .ok_or_else(|| format!("Interval seconds out of range: {seconds_text}"))
 }
 
 /// Parses a decimal string to i128 with the given scale.
@@ -1123,5 +1223,242 @@ mod tests {
             exasol_type_to_arrow(&ExasolType::Double).unwrap(),
             DataType::Float64
         );
+    }
+
+    #[test]
+    fn test_parse_interval_reads_every_day_to_second_component() {
+        let (days, nanos) = days_and_nanos_of("+01 12:30:45.123456789");
+        assert_eq!(days, 1);
+        assert_eq!(
+            nanos,
+            12 * 3600 * 1_000_000_000 + 30 * 60 * 1_000_000_000 + 45 * 1_000_000_000 + 123_456_789
+        );
+    }
+
+    #[test]
+    fn test_parse_interval_ym_zero_years() {
+        let months = months_of("+00-06");
+        assert_eq!(months, 6);
+    }
+
+    #[test]
+    fn test_parse_interval_ym_zero_months() {
+        let months = months_of("+05-00");
+        assert_eq!(months, 60);
+    }
+
+    #[test]
+    fn test_parse_interval_ym_large_value() {
+        let months = months_of("+99-11");
+        assert_eq!(months, 99 * 12 + 11);
+    }
+
+    #[test]
+    fn test_parse_interval_ym_negative_large_value() {
+        let months = months_of("-99-11");
+        assert_eq!(months, -(99 * 12 + 11));
+    }
+
+    #[test]
+    fn test_parse_interval_reads_unsigned_text_as_positive() {
+        assert_eq!(months_of("01-06"), 18);
+    }
+
+    #[test]
+    fn test_parse_interval_ym_invalid_years() {
+        let result = parse_interval("+XX-06");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_ym_invalid_months() {
+        let result = parse_interval("+01-XX");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_ds_days_only() {
+        let (days, nanos) = days_and_nanos_of("+05");
+        assert_eq!(days, 5);
+        assert_eq!(nanos, 0);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_hours_minutes_only() {
+        let (days, nanos) = days_and_nanos_of("+01 12:30");
+        assert_eq!(days, 1);
+        assert_eq!(nanos, 12 * 3600 * 1_000_000_000 + 30 * 60 * 1_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_negative_values() {
+        let (days, nanos) = days_and_nanos_of("-03 06:15:30");
+        assert_eq!(days, -3);
+        assert_eq!(
+            nanos,
+            -(6 * 3600 * 1_000_000_000 + 15 * 60 * 1_000_000_000 + 30 * 1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn test_parse_interval_ds_with_fractional_3_digits() {
+        let (days, nanos) = days_and_nanos_of("+00 00:00:00.123");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, 123_000_000);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_with_fractional_6_digits() {
+        let (days, nanos) = days_and_nanos_of("+00 00:00:00.123456");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, 123_456_000);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_with_fractional_9_digits() {
+        let (days, nanos) = days_and_nanos_of("+00 00:00:00.123456789");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, 123_456_789);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_with_fractional_12_digits() {
+        let (days, nanos) = days_and_nanos_of("+00 00:00:00.123456789012");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, 123_456_789);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_invalid_days() {
+        let result = parse_interval("+XX 12:30:45");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_ds_time_without_colon_is_ignored() {
+        let (days, nanos) = days_and_nanos_of("+01 12");
+        assert_eq!(days, 1);
+        assert_eq!(nanos, 0);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_ignores_segments_after_the_time() {
+        let (days, nanos) = days_and_nanos_of("+01 01:00:00 extra");
+        assert_eq!(days, 1);
+        assert_eq!(nanos, 3600 * 1_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_ignores_fields_after_the_seconds() {
+        let (days, nanos) = days_and_nanos_of("+00 00:00:01:99");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_empty_string_reports_invalid_days() {
+        assert_eq!(parse_interval("").unwrap_err(), "Invalid days: ");
+    }
+
+    #[test]
+    fn test_parse_interval_ds_reports_invalid_hours() {
+        let message = parse_interval("+01 XX:30").unwrap_err();
+        assert_eq!(message, "Invalid hours: XX");
+    }
+
+    #[test]
+    fn test_parse_interval_ds_reports_invalid_minutes() {
+        let message = parse_interval("+01 12:XX").unwrap_err();
+        assert_eq!(message, "Invalid minutes: XX");
+    }
+
+    #[test]
+    fn test_parse_interval_ds_reports_invalid_seconds() {
+        let message = parse_interval("+01 12:30:XX").unwrap_err();
+        assert_eq!(message, "Invalid seconds: XX");
+    }
+
+    #[test]
+    fn test_parse_interval_ds_non_numeric_fraction_counts_as_zero() {
+        let (days, nanos) = days_and_nanos_of("+00 00:00:01.abc");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_interval_ds_negative_nanos_only() {
+        let (days, nanos) = days_and_nanos_of("-00 01:00:00");
+        assert_eq!(days, 0);
+        assert_eq!(nanos, -3600 * 1_000_000_000);
+    }
+
+    /// Scenario: INTERVAL type mapping
+    #[test]
+    fn test_parse_interval_reads_exasol_wire_text_of_both_forms() {
+        assert_eq!(
+            parse_interval("+01-02").unwrap(),
+            IntervalMonthDayNano::new(14, 0, 0)
+        );
+        assert_eq!(
+            parse_interval("-01-02").unwrap(),
+            IntervalMonthDayNano::new(-14, 0, 0)
+        );
+        assert_eq!(
+            parse_interval("-03 04:05:06.789").unwrap(),
+            IntervalMonthDayNano::new(0, -3, -14_706_789_000_000)
+        );
+        assert_eq!(
+            parse_interval("+03 04:05:06").unwrap(),
+            IntervalMonthDayNano::new(0, 3, 14_706_000_000_000)
+        );
+    }
+
+    #[test]
+    fn test_parse_interval_reads_the_largest_day_to_second_value() {
+        assert_eq!(
+            parse_interval("-999999999 23:59:59.999000000").unwrap(),
+            IntervalMonthDayNano::new(0, -999_999_999, -86_399_999_000_000)
+        );
+    }
+
+    /// Scenario: INTERVAL YEAR TO MONTH value outside the Arrow month range
+    #[test]
+    fn test_parse_interval_rejects_month_count_outside_i32_range() {
+        let message = parse_interval("+999999999-11").unwrap_err();
+        assert!(message.contains("out of range"), "{message}");
+        assert!(parse_interval("-999999999-11").is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_accepts_the_largest_year_to_month_value_of_i32() {
+        assert_eq!(
+            parse_interval("+178956970-07").unwrap(),
+            IntervalMonthDayNano::new(i32::MAX, 0, 0)
+        );
+        assert!(parse_interval("+178956970-08").is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_rejects_extra_dash_parts() {
+        assert!(parse_interval("+1-2-3")
+            .unwrap_err()
+            .contains("Invalid interval format"));
+    }
+
+    #[test]
+    fn test_parse_interval_rejects_time_that_overflows_nanoseconds() {
+        assert!(parse_interval("+00 9223372036854775807:00").is_err());
+    }
+
+    fn months_of(text: &str) -> i32 {
+        let interval = parse_interval(text).unwrap();
+        assert_eq!((interval.days, interval.nanoseconds), (0, 0));
+        interval.months
+    }
+
+    fn days_and_nanos_of(text: &str) -> (i32, i64) {
+        let interval = parse_interval(text).unwrap();
+        assert_eq!(interval.months, 0);
+        (interval.days, interval.nanoseconds)
     }
 }

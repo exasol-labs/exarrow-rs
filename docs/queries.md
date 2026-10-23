@@ -33,19 +33,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Arrow RecordBatches provide efficient columnar access:
 
 ```rust
-use arrow::array::{StringArray, Int64Array};
+use arrow::array::{Decimal128Array, StringArray};
 
 let results = connection.query("SELECT name, age FROM users").await?;
 
 for batch in results {
     let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let ages = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let ages = batch.column(1).as_any().downcast_ref::<Decimal128Array>().unwrap();
 
     for i in 0..batch.num_rows() {
         println!("{}: {}", names.value(i), ages.value(i));
     }
 }
 ```
+
+An `INTEGER` column is `Decimal128(18, 0)`, and its `value(i)` is the integer because the scale is 0.
 
 ## Execute Update
 

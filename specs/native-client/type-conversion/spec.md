@@ -4,16 +4,17 @@ Specifies the per-type binary-to-Arrow conversion rules the native TCP protocol 
 
 ## Background
 
-Each column's data is contiguous and matches Arrow's memory layout, so conversion reads directly into the matching Arrow array type.
+Each column's data is contiguous in the frame, so conversion reads it directly into the column's Arrow array, with no intermediate array.
 
 ## Scenarios
 
 ### Scenario: Direct binary to Arrow conversion for numeric types
 
-* *GIVEN* a result set contains columns of type `T_double` (8), `T_decimal` (6), `T_integer` (5), `T_smallint` (4), or `T_real` (7)
+* *GIVEN* a result set contains columns of type `T_double` (8), `T_decimal` (6), `T_smalldecimal` (63), `T_bigdecimal` (64), `T_integer` (5), `T_smallint` (4), or `T_real` (7)
 * *WHEN* parsing column data
-* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128, `T_integer` → Int64, `T_smallint` → Int32, while the reported Exasol type for both is DECIMAL with precision 18 and 9 respectively and scale 0)
-* *AND* the system SHALL handle little-endian to native byte order conversion
+* *THEN* the system SHALL read the binary values directly into Arrow numeric arrays (`T_double`/`T_real` → Float64, `T_decimal` → Decimal128 with the precision and scale of the column description, `T_smalldecimal` → Decimal128 read from a 4-byte value and `T_bigdecimal` → Decimal128 read from a 16-byte value, both with the precision and scale of the column description, `T_integer` → Decimal128(18, 0), `T_smallint` → Decimal128(9, 0)), converting each little-endian value to native byte order
+* *AND* the system SHALL read each `T_integer` value as an 8-byte integer and each `T_smallint` value as a 4-byte integer into the Decimal128 array
+* *AND* the Arrow data type of a `T_integer` or `T_smallint` field SHALL equal the Arrow data type of the DECIMAL(18,0) or DECIMAL(9,0) that the driver reports for the column in the result set metadata, because the column description of these wire types carries no precision or scale
 * *AND* decimal values SHALL preserve precision and scale
 
 ### Scenario: Direct binary to Arrow conversion for string types
@@ -34,16 +35,18 @@ Each column's data is contiguous and matches Arrow's memory layout, so conversio
 
 ### Scenario: Direct binary to Arrow conversion for interval types
 
-* *GIVEN* a result set contains columns of type `T_interval_year` (16) or `T_interval_day` (17)
+* *GIVEN* a result set contains columns of type `T_interval_year` (16) or `T_interval_day` (17), whose values Exasol sends as length-prefixed text, such as `+01-02` or `-03 04:05:06.789`
 * *WHEN* parsing column data
-* *THEN* the system SHALL convert interval values to Arrow Utf8 arrays (string representation)
+* *THEN* the system SHALL parse each value from the wire bytes into an Arrow IntervalMonthDayNano array, with no intermediate Utf8 array
+* *AND* the sign of the text SHALL apply to every component of the value
+* *AND* text that is not a valid interval, or a month count outside the 32-bit signed integer range, SHALL fail the parse with an error that names the column
 
 ### Scenario: Direct binary to Arrow conversion for binary and geometry types
 
 * *GIVEN* a result set contains columns of type `T_binary` (15), `T_hashtype` (126), or `T_geometry` (123)
 * *WHEN* parsing column data
-* *THEN* `T_binary` SHALL map to Arrow Binary arrays
-* *AND* `T_hashtype` and `T_geometry` SHALL map to Arrow Utf8 arrays
+* *THEN* `T_binary`, `T_hashtype`, and `T_geometry` SHALL map to Arrow Binary arrays
+* *AND* each value SHALL hold the length-prefixed bytes that Exasol sends, unchanged, which for `T_geometry` are WKT text and for `T_hashtype` are the text of the session's `HASHTYPE_FORMAT`, hexadecimal by default
 
 ### Scenario: Boolean type conversion
 

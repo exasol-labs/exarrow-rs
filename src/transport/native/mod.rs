@@ -1995,6 +1995,7 @@ mod tests {
             scale: None,
             is_varchar: false,
             max_len: None,
+            interval_fraction: None,
         }
     }
 
@@ -2126,6 +2127,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 

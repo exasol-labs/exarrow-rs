@@ -959,13 +959,12 @@ fn primitive_value_at<T: arrow::datatypes::ArrowPrimitiveType>(
 }
 
 /// Extract an i32 value from an Arrow array at the given index.
-/// Handles various numeric array types that Exasol might return.
+/// Exasol returns whole numbers as Decimal128 on both transports, so Int32 and
+/// Int64 columns read as absent.
 fn get_int_value(array: &dyn arrow::array::Array, idx: usize) -> Option<i32> {
-    use arrow::datatypes::{DataType, Decimal128Type, Float64Type, Int32Type, Int64Type};
+    use arrow::datatypes::{DataType, Decimal128Type, Float64Type};
 
     match array.data_type() {
-        DataType::Int32 => primitive_value_at::<Int32Type>(array, idx),
-        DataType::Int64 => primitive_value_at::<Int64Type>(array, idx).map(|value| value as i32),
         DataType::Float64 => {
             primitive_value_at::<Float64Type>(array, idx).map(|value| value as i32)
         }
@@ -2640,6 +2639,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         };
         let exasol = transport_datatype_to_exasol(&dt).unwrap();
         assert_eq!(
@@ -2661,6 +2661,7 @@ mod tests {
             character_set: Some("UTF8".to_string()),
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         };
         let exasol = transport_datatype_to_exasol(&dt).unwrap();
         assert_eq!(exasol, ExasolType::Varchar { size: 100 });
@@ -3078,10 +3079,8 @@ mod tests {
 
     #[test]
     fn get_int_value_reads_every_numeric_column_type_exasol_may_report() {
-        use arrow::array::{Decimal128Array, Float64Array, Int32Array, Int64Array};
+        use arrow::array::{Decimal128Array, Float64Array};
 
-        assert_eq!(get_int_value(&Int32Array::from(vec![7]), 0), Some(7));
-        assert_eq!(get_int_value(&Int64Array::from(vec![7_i64]), 0), Some(7));
         assert_eq!(
             get_int_value(&Float64Array::from(vec![7.9_f64]), 0),
             Some(7),
@@ -3097,8 +3096,16 @@ mod tests {
     fn get_int_value_reports_null_and_unsupported_columns_as_absent() {
         use arrow::array::{Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray};
 
-        assert_eq!(get_int_value(&Int32Array::from(vec![None::<i32>]), 0), None);
-        assert_eq!(get_int_value(&Int64Array::from(vec![None::<i64>]), 0), None);
+        assert_eq!(
+            get_int_value(&Int32Array::from(vec![7]), 0),
+            None,
+            "Exasol returns whole numbers as Decimal128, so Int32 is not a numeric ordinal"
+        );
+        assert_eq!(
+            get_int_value(&Int64Array::from(vec![7_i64]), 0),
+            None,
+            "Exasol returns whole numbers as Decimal128, so Int64 is not a numeric ordinal"
+        );
         assert_eq!(
             get_int_value(&Float64Array::from(vec![None::<f64>]), 0),
             None
@@ -3116,9 +3123,9 @@ mod tests {
 
     #[test]
     fn get_int_value_reads_the_requested_row_not_the_first() {
-        use arrow::array::Int32Array;
+        use arrow::array::Decimal128Array;
 
-        let array = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let array = Decimal128Array::from(vec![Some(1_i128), None, Some(3)]);
         assert_eq!(get_int_value(&array, 0), Some(1));
         assert_eq!(get_int_value(&array, 1), None);
         assert_eq!(get_int_value(&array, 2), Some(3));
@@ -4958,6 +4965,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         };
         expect_prepare_of(
             &mut transport,

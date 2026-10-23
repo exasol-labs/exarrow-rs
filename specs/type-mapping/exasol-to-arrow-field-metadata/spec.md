@@ -34,17 +34,24 @@ The type mappings themselves are specified in `type-mapping/exasol-to-arrow`.
 * *WHEN* `SELECT * FROM M` runs over the native transport or the WebSocket transport
 * *THEN* every field of the result set metadata schema and of the first RecordBatch SHALL be nullable, including `AMOUNT`
 
-### Scenario: Field metadata on the native transport keeps the decoded Arrow data type
-
-* *GIVEN* an authenticated native TCP session exists
-* *WHEN* the query `SELECT CAST('3 04:05:06.789' AS INTERVAL DAY TO SECOND) AS IV` returns one row
-* *THEN* the field `IV` of the batch schema of the first RecordBatch SHALL have the Arrow data type `Utf8`, which `native-client/type-conversion` specifies for `T_interval_day`
-* *AND* the field `IV` SHALL carry the key `exasol:type_name` with the value `INTERVAL DAY TO SECOND`
-* *AND* the column `IV` SHALL hold one non-null string value
-
 ### Scenario: HASHTYPE field metadata carries the byte size of the column
 
-* *GIVEN* an authenticated native TCP session exists that uses the default `HASHTYPE_FORMAT` (`HEX`)
+* *GIVEN* a native TCP or WebSocket session exists that uses the default `HASHTYPE_FORMAT` (`HEX`)
 * *WHEN* the query `SELECT CAST('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' AS HASHTYPE(32 BYTE)) AS H` returns one row
 * *THEN* `TypeMapper::from_field_metadata` SHALL return `ExasolType::Hashtype` with `byte_size` `32` for the field `H` of the result set metadata schema and for the field `H` of the batch schema of the first RecordBatch
 * *AND* both fields SHALL carry the key `exasol:type_name` with the value `HASHTYPE`
+
+### Scenario: INTERVAL DAY TO SECOND field metadata carries the fractional second precision
+
+* *GIVEN* a native TCP or WebSocket session exists
+* *WHEN* the query `SELECT CAST('3 04:05:06.789123' AS INTERVAL DAY(2) TO SECOND(6)) AS IV` returns one row
+* *THEN* `TypeMapper::from_field_metadata` SHALL return `ExasolType::IntervalDayToSecond` with `precision` `6` for the field `IV` of the result set metadata schema and for the field `IV` of the batch schema of the first RecordBatch
+* *AND* both fields SHALL carry the key `exasol:type_name` with the value `INTERVAL DAY TO SECOND`
+
+### Scenario: GEOMETRY field metadata carries the SRID that Exasol reports
+
+* *GIVEN* a native TCP or WebSocket session exists
+* *WHEN* the query `SELECT CAST('POINT(1 2)' AS GEOMETRY(4326)) AS G1, CAST('POINT(1 2)' AS GEOMETRY) AS G0` returns one row
+* *THEN* over the WebSocket transport, the fields `G1` and `G0` of the result set metadata schema and of the batch schema of the first RecordBatch SHALL carry the key `exasol:srid` with the values `4326` and `0`, and `TypeMapper::from_field_metadata` SHALL return `ExasolType::Geometry` with `srid` `Some(4326)` and `Some(0)`
+* *AND* over the native transport, neither field SHALL carry the key `exasol:srid`, and `TypeMapper::from_field_metadata` SHALL return `ExasolType::Geometry` with `srid` `None`, because the native column metadata carries no SRID
+* *AND* on both transports, the fields `G1` and `G0` of both schemas SHALL carry the key `exasol:type_name` with the value `GEOMETRY`

@@ -16,8 +16,11 @@ mod common;
 #[path = "common/schema_activation.rs"]
 mod schema_activation;
 
-use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
-use arrow::datatypes::DataType;
+use arrow::array::{
+    Array, BinaryArray, BooleanArray, Decimal128Array, Float64Array, IntervalMonthDayNanoArray,
+    StringArray,
+};
+use arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit};
 use common::{
     assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
     assert_every_key_once, assert_partly_inline, column_metadata_table_ddl,
@@ -993,70 +996,6 @@ async fn test_ws_auto_commit_behavior() {
 
 // ── Section 7: Arrow Conversion ───────────────────────────────────────────────
 
-/// 7.1 INTEGER to Arrow Int64 over WebSocket.
-#[tokio::test]
-async fn test_ws_integer_to_arrow_int64() {
-    skip_if_no_exasol!();
-
-    let mut conn = get_ws_connection().await.expect("Failed to connect");
-
-    let schema_name = generate_test_schema_name();
-
-    conn.execute_update(&format!("CREATE SCHEMA {}", schema_name))
-        .await
-        .expect("CREATE SCHEMA should succeed");
-
-    conn.execute_update(&format!(
-        "CREATE TABLE {}.int_test (small_int INTEGER, big_int DECIMAL(18,0))",
-        schema_name
-    ))
-    .await
-    .expect("CREATE TABLE should succeed");
-
-    conn.execute_update(&format!(
-        r#"
-        INSERT INTO {}.int_test VALUES
-        (0, 0),
-        (1, 1),
-        (-1, -1),
-        (2147483647, 999999999999999999),
-        (-2147483648, -999999999999999999)
-        "#,
-        schema_name
-    ))
-    .await
-    .expect("INSERT should succeed");
-
-    let batches = conn
-        .query(&format!(
-            "SELECT small_int, big_int FROM {}.int_test ORDER BY small_int",
-            schema_name
-        ))
-        .await
-        .expect("SELECT should succeed");
-
-    assert!(!batches.is_empty(), "Should return results");
-
-    let batch = &batches[0];
-    assert_eq!(batch.num_rows(), 5, "Should have 5 rows");
-
-    let schema = batch.schema();
-    for field in schema.fields() {
-        let dt = field.data_type();
-        assert!(
-            matches!(
-                dt,
-                DataType::Int64 | DataType::Int32 | DataType::Decimal128(_, _) | DataType::Float64
-            ),
-            "Integer columns should be numeric Arrow type, got {:?}",
-            dt
-        );
-    }
-
-    ws_cleanup_schema(&mut conn, &schema_name).await;
-    conn.close().await.expect("Failed to close connection");
-}
-
 /// 7.2 VARCHAR to Arrow Utf8 over WebSocket.
 #[tokio::test]
 async fn test_ws_varchar_to_arrow_utf8() {
@@ -1401,6 +1340,8 @@ async fn test_ws_boolean_type_conversion() {
 }
 
 /// DOUBLE type conversion over WebSocket.
+///
+/// Scenario: Non-decimal numeric type mapping
 #[tokio::test]
 async fn test_ws_double_type_conversion() {
     skip_if_no_exasol!();
@@ -2474,7 +2415,7 @@ fn test_ws_every_iterated_batch_carries_the_result_set_field_metadata() {
         .expect("Failed to close connection");
 }
 
-// Zero rows, because the WebSocket row conversion of HASHTYPE values fails (issue #107).
+/// Scenario: HASHTYPE field metadata carries the byte size of the column
 #[tokio::test]
 async fn test_ws_hashtype_field_metadata_carries_the_declared_byte_size() {
     skip_if_no_exasol!();
@@ -2484,7 +2425,7 @@ async fn test_ws_hashtype_field_metadata_carries_the_declared_byte_size() {
     let result_set = conn
         .execute(
             "SELECT CAST('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
-             AS HASHTYPE(32 BYTE)) AS H FROM DUAL WHERE FALSE",
+             AS HASHTYPE(32 BYTE)) AS H FROM DUAL",
         )
         .await
         .expect("HASHTYPE query should succeed");
@@ -2493,12 +2434,337 @@ async fn test_ws_hashtype_field_metadata_carries_the_declared_byte_size() {
         .expect("a SELECT has metadata")
         .schema
         .clone();
+    let batches = result_set
+        .fetch_all()
+        .await
+        .expect("fetch_all should succeed");
+    assert_eq!(batches[0].num_rows(), 1);
 
-    let field = metadata_schema.field_with_name("H").expect("field H");
+    for schema in [metadata_schema, batches[0].schema()] {
+        let field = schema.field_with_name("H").expect("field H");
+        assert_eq!(
+            TypeMapper::from_field_metadata(field.metadata()),
+            Some(ExasolType::Hashtype { byte_size: 32 })
+        );
+    }
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// The value `literal_cast` in row 1 and NULL cast to `type_sql` in row 2 of an equality test.
+struct TwoRowCase {
+    literal_cast: &'static str,
+    type_sql: &'static str,
+}
+
+impl TwoRowCase {
+    /// Builds the query ordered by the row number `N`, with `filter` before the ORDER BY.
+    fn query(&self, filter: &str) -> String {
+        let TwoRowCase {
+            literal_cast,
+            type_sql,
+        } = self;
+        format!(
+            "SELECT N, V FROM (SELECT 1 AS N, {literal_cast} AS V FROM DUAL \
+             UNION ALL SELECT 2, CAST(NULL AS {type_sql}) FROM DUAL) {filter} ORDER BY N"
+        )
+    }
+}
+
+/// Runs `sql` and returns the result set metadata schema and the single batch it returns.
+async fn metadata_schema_and_batch(
+    conn: &mut Connection,
+    sql: &str,
+) -> (
+    arrow::datatypes::SchemaRef,
+    arrow::record_batch::RecordBatch,
+) {
+    let (metadata_schema, batches) = common::metadata_schema_and_batches(conn, sql).await;
+    assert_eq!(batches.len(), 1);
+    (
+        metadata_schema,
+        batches.into_iter().next().expect("one batch"),
+    )
+}
+
+/// Asserts that field `V` has `expected` in the result set metadata schema, in the batch, and
+/// in the zero-row batch of the same query, and that the second row of the batch is NULL.
+async fn assert_two_row_result(
+    conn: &mut Connection,
+    case: &TwoRowCase,
+    expected: &DataType,
+) -> arrow::record_batch::RecordBatch {
+    let (metadata_schema, batch) = metadata_schema_and_batch(conn, &case.query("")).await;
+    let (_, zero_row) = metadata_schema_and_batch(conn, &case.query("WHERE FALSE")).await;
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(zero_row.num_rows(), 0);
+
+    for (place, schema) in [
+        ("metadata schema", metadata_schema),
+        ("batch", batch.schema()),
+        ("zero-row batch", zero_row.schema()),
+    ] {
+        let field = schema.field_with_name("V").expect("field V");
+        assert_eq!(field.data_type(), expected, "V in the {place}");
+    }
+    assert!(batch.column_by_name("V").expect("column V").is_null(1));
+    batch
+}
+
+/// Runs the two-row query over the native transport and asserts that its data type and values
+/// equal those of the WebSocket batch.
+#[cfg(feature = "native")]
+async fn assert_equals_native(ws_batch: &arrow::record_batch::RecordBatch, case: &TwoRowCase) {
+    let mut native = common::get_test_connection_with_transport("native")
+        .await
+        .expect("Failed to connect over native");
+    let (_, native_batch) = metadata_schema_and_batch(&mut native, &case.query("")).await;
+
+    let ws_field = ws_batch.schema().field_with_name("V").unwrap().clone();
+    let native_field = native_batch.schema().field_with_name("V").unwrap().clone();
+    assert_eq!(ws_field.data_type(), native_field.data_type());
     assert_eq!(
-        TypeMapper::from_field_metadata(field.metadata()),
-        Some(ExasolType::Hashtype { byte_size: 32 })
+        ws_batch.column_by_name("V").unwrap(),
+        native_batch.column_by_name("V").unwrap()
     );
+    native.close().await.expect("Failed to close connection");
+}
+
+fn interval_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> IntervalMonthDayNano {
+    batch
+        .column_by_name("V")
+        .expect("column V")
+        .as_any()
+        .downcast_ref::<IntervalMonthDayNanoArray>()
+        .expect("an interval column")
+        .value(row)
+}
+
+fn decimal_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> i128 {
+    batch
+        .column_by_name("V")
+        .expect("column V")
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("a decimal column")
+        .value(row)
+}
+
+fn binary_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> Vec<u8> {
+    batch
+        .column_by_name("V")
+        .expect("column V")
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("a binary column")
+        .value(row)
+        .to_vec()
+}
+
+/// Scenario: INTERVAL type mapping
+/// Scenario: Date and time types mapping
+/// Scenario: INTERVAL YEAR TO MONTH value outside the Arrow month range
+/// Scenario: WebSocket INTERVAL, GEOMETRY, and HASHTYPE results equal native results
+#[tokio::test]
+async fn test_ws_interval_year_to_month_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST('1-2' AS INTERVAL YEAR(2) TO MONTH)",
+        type_sql: "INTERVAL YEAR(2) TO MONTH",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(
+        &mut conn,
+        &CASE,
+        &DataType::Interval(IntervalUnit::MonthDayNano),
+    )
+    .await;
+    assert_eq!(
+        interval_value(&batch, 0),
+        IntervalMonthDayNano::new(14, 0, 0)
+    );
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    let error = conn
+        .query("SELECT CAST('999999999-11' AS INTERVAL YEAR(9) TO MONTH) AS BIG")
+        .await
+        .expect_err("a month count outside the i32 range should fail");
+    assert!(error.to_string().contains("BIG"), "{error}");
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: INTERVAL type mapping
+/// Scenario: WebSocket INTERVAL, GEOMETRY, and HASHTYPE results equal native results
+#[tokio::test]
+async fn test_ws_interval_day_to_second_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST('-3 04:05:06.789' AS INTERVAL DAY(2) TO SECOND(3))",
+        type_sql: "INTERVAL DAY(2) TO SECOND(3)",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(
+        &mut conn,
+        &CASE,
+        &DataType::Interval(IntervalUnit::MonthDayNano),
+    )
+    .await;
+    assert_eq!(
+        interval_value(&batch, 0),
+        IntervalMonthDayNano::new(0, -3, -14_706_789_000_000)
+    );
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: GEOMETRY type handling
+/// Scenario: WebSocket INTERVAL, GEOMETRY, and HASHTYPE results equal native results
+#[tokio::test]
+async fn test_ws_geometry_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST('POINT(1 2)' AS GEOMETRY)",
+        type_sql: "GEOMETRY",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Binary).await;
+    assert_eq!(binary_value(&batch, 0), b"POINT (1 2)");
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: HASHTYPE type mapping
+/// Scenario: WebSocket INTERVAL, GEOMETRY, and HASHTYPE results equal native results
+#[tokio::test]
+async fn test_ws_hashtype_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST('550e8400-e29b-11d4-a716-446655440000' AS HASHTYPE(16 BYTE))",
+        type_sql: "HASHTYPE(16 BYTE)",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Binary).await;
+    assert_eq!(binary_value(&batch, 0), b"550e8400e29b11d4a716446655440000");
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: INTEGER and SMALLINT type mapping
+/// Scenario: WebSocket INTEGER and SMALLINT results equal native results
+#[tokio::test]
+async fn test_ws_integer_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST(-999999999999999999 AS INTEGER)",
+        type_sql: "INTEGER",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Decimal128(18, 0)).await;
+    assert_eq!(decimal_value(&batch, 0), -999_999_999_999_999_999);
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: INTEGER and SMALLINT type mapping
+/// Scenario: WebSocket INTEGER and SMALLINT results equal native results
+#[tokio::test]
+async fn test_ws_smallint_result_equals_native() {
+    skip_if_no_exasol!();
+
+    const CASE: TwoRowCase = TwoRowCase {
+        literal_cast: "CAST(999999999 AS SMALLINT)",
+        type_sql: "SMALLINT",
+    };
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    let batch = assert_two_row_result(&mut conn, &CASE, &DataType::Decimal128(9, 0)).await;
+    assert_eq!(decimal_value(&batch, 0), 999_999_999);
+    #[cfg(feature = "native")]
+    assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: INTERVAL DAY TO SECOND field metadata carries the fractional second precision
+/// Scenario: GEOMETRY field metadata carries the SRID that Exasol reports
+#[tokio::test]
+async fn test_ws_type_parameters_in_field_metadata() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    for (sql, columns) in [
+        (
+            "SELECT CAST('3 04:05:06.789123' AS INTERVAL DAY(2) TO SECOND(6)) AS IV",
+            vec![(
+                "IV",
+                "INTERVAL DAY TO SECOND",
+                None,
+                ExasolType::IntervalDayToSecond { precision: 6 },
+            )],
+        ),
+        (
+            "SELECT CAST('POINT(1 2)' AS GEOMETRY(4326)) AS G1, CAST('POINT(1 2)' AS GEOMETRY) AS G0",
+            vec![
+                (
+                    "G1",
+                    "GEOMETRY",
+                    Some("4326"),
+                    ExasolType::Geometry { srid: Some(4326) },
+                ),
+                (
+                    "G0",
+                    "GEOMETRY",
+                    Some("0"),
+                    ExasolType::Geometry { srid: Some(0) },
+                ),
+            ],
+        ),
+    ] {
+        let (metadata_schema, batch) = metadata_schema_and_batch(&mut conn, sql).await;
+        assert_eq!(batch.num_rows(), 1);
+
+        for schema in [metadata_schema, batch.schema()] {
+            for (name, type_name, srid, expected) in &columns {
+                let field = schema.field_with_name(name).expect("field");
+                assert_eq!(
+                    field.metadata().get("exasol:type_name").map(String::as_str),
+                    Some(*type_name),
+                    "{name}"
+                );
+                assert_eq!(
+                    field.metadata().get("exasol:srid").map(String::as_str),
+                    *srid,
+                    "{name}"
+                );
+                assert_eq!(
+                    TypeMapper::from_field_metadata(field.metadata()).as_ref(),
+                    Some(expected),
+                    "{name}"
+                );
+            }
+        }
+    }
 
     conn.close().await.expect("Failed to close connection");
 }

@@ -1,7 +1,8 @@
 use super::constants::{
-    T_BIGDECIMAL, T_BINARY, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE,
-    T_INTEGER, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_REAL, T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP,
-    T_TIMESTAMP_LOCAL_TZ, T_TIMESTAMP_UTC,
+    INTEGER_DECIMAL_PRECISION, SMALLINT_DECIMAL_PRECISION, T_BIGDECIMAL, T_BINARY, T_BOOLEAN,
+    T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY, T_HASHTYPE, T_INTEGER, T_INTERVAL_DAY,
+    T_INTERVAL_YEAR, T_REAL, T_SMALLDECIMAL, T_SMALLINT, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ,
+    T_TIMESTAMP_UTC,
 };
 use super::result_parser::NativeColumnMeta;
 
@@ -16,6 +17,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_DOUBLE => crate::transport::messages::DataType::double(),
         T_REAL => crate::transport::messages::DataType {
@@ -26,9 +28,10 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
-        T_INTEGER => crate::transport::messages::DataType::decimal(18, 0),
-        T_SMALLINT => crate::transport::messages::DataType::decimal(9, 0),
+        T_INTEGER => crate::transport::messages::DataType::decimal(INTEGER_DECIMAL_PRECISION, 0),
+        T_SMALLINT => crate::transport::messages::DataType::decimal(SMALLINT_DECIMAL_PRECISION, 0),
         T_BOOLEAN => crate::transport::messages::DataType::boolean(),
         T_CHAR => {
             if meta.is_varchar {
@@ -44,6 +47,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
                     character_set: Some("UTF8".to_string()),
                     with_local_time_zone: None,
                     fraction: None,
+                    srid: None,
                 }
             }
         }
@@ -55,6 +59,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_TIMESTAMP => crate::transport::messages::DataType {
             type_name: "TIMESTAMP".to_string(),
@@ -64,6 +69,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_TIMESTAMP_LOCAL_TZ => crate::transport::messages::DataType {
             type_name: "TIMESTAMP WITH LOCAL TIME ZONE".to_string(),
@@ -73,6 +79,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: Some(true),
             fraction: None,
+            srid: None,
         },
         T_TIMESTAMP_UTC => crate::transport::messages::DataType {
             type_name: "TIMESTAMP WITH LOCAL TIME ZONE".to_string(),
@@ -82,6 +89,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: Some(true),
             fraction: None,
+            srid: None,
         },
         T_BINARY => crate::transport::messages::DataType {
             type_name: "BINARY".to_string(),
@@ -91,6 +99,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_GEOMETRY => crate::transport::messages::DataType {
             type_name: "GEOMETRY".to_string(),
@@ -100,6 +109,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_HASHTYPE => crate::transport::messages::DataType {
             type_name: "HASHTYPE".to_string(),
@@ -109,6 +119,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_INTERVAL_YEAR => crate::transport::messages::DataType {
             type_name: "INTERVAL YEAR TO MONTH".to_string(),
@@ -118,6 +129,7 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         },
         T_INTERVAL_DAY => crate::transport::messages::DataType {
             type_name: "INTERVAL DAY TO SECOND".to_string(),
@@ -126,7 +138,8 @@ pub fn native_meta_to_data_type(meta: &NativeColumnMeta) -> crate::transport::me
             size: None,
             character_set: None,
             with_local_time_zone: None,
-            fraction: None,
+            fraction: meta.interval_fraction,
+            srid: None,
         },
         _ => crate::transport::messages::DataType::varchar(2_000_000),
     }
@@ -178,6 +191,7 @@ mod tests {
             scale: None,
             is_varchar: false,
             max_len: Some(64),
+            interval_fraction: None,
         };
 
         let data_type = native_meta_to_data_type(&meta);
@@ -340,6 +354,7 @@ mod tests {
                 scale: Some(3),
                 is_varchar: case.is_varchar,
                 max_len: case.max_len,
+                interval_fraction: None,
             };
 
             let dt = native_meta_to_data_type(&meta);
@@ -366,6 +381,24 @@ mod tests {
     }
 
     #[test]
+    fn interval_day_to_second_reports_the_declared_fraction() {
+        let meta = NativeColumnMeta {
+            name: "IV".to_string(),
+            type_id: T_INTERVAL_DAY,
+            precision: None,
+            scale: None,
+            is_varchar: false,
+            max_len: None,
+            interval_fraction: Some(6),
+        };
+
+        let dt = native_meta_to_data_type(&meta);
+
+        assert_eq!(dt.type_name, "INTERVAL DAY TO SECOND");
+        assert_eq!(dt.fraction, Some(6));
+    }
+
+    #[test]
     fn maps_integer_to_decimal_18_0() {
         let meta = NativeColumnMeta {
             name: "x".to_string(),
@@ -374,6 +407,7 @@ mod tests {
             scale: None,
             is_varchar: false,
             max_len: None,
+            interval_fraction: None,
         };
         let dt = native_meta_to_data_type(&meta);
         assert_eq!(dt.type_name, "DECIMAL");
@@ -390,6 +424,7 @@ mod tests {
             scale: None,
             is_varchar: true,
             max_len: Some(100),
+            interval_fraction: None,
         };
         let dt = native_meta_to_data_type(&meta);
         assert_eq!(dt.type_name, "VARCHAR");
@@ -405,6 +440,7 @@ mod tests {
             scale: None,
             is_varchar: false,
             max_len: None,
+            interval_fraction: None,
         };
         let dt = native_meta_to_data_type(&meta);
         assert_eq!(dt.type_name, "TIMESTAMP WITH LOCAL TIME ZONE");

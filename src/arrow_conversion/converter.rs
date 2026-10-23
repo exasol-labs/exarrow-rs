@@ -299,7 +299,9 @@ fn parse_exasol_type(
             Ok(ExasolType::IntervalDayToSecond { precision })
         }
 
-        "GEOMETRY" => Ok(ExasolType::Geometry { srid: None }),
+        "GEOMETRY" => Ok(ExasolType::Geometry {
+            srid: data_type.srid,
+        }),
 
         "HASHTYPE" => Ok(ExasolType::hashtype_from_reported_size(data_type.size)),
 
@@ -340,6 +342,7 @@ mod tests {
             character_set: None,
             with_local_time_zone: None,
             fraction: None,
+            srid: None,
         }
     }
 
@@ -834,6 +837,22 @@ mod tests {
         };
         let message = invalid_format_message(parse_exasol_type(&data_type).unwrap_err());
         assert_eq!(message, "DECIMAL type missing scale");
+    }
+
+    #[test]
+    fn test_parse_exasol_type_geometry_reads_the_srid() {
+        let with_srid = DataType {
+            srid: Some(4326),
+            ..scalar_type("GEOMETRY")
+        };
+        assert_eq!(
+            parse_exasol_type(&with_srid).unwrap(),
+            ExasolType::Geometry { srid: Some(4326) }
+        );
+        assert_eq!(
+            parse_exasol_type(&scalar_type("GEOMETRY")).unwrap(),
+            ExasolType::Geometry { srid: None }
+        );
     }
 
     #[test]

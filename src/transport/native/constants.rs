@@ -114,6 +114,12 @@ pub const T_SMALLINT: u32 = 4;
 /// Wire type: integer (i64).
 pub const T_INTEGER: u32 = 5;
 
+/// DECIMAL precision, at scale 0, that the `T_SMALLINT` wire type stands for.
+pub const SMALLINT_DECIMAL_PRECISION: i32 = 9;
+
+/// DECIMAL precision, at scale 0, that the `T_INTEGER` wire type stands for.
+pub const INTEGER_DECIMAL_PRECISION: i32 = 18;
+
 /// Wire type: decimal.
 pub const T_DECIMAL: u32 = 6;
 

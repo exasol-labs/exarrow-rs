@@ -499,3 +499,154 @@ async fn test_native_decimal_fidelity() {
 
     conn.close().await.expect("Failed to close");
 }
+
+/// Asserts that every field has `expected` in the result set metadata schema, in the batch of
+/// `sql`, and in the zero-row batch of `sql` with a trailing `WHERE FALSE`.
+async fn assert_data_type_in_all_three_schemas(
+    conn: &mut exarrow_rs::adbc::Connection,
+    sql: &str,
+    expected: &arrow::datatypes::DataType,
+) -> arrow::record_batch::RecordBatch {
+    let (metadata_schema, batches) = common::metadata_schema_and_batches(conn, sql).await;
+    let zero_row = conn
+        .query(format!("{sql} WHERE FALSE"))
+        .await
+        .expect("zero-row query should succeed");
+    assert_eq!(zero_row[0].num_rows(), 0);
+
+    for (place, schema) in [
+        ("metadata schema", metadata_schema),
+        ("batch", batches[0].schema()),
+        ("zero-row batch", zero_row[0].schema()),
+    ] {
+        for field in schema.fields() {
+            assert_eq!(
+                field.data_type(),
+                expected,
+                "{} in the {place}",
+                field.name()
+            );
+        }
+    }
+    batches.into_iter().next().expect("one batch")
+}
+
+/// Scenario: INTERVAL type mapping
+/// Scenario: Date and time types mapping
+/// Scenario: INTERVAL YEAR TO MONTH value outside the Arrow month range
+/// Scenario: Direct binary to Arrow conversion for interval types
+#[tokio::test]
+async fn test_native_interval_results_are_month_day_nano() {
+    skip_if_no_exasol!();
+
+    use arrow::array::IntervalMonthDayNanoArray;
+    use arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit};
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    let batch = assert_data_type_in_all_three_schemas(
+        &mut conn,
+        "SELECT CAST('1-2' AS INTERVAL YEAR(2) TO MONTH) AS YM, \
+         CAST('-3 04:05:06.789' AS INTERVAL DAY(2) TO SECOND(3)) AS DS FROM DUAL",
+        &DataType::Interval(IntervalUnit::MonthDayNano),
+    )
+    .await;
+
+    let value = |name: &str| {
+        batch
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .expect("an interval column")
+            .value(0)
+    };
+    assert_eq!(value("YM"), IntervalMonthDayNano::new(14, 0, 0));
+    assert_eq!(
+        value("DS"),
+        IntervalMonthDayNano::new(0, -3, -14_706_789_000_000)
+    );
+
+    let error = conn
+        .query("SELECT CAST('999999999-11' AS INTERVAL YEAR(9) TO MONTH) AS BIG")
+        .await
+        .expect_err("a month count outside the i32 range should fail");
+    assert!(error.to_string().contains("BIG"), "{error}");
+
+    conn.close().await.expect("Failed to close");
+}
+
+/// Scenario: GEOMETRY type handling
+/// Scenario: HASHTYPE type mapping
+/// Scenario: Direct binary to Arrow conversion for binary and geometry types
+#[tokio::test]
+async fn test_native_geometry_and_hashtype_results_are_binary() {
+    skip_if_no_exasol!();
+
+    use arrow::array::BinaryArray;
+    use arrow::datatypes::DataType;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    for (sql, name, expected) in [
+        (
+            "SELECT CAST('POINT(1 2)' AS GEOMETRY) AS G FROM DUAL",
+            "G",
+            "POINT (1 2)",
+        ),
+        (
+            "SELECT CAST('550e8400-e29b-11d4-a716-446655440000' AS HASHTYPE(16 BYTE)) AS H \
+             FROM DUAL",
+            "H",
+            "550e8400e29b11d4a716446655440000",
+        ),
+    ] {
+        let batch = assert_data_type_in_all_three_schemas(&mut conn, sql, &DataType::Binary).await;
+        let values = batch
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("a binary column");
+        assert_eq!(values.value(0), expected.as_bytes(), "{name}");
+    }
+
+    conn.close().await.expect("Failed to close");
+}
+
+/// Scenario: INTEGER and SMALLINT type mapping
+#[tokio::test]
+async fn test_native_integer_and_smallint_results_are_decimal128() {
+    skip_if_no_exasol!();
+
+    use arrow::array::Decimal128Array;
+    use arrow::datatypes::DataType;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+
+    for (sql, name, expected_type, expected_value) in [
+        (
+            "SELECT CAST(-999999999999999999 AS INTEGER) AS I FROM DUAL",
+            "I",
+            DataType::Decimal128(18, 0),
+            -999_999_999_999_999_999i128,
+        ),
+        (
+            "SELECT CAST(999999999 AS SMALLINT) AS S FROM DUAL",
+            "S",
+            DataType::Decimal128(9, 0),
+            999_999_999i128,
+        ),
+    ] {
+        let batch = assert_data_type_in_all_three_schemas(&mut conn, sql, &expected_type).await;
+        let values = batch
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("a Decimal128 column");
+        assert_eq!(values.value(0), expected_value, "{name}");
+    }
+
+    conn.close().await.expect("Failed to close");
+}
