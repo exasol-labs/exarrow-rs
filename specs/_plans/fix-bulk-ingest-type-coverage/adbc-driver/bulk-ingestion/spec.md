@@ -1,13 +1,13 @@
 <!-- DELTA:CHANGED -->
 # Feature: Bulk Ingestion
 
-Ingests Arrow RecordBatches into Exasol tables through the ADBC Statement, in create, append, create-append, and replace modes, into a target schema of the single `EXA` catalog. The driver checks the target catalog and every bound column type before it sends the first SQL statement of an ingest.
+Ingests Arrow RecordBatches into Exasol tables through the ADBC Statement, in create, append, create-append, and replace modes, into a target schema of the single `EXA` catalog. The driver checks the target catalog and every bound column type before it sends the first SQL statement of an ingest, with the same column type rule in every mode.
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
 ## Background
 
-Exasol does not support `CREATE TEMPORARY TABLE`. Exasol has one catalog, named `EXA`, and no binary column type. Exasol DECIMAL precision does not exceed 36.
+Exasol does not support `CREATE TEMPORARY TABLE`. Exasol has one catalog, named `EXA`, and no binary column type. Exasol DECIMAL precision does not exceed 36, and Exasol INTERVAL DAY TO SECOND has no month component.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
@@ -16,22 +16,11 @@ Exasol does not support `CREATE TEMPORARY TABLE`. Exasol has one catalog, named 
 ### Scenario: A bound column type that the driver cannot ingest fails before any SQL statement
 
 * *GIVEN* a table `KEEP` that holds one row, and no table named `NEW_T`
-* *AND* a RecordBatch with an `Int32` column `ID` and a column `C` of one of the Arrow types `Time32(Second)`, `Time64(Microsecond)`, `Duration(Second)`, `List(Int32)`, `Null`, or `Interval(MonthDayNano)`
+* *AND* a RecordBatch with an `Int32` column `ID` and a column `C` of one of the Arrow types `Time32(Second)`, `Time64(Microsecond)`, `Duration(Second)`, `List(Int32)`, `Null`, `Decimal128(38, 2)`, or `Decimal128(10, -2)`
 * *WHEN* the RecordBatch is ingested into `KEEP` with `IngestMode` `Append` or `Replace`, and into `NEW_T` with `IngestMode` `Create` or `CreateAppend`
 * *THEN* each ingest SHALL fail with `AdbcStatus::InvalidArguments`, and the error message SHALL name the column `C` and its Arrow type
 * *AND* the driver SHALL send no SQL statement to Exasol for the ingest
 * *AND* `KEEP` SHALL still hold its one row, and no table named `NEW_T` SHALL exist
-<!-- /DELTA:NEW -->
-
-<!-- DELTA:NEW -->
-### Scenario: A Decimal column with a precision above 36 is appended but never used to create a table
-
-* *GIVEN* a table `T` with a column `N DECIMAL(36,2)`, and no table named `NEW_T`
-* *AND* a RecordBatch with a `Decimal128(38, 2)` column `N` that holds `1234.56`
-* *WHEN* the RecordBatch is ingested into `T` with `IngestMode` `Append`
-* *THEN* the ingest SHALL return 1 row, and `T` SHALL hold `1234.56`
-* *AND* the same RecordBatch ingested into `T` with `IngestMode` `Replace`, or into `NEW_T` with `IngestMode` `Create` or `CreateAppend`, SHALL fail with `AdbcStatus::InvalidArguments` before any SQL statement, with an error message that names the column `N` and its Arrow type
-* *AND* `T` SHALL still exist after the `Replace` ingest, and no table named `NEW_T` SHALL exist
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
@@ -51,6 +40,27 @@ Exasol does not support `CREATE TEMPORARY TABLE`. Exasol has one catalog, named 
 * *WHEN* the RecordBatch is ingested with `IngestMode` `Create` into a table that does not exist
 * *THEN* the created table SHALL have the columns `B`, `LB`, `BV`, and `FB` of type `VARCHAR(2000000)`
 * *AND* selecting the first row back SHALL return the text `00abff` in every column, and every value of the second row SHALL be NULL
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:NEW -->
+### Scenario: Interval columns are ingested
+
+* *GIVEN* a RecordBatch with a row of values and a row of nulls in these columns: `YM` `Interval(YearMonth)` holding -63 months, `DT` `Interval(DayTime)` holding 2 days and 46_210_123 ms, and `MDN` `Interval(MonthDayNano)` holding 0 months, -2 days, and -46_210_123_000_000 ns
+* *WHEN* the RecordBatch is ingested with `IngestMode` `Create` into a table that does not exist
+* *THEN* the ingest SHALL return 2 rows
+* *AND* the created table SHALL have the columns `YM INTERVAL YEAR(9) TO MONTH`, `DT INTERVAL DAY(9) TO SECOND(3)`, and `MDN INTERVAL DAY(9) TO SECOND(3)`
+* *AND* in the first row, `YM` SHALL equal `CAST('-5-3' AS INTERVAL YEAR(9) TO MONTH)`, `DT` SHALL equal `CAST('2 12:50:10.123' AS INTERVAL DAY(9) TO SECOND(3))`, and `MDN` SHALL equal `CAST('-2 12:50:10.123' AS INTERVAL DAY(9) TO SECOND(3))`
+* *AND* every value of the second row SHALL be NULL
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:NEW -->
+### Scenario: An Interval(MonthDayNano) value with a month component fails the ingest
+
+* *GIVEN* a table `T` with a column `I INTERVAL DAY(9) TO SECOND(3)` that holds one row
+* *AND* a RecordBatch with an `Interval(MonthDayNano)` column `I` holding 1 month, 0 days, and 0 ns
+* *WHEN* the RecordBatch is ingested into `T` with `IngestMode` `Append`
+* *THEN* the ingest SHALL fail with `AdbcStatus::Internal`, the status of every import error, and the error message SHALL name the month count and state that Exasol INTERVAL DAY TO SECOND has no month component
+* *AND* `T` SHALL still hold only its one row
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
