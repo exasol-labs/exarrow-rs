@@ -11,7 +11,16 @@ use crate::types::ExasolType;
 
 const MICROSECOND_DIGITS: usize = 6;
 const NANOSECOND_DIGITS: usize = 9;
-const MONTHS_PER_YEAR: i32 = 12;
+const MONTHS_PER_YEAR: i64 = 12;
+const MILLIS_PER_DAY: i64 = 86_400_000;
+const MILLIS_PER_SECOND: u64 = 1_000;
+const MILLIS_PER_MINUTE: u64 = 60 * MILLIS_PER_SECOND;
+const MILLIS_PER_HOUR: u64 = 60 * MILLIS_PER_MINUTE;
+const SECONDS_PER_MINUTE: u64 = 60;
+const MINUTES_PER_HOUR: u64 = 60;
+/// The most days that an INTERVAL DAY TO SECOND column of leading precision 9 holds.
+const MAX_INTERVAL_DAYS: u64 = 999_999_999;
+const NANOS_PER_MILLISECOND: i64 = 1_000_000;
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
 const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
@@ -120,6 +129,21 @@ pub fn format_date32(days: i32) -> Result<String, String> {
             )
         })?;
     Ok(date.format("%Y-%m-%d").to_string())
+}
+
+/// Formats the day that holds the Date64 instant, in milliseconds since 1970-01-01, as `YYYY-MM-DD`.
+///
+/// Fails for a date outside the years 1 to 9999.
+pub fn format_date64(milliseconds: i64) -> Result<String, String> {
+    let outside_range = || {
+        format!(
+            "Date64 value {milliseconds} is outside 0001-01-01 to 9999-12-31, the range Exasol accepts"
+        )
+    };
+    // Flooring keeps a pre-epoch value on the day that holds it.
+    let days =
+        i32::try_from(milliseconds.div_euclid(MILLIS_PER_DAY)).map_err(|_| outside_range())?;
+    format_date32(days).map_err(|_| outside_range())
 }
 
 /// Formats microseconds since the epoch as `YYYY-MM-DD HH:MM:SS.ffffff`.
@@ -348,34 +372,117 @@ pub fn parse_interval(text: &str) -> Result<IntervalMonthDayNano, String> {
         Some(b'+') => (false, &text[1..]),
         _ => (false, text),
     };
-    let (months, days, nanoseconds) = if body.contains('-') {
-        (parse_interval_months(body, text)?, 0, 0)
-    } else {
-        let (days, nanoseconds) = parse_interval_days_and_nanos(body)?;
-        (0, days, nanoseconds)
-    };
+    if body.contains('-') {
+        let months = parse_interval_months(body, text)?;
+        // The sign applies before the i32 check, because i32::MIN months has no positive i32.
+        let signed_months = if negative { -months } else { months };
+        let months = i32::try_from(signed_months)
+            .map_err(|_| format!("Interval month count out of range: {text}"))?;
+        return Ok(IntervalMonthDayNano::new(months, 0, 0));
+    }
+    let (days, nanoseconds) = parse_interval_days_and_nanos(body)?;
     Ok(if negative {
-        IntervalMonthDayNano::new(-months, -days, -nanoseconds)
+        IntervalMonthDayNano::new(0, -days, -nanoseconds)
     } else {
-        IntervalMonthDayNano::new(months, days, nanoseconds)
+        IntervalMonthDayNano::new(0, days, nanoseconds)
     })
 }
 
-fn parse_interval_months(body: &str, text: &str) -> Result<i32, String> {
+fn parse_interval_months(body: &str, text: &str) -> Result<i64, String> {
     let parts: Vec<&str> = body.split('-').collect();
     if parts.len() != 2 {
         return Err(format!("Invalid interval format: {text}"));
     }
-    let years: i32 = parts[0]
+    let years: i64 = parts[0]
         .parse()
         .map_err(|_| format!("Invalid years: {}", parts[0]))?;
-    let months: i32 = parts[1]
+    let months: i64 = parts[1]
         .parse()
         .map_err(|_| format!("Invalid months: {}", parts[1]))?;
     years
         .checked_mul(MONTHS_PER_YEAR)
         .and_then(|total| total.checked_add(months))
         .ok_or_else(|| format!("Interval month count out of range: {text}"))
+}
+
+/// Writes an Arrow Interval(YearMonth) month count as Exasol INTERVAL YEAR TO MONTH text,
+/// such as `5-03` or `-5-03`.
+///
+/// The text is the form that [`parse_interval`] reads, with no `+` sign and no zero-padded
+/// years. The count is split in `i64`, so `i32::MIN` months becomes `-178956970-08`.
+#[must_use]
+pub fn format_interval_year_to_month(months: i32) -> String {
+    let months = i64::from(months);
+    let sign = if months < 0 { "-" } else { "" };
+    let magnitude = months.abs();
+    format!(
+        "{sign}{}-{:02}",
+        magnitude / MONTHS_PER_YEAR,
+        magnitude % MONTHS_PER_YEAR
+    )
+}
+
+/// Writes a day count and a time part in milliseconds as Exasol INTERVAL DAY TO SECOND
+/// text, such as `2 12:50:10.123` or `-2 12:50:10.123`.
+///
+/// The days and the time part add up as days of 86,400,000 ms, so one sign applies to the
+/// whole value, as in the form that [`parse_interval`] reads.
+///
+/// # Errors
+/// Fails for a value of more than 999,999,999 days, the most that a column of leading
+/// precision 9 holds.
+pub fn format_interval_day_to_second(days: i32, milliseconds: i64) -> Result<String, String> {
+    let out_of_range = || {
+        format!(
+            "Interval value of {days} days and {milliseconds} milliseconds is out of range, because INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days"
+        )
+    };
+    let total = i64::from(days)
+        .checked_mul(MILLIS_PER_DAY)
+        .and_then(|day_millis| day_millis.checked_add(milliseconds))
+        .ok_or_else(out_of_range)?;
+    let magnitude = total.unsigned_abs();
+    let whole_days = magnitude / MILLIS_PER_DAY as u64;
+    if whole_days > MAX_INTERVAL_DAYS {
+        return Err(out_of_range());
+    }
+    let time = magnitude % MILLIS_PER_DAY as u64;
+    let sign = if total < 0 { "-" } else { "" };
+    Ok(format!(
+        "{sign}{whole_days} {:02}:{:02}:{:02}.{:03}",
+        time / MILLIS_PER_HOUR,
+        time / MILLIS_PER_MINUTE % MINUTES_PER_HOUR,
+        time / MILLIS_PER_SECOND % SECONDS_PER_MINUTE,
+        time % MILLIS_PER_SECOND
+    ))
+}
+
+/// Writes an Arrow Interval(MonthDayNano) value as Exasol INTERVAL DAY TO SECOND text, in
+/// the form of [`format_interval_day_to_second`].
+///
+/// # Errors
+/// Fails for a month component, which INTERVAL DAY TO SECOND does not have, for nanoseconds
+/// that are not whole milliseconds, which Exasol cannot store without loss, and for more
+/// than 999,999,999 days.
+pub fn format_interval_month_day_nano(value: IntervalMonthDayNano) -> Result<String, String> {
+    let IntervalMonthDayNano {
+        months,
+        days,
+        nanoseconds,
+    } = value;
+    let described =
+        format!("Interval value of {months} months, {days} days, and {nanoseconds} nanoseconds");
+    if months != 0 {
+        return Err(format!(
+            "{described} has a month component, but Exasol INTERVAL DAY TO SECOND has no month component"
+        ));
+    }
+    if nanoseconds % NANOS_PER_MILLISECOND != 0 {
+        return Err(format!(
+            "{described} has a fraction of a millisecond, but Exasol stores INTERVAL DAY TO SECOND values in whole milliseconds"
+        ));
+    }
+    format_interval_day_to_second(days, nanoseconds / NANOS_PER_MILLISECOND)
 }
 
 fn parse_interval_days_and_nanos(body: &str) -> Result<(i32, i64), String> {
@@ -1040,6 +1147,26 @@ mod tests {
 
     /// Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
     #[test]
+    fn test_format_date64_floors_to_the_day_that_holds_it_and_rejects_dates_outside_exasol_range() {
+        for (milliseconds, expected) in [
+            (-1, "1969-12-31"),
+            (-86_400_001, "1969-12-30"),
+            (1_577_836_800_000, "2020-01-01"),
+        ] {
+            assert_eq!(
+                format_date64(milliseconds).as_deref(),
+                Ok(expected),
+                "{milliseconds} ms"
+            );
+        }
+        for milliseconds in [253_402_300_800_000, i64::MAX] {
+            let message = format_date64(milliseconds).unwrap_err();
+            assert!(message.contains(&milliseconds.to_string()), "{message}");
+        }
+    }
+
+    /// Scenario: RecordBatch import rejects DATE and TIMESTAMP values outside Exasol's range
+    #[test]
     fn test_format_date32_rejects_days_outside_exasol_range() {
         for days in [-719_163, 2_932_897, i32::MIN, i32::MAX] {
             assert!(format_date32(days).is_err(), "day {days}");
@@ -1448,6 +1575,125 @@ mod tests {
     #[test]
     fn test_parse_interval_rejects_time_that_overflows_nanoseconds() {
         assert!(parse_interval("+00 9223372036854775807:00").is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_reads_the_smallest_month_count_of_i32() {
+        assert_eq!(
+            parse_interval("-178956970-08").unwrap(),
+            IntervalMonthDayNano::new(i32::MIN, 0, 0)
+        );
+        assert!(parse_interval("-178956970-09").is_err());
+    }
+
+    fn duration_millis(interval: IntervalMonthDayNano) -> i64 {
+        i64::from(interval.days) * MILLIS_PER_DAY + interval.nanoseconds / NANOS_PER_MILLISECOND
+    }
+
+    /// Scenario: RecordBatch import writes Arrow interval values as Exasol INTERVAL text
+    #[test]
+    fn test_interval_text_writer_writes_exasol_interval_text() {
+        for (months, expected) in [
+            (63, "5-03"),
+            (-63, "-5-03"),
+            (i32::MAX, "178956970-07"),
+            (i32::MIN, "-178956970-08"),
+            (0, "0-00"),
+        ] {
+            let text = format_interval_year_to_month(months);
+            assert_eq!(text, expected, "{months} months");
+            assert_eq!(
+                parse_interval(&text).unwrap(),
+                IntervalMonthDayNano::new(months, 0, 0),
+                "{text}"
+            );
+        }
+
+        let day_time = [
+            ((2, 46_210_123), "2 12:50:10.123"),
+            ((-2, -46_210_123), "-2 12:50:10.123"),
+            ((0, 86_400_000), "1 00:00:00.000"),
+            ((0, -1), "-0 00:00:00.001"),
+            ((-999_999_999, -86_399_999), "-999999999 23:59:59.999"),
+        ];
+        for ((days, milliseconds), expected) in day_time {
+            let text = format_interval_day_to_second(days, milliseconds).unwrap();
+            assert_eq!(text, expected, "{days} days {milliseconds} ms");
+            let parsed = parse_interval(&text).unwrap();
+            assert_eq!(parsed.months, 0, "{text}");
+            assert_eq!(
+                duration_millis(parsed),
+                i64::from(days) * MILLIS_PER_DAY + milliseconds,
+                "{text}"
+            );
+        }
+
+        let month_day_nano = [
+            (
+                IntervalMonthDayNano::new(0, 2, 46_210_123_000_000),
+                "2 12:50:10.123",
+            ),
+            (
+                IntervalMonthDayNano::new(0, -2, -46_210_123_000_000),
+                "-2 12:50:10.123",
+            ),
+            (
+                IntervalMonthDayNano::new(0, 1, -1_000_000),
+                "0 23:59:59.999",
+            ),
+        ];
+        for (value, expected) in month_day_nano {
+            let text = format_interval_month_day_nano(value).unwrap();
+            assert_eq!(text, expected, "{value:?}");
+            let parsed = parse_interval(&text).unwrap();
+            assert_eq!(parsed.months, 0, "{text}");
+            assert_eq!(duration_millis(parsed), duration_millis(value), "{text}");
+        }
+    }
+
+    /// Scenario: The import CSV conversion rejects interval values that INTERVAL DAY TO SECOND cannot hold
+    #[test]
+    fn test_interval_text_writer_rejects_values_that_day_to_second_cannot_hold() {
+        let cases = [
+            (
+                format_interval_month_day_nano(IntervalMonthDayNano::new(1, 0, 0)),
+                "1 months",
+                "Exasol INTERVAL DAY TO SECOND has no month component",
+            ),
+            (
+                format_interval_month_day_nano(IntervalMonthDayNano::new(0, 0, 1_500_000)),
+                "1500000 nanoseconds",
+                "Exasol stores INTERVAL DAY TO SECOND values in whole milliseconds",
+            ),
+            (
+                format_interval_month_day_nano(IntervalMonthDayNano::new(0, 1_000_000_000, 0)),
+                "1000000000 days",
+                "INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days",
+            ),
+            (
+                format_interval_day_to_second(-1_000_000_000, 0),
+                "-1000000000 days",
+                "INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days",
+            ),
+            (
+                format_interval_day_to_second(999_999_999, 86_400_000),
+                "86400000 milliseconds",
+                "INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days",
+            ),
+            (
+                format_interval_day_to_second(0, i64::MAX),
+                "9223372036854775807 milliseconds",
+                "INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days",
+            ),
+        ];
+
+        for (result, value, reason) in cases {
+            let message = result.unwrap_err();
+            assert!(
+                message.contains(value) && message.contains(reason),
+                "{message}"
+            );
+        }
     }
 
     fn months_of(text: &str) -> i32 {

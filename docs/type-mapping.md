@@ -81,6 +81,56 @@ POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))
 
 Hash values (MD5, SHA-1, SHA-256, UUID, etc.) are returned as Arrow `Binary` columns. Each value holds the bytes of the text that Exasol sends, which follows the session setting `HASHTYPE_FORMAT`. With the default `HEX`, the value is the hexadecimal text, such as the 32 bytes of `550e8400e29b11d4a716446655440000`. With `UUID` or `BASE64`, it is the text in that format. The bytes are not the decoded hash.
 
+## Arrow to Exasol Type Conversions
+
+ADBC bulk ingestion, RecordBatch import, Arrow IPC import, and CSV-path Parquet import write Arrow values to Exasol as CSV text through one conversion. When these paths create a table, they take the column types from the table below. This mapping is `TypeMapper::arrow_to_exasol`, and it maps only the Arrow types that the conversion converts.
+
+| Arrow Type                                                              | Exasol Column Type                  | Notes                                          |
+|-------------------------------------------------------------------------|-------------------------------------|------------------------------------------------|
+| `Boolean`                                                               | `BOOLEAN`                           |                                                |
+| `Int8`, `Int16`, `Int32`, `UInt8`, `UInt16`, `UInt32`                   | `DECIMAL(18, 0)`                    |                                                |
+| `Int64`, `UInt64`                                                       | `DECIMAL(36, 0)`                    |                                                |
+| `Float32`, `Float64`                                                    | `DOUBLE`                            |                                                |
+| `Decimal128(p, s)`, `Decimal256(p, s)`                                  | `DECIMAL(p, s)`                     | Precision 1–36, scale 0 to p                   |
+| `Utf8`, `LargeUtf8`, `Utf8View`                                         | `VARCHAR(2000000)`                  |                                                |
+| `Dictionary` with an integer key and `Utf8` or `LargeUtf8` values       | `VARCHAR(2000000)`                  | Each value is written as its string            |
+| `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary(n)`             | `VARCHAR(2000000)`                  | Lowercase hex text, such as `00abff`           |
+| `Date32`, `Date64`                                                      | `DATE`                              | `Date64` rounds down to the day that holds it  |
+| `Timestamp(unit, None)`                                                 | `TIMESTAMP`                         |                                                |
+| `Timestamp(unit, timezone)`                                             | `TIMESTAMP WITH LOCAL TIME ZONE`    |                                                |
+| `Interval(YearMonth)`                                                   | `INTERVAL YEAR(9) TO MONTH`         |                                                |
+| `Interval(DayTime)`, `Interval(MonthDayNano)`                           | `INTERVAL DAY(9) TO SECOND(3)`      |                                                |
+
+Any other Arrow type, such as `Time32`, `Time64`, `Duration`, a list, or `Null`, has no Exasol column type and is rejected.
+
+### Binary types
+
+Exasol has no binary column type. The driver stores every binary value as lowercase hexadecimal text in a `VARCHAR(2000000)` column, so the bytes `0x00 0xAB 0xFF` become the text `00abff`. A query returns this column as `Utf8`, not `Binary`. Native Parquet import does not apply this rule, because Exasol's Parquet reader loads those values.
+
+### DECIMAL limits
+
+Exasol `DECIMAL` takes a precision up to 36. ADBC bulk ingestion rejects a `Decimal128` or `Decimal256` column with a precision above 36, a negative scale, or a scale above the precision in every ingest mode, including append, before it sends any SQL statement. A Parquet auto-create import of such a column fails with `ImportError::SchemaInferenceError` before `CREATE TABLE`. RecordBatch import into an existing table does not check the mapping, so it still converts larger decimals and negative scales. For a negative scale, the value is written as its integer digits followed by one zero per unit of scale.
+
+### INTERVAL values that fail
+
+Exasol stores `INTERVAL DAY TO SECOND` values in whole milliseconds and has no month component in that type. An import fails with `ImportError::ConversionError`, and the message names the value, for:
+
+- an `Interval(MonthDayNano)` value with a month component
+- a day-time value with a fraction of a millisecond
+- a day-time value of more than 999,999,999 days
+
+The driver never rounds or truncates an interval value. Created columns have a leading precision of 9, so an `INTERVAL YEAR TO MONTH` column holds every `Interval(YearMonth)` value.
+
+A value read from an `INTERVAL YEAR TO MONTH` column arrives as `Interval(MonthDayNano)` with a month component. To write it back, cast the column to `Interval(YearMonth)` first.
+
+### Parquet auto-create
+
+CSV-path Parquet import with table creation uses the mapping above. This path serves servers before 2025.1.11 and imports with `with_native_parquet(Some(false))`.
+
+Native Parquet import with table creation accepts only these Arrow types: `Boolean`, the signed and unsigned integer types, `Float32`, `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`, `Date32`, `Date64`, `Timestamp`, `Decimal128`, and `Decimal256`. It rejects every other field, such as `Utf8View`, a string dictionary, `BinaryView`, `FixedSizeBinary`, or `Interval`, with `ImportError::SchemaInferenceError` before `CREATE TABLE`. The message names the file, the column, and its Arrow type. Import such a file with `with_native_parquet(Some(false))`.
+
+CSV-path Parquet import rejects an `Interval` column from a file written without its Arrow schema. Without the schema, the Parquet reader cannot tell the interval unit and reads the column as `Interval(DayTime)`, which would drop the month part. The import fails with `ImportError::SchemaInferenceError` before `CREATE TABLE` and before `IMPORT`. A file written with its Arrow schema, such as one that `ArrowWriter` writes by default, imports its interval columns.
+
 ## NULL Handling
 
 All types support NULL values. Arrow represents nulls via validity bitmaps, which is compatible with Exasol's NULL semantics.

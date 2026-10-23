@@ -4272,3 +4272,512 @@ fn test_execute_schema_without_sql_fails_with_invalid_state() {
         .expect_err("an ingest-only statement has no schema");
     assert_eq!(error.status, Status::InvalidState);
 }
+
+// Bulk ingestion column types and target catalog
+
+/// The destination of a bulk ingest: the target table, the ingest mode, and an optional target catalog.
+struct IngestTarget<'a> {
+    table: &'a str,
+    mode: &'a str,
+    catalog: Option<OptionValue>,
+}
+
+/// Ingest `batch` into `target`, with its catalog as `adbc.ingest.target_catalog` when given.
+fn ingest_batch<C: AdbcConnection>(
+    conn: &mut C,
+    target: IngestTarget,
+    batch: RecordBatch,
+) -> Result<Option<i64>, adbc_core::error::Error> {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    let mut set = |key: &str, value: OptionValue| {
+        stmt.set_option(OptionStatement::Other(key.to_string()), value)
+            .unwrap();
+    };
+    set(
+        "adbc.ingest.target_table",
+        OptionValue::String(target.table.to_string()),
+    );
+    set(
+        "adbc.ingest.mode",
+        OptionValue::String(target.mode.to_string()),
+    );
+    if let Some(catalog) = target.catalog {
+        set("adbc.ingest.target_catalog", catalog);
+    }
+    stmt.bind(batch).unwrap();
+    stmt.execute_update()
+}
+
+/// Every cell of the result of `sql` as text, `None` for NULL.
+fn text_rows<C: AdbcConnection>(conn: &mut C, sql: &str) -> Vec<Vec<Option<String>>> {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(sql).unwrap();
+    let mut rows = Vec::new();
+    for batch in stmt.execute().unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+        let batch = batch.expect("Failed to read batch");
+        let columns: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                let text = arrow::compute::cast(column, &DataType::Utf8).expect("cast to text");
+                text.as_any().downcast_ref::<StringArray>().unwrap().clone()
+            })
+            .collect();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                columns
+                    .iter()
+                    .map(|c| (!c.is_null(row)).then(|| c.value(row).to_string()))
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+/// The first cell of every row of `sql` as text.
+fn first_column_text<C: AdbcConnection>(conn: &mut C, sql: &str) -> Vec<String> {
+    text_rows(conn, sql)
+        .into_iter()
+        .map(|row| row[0].clone().expect("a non-null first cell"))
+        .collect()
+}
+
+/// The `COLUMN_TYPE` of every column of `schema_name.table`, in column order.
+fn column_types_of<C: AdbcConnection>(conn: &mut C, schema_name: &str, table: &str) -> Vec<String> {
+    first_column_text(
+        conn,
+        &format!(
+            "SELECT COLUMN_TYPE FROM EXA_ALL_COLUMNS WHERE COLUMN_SCHEMA = '{schema_name}' \
+             AND COLUMN_TABLE = '{table}' ORDER BY COLUMN_ORDINAL_POSITION"
+        ),
+    )
+}
+
+/// A new schema named from `prefix`, made the current schema of `conn` so that table names in
+/// SQL need no qualifier.
+fn create_ingest_schema<C: AdbcConnection>(conn: &mut C, prefix: &str) -> String {
+    let schema_name = generate_unique_test_name(prefix);
+    execute_ddl(conn, format!("CREATE SCHEMA {schema_name}"));
+    execute_ddl(conn, format!("OPEN SCHEMA {schema_name}"));
+    schema_name
+}
+
+/// A one-row batch with an `Int32` column `ID` and a null `C` column of `column_type`.
+fn id_and_null_column_batch(column_type: DataType) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("ID", DataType::Int32, false),
+            Field::new("C", column_type.clone(), true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            arrow::array::new_null_array(&column_type, 1),
+        ],
+    )
+    .unwrap()
+}
+
+/// Scenario: A bound column type that the driver cannot ingest fails before any SQL statement
+#[test]
+fn test_bulk_ingest_rejects_an_uningestible_column_type_before_any_sql() {
+    skip_if_no_library!();
+
+    use arrow::datatypes::TimeUnit;
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_REJECT");
+    execute_ddl(&mut conn, "CREATE TABLE KEEP (ID INT)".to_string());
+    execute_ddl(&mut conn, "INSERT INTO KEEP VALUES (1)".to_string());
+    let baseline = statements_during(&mut conn, || {});
+
+    let types = [
+        DataType::Time32(TimeUnit::Second),
+        DataType::Time64(TimeUnit::Microsecond),
+        DataType::Duration(TimeUnit::Second),
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        DataType::Null,
+        DataType::Decimal128(38, 2),
+        DataType::Decimal128(10, -2),
+    ];
+    let modes = [
+        ("adbc.ingest.mode.append", "KEEP"),
+        ("adbc.ingest.mode.replace", "KEEP"),
+        ("adbc.ingest.mode.create", "NEW_T"),
+        ("adbc.ingest.mode.create_append", "NEW_T"),
+    ];
+    for (mode, target) in modes {
+        for data_type in &types {
+            let before = current_statement(&mut conn);
+            let error = ingest_batch(
+                &mut conn,
+                IngestTarget {
+                    table: target,
+                    mode,
+                    catalog: None,
+                },
+                id_and_null_column_batch(data_type.clone()),
+            )
+            .expect_err("an uningestible column type must fail the ingest");
+            let sent = current_statement(&mut conn) - before;
+            let context = format!("{mode} {data_type:?}: {}", error.message);
+            assert_eq!(error.status, Status::InvalidArguments, "{context}");
+            assert!(error.message.contains("'C'"), "{context}");
+            assert!(
+                error.message.contains(&format!("{data_type:?}")),
+                "{context}"
+            );
+            assert_eq!(sent, baseline, "no SQL statement may run: {context}");
+        }
+    }
+
+    assert_eq!(
+        integers_from(&mut conn, "SELECT COUNT(*) FROM KEEP".to_string()),
+        vec![1]
+    );
+    assert_eq!(
+        integers_from(
+            &mut conn,
+            format!("SELECT COUNT(*) FROM EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{schema_name}'"),
+        ),
+        vec![1]
+    );
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Date64, Decimal256, string dictionary, and Utf8View columns are ingested
+#[test]
+fn test_bulk_ingest_creates_date64_decimal256_dictionary_and_utf8view_columns() {
+    skip_if_no_library!();
+
+    use arrow::array::{
+        Date64Array, Decimal256Array, DictionaryArray, LargeStringArray, StringViewArray,
+        UInt32Array,
+    };
+    use arrow::datatypes::{i256, Int32Type, UInt32Type};
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_TYPES");
+
+    let unscaled = i256::from_string("-123456789012345678901234567890123456").unwrap();
+    let dictionary_s: DictionaryArray<Int32Type> = vec![Some("alpha"), None].into_iter().collect();
+    let dictionary_l = DictionaryArray::<UInt32Type>::try_new(
+        UInt32Array::from(vec![Some(0), None]),
+        Arc::new(LargeStringArray::from(vec!["beta"])),
+    )
+    .unwrap();
+    let columns: Vec<(&str, Arc<dyn Array>)> = vec![
+        (
+            "D",
+            Arc::new(Date64Array::from(vec![Some(1_577_836_800_000), None])),
+        ),
+        (
+            "N",
+            Arc::new(
+                Decimal256Array::from(vec![Some(unscaled), None])
+                    .with_precision_and_scale(36, 2)
+                    .unwrap(),
+            ),
+        ),
+        ("S", Arc::new(dictionary_s)),
+        ("L", Arc::new(dictionary_l)),
+        (
+            "V",
+            Arc::new(StringViewArray::from(vec![Some("gamma"), None])),
+        ),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).unwrap();
+
+    let rows = ingest_batch(
+        &mut conn,
+        IngestTarget {
+            table: "NEW_T",
+            mode: "adbc.ingest.mode.create",
+            catalog: None,
+        },
+        batch,
+    )
+    .expect("the ingest must succeed");
+    assert_eq!(rows, Some(2));
+
+    assert_eq!(
+        column_types_of(&mut conn, &schema_name, "NEW_T"),
+        vec![
+            "DATE",
+            "DECIMAL(36,2)",
+            "VARCHAR(2000000) UTF8",
+            "VARCHAR(2000000) UTF8",
+            "VARCHAR(2000000) UTF8",
+        ]
+    );
+    let text = |name: &str| format!("CAST({name} AS VARCHAR(100))");
+    let select = format!(
+        "SELECT {}, {}, S, L, V FROM NEW_T ORDER BY D NULLS LAST",
+        text("D"),
+        text("N")
+    );
+    let expected_first: Vec<Option<String>> = [
+        "2020-01-01",
+        "-1234567890123456789012345678901234.56",
+        "alpha",
+        "beta",
+        "gamma",
+    ]
+    .iter()
+    .map(|v| Some(v.to_string()))
+    .collect();
+    assert_eq!(
+        text_rows(&mut conn, &select),
+        vec![expected_first, vec![None; 5]]
+    );
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Binary column types are stored as lowercase hexadecimal text
+#[test]
+fn test_bulk_ingest_stores_binary_columns_as_lowercase_hex_text() {
+    skip_if_no_library!();
+
+    use arrow::array::{BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray};
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_BINARY");
+
+    let bytes: &[u8] = &[0x00, 0xAB, 0xFF];
+    let fixed = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        vec![Some(bytes), None].into_iter(),
+        3,
+    )
+    .unwrap();
+    let columns: Vec<(&str, Arc<dyn Array>)> = vec![
+        ("B", Arc::new(BinaryArray::from(vec![Some(bytes), None]))),
+        (
+            "LB",
+            Arc::new(LargeBinaryArray::from(vec![Some(bytes), None])),
+        ),
+        (
+            "BV",
+            Arc::new(BinaryViewArray::from(vec![Some(bytes), None])),
+        ),
+        ("FB", Arc::new(fixed)),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).unwrap();
+
+    ingest_batch(
+        &mut conn,
+        IngestTarget {
+            table: "NEW_T",
+            mode: "adbc.ingest.mode.create",
+            catalog: None,
+        },
+        batch,
+    )
+    .expect("the ingest must succeed");
+
+    assert_eq!(
+        column_types_of(&mut conn, &schema_name, "NEW_T"),
+        vec!["VARCHAR(2000000) UTF8"; 4]
+    );
+    let first = vec![Some("00abff".to_string()); 4];
+    assert_eq!(
+        text_rows(
+            &mut conn,
+            "SELECT B, LB, BV, FB FROM NEW_T ORDER BY B NULLS LAST"
+        ),
+        vec![first, vec![None; 4]]
+    );
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Interval columns are ingested
+#[test]
+fn test_bulk_ingest_creates_interval_columns_of_leading_precision_9() {
+    skip_if_no_library!();
+
+    use arrow::array::{IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray};
+    use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano};
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_INTERVAL");
+
+    let columns: Vec<(&str, Arc<dyn Array>)> = vec![
+        (
+            "YM",
+            Arc::new(IntervalYearMonthArray::from(vec![Some(-63), None])),
+        ),
+        (
+            "DT",
+            Arc::new(IntervalDayTimeArray::from(vec![
+                Some(IntervalDayTime::new(2, 46_210_123)),
+                None,
+            ])),
+        ),
+        (
+            "MDN",
+            Arc::new(IntervalMonthDayNanoArray::from(vec![
+                Some(IntervalMonthDayNano::new(0, -2, -46_210_123_000_000)),
+                None,
+            ])),
+        ),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).unwrap();
+
+    let rows = ingest_batch(
+        &mut conn,
+        IngestTarget {
+            table: "NEW_T",
+            mode: "adbc.ingest.mode.create",
+            catalog: None,
+        },
+        batch,
+    )
+    .expect("the ingest must succeed");
+    assert_eq!(rows, Some(2));
+
+    assert_eq!(
+        column_types_of(&mut conn, &schema_name, "NEW_T"),
+        vec![
+            "INTERVAL YEAR(9) TO MONTH",
+            "INTERVAL DAY(9) TO SECOND(3)",
+            "INTERVAL DAY(9) TO SECOND(3)",
+        ]
+    );
+    assert_eq!(
+        first_column_text(
+            &mut conn,
+            "SELECT YM = CAST('-5-3' AS INTERVAL YEAR(9) TO MONTH) \
+             AND DT = CAST('2 12:50:10.123' AS INTERVAL DAY(9) TO SECOND(3)) \
+             AND MDN = CAST('-2 12:50:10.123' AS INTERVAL DAY(9) TO SECOND(3)) \
+             FROM NEW_T WHERE YM IS NOT NULL"
+        ),
+        vec!["true"]
+    );
+    assert_eq!(
+        integers_from(
+            &mut conn,
+            "SELECT COUNT(*) FROM NEW_T WHERE YM IS NULL AND DT IS NULL AND MDN IS NULL"
+                .to_string()
+        ),
+        vec![1]
+    );
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: An Interval(MonthDayNano) value with a month component fails the ingest
+#[test]
+fn test_bulk_ingest_rejects_an_interval_value_with_a_month_component() {
+    skip_if_no_library!();
+
+    use arrow::array::IntervalMonthDayNanoArray;
+    use arrow::datatypes::IntervalMonthDayNano;
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_MONTH");
+    execute_ddl(
+        &mut conn,
+        "CREATE TABLE T (I INTERVAL DAY(9) TO SECOND(3))".to_string(),
+    );
+    execute_ddl(
+        &mut conn,
+        "INSERT INTO T VALUES (CAST('1 00:00:00.000' AS INTERVAL DAY(9) TO SECOND(3)))".to_string(),
+    );
+
+    let batch = RecordBatch::try_from_iter(vec![(
+        "I",
+        Arc::new(IntervalMonthDayNanoArray::from(vec![Some(
+            IntervalMonthDayNano::new(1, 0, 0),
+        )])) as Arc<dyn Array>,
+    )])
+    .unwrap();
+    let error = ingest_batch(
+        &mut conn,
+        IngestTarget {
+            table: "T",
+            mode: "adbc.ingest.mode.append",
+            catalog: None,
+        },
+        batch,
+    )
+    .expect_err("a month component must fail the ingest");
+
+    assert_eq!(error.status, Status::Internal, "{}", error.message);
+    assert!(error.message.contains("1 months"), "{}", error.message);
+    assert!(
+        error
+            .message
+            .contains("Exasol INTERVAL DAY TO SECOND has no month component"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        integers_from(&mut conn, "SELECT COUNT(*) FROM T".to_string()),
+        vec![1]
+    );
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: Target catalog EXA is accepted in any letter case
+#[test]
+fn test_bulk_ingest_accepts_target_catalog_exa_in_any_letter_case() {
+    skip_if_no_library!();
+
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_EXA");
+
+    for (table, catalog) in [("T_UPPER", "EXA"), ("T_LOWER", "exa")] {
+        let rows = ingest_batch(
+            &mut conn,
+            IngestTarget {
+                table,
+                mode: "adbc.ingest.mode.create",
+                catalog: Some(OptionValue::String(catalog.to_string())),
+            },
+            make_test_batch(),
+        )
+        .unwrap_or_else(|e| panic!("catalog {catalog}: {e:?}"));
+        assert_eq!(rows, Some(3), "catalog {catalog}");
+        assert_eq!(
+            integers_from(&mut conn, format!("SELECT COUNT(*) FROM {table}")),
+            vec![3]
+        );
+    }
+    drop_test_schema(&mut conn, &schema_name);
+}
+
+/// Scenario: A target catalog other than EXA fails before any SQL statement
+#[test]
+fn test_bulk_ingest_rejects_a_target_catalog_other_than_exa_before_any_sql() {
+    skip_if_no_library!();
+
+    let (_driver, _db, mut conn) = open_connection(get_test_uri());
+    let schema_name = create_ingest_schema(&mut conn, "TEST_INGEST_CATALOG");
+    let baseline = statements_during(&mut conn, || {});
+
+    let catalogs = [
+        OptionValue::String("BOGUS".to_string()),
+        OptionValue::String(String::new()),
+        OptionValue::Int(1),
+    ];
+    for catalog in catalogs {
+        let before = current_statement(&mut conn);
+        let error = ingest_batch(
+            &mut conn,
+            IngestTarget {
+                table: "NEW_T",
+                mode: "adbc.ingest.mode.create",
+                catalog: Some(catalog.clone()),
+            },
+            make_test_batch(),
+        )
+        .expect_err("a catalog other than EXA must fail the ingest");
+        let sent = current_statement(&mut conn) - before;
+        let context = format!("{catalog:?}: {}", error.message);
+        assert_eq!(error.status, Status::InvalidArguments, "{context}");
+        assert!(error.message.contains("only the catalog EXA"), "{context}");
+        assert_eq!(sent, baseline, "no SQL statement may run: {context}");
+    }
+
+    assert_eq!(
+        integers_from(
+            &mut conn,
+            format!("SELECT COUNT(*) FROM EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{schema_name}'"),
+        ),
+        vec![0]
+    );
+    drop_test_schema(&mut conn, &schema_name);
+}

@@ -4000,6 +4000,364 @@ async fn test_parquet_import_csv_path_keeps_pre_epoch_fractional_timestamps() {
     conn.close().await.expect("Failed to close connection");
 }
 
+// Section: Arrow types that the import CSV conversion converts
+
+async fn create_schema(conn: &mut Connection, schema_name: &str) {
+    conn.execute_update(&format!("CREATE SCHEMA IF NOT EXISTS {schema_name}"))
+        .await
+        .expect("CREATE SCHEMA should succeed");
+}
+
+fn write_parquet_with(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+    options: parquet::arrow::arrow_writer::ArrowWriterOptions,
+) {
+    let file = std::fs::File::create(path).expect("Failed to create parquet file");
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new_with_options(file, batch.schema(), options)
+            .expect("Failed to create ArrowWriter");
+    writer.write(batch).expect("Failed to write batch");
+    writer.close().expect("Failed to close ArrowWriter");
+}
+
+/// A batch with the field `ID` (Int64) holding 1 and the field `X` holding `x`.
+fn id_and_x_batch(x: arrow::array::ArrayRef) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("X", x.data_type().clone(), true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int64Array::from(vec![1])), x],
+    )
+    .expect("Failed to create RecordBatch")
+}
+
+async fn table_exists(conn: &mut Connection, schema_name: &str, table: &str) -> bool {
+    count_of(
+        conn,
+        &format!(
+            "SELECT COUNT(*) FROM EXA_ALL_TABLES \
+             WHERE TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table}'"
+        ),
+    )
+    .await
+        > 0
+}
+
+fn assert_schema_inference_error(result: Result<u64, ImportError>, parts: &[&str]) {
+    match result {
+        Err(ImportError::SchemaInferenceError(message)) => assert!(
+            parts.iter().all(|part| message.contains(part)),
+            "the message must contain {parts:?}, got: {message}"
+        ),
+        other => panic!("expected ImportError::SchemaInferenceError, got: {other:?}"),
+    }
+}
+
+/// Scenario: CSV-path Parquet import converts values as RecordBatch import does
+#[tokio::test]
+async fn test_parquet_import_csv_path_converts_values_as_record_batch_import() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::{Decimal128Array, DictionaryArray, FixedSizeBinaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_schema(&mut conn, &schema_name).await;
+    let schema = Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("N", DataType::Decimal128(5, 2), true),
+        Field::new(
+            "S",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        ),
+        Field::new("B", DataType::FixedSizeBinary(2), true),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(
+                Decimal128Array::from(vec![-5])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ),
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a;b"])),
+            )),
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0xABu8, 0xCD]].into_iter()).unwrap()),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("values.parquet");
+    write_parquet_with(
+        &parquet_path,
+        &batch,
+        parquet::arrow::arrow_writer::ArrowWriterOptions::new(),
+    );
+
+    let rows = conn
+        .import_from_parquet(
+            "T",
+            &parquet_path,
+            ParquetImportOptions::default()
+                .with_schema(&schema_name)
+                .with_native_parquet(Some(false))
+                .with_create_table_if_not_exists(true)
+                .with_column_separator(';'),
+        )
+        .await
+        .expect("Parquet import should succeed");
+
+    assert_eq!(rows, 1);
+    let column_types = text_rows(
+        &mut conn,
+        &format!(
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM EXA_ALL_COLUMNS \
+             WHERE COLUMN_SCHEMA = '{schema_name}' AND COLUMN_TABLE = 'T' \
+             AND COLUMN_NAME IN ('N', 'S', 'B') ORDER BY COLUMN_ORDINAL_POSITION"
+        ),
+    )
+    .await;
+    assert_eq!(
+        column_types,
+        [
+            ["N", "DECIMAL(5,2)"],
+            ["S", "VARCHAR(2000000) UTF8"],
+            ["B", "VARCHAR(2000000) UTF8"],
+        ]
+    );
+    let stored = text_rows(&mut conn, &format!("SELECT N, S, B FROM {schema_name}.T")).await;
+    assert_eq!(stored, [["-0.05", "a;b", "abcd"]]);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Native Parquet import with table creation rejects Utf8View, dictionary, BinaryView, FixedSizeBinary, and interval columns
+#[tokio::test]
+async fn test_parquet_import_native_path_rejects_csv_only_types_before_create_table() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::{
+        ArrayRef, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray, Int32Array,
+        IntervalDayTimeArray, IntervalYearMonthArray, StringViewArray,
+    };
+    use arrow::datatypes::{Int32Type, IntervalDayTime};
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_schema(&mut conn, &schema_name).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let cases: [(ArrayRef, &str); 6] = [
+        (Arc::new(StringViewArray::from(vec!["a"])), "Utf8View"),
+        (
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a"])),
+            )),
+            "Dictionary(Int32, Utf8)",
+        ),
+        (
+            Arc::new(BinaryViewArray::from(vec![&[1u8][..]])),
+            "BinaryView",
+        ),
+        (
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[7u8; 16]].into_iter()).unwrap()),
+            "FixedSizeBinary(16)",
+        ),
+        (
+            Arc::new(IntervalYearMonthArray::from(vec![14])),
+            "Interval(YearMonth)",
+        ),
+        (
+            Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(1, 0)])),
+            "Interval(DayTime)",
+        ),
+    ];
+
+    for (index, (x, type_name)) in cases.into_iter().enumerate() {
+        let parquet_path = temp_dir.path().join(format!("x_{index}.parquet"));
+        write_parquet_with(
+            &parquet_path,
+            &id_and_x_batch(x),
+            parquet::arrow::arrow_writer::ArrowWriterOptions::new(),
+        );
+
+        let result = conn
+            .import_from_parquet(
+                "T",
+                &parquet_path,
+                ParquetImportOptions::default()
+                    .with_schema(&schema_name)
+                    .with_native_parquet(Some(true))
+                    .with_create_table_if_not_exists(true),
+            )
+            .await;
+
+        assert_schema_inference_error(
+            result,
+            &["'X'", type_name, "with_native_parquet(Some(false))"],
+        );
+    }
+    assert!(!table_exists(&mut conn, &schema_name, "T").await);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: RecordBatch import writes Arrow interval values as Exasol INTERVAL text
+#[tokio::test]
+async fn test_record_batch_import_stores_interval_values() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    use arrow::array::{IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray};
+    use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano, IntervalUnit};
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_table(
+        &mut conn,
+        &schema_name,
+        "T",
+        "ID DECIMAL(18,0), YM INTERVAL YEAR(9) TO MONTH, \
+         DT INTERVAL DAY(9) TO SECOND(3), MDN INTERVAL DAY(9) TO SECOND(3)",
+    )
+    .await;
+    let schema = Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("YM", DataType::Interval(IntervalUnit::YearMonth), true),
+        Field::new("DT", DataType::Interval(IntervalUnit::DayTime), true),
+        Field::new("MDN", DataType::Interval(IntervalUnit::MonthDayNano), true),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(IntervalYearMonthArray::from(vec![
+                Some(63),
+                Some(-63),
+                Some(2_147_483_647),
+                None,
+            ])),
+            Arc::new(IntervalDayTimeArray::from(vec![
+                Some(IntervalDayTime::new(2, 46_210_123)),
+                Some(IntervalDayTime::new(-2, -46_210_123)),
+                Some(IntervalDayTime::new(0, 86_400_000)),
+                None,
+            ])),
+            Arc::new(IntervalMonthDayNanoArray::from(vec![
+                Some(IntervalMonthDayNano::new(0, 2, 46_210_123_000_000)),
+                Some(IntervalMonthDayNano::new(0, -2, -46_210_123_000_000)),
+                Some(IntervalMonthDayNano::new(0, 1, -1_000_000)),
+                None,
+            ])),
+        ],
+    )
+    .expect("Failed to create RecordBatch");
+
+    conn.import_from_record_batch(
+        &format!("{schema_name}.T"),
+        &batch,
+        ArrowImportOptions::default(),
+    )
+    .await
+    .expect("Arrow import should succeed");
+
+    let stored = text_rows(
+        &mut conn,
+        &format!(
+            "SELECT ID, CAST(YM AS VARCHAR(40)), CAST(DT AS VARCHAR(40)), \
+             CAST(MDN AS VARCHAR(40)) FROM {schema_name}.T ORDER BY ID"
+        ),
+    )
+    .await;
+    let expected = [
+        (1, "5-3", "2 12:50:10.123", "2 12:50:10.123"),
+        (2, "-5-3", "-2 12:50:10.123", "-2 12:50:10.123"),
+        (3, "178956970-7", "1 00:00:00.000", "0 23:59:59.999"),
+    ];
+    for (id, ym, dt, mdn) in expected {
+        let matching = count_of(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*) FROM {schema_name}.T WHERE ID = {id} \
+                 AND YM = CAST('{ym}' AS INTERVAL YEAR(9) TO MONTH) \
+                 AND DT = CAST('{dt}' AS INTERVAL DAY(9) TO SECOND(3)) \
+                 AND MDN = CAST('{mdn}' AS INTERVAL DAY(9) TO SECOND(3))"
+            ),
+        )
+        .await;
+        assert_eq!(matching, 1, "ID {id}, stored rows: {stored:?}");
+    }
+    let nulls = count_of(
+        &mut conn,
+        &format!(
+            "SELECT COUNT(*) FROM {schema_name}.T \
+             WHERE ID = 4 AND YM IS NULL AND DT IS NULL AND MDN IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(nulls, 1, "stored rows: {stored:?}");
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: CSV-path Parquet import rejects an INTERVAL column from a file without an Arrow schema
+#[tokio::test]
+async fn test_parquet_import_csv_path_rejects_interval_without_arrow_schema() {
+    assert!(
+        common::is_exasol_available(),
+        "Exasol is not available; this test requires a running database"
+    );
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    let schema_name = generate_test_schema_name();
+    create_schema(&mut conn, &schema_name).await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let parquet_path = temp_dir.path().join("interval.parquet");
+    write_parquet_with(
+        &parquet_path,
+        &id_and_x_batch(Arc::new(arrow::array::IntervalYearMonthArray::from(vec![
+            14,
+        ]))),
+        parquet::arrow::arrow_writer::ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+    );
+
+    let result = conn
+        .import_from_parquet(
+            "T",
+            &parquet_path,
+            ParquetImportOptions::default()
+                .with_schema(&schema_name)
+                .with_native_parquet(Some(false))
+                .with_create_table_if_not_exists(true),
+        )
+        .await;
+
+    assert_schema_inference_error(result, &["'X'", "would lose its month part"]);
+    assert!(!table_exists(&mut conn, &schema_name, "T").await);
+
+    cleanup_schema(&mut conn, &schema_name).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
 // Section: HTTP tunnel TLS
 //
 // These tests fail instead of skipping when Exasol is unavailable (AGENTS.md).

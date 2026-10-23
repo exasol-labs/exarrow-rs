@@ -33,6 +33,13 @@ pub enum ColumnNameMode {
     Sanitize,
 }
 
+/// The largest leading field precision of an Exasol INTERVAL type. The default of 2 holds at
+/// most 99 years or days, while 9 holds every Arrow Interval(YearMonth) value.
+const INTERVAL_LEADING_PRECISION: u8 = 9;
+
+/// The largest precision of an Exasol DECIMAL column.
+const MAX_DECIMAL_PRECISION: u8 = 36;
+
 /// Exasol data type representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "UPPERCASE")]
@@ -149,9 +156,11 @@ impl ExasolType {
                     "TIMESTAMP".to_string()
                 }
             }
-            ExasolType::IntervalYearToMonth => "INTERVAL YEAR TO MONTH".to_string(),
+            ExasolType::IntervalYearToMonth => {
+                format!("INTERVAL YEAR({INTERVAL_LEADING_PRECISION}) TO MONTH")
+            }
             ExasolType::IntervalDayToSecond { precision } => {
-                format!("INTERVAL DAY TO SECOND({precision})")
+                format!("INTERVAL DAY({INTERVAL_LEADING_PRECISION}) TO SECOND({precision})")
             }
             ExasolType::Geometry { srid } => {
                 if let Some(srid) = srid {
@@ -239,25 +248,36 @@ impl TypeMapper {
         }
     }
 
-    /// Convert an Arrow DataType to an Exasol type.
+    /// Map an Arrow type to the Exasol column type that a created table uses for it.
     ///
-    /// This is used for parameter binding and type inference.
-    ///
-    /// # Arguments
-    /// * `arrow_type` - The Arrow type to convert
-    ///
-    /// # Returns
-    /// The corresponding Exasol type
+    /// Maps only the Arrow types that the import CSV conversion in `crate::import::arrow`
+    /// converts, so a table created from this mapping can be filled by an import of the same
+    /// data. Binary types map to `VARCHAR(2000000)`, which holds their lowercase hex text,
+    /// because Exasol has no binary column type.
     ///
     /// # Errors
-    /// Returns `ConversionError::UnsupportedType` if the type cannot be mapped
+    /// Returns `ConversionError::UnsupportedType`, which names the Arrow type, for a type
+    /// without an Exasol column type, such as Time64, a list, or a decimal outside Exasol's
+    /// DECIMAL limits of precision 1 to 36 and a scale from 0 to the precision.
     pub fn arrow_to_exasol(arrow_type: &DataType) -> Result<ExasolType, ConversionError> {
+        const LONGEST_VARCHAR: ExasolType = ExasolType::Varchar { size: 2_000_000 };
+
         match arrow_type {
             DataType::Boolean => Ok(ExasolType::Boolean),
 
-            DataType::Utf8 | DataType::LargeUtf8 => {
-                // Default to VARCHAR(2000000) for string types
-                Ok(ExasolType::Varchar { size: 2000000 })
+            DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_) => Ok(LONGEST_VARCHAR),
+
+            DataType::Dictionary(key_type, value_type)
+                if key_type.is_dictionary_key_type()
+                    && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+            {
+                Ok(LONGEST_VARCHAR)
             }
 
             DataType::Int8 | DataType::Int16 | DataType::Int32 => Ok(ExasolType::Decimal {
@@ -283,10 +303,20 @@ impl TypeMapper {
             DataType::Float32 | DataType::Float64 => Ok(ExasolType::Double),
 
             DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-                Ok(ExasolType::Decimal {
-                    precision: *precision,
-                    scale: *scale,
-                })
+                if (1..=MAX_DECIMAL_PRECISION).contains(precision)
+                    && (0..=*precision as i8).contains(scale)
+                {
+                    Ok(ExasolType::Decimal {
+                        precision: *precision,
+                        scale: *scale,
+                    })
+                } else {
+                    Err(ConversionError::UnsupportedType {
+                        exasol_type: format!(
+                            "Arrow type {arrow_type:?}, because Exasol DECIMAL takes a precision from 1 to {MAX_DECIMAL_PRECISION} and a scale from 0 to the precision"
+                        ),
+                    })
+                }
             }
 
             DataType::Date32 | DataType::Date64 => Ok(ExasolType::Date),
@@ -295,10 +325,11 @@ impl TypeMapper {
                 with_local_time_zone: tz.is_some(),
             }),
 
-            DataType::Interval(_) => Ok(ExasolType::IntervalDayToSecond { precision: 3 }),
+            DataType::Interval(IntervalUnit::YearMonth) => Ok(ExasolType::IntervalYearToMonth),
 
-            DataType::Binary | DataType::LargeBinary => {
-                Ok(ExasolType::Varchar { size: 2000000 }) // Store as hex string
+            // Exasol stores INTERVAL DAY TO SECOND values in whole milliseconds.
+            DataType::Interval(IntervalUnit::DayTime | IntervalUnit::MonthDayNano) => {
+                Ok(ExasolType::IntervalDayToSecond { precision: 3 })
             }
 
             _ => Err(ConversionError::UnsupportedType {
@@ -385,19 +416,137 @@ mod tests {
         assert_eq!(reverse, exasol_type);
     }
 
+    const DICTIONARY_KEY_TYPES: [DataType; 8] = [
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+    ];
+
+    const TIME_UNITS: [TimeUnit; 4] = [
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ];
+
+    fn dictionary(key: DataType, value: DataType) -> DataType {
+        DataType::Dictionary(Box::new(key), Box::new(value))
+    }
+
+    fn ddl_type_of(arrow_type: &DataType) -> String {
+        TypeMapper::arrow_to_exasol(arrow_type)
+            .unwrap_or_else(|e| panic!("{arrow_type:?}: {e}"))
+            .to_ddl_type()
+    }
+
+    /// Scenario: String, binary, date, timestamp, interval, boolean, and decimal type mappings for DDL generation
     #[test]
-    fn test_arrow_decimal256_to_exasol() {
-        // Test that Arrow Decimal256 types (from external sources) correctly convert to Exasol type.
-        // Note: Exasol itself only produces precision <= 36, but Arrow sources may use Decimal256.
-        let arrow_type = DataType::Decimal256(40, 5);
-        let exasol_type = TypeMapper::arrow_to_exasol(&arrow_type).unwrap();
-        assert_eq!(
-            exasol_type,
-            ExasolType::Decimal {
-                precision: 40,
-                scale: 5
-            }
-        );
+    fn test_arrow_to_exasol_maps_string_binary_date_timestamp_interval_boolean_and_decimal_types() {
+        let mut cases = vec![
+            (DataType::Boolean, "BOOLEAN"),
+            (DataType::Date32, "DATE"),
+            (DataType::Date64, "DATE"),
+            (DataType::Utf8, "VARCHAR(2000000)"),
+            (DataType::LargeUtf8, "VARCHAR(2000000)"),
+            (DataType::Utf8View, "VARCHAR(2000000)"),
+            (DataType::Binary, "VARCHAR(2000000)"),
+            (DataType::LargeBinary, "VARCHAR(2000000)"),
+            (DataType::BinaryView, "VARCHAR(2000000)"),
+            (DataType::FixedSizeBinary(1), "VARCHAR(2000000)"),
+            (DataType::FixedSizeBinary(16), "VARCHAR(2000000)"),
+            (DataType::Decimal128(1, 0), "DECIMAL(1,0)"),
+            (DataType::Decimal128(36, 2), "DECIMAL(36,2)"),
+            (DataType::Decimal128(10, 10), "DECIMAL(10,10)"),
+            (DataType::Decimal256(36, 0), "DECIMAL(36,0)"),
+            (DataType::Decimal256(36, 36), "DECIMAL(36,36)"),
+            (
+                DataType::Interval(IntervalUnit::YearMonth),
+                "INTERVAL YEAR(9) TO MONTH",
+            ),
+            (
+                DataType::Interval(IntervalUnit::DayTime),
+                "INTERVAL DAY(9) TO SECOND(3)",
+            ),
+            (
+                DataType::Interval(IntervalUnit::MonthDayNano),
+                "INTERVAL DAY(9) TO SECOND(3)",
+            ),
+        ];
+        for unit in TIME_UNITS {
+            cases.push((DataType::Timestamp(unit, None), "TIMESTAMP"));
+            cases.push((
+                DataType::Timestamp(unit, Some("Europe/Berlin".into())),
+                "TIMESTAMP WITH LOCAL TIME ZONE",
+            ));
+        }
+        for key in DICTIONARY_KEY_TYPES {
+            cases.push((dictionary(key.clone(), DataType::Utf8), "VARCHAR(2000000)"));
+            cases.push((dictionary(key, DataType::LargeUtf8), "VARCHAR(2000000)"));
+        }
+
+        for (arrow_type, expected) in cases {
+            assert_eq!(ddl_type_of(&arrow_type), expected, "{arrow_type:?}");
+        }
+    }
+
+    /// Scenario: Arrow types without an Exasol column type are rejected
+    #[test]
+    fn test_arrow_to_exasol_rejects_types_without_an_exasol_column_type() {
+        use arrow::datatypes::{Field, Fields, UnionFields, UnionMode};
+        use std::sync::Arc;
+
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ));
+        let mut cases = vec![
+            DataType::Decimal128(37, 0),
+            DataType::Decimal128(38, 2),
+            DataType::Decimal256(40, 5),
+            DataType::Decimal256(76, -10),
+            DataType::Decimal128(10, -2),
+            DataType::Decimal128(5, 6),
+            DataType::Decimal256(36, -1),
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Null,
+            DataType::Float16,
+            DataType::List(item.clone()),
+            DataType::LargeList(item.clone()),
+            DataType::FixedSizeList(item.clone(), 2),
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+            DataType::Map(entries, false),
+            DataType::Union(
+                UnionFields::try_new(vec![0], vec![Field::new("a", DataType::Int32, true)])
+                    .unwrap(),
+                UnionMode::Sparse,
+            ),
+            dictionary(DataType::Int32, DataType::Int32),
+            dictionary(DataType::Int8, DataType::Binary),
+            dictionary(DataType::UInt16, DataType::Utf8View),
+        ];
+        cases.extend(TIME_UNITS.map(DataType::Duration));
+
+        for arrow_type in cases {
+            let error = TypeMapper::arrow_to_exasol(&arrow_type).unwrap_err();
+            assert!(
+                matches!(&error, ConversionError::UnsupportedType { .. })
+                    && error.to_string().contains(&format!("{arrow_type:?}")),
+                "{arrow_type:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -671,10 +820,10 @@ mod tests {
     #[test]
     fn test_to_ddl_type_interval() {
         let t = ExasolType::IntervalYearToMonth;
-        assert_eq!(t.to_ddl_type(), "INTERVAL YEAR TO MONTH");
+        assert_eq!(t.to_ddl_type(), "INTERVAL YEAR(9) TO MONTH");
 
         let t2 = ExasolType::IntervalDayToSecond { precision: 6 };
-        assert_eq!(t2.to_ddl_type(), "INTERVAL DAY TO SECOND(6)");
+        assert_eq!(t2.to_ddl_type(), "INTERVAL DAY(9) TO SECOND(6)");
     }
 
     #[test]
