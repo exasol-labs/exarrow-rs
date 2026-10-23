@@ -183,6 +183,51 @@ pub(crate) fn generate_create_table_ddl(table_name: &str, schema: &Schema) -> Ad
     ))
 }
 
+/// Fail an ingest whose `adbc.ingest.target_catalog` is set to anything but `EXA`.
+///
+/// An empty or non-string value fails like any other non-`EXA` value.
+fn check_ingest_target_catalog(catalog: Option<&OptionValue>) -> AdbcResult<()> {
+    let Some(value) = catalog else {
+        return Ok(());
+    };
+    match value {
+        OptionValue::String(name) if catalog_is_exasol(Some(name)) => Ok(()),
+        OptionValue::String(name) => Err(unsupported_target_catalog(&format!("{name:?}"))),
+        other => Err(unsupported_target_catalog(&format!("{other:?}"))),
+    }
+}
+
+fn unsupported_target_catalog(value: &str) -> AdbcError {
+    AdbcError::with_message_and_status(
+        format!("Target catalog {value} is not supported: Exasol has only the catalog EXA"),
+        AdbcStatus::InvalidArguments,
+    )
+}
+
+/// Fail an ingest whose bound schema holds a column that Exasol cannot store or that the import
+/// CSV conversion cannot convert, so no mode sends SQL for a batch it cannot finish.
+fn check_ingest_column_types(schema: &Schema) -> AdbcResult<()> {
+    for field in schema.fields() {
+        TypeMapper::arrow_to_exasol(field.data_type()).map_err(|e| {
+            AdbcError::with_message_and_status(
+                format!(
+                    "Cannot ingest column '{}' of Arrow type {:?}: {}",
+                    field.name(),
+                    field.data_type(),
+                    e
+                ),
+                AdbcStatus::InvalidArguments,
+            )
+        })?;
+    }
+    crate::import::arrow::check_schema_converts(schema).map_err(|e| {
+        AdbcError::with_message_and_status(
+            format!("Cannot ingest the bound columns: {e}"),
+            AdbcStatus::InvalidArguments,
+        )
+    })
+}
+
 /// Parse an Exasol type name string from system views into an ExasolType.
 ///
 /// Handles formats like "DECIMAL(18,0)", "VARCHAR(100)", "BOOLEAN", "TIMESTAMP",
@@ -2126,12 +2171,14 @@ impl FfiStatement {
             )
         })?;
 
+        check_ingest_target_catalog(self.options.get("adbc.ingest.target_catalog"))?;
+        let arrow_schema = batch.schema();
+        check_ingest_column_types(&arrow_schema)?;
+
         let conn_arc = self.conn.as_ref().ok_or_else(|| {
             AdbcError::with_message_and_status("No connection available", AdbcStatus::InvalidState)
         })?;
         let conn_arc = Arc::clone(conn_arc);
-
-        let arrow_schema = batch.schema();
 
         match ingest_mode.as_str() {
             "adbc.ingest.mode.create" => {
@@ -2853,6 +2900,156 @@ mod tests {
                 "Expected 'No data bound' error, got: {}",
                 err.message
             ),
+        }
+    }
+
+    const INGEST_MODES: [&str; 4] = [
+        "adbc.ingest.mode.append",
+        "adbc.ingest.mode.replace",
+        "adbc.ingest.mode.create",
+        "adbc.ingest.mode.create_append",
+    ];
+
+    /// A statement without a connection that ingests one null row of `data_type` into `T`, so an
+    /// `InvalidArguments` result proves that the check ran before the connection lookup.
+    fn ingest_statement_without_connection(
+        mode: &str,
+        column_type: DataType,
+        catalog: Option<OptionValue>,
+    ) -> FfiStatement {
+        let mut stmt = FfiStatement::new();
+        let mut set = |key: &str, value: OptionValue| {
+            stmt.set_option(OptionStatement::Other(key.to_string()), value)
+                .unwrap();
+        };
+        set(
+            "adbc.ingest.target_table",
+            OptionValue::String("T".to_string()),
+        );
+        set("adbc.ingest.mode", OptionValue::String(mode.to_string()));
+        if let Some(catalog) = catalog {
+            set("adbc.ingest.target_catalog", catalog);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ID", DataType::Int32, false),
+            Field::new("C", column_type.clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1])),
+                arrow::array::new_null_array(&column_type, 1),
+            ],
+        )
+        .unwrap();
+        stmt.bind(batch).unwrap();
+        stmt
+    }
+
+    /// Scenario: A bound column type that the driver cannot ingest fails before any SQL statement
+    #[test]
+    fn test_bulk_ingest_rejects_an_uningestible_column_type_in_every_mode_before_any_sql() {
+        let uningestible = [
+            DataType::Time32(arrow::datatypes::TimeUnit::Second),
+            DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+            DataType::Duration(arrow::datatypes::TimeUnit::Second),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            DataType::Null,
+            DataType::Decimal128(38, 2),
+            DataType::Decimal128(10, -2),
+        ];
+        for mode in INGEST_MODES {
+            for data_type in &uningestible {
+                let mut stmt = ingest_statement_without_connection(mode, data_type.clone(), None);
+                let err = stmt.execute_update().unwrap_err();
+                assert_eq!(
+                    err.status,
+                    AdbcStatus::InvalidArguments,
+                    "{mode} {data_type:?}: {}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains("'C'") && err.message.contains(&format!("{data_type:?}")),
+                    "{mode} {data_type:?}: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bulk_ingest_accepts_ingestible_column_types_up_to_the_connection_lookup() {
+        let ingestible = [
+            DataType::Date64,
+            DataType::Decimal128(36, 2),
+            DataType::Decimal256(36, 2),
+            DataType::Utf8View,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(3),
+            DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+        ];
+        for mode in INGEST_MODES {
+            for data_type in &ingestible {
+                let mut stmt = ingest_statement_without_connection(mode, data_type.clone(), None);
+                let err = stmt.execute_update().unwrap_err();
+                assert_eq!(err.status, AdbcStatus::InvalidState, "{mode} {data_type:?}");
+                assert!(err.message.contains("No connection available"));
+            }
+        }
+    }
+
+    /// Scenario: A target catalog other than EXA fails before any SQL statement
+    #[test]
+    fn test_bulk_ingest_rejects_a_target_catalog_other_than_exa_before_any_sql() {
+        let catalogs = [
+            OptionValue::String("BOGUS".to_string()),
+            OptionValue::String(String::new()),
+            OptionValue::Int(1),
+        ];
+        for catalog in catalogs {
+            let mut stmt = ingest_statement_without_connection(
+                "adbc.ingest.mode.create",
+                DataType::Utf8,
+                Some(catalog.clone()),
+            );
+            let err = stmt.execute_update().unwrap_err();
+            assert_eq!(
+                err.status,
+                AdbcStatus::InvalidArguments,
+                "{catalog:?}: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("only the catalog EXA"),
+                "{catalog:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_bulk_ingest_names_the_rejected_target_catalog() {
+        let mut stmt = ingest_statement_without_connection(
+            "adbc.ingest.mode.create",
+            DataType::Utf8,
+            Some(OptionValue::String("BOGUS".to_string())),
+        );
+        let err = stmt.execute_update().unwrap_err();
+        assert!(err.message.contains("BOGUS"), "{}", err.message);
+    }
+
+    /// Scenario: Target catalog EXA is accepted in any letter case
+    #[test]
+    fn test_bulk_ingest_accepts_target_catalog_exa_in_any_letter_case() {
+        for catalog in ["EXA", "exa"] {
+            let mut stmt = ingest_statement_without_connection(
+                "adbc.ingest.mode.create",
+                DataType::Utf8,
+                Some(OptionValue::String(catalog.to_string())),
+            );
+            let err = stmt.execute_update().unwrap_err();
+            assert_eq!(err.status, AdbcStatus::InvalidState, "{catalog}");
+            assert!(err.message.contains("No connection available"), "{catalog}");
         }
     }
 

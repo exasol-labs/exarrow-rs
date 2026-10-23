@@ -10,16 +10,13 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
+};
+use parquet::arrow::ARROW_SCHEMA_META_KEY;
 use parquet::file::reader::ChunkReader;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
@@ -27,6 +24,7 @@ use crate::query::import::{ImportFileEntry, ImportFormat, ImportQuery, RowSepara
 use crate::transport::HttpTransportClient;
 use crate::types::{infer_schema_from_parquet, infer_schema_from_parquet_files, ColumnNameMode};
 
+use super::arrow::{check_schema_converts, format_row, CsvWriterOptions};
 use super::parallel::{
     finish_import, resolve_stream_task, stream_in_parallel, stream_parquet_files_parallel,
     ParallelTransportPool, CHUNK_SIZE as CHUNKED_TRANSFER_SIZE,
@@ -267,6 +265,11 @@ where
 {
     if options.create_table_if_not_exists {
         let inferred_schema = infer_schema_from_parquet(file_path, options.column_name_mode)?;
+        if use_native {
+            check_native_auto_create_footer(file_path)?;
+        } else {
+            check_csv_auto_create_footer(file_path)?;
+        }
         let ddl = inferred_schema.to_ddl(table, options.schema.as_deref());
         create_table_from_ddl(&mut execute_sql, ddl).await?;
     }
@@ -312,6 +315,119 @@ where
     }
 }
 
+/// Rejects a file that native Parquet import cannot create columns for, before auto-create
+/// sends `CREATE TABLE`, so the rejected file leaves no table behind.
+///
+/// The native path accepts only the fields of [`native_auto_create_accepts`].
+fn check_native_auto_create_footer(path: &Path) -> Result<(), ImportError> {
+    let footer = read_footer(path)?;
+    check_native_auto_create_types(footer.schema()).map_err(|reason| rejected_footer(path, reason))
+}
+
+/// Rejects a file that the CSV import path would convert wrongly, before auto-create sends
+/// `CREATE TABLE`, so the rejected file leaves no table behind.
+///
+/// The CSV path applies [`check_intervals_keep_month_part`].
+fn check_csv_auto_create_footer(path: &Path) -> Result<(), ImportError> {
+    let footer = read_footer(path)?;
+    check_intervals_keep_month_part(&footer).map_err(|reason| rejected_footer(path, reason))
+}
+
+fn rejected_footer(path: &Path, reason: String) -> ImportError {
+    ImportError::SchemaInferenceError(format!("Parquet file '{}': {reason}", path.display()))
+}
+
+fn read_footer(path: &Path) -> Result<ArrowReaderMetadata, ImportError> {
+    let unreadable = |e: &dyn std::fmt::Display| {
+        ImportError::SchemaInferenceError(format!(
+            "Failed to read the Parquet footer of '{}': {e}",
+            path.display()
+        ))
+    };
+    let file = std::fs::File::open(path).map_err(|e| unreadable(&e))?;
+    ArrowReaderMetadata::load(&file, Default::default()).map_err(|e| unreadable(&e))
+}
+
+/// The Arrow types for which native Parquet import with table creation creates a column.
+///
+/// Nothing verifies what Exasol's Parquet reader loads for any other type, so a type that
+/// `TypeMapper::arrow_to_exasol` maps later stays rejected here until it is added.
+fn native_auto_create_accepts(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+    )
+}
+
+fn check_native_auto_create_types(schema: &Schema) -> Result<(), String> {
+    let rejected = schema
+        .fields()
+        .iter()
+        .find(|field| !native_auto_create_accepts(field.data_type()));
+    match rejected {
+        Some(field) => Err(format!(
+            "column '{}' has the Arrow type {:?}, for which native Parquet import cannot \
+             create a column; import the file with with_native_parquet(Some(false))",
+            field.name(),
+            field.data_type()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Rejects an Interval field of a file whose footer holds no Arrow schema.
+///
+/// The Parquet reader then reads a Parquet INTERVAL column as Interval(DayTime) and drops
+/// its month part, so converting the column would store wrong values without an error.
+fn check_intervals_keep_month_part(footer: &ArrowReaderMetadata) -> Result<(), String> {
+    let has_arrow_schema = footer
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.key == ARROW_SCHEMA_META_KEY)
+        });
+    if has_arrow_schema {
+        return Ok(());
+    }
+    let interval = footer
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| matches!(field.data_type(), DataType::Interval(_)));
+    match interval {
+        Some(field) => Err(format!(
+            "column '{}' holds Parquet INTERVAL values in a file without an Arrow schema, \
+             which the Parquet reader reads as {:?}, so the column would lose its month part; \
+             write the file with its Arrow schema to import it",
+            field.name(),
+            field.data_type()
+        )),
+        None => Ok(()),
+    }
+}
+
 /// A Parquet source opened for CSV conversion.
 pub(crate) struct ParquetCsvSource {
     /// The row count that the footer reports, known before any row group is decoded.
@@ -322,8 +438,8 @@ pub(crate) struct ParquetCsvSource {
 
 /// Reads the footer of `source` and builds a reader at `options.batch_size`.
 ///
-/// Only the footer is read here, so a caller can reject a broken file and
-/// skip a row-less one before it connects or runs any SQL.
+/// Only the footer is read here, so a caller can reject a broken file or an Interval column
+/// that would lose its month part, and skip a row-less file, before it connects or runs any SQL.
 pub(crate) fn open_parquet_csv_reader<R>(
     source: R,
     options: &ParquetImportOptions,
@@ -331,7 +447,9 @@ pub(crate) fn open_parquet_csv_reader<R>(
 where
     R: ChunkReader + 'static,
 {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(source)?;
+    let footer = ArrowReaderMetadata::load(&source, Default::default())?;
+    check_intervals_keep_month_part(&footer).map_err(ImportError::SchemaInferenceError)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(source, footer);
     let footer_rows = builder.metadata().file_metadata().num_rows();
     let row_count = u64::try_from(footer_rows).map_err(|_| {
         ImportError::ParquetError(format!(
@@ -696,6 +814,13 @@ where
     // Auto-create table if enabled (for multi-file, infer union schema)
     if options.create_table_if_not_exists {
         let inferred_schema = infer_schema_from_parquet_files(&paths, options.column_name_mode)?;
+        for path in &paths {
+            if use_native {
+                check_native_auto_create_footer(path)?;
+            } else {
+                check_csv_auto_create_footer(path)?;
+            }
+        }
         let ddl = inferred_schema.to_ddl(table, options.schema.as_deref());
         create_table_from_ddl(&mut execute_sql, ddl).await?;
     }
@@ -804,341 +929,31 @@ fn build_multi_file_parquet_native_query(
     )
 }
 
-/// Converts an Arrow RecordBatch to CSV rows.
+/// Converts an Arrow RecordBatch to CSV rows, one string per row without a row terminator.
 ///
-/// This function handles all Arrow data types and converts them to CSV-compatible
-/// string representations suitable for Exasol import.
-///
-/// # Arguments
-///
-/// * `batch` - The RecordBatch to convert
-/// * `options` - Import options containing CSV formatting settings
-///
-/// # Returns
-///
-/// A vector of CSV row strings.
+/// The rows come from the import CSV conversion that RecordBatch import uses, with the
+/// separator, delimiter, and null value of `options`, so a CSV-path Parquet import converts
+/// every value as RecordBatch import does.
 ///
 /// # Errors
 ///
-/// Returns `ImportError::ConversionError` if a value cannot be converted.
+/// Returns `ImportError::ConversionError` that names the first column whose Arrow type the
+/// conversion does not convert, or that names a value it cannot convert.
 pub fn record_batch_to_csv(
     batch: &RecordBatch,
     options: &ParquetImportOptions,
 ) -> Result<Vec<String>, ImportError> {
-    let num_rows = batch.num_rows();
-    let num_cols = batch.num_columns();
-
-    if num_rows == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::with_capacity(num_rows);
-    let separator = options.column_separator;
-    let delimiter = options.column_delimiter;
-    let null_value = &options.null_value;
-
-    for row_idx in 0..num_rows {
-        let mut row_parts = Vec::with_capacity(num_cols);
-
-        for col_idx in 0..num_cols {
-            let column = batch.column(col_idx);
-            let value = format_arrow_value(column.as_ref(), row_idx, delimiter, null_value)?;
-            row_parts.push(value);
-        }
-
-        rows.push(row_parts.join(&separator.to_string()));
-    }
-
-    Ok(rows)
-}
-
-/// Formats a single Arrow array value at the given index as a CSV string.
-///
-/// # Arguments
-///
-/// * `array` - The Arrow array
-/// * `row_idx` - The row index to format
-/// * `delimiter` - The CSV delimiter character for quoting
-/// * `null_value` - The string representation of NULL
-///
-/// # Returns
-///
-/// The formatted value as a string.
-fn format_arrow_value(
-    array: &dyn Array,
-    row_idx: usize,
-    delimiter: char,
-    null_value: &str,
-) -> Result<String, ImportError> {
-    if array.is_null(row_idx) {
-        return Ok(null_value.to_string());
-    }
-
-    let data_type = array.data_type();
-    let result = match data_type {
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Boolean array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Int8 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Int16 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Int32 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Int64 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::UInt8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid UInt8 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::UInt16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid UInt16 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::UInt32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid UInt32 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::UInt64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid UInt64 array".to_string()))?;
-            Ok(arr.value(row_idx).to_string())
-        }
-
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Float32 array".to_string()))?;
-            Ok(format_float(f64::from(arr.value(row_idx))))
-        }
-
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Float64 array".to_string()))?;
-            Ok(format_float(arr.value(row_idx)))
-        }
-
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Utf8 array".to_string()))?;
-            Ok(escape_csv_string(arr.value(row_idx), delimiter))
-        }
-
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid LargeUtf8 array".to_string())
-                })?;
-            Ok(escape_csv_string(arr.value(row_idx), delimiter))
-        }
-
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Binary array".to_string()))?;
-            Ok(hex::encode(arr.value(row_idx)))
-        }
-
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid LargeBinary array".to_string())
-                })?;
-            Ok(hex::encode(arr.value(row_idx)))
-        }
-
-        DataType::Date32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| ImportError::ConversionError("Invalid Date32 array".to_string()))?;
-            crate::types::conversion::format_date32(arr.value(row_idx))
-                .map_err(ImportError::ConversionError)
-        }
-
-        DataType::Timestamp(unit, _) => format_timestamp(array, row_idx, unit),
-
-        DataType::Decimal128(_, scale) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid Decimal128 array".to_string())
-                })?;
-            Ok(format_decimal128(arr.value(row_idx), *scale))
-        }
-
-        _ => Err(ImportError::ConversionError(format!(
-            "Unsupported Arrow type: {:?}",
-            data_type
-        ))),
+    check_schema_converts(batch.schema_ref())?;
+    let csv_options = CsvWriterOptions {
+        column_separator: options.column_separator,
+        column_delimiter: options.column_delimiter,
+        row_separator: "",
+        null_value: options.null_value.clone(),
+        ..CsvWriterOptions::default()
     };
-
-    result
-}
-
-/// Formats a floating-point number for CSV output.
-///
-/// Uses standard notation for normal numbers and scientific notation for
-/// very large or very small numbers.
-fn format_float(value: f64) -> String {
-    if value.is_nan() {
-        return "NaN".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_positive() {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        };
-    }
-
-    // Use standard notation for most numbers
-    let abs = value.abs();
-    if abs == 0.0 || (0.0001..1_000_000_000_000.0).contains(&abs) {
-        format!("{value}")
-    } else {
-        // Use scientific notation for very large or very small numbers
-        format!("{value:e}")
-    }
-}
-
-/// Escapes a string value for CSV output.
-///
-/// Quotes the string if it contains the delimiter, separator, or newlines.
-/// Also escapes any existing delimiter characters by doubling them.
-fn escape_csv_string(value: &str, delimiter: char) -> String {
-    let needs_quoting = value.contains(delimiter)
-        || value.contains(',')
-        || value.contains('\n')
-        || value.contains('\r');
-
-    if needs_quoting {
-        let escaped = value.replace(delimiter, &format!("{delimiter}{delimiter}"));
-        format!("{delimiter}{escaped}{delimiter}")
-    } else {
-        value.to_string()
-    }
-}
-
-/// Formats a timestamp value as YYYY-MM-DD HH:MM:SS.ffffff.
-fn format_timestamp(
-    array: &dyn Array,
-    row_idx: usize,
-    unit: &TimeUnit,
-) -> Result<String, ImportError> {
-    let value = match unit {
-        TimeUnit::Second => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid TimestampSecond array".to_string())
-                })?;
-            arr.value(row_idx)
-        }
-        TimeUnit::Millisecond => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid TimestampMillisecond array".to_string())
-                })?;
-            arr.value(row_idx)
-        }
-        TimeUnit::Microsecond => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid TimestampMicrosecond array".to_string())
-                })?;
-            arr.value(row_idx)
-        }
-        TimeUnit::Nanosecond => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| {
-                    ImportError::ConversionError("Invalid TimestampNanosecond array".to_string())
-                })?;
-            arr.value(row_idx)
-        }
-    };
-
-    crate::types::conversion::format_timestamp(unit, value).map_err(ImportError::ConversionError)
-}
-
-/// Formats a Decimal128 value with the given scale.
-fn format_decimal128(value: i128, scale: i8) -> String {
-    if scale <= 0 {
-        // No decimal places needed
-        let multiplier = 10i128.pow((-scale) as u32);
-        return (value * multiplier).to_string();
-    }
-
-    let scale_u32 = scale as u32;
-    let divisor = 10i128.pow(scale_u32);
-    let integer_part = value / divisor;
-    let fractional_part = (value % divisor).abs();
-
-    format!(
-        "{integer_part}.{fractional_part:0>width$}",
-        width = scale_u32 as usize
-    )
+    (0..batch.num_rows())
+        .map(|row_idx| format_row(&csv_options, batch, row_idx))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1147,8 +962,13 @@ mod tests {
     use crate::transport::test_support::{
         finish_within, ChunkedBody, FakeExasolServer, DISCONNECT_BOUND, LOOPBACK_TEST_BOUND,
     };
-    use arrow::array::{ArrayRef, StringBuilder};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray, StringBuilder,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -1197,69 +1017,6 @@ mod tests {
         let rows = record_batch_to_csv(&batch, &options).unwrap();
 
         assert_eq!(rows[0], "1;Alice;true");
-    }
-
-    #[test]
-    fn test_escape_csv_string_no_special_chars() {
-        let result = escape_csv_string("hello", '"');
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_escape_csv_string_with_comma() {
-        let result = escape_csv_string("hello,world", '"');
-        assert_eq!(result, "\"hello,world\"");
-    }
-
-    #[test]
-    fn test_escape_csv_string_with_delimiter() {
-        let result = escape_csv_string("say \"hello\"", '"');
-        assert_eq!(result, "\"say \"\"hello\"\"\"");
-    }
-
-    #[test]
-    fn test_escape_csv_string_with_newline() {
-        let result = escape_csv_string("line1\nline2", '"');
-        assert_eq!(result, "\"line1\nline2\"");
-    }
-
-    #[test]
-    fn test_format_float_normal() {
-        // Use slightly different values to avoid clippy::approx_constant
-        assert_eq!(format_float(3.14158), "3.14158");
-        assert_eq!(format_float(-123.456), "-123.456");
-        assert_eq!(format_float(0.0), "0");
-    }
-
-    #[test]
-    fn test_format_float_scientific() {
-        let result = format_float(1e15);
-        assert!(result.contains('e') || result == "1000000000000000");
-
-        let result = format_float(1e-6);
-        assert!(result.contains('e') || result == "0.000001");
-    }
-
-    #[test]
-    fn test_format_float_special() {
-        assert_eq!(format_float(f64::NAN), "NaN");
-        assert_eq!(format_float(f64::INFINITY), "Infinity");
-        assert_eq!(format_float(f64::NEG_INFINITY), "-Infinity");
-    }
-
-    #[test]
-    fn test_format_decimal128() {
-        // 12345 with scale 2 should be 123.45
-        assert_eq!(format_decimal128(12345, 2), "123.45");
-
-        // 100 with scale 0 should be 100
-        assert_eq!(format_decimal128(100, 0), "100");
-
-        // Negative scale multiplies
-        assert_eq!(format_decimal128(5, -2), "500");
-
-        // Fractional with leading zeros
-        assert_eq!(format_decimal128(1001, 3), "1.001");
     }
 
     #[test]
@@ -1825,60 +1582,93 @@ mod tests {
         assert!(!sql.contains("NULL = "), "got: {sql}");
     }
 
-    #[test]
-    fn test_format_arrow_value_large_utf8_is_escaped() {
-        let array = LargeStringArray::from(vec![Some("a,b"), Some("plain")]);
-
-        assert_eq!(
-            format_arrow_value(&array, 0, '"', "").unwrap(),
-            "\"a,b\"".to_string()
-        );
-        assert_eq!(
-            format_arrow_value(&array, 1, '"', "").unwrap(),
-            "plain".to_string()
-        );
-    }
-
-    #[test]
-    fn test_format_arrow_value_large_binary_is_hex_encoded() {
-        let array = LargeBinaryArray::from(vec![Some(&[0xDEu8, 0xADu8][..])]);
-
-        assert_eq!(format_arrow_value(&array, 0, '"', "").unwrap(), "dead");
+    /// A batch of one nullable field per array, named `c0`, `c1`, and so on.
+    fn batch_of(columns: Vec<ArrayRef>) -> RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| Field::new(format!("c{idx}"), column.data_type().clone(), true))
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("batch")
     }
 
     /// Scenario: CSV-path Parquet import formats pre-epoch timestamps of every time unit as times before the epoch
     #[test]
-    fn test_format_timestamp_before_epoch_in_every_unit() {
-        let second = TimestampSecondArray::from(vec![-1]);
-        let millisecond = TimestampMillisecondArray::from(vec![-1]);
-        let microsecond = TimestampMicrosecondArray::from(vec![-1, -500_000]);
-        let nanosecond = TimestampNanosecondArray::from(vec![-1]);
+    fn test_record_batch_to_csv_formats_pre_epoch_timestamps_in_every_unit() {
+        let batch = batch_of(vec![
+            Arc::new(TimestampSecondArray::from(vec![-1, 0])),
+            Arc::new(TimestampMillisecondArray::from(vec![-1, 0])),
+            Arc::new(TimestampMicrosecondArray::from(vec![-1, -500_000])),
+            Arc::new(TimestampNanosecondArray::from(vec![-1, 0])),
+        ]);
+
+        let rows = record_batch_to_csv(&batch, &ParquetImportOptions::default()).unwrap();
 
         assert_eq!(
-            format_timestamp(&second, 0, &TimeUnit::Second).unwrap(),
-            "1969-12-31 23:59:59.000000"
+            rows,
+            [
+                "1969-12-31 23:59:59.000000,1969-12-31 23:59:59.999000,\
+                 1969-12-31 23:59:59.999999,1969-12-31 23:59:59.999999",
+                "1970-01-01 00:00:00.000000,1970-01-01 00:00:00.000000,\
+                 1969-12-31 23:59:59.500000,1970-01-01 00:00:00.000000",
+            ]
         );
-        assert_eq!(
-            format_timestamp(&millisecond, 0, &TimeUnit::Millisecond).unwrap(),
-            "1969-12-31 23:59:59.999000"
-        );
-        assert_eq!(
-            format_timestamp(&microsecond, 0, &TimeUnit::Microsecond).unwrap(),
-            "1969-12-31 23:59:59.999999"
-        );
-        assert_eq!(
-            format_timestamp(&nanosecond, 0, &TimeUnit::Nanosecond).unwrap(),
-            "1969-12-31 23:59:59.999999"
-        );
-        assert_eq!(
-            format_timestamp(&microsecond, 1, &TimeUnit::Microsecond).unwrap(),
-            "1969-12-31 23:59:59.500000"
+    }
+
+    /// Scenario: CSV-path Parquet import converts values as RecordBatch import does
+    #[test]
+    fn test_record_batch_to_csv_converts_values_as_record_batch_import_does() {
+        use arrow::array::{DictionaryArray, FixedSizeBinaryArray};
+        use arrow::datatypes::Int32Type;
+
+        let batch = batch_of(vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(
+                Decimal128Array::from(vec![-5])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ),
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a;b"])),
+            )),
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0xABu8, 0xCD]].into_iter()).unwrap()),
+        ]);
+        let options = ParquetImportOptions::default().with_column_separator(';');
+
+        let rows = record_batch_to_csv(&batch, &options).unwrap();
+
+        assert_eq!(rows, ["1;-0.05;\"a;b\";abcd"]);
+    }
+
+    #[test]
+    fn test_record_batch_to_csv_writes_floats_without_an_exponent() {
+        let batch = batch_of(vec![Arc::new(Float64Array::from(vec![1e15, 1e-6]))]);
+
+        let rows = record_batch_to_csv(&batch, &ParquetImportOptions::default()).unwrap();
+
+        assert_eq!(rows, ["1000000000000000", "0.000001"]);
+    }
+
+    #[test]
+    fn test_record_batch_to_csv_names_the_column_of_a_type_without_a_conversion() {
+        let batch = batch_of(vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(arrow::array::Time32SecondArray::from(vec![1])),
+        ]);
+
+        let err = record_batch_to_csv(&batch, &ParquetImportOptions::default()).unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(message)
+                if message.contains("'c1'") && message.contains("Time32(Second)")),
+            "got: {err}"
         );
     }
 
     /// Scenario: CSV-path Parquet import rejects DATE and TIMESTAMP values outside Exasol's range
     #[test]
-    fn test_format_arrow_value_rejects_dates_and_timestamps_outside_exasol_range() {
+    fn test_record_batch_to_csv_rejects_dates_and_timestamps_outside_exasol_range() {
         let cases: [(ArrayRef, &str); 4] = [
             (Arc::new(Date32Array::from(vec![2_932_897])), "2932897"),
             (Arc::new(Date32Array::from(vec![-719_163])), "-719163"),
@@ -1895,60 +1685,14 @@ mod tests {
         ];
 
         for (array, value) in cases {
-            let err = format_arrow_value(array.as_ref(), 0, '"', "").unwrap_err();
+            let data_type = array.data_type().clone();
+            let err = record_batch_to_csv(&batch_of(vec![array]), &ParquetImportOptions::default())
+                .unwrap_err();
             assert!(
                 matches!(&err, ImportError::ConversionError(message) if message.contains(value)),
-                "{:?} {value}: {err}",
-                array.data_type()
+                "{data_type:?} {value}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn test_format_arrow_value_rejects_unsupported_type() {
-        let array = arrow::array::Time32SecondArray::from(vec![1]);
-
-        let err = format_arrow_value(&array, 0, '"', "").unwrap_err();
-
-        assert!(
-            err.to_string().contains("Unsupported Arrow type"),
-            "got: {err}"
-        );
-        assert!(err.to_string().contains("Time32"), "got: {err}");
-    }
-
-    #[test]
-    fn test_format_arrow_value_null_uses_null_marker() {
-        let array = LargeStringArray::from(vec![None::<&str>]);
-
-        assert_eq!(format_arrow_value(&array, 0, '"', "\\N").unwrap(), "\\N");
-    }
-
-    #[test]
-    fn test_format_timestamp_second_unit() {
-        let array = TimestampSecondArray::from(vec![86_400 + 3_661]);
-
-        let formatted = format_timestamp(&array, 0, &TimeUnit::Second).unwrap();
-
-        assert_eq!(formatted, "1970-01-02 01:01:01.000000");
-    }
-
-    #[test]
-    fn test_format_timestamp_millisecond_unit() {
-        let array = TimestampMillisecondArray::from(vec![1_500]);
-
-        let formatted = format_timestamp(&array, 0, &TimeUnit::Millisecond).unwrap();
-
-        assert_eq!(formatted, "1970-01-01 00:00:01.500000");
-    }
-
-    #[test]
-    fn test_format_timestamp_microsecond_unit() {
-        let array = TimestampMicrosecondArray::from(vec![1_000_123]);
-
-        let formatted = format_timestamp(&array, 0, &TimeUnit::Microsecond).unwrap();
-
-        assert_eq!(formatted, "1970-01-01 00:00:01.000123");
     }
 
     fn create_empty_test_parquet_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -2925,12 +2669,374 @@ mod tests {
         assert!(with.contains("PUBLIC KEY 'ab:cd'"), "got: {with}");
     }
 
+    fn write_parquet(
+        path: std::path::PathBuf,
+        batch: &RecordBatch,
+        options: parquet::arrow::arrow_writer::ArrowWriterOptions,
+    ) -> std::path::PathBuf {
+        let file = std::fs::File::create(&path).expect("create file");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new_with_options(file, batch.schema(), options)
+                .expect("writer");
+        writer.write(batch).expect("write");
+        writer.close().expect("close");
+        path
+    }
+
+    fn with_arrow_schema() -> parquet::arrow::arrow_writer::ArrowWriterOptions {
+        parquet::arrow::arrow_writer::ArrowWriterOptions::new()
+    }
+
+    fn without_arrow_schema() -> parquet::arrow::arrow_writer::ArrowWriterOptions {
+        parquet::arrow::arrow_writer::ArrowWriterOptions::new().with_skip_arrow_metadata(true)
+    }
+
+    /// A batch with the non-nullable field `ID` (Int64) holding 1 and the field `X` holding `x`.
+    fn id_and_x(x: ArrayRef) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("ID", DataType::Int64, false),
+            Field::new("X", x.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int64Array::from(vec![1])), x],
+        )
+        .expect("batch")
+    }
+
+    fn fourteen_months() -> ArrayRef {
+        Arc::new(arrow::array::IntervalYearMonthArray::from(vec![14]))
+    }
+
+    type SqlLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Records every SQL statement and fails it, so an import stops at its first statement.
+    fn record_and_fail_sql(
+        log: &SqlLog,
+    ) -> impl FnMut(String) -> std::future::Ready<Result<u64, String>> {
+        let log = Arc::clone(log);
+        move |sql| {
+            log.lock().expect("sql log").push(sql);
+            std::future::ready(Err("the test stops at the first statement".to_string()))
+        }
+    }
+
+    fn auto_create_options() -> ParquetImportOptions {
+        ParquetImportOptions::default().with_create_table_if_not_exists(true)
+    }
+
+    fn assert_schema_inference_error(err: &ImportError, parts: &[&str]) {
+        assert!(
+            matches!(err, ImportError::SchemaInferenceError(message)
+                if parts.iter().all(|part| message.contains(part))),
+            "expected a schema inference error containing {parts:?}, got: {err}"
+        );
+    }
+
+    /// Scenario: Native Parquet import with table creation rejects Utf8View, dictionary, BinaryView, FixedSizeBinary, and interval columns
+    #[tokio::test]
+    async fn test_native_parquet_auto_create_rejects_csv_only_types_before_any_sql() {
+        use arrow::array::{
+            BinaryViewArray, DictionaryArray, FixedSizeBinaryArray, IntervalDayTimeArray,
+            StringViewArray,
+        };
+        use arrow::datatypes::{Int32Type, IntervalDayTime};
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let accepted = write_parquet(
+            temp_dir.path().join("accepted.parquet"),
+            &id_and_x(Arc::new(StringArray::from(vec!["a"]))),
+            with_arrow_schema(),
+        );
+        let cases: [(ArrayRef, &str); 6] = [
+            (Arc::new(StringViewArray::from(vec!["a"])), "Utf8View"),
+            (
+                Arc::new(DictionaryArray::<Int32Type>::new(
+                    Int32Array::from(vec![0]),
+                    Arc::new(StringArray::from(vec!["a"])),
+                )),
+                "Dictionary(Int32, Utf8)",
+            ),
+            (
+                Arc::new(BinaryViewArray::from(vec![&[1u8][..]])),
+                "BinaryView",
+            ),
+            (
+                Arc::new(FixedSizeBinaryArray::try_from_iter([[7u8; 16]].into_iter()).unwrap()),
+                "FixedSizeBinary(16)",
+            ),
+            (fourteen_months(), "Interval(YearMonth)"),
+            (
+                Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(1, 0)])),
+                "Interval(DayTime)",
+            ),
+        ];
+
+        for (index, (x, type_name)) in cases.into_iter().enumerate() {
+            let name = format!("rejected_{index}.parquet");
+            let rejected = write_parquet(
+                temp_dir.path().join(&name),
+                &id_and_x(x),
+                with_arrow_schema(),
+            );
+            let parts = [
+                "X",
+                type_name,
+                "with_native_parquet(Some(false))",
+                name.as_str(),
+            ];
+
+            let log = SqlLog::default();
+            let err = import_from_parquet(
+                record_and_fail_sql(&log),
+                "T",
+                &rejected,
+                auto_create_options(),
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert_schema_inference_error(&err, &parts);
+            assert!(log.lock().unwrap().is_empty(), "{type_name}");
+
+            let log = SqlLog::default();
+            let err = import_from_parquet_files(
+                record_and_fail_sql(&log),
+                "T",
+                vec![accepted.clone(), rejected],
+                auto_create_options(),
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert_schema_inference_error(&err, &parts);
+            assert!(log.lock().unwrap().is_empty(), "{type_name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_parquet_auto_create_accepts_every_allow_listed_type() {
+        use arrow::array::{Date64Array, Decimal256Array, LargeBinaryArray, LargeStringArray};
+        use arrow::datatypes::i256;
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(Int8Array::from(vec![1])),
+            Arc::new(Int16Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(UInt8Array::from(vec![1])),
+            Arc::new(UInt16Array::from(vec![1])),
+            Arc::new(UInt32Array::from(vec![1])),
+            Arc::new(UInt64Array::from(vec![1])),
+            Arc::new(Float32Array::from(vec![1.5])),
+            Arc::new(Float64Array::from(vec![1.5])),
+            Arc::new(StringArray::from(vec!["s"])),
+            Arc::new(LargeStringArray::from(vec!["s"])),
+            Arc::new(BinaryArray::from(vec![&[1u8][..]])),
+            Arc::new(LargeBinaryArray::from(vec![&[1u8][..]])),
+            Arc::new(Date32Array::from(vec![1])),
+            Arc::new(Date64Array::from(vec![86_400_000])),
+            Arc::new(TimestampSecondArray::from(vec![1])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1]).with_timezone("UTC")),
+            Arc::new(
+                Decimal128Array::from(vec![1])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(1)])
+                    .with_precision_and_scale(36, 2)
+                    .unwrap(),
+            ),
+        ];
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = write_parquet(
+            temp_dir.path().join("allowed.parquet"),
+            &batch_of(columns),
+            with_arrow_schema(),
+        );
+        let log = SqlLog::default();
+
+        let err = import_from_parquet(
+            record_and_fail_sql(&log),
+            "T",
+            &path,
+            auto_create_options(),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
+        let log = log.lock().unwrap();
+        assert!(log[0].starts_with("CREATE TABLE"), "got: {log:?}");
+    }
+
+    /// Scenario: CSV-path Parquet import rejects an INTERVAL column from a file without an Arrow schema
+    #[tokio::test]
+    async fn test_csv_path_parquet_import_rejects_interval_without_arrow_schema_before_any_sql() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let batch = id_and_x(fourteen_months());
+        let accepted = write_parquet(
+            temp_dir.path().join("accepted.parquet"),
+            &batch,
+            with_arrow_schema(),
+        );
+        let rejected = write_parquet(
+            temp_dir.path().join("rejected.parquet"),
+            &batch,
+            without_arrow_schema(),
+        );
+        let parts = ["'X'", "would lose its month part", "rejected.parquet"];
+
+        let log = SqlLog::default();
+        let err = import_from_parquet(
+            record_and_fail_sql(&log),
+            "T",
+            &rejected,
+            auto_create_options(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_schema_inference_error(&err, &parts);
+        assert!(log.lock().unwrap().is_empty());
+
+        let log = SqlLog::default();
+        let err = import_from_parquet_files(
+            record_and_fail_sql(&log),
+            "T",
+            vec![accepted, rejected],
+            auto_create_options(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_schema_inference_error(&err, &parts);
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: CSV-path Parquet import rejects an INTERVAL column from a file without an Arrow schema
     #[test]
-    fn test_format_timestamp_nanosecond_unit_truncates_to_micros() {
-        let array = TimestampNanosecondArray::from(vec![1_000_123_999]);
+    fn test_open_parquet_csv_reader_rejects_interval_without_arrow_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = write_parquet(
+            temp_dir.path().join("interval.parquet"),
+            &id_and_x(fourteen_months()),
+            without_arrow_schema(),
+        );
+        let bytes = Bytes::from(std::fs::read(&path).expect("read file"));
 
-        let formatted = format_timestamp(&array, 0, &TimeUnit::Nanosecond).unwrap();
+        let err = open_parquet_csv_reader(bytes, &ParquetImportOptions::default())
+            .err()
+            .expect("the reader must reject the interval column");
 
-        assert_eq!(formatted, "1970-01-01 00:00:01.000123");
+        assert_schema_inference_error(&err, &["'X'", "would lose its month part"]);
+    }
+
+    #[test]
+    fn test_auto_create_footer_checks_name_a_file_whose_footer_cannot_be_read() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let missing = temp_dir.path().join("missing.parquet");
+        let not_parquet = temp_dir.path().join("not_parquet.parquet");
+        std::fs::write(&not_parquet, b"definitely not parquet").expect("write the fixture");
+
+        for path in [missing, not_parquet] {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            for err in [
+                check_native_auto_create_footer(&path).unwrap_err(),
+                check_csv_auto_create_footer(&path).unwrap_err(),
+            ] {
+                assert_schema_inference_error(&err, &["Failed to read the Parquet footer", &name]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_csv_path_parquet_auto_create_accepts_interval_from_a_file_with_its_arrow_schema()
+    {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = write_parquet(
+            temp_dir.path().join("interval.parquet"),
+            &id_and_x(fourteen_months()),
+            with_arrow_schema(),
+        );
+        let log = SqlLog::default();
+
+        let err = import_from_parquet(
+            record_and_fail_sql(&log),
+            "T",
+            &path,
+            auto_create_options(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
+        let log = log.lock().unwrap();
+        assert!(
+            log[0].starts_with("CREATE TABLE") && log[0].contains("INTERVAL YEAR(9) TO MONTH"),
+            "got: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_csv_path_parquet_import_accepts_a_file_without_arrow_schema_and_without_intervals(
+    ) {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = write_parquet(
+            temp_dir.path().join("plain.parquet"),
+            &id_and_x(Arc::new(StringArray::from(vec!["a"]))),
+            without_arrow_schema(),
+        );
+        let options = ParquetImportOptions::default();
+        let source = open_parquet_csv_reader(std::fs::File::open(&path).expect("open"), &options)
+            .expect("a file without an Interval column needs no Arrow schema");
+        let mut csv = Vec::new();
+
+        render_parquet_csv(source.reader, &options, |buffer| {
+            csv.extend(buffer);
+            Ok(())
+        })
+        .expect("conversion");
+        assert_eq!(String::from_utf8(csv).unwrap(), "1,a\n");
+
+        let log = SqlLog::default();
+        let err = import_from_parquet(
+            record_and_fail_sql(&log),
+            "T",
+            &path,
+            auto_create_options(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ImportError::SqlError(_)), "got: {err}");
+        let log = log.lock().unwrap();
+        assert!(log[0].starts_with("CREATE TABLE"), "got: {log:?}");
+    }
+
+    #[test]
+    fn test_render_parquet_csv_converts_interval_from_a_file_with_its_arrow_schema() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let path = write_parquet(
+            temp_dir.path().join("interval.parquet"),
+            &id_and_x(fourteen_months()),
+            with_arrow_schema(),
+        );
+        let options = ParquetImportOptions::default();
+        let source = open_parquet_csv_reader(std::fs::File::open(&path).expect("open"), &options)
+            .expect("a file with its Arrow schema keeps the interval unit");
+        let mut csv = Vec::new();
+
+        render_parquet_csv(source.reader, &options, |buffer| {
+            csv.extend(buffer);
+            Ok(())
+        })
+        .expect("conversion");
+
+        assert_eq!(String::from_utf8(csv).unwrap(), "1,1-02\n");
     }
 }

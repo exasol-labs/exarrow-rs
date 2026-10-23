@@ -118,6 +118,24 @@ A bound batch runs as one execution and stores all of its rows or none when its 
 
 A bound batch needs several times its Arrow size in driver memory. For large loads, use bulk ingestion (`cursor.adbc_ingest`).
 
+### Bulk ingestion
+
+`cursor.adbc_ingest` loads Arrow data into a table. The `mode` argument is `append`, `create`, `create_append`, or `replace`, and `db_schema_name` names the target schema:
+
+```python
+import pyarrow as pa
+
+data = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+rows = cursor.adbc_ingest("my_table", data, mode="create", db_schema_name="my_schema")
+print(rows)  # 3
+```
+
+Exasol has one catalog, `EXA`. The `catalog_name` argument, which sets `adbc.ingest.target_catalog`, accepts only `EXA` in any letter case. Any other value fails with `InvalidArguments`.
+
+The driver checks the target catalog and the type of every bound column before it sends the first SQL statement, with the same rule in every mode. A rejected catalog or column type fails with `InvalidArguments` and changes no table: replace mode keeps the existing table and its rows, and create mode creates no table. [Arrow to Exasol Type Conversions](type-mapping.md#arrow-to-exasol-type-conversions) lists the accepted types and their Exasol column types.
+
+The driver converts the values after the DDL of create, create-append, and replace mode. A value that the conversion rejects fails the ingest with `Internal` after that DDL ran. Examples are a date outside 0001-01-01 to 9999-12-31 and an `Interval(MonthDayNano)` value with a month component, which is what a value read from an `INTERVAL YEAR TO MONTH` column holds. Replace mode has then dropped the old table, and create mode leaves an empty table behind. To avoid this, check the values before you ingest them.
+
 ### Python (Polars)
 
 Polars has native ADBC support, allowing direct queries into DataFrames:

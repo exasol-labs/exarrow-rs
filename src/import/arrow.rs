@@ -6,7 +6,8 @@
 //! # Overview
 //!
 //! Arrow data is converted to CSV format using [`ArrowToCsvWriter`] which:
-//! - Handles all Arrow data types (Int, Float, String, Date, Timestamp, Decimal, etc.)
+//! - Converts every Arrow type that `TypeMapper::arrow_to_exasol` maps to an Exasol column
+//!   type, plus decimals beyond Exasol's DECIMAL limits for imports into existing tables
 //! - Properly escapes CSV special characters
 //! - Handles NULL values
 //! - Supports configurable CSV format options
@@ -15,15 +16,17 @@
 //!
 
 use super::ImportError;
+use crate::types::conversion;
 use arrow::array::cast::AsArray;
 use arrow::array::types::{
-    Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    ArrowDictionaryKeyType, ArrowPrimitiveType, ArrowTimestampType, Date32Type, Date64Type,
+    Decimal128Type, Decimal256Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Int8Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow::array::{Array, RecordBatch};
-use arrow::datatypes::DataType;
-use std::fmt::Write as FmtWrite;
+use arrow::array::{Array, OffsetSizeTrait, RecordBatch};
+use arrow::datatypes::{ArrowNativeType, DataType, IntervalUnit, Schema, TimeUnit};
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -169,12 +172,12 @@ impl ArrowImportOptions {
 /// Arrow to CSV writer that converts RecordBatches to CSV format.
 ///
 /// This writer handles:
-/// - All Arrow numeric types (Int8-64, UInt8-64, Float32/64)
-/// - String types (Utf8, LargeUtf8)
-/// - Boolean types
-/// - Date types (Date32)
-/// - Timestamp types (with various precisions)
-/// - Decimal128 types
+/// - Boolean, integer, and floating-point types
+/// - String types (Utf8, LargeUtf8, Utf8View, and dictionaries of Utf8 or LargeUtf8 values)
+/// - Binary types (Binary, LargeBinary, BinaryView, FixedSizeBinary) as lowercase hex text
+/// - Date32, Date64, and Timestamp types of every unit
+/// - Decimal128 and Decimal256 types
+/// - Interval types of every unit, as Exasol INTERVAL text
 /// - NULL handling
 /// - Proper CSV escaping
 pub struct ArrowToCsvWriter<W: AsyncWrite + Unpin> {
@@ -195,8 +198,10 @@ impl<W: AsyncWrite + Unpin> ArrowToCsvWriter<W> {
 
     /// Write a RecordBatch to CSV format.
     ///
-    /// Returns the number of bytes written.
+    /// Returns the number of bytes written. A batch with a column type that the conversion
+    /// does not convert fails before any of its bytes, the header included, are written.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<usize, ImportError> {
+        check_schema_converts(batch.schema_ref())?;
         let mut bytes_written = 0;
         let num_rows = batch.num_rows();
 
@@ -258,7 +263,11 @@ impl<W: Write> SyncArrowToCsvWriter<W> {
     }
 
     /// Write a RecordBatch to CSV format synchronously.
+    ///
+    /// A batch with a column type that the conversion does not convert fails before any of
+    /// its bytes, the header included, are written.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<usize, ImportError> {
+        check_schema_converts(batch.schema_ref())?;
         let mut bytes_written = 0;
         let num_rows = batch.num_rows();
 
@@ -310,7 +319,7 @@ fn format_header(options: &CsvWriterOptions, batch: &RecordBatch) -> String {
 }
 
 /// Format one batch row as a separator-joined CSV line, terminated by the row separator.
-fn format_row(
+pub(crate) fn format_row(
     options: &CsvWriterOptions,
     batch: &RecordBatch,
     row_idx: usize,
@@ -329,112 +338,286 @@ fn format_row(
     Ok(row_str)
 }
 
+/// Converts the non-null value at a row of an Arrow array to its CSV field text.
+type ValueFormatter = fn(&CsvWriterOptions, &dyn Array, usize) -> Result<String, ImportError>;
+
+const UNSUPPORTED_TYPE: &str = "Unsupported Arrow type for CSV conversion";
+
+/// Resolves the formatter that converts the values of an Arrow type to CSV text.
+///
+/// This match is the one list of the Arrow types that the import CSV conversion converts:
+/// the row formatter and [`check_schema_converts`] both resolve through it, so they cannot
+/// disagree about a type. A formatter reads its array as `data_type`, so it must only be
+/// called with an array of that type.
+fn resolve_value_formatter(data_type: &DataType) -> Result<ValueFormatter, ImportError> {
+    let formatter: ValueFormatter = match data_type {
+        DataType::Boolean => format_boolean,
+        DataType::Int8 => format_integer::<Int8Type>,
+        DataType::Int16 => format_integer::<Int16Type>,
+        DataType::Int32 => format_integer::<Int32Type>,
+        DataType::Int64 => format_integer::<Int64Type>,
+        DataType::UInt8 => format_integer::<UInt8Type>,
+        DataType::UInt16 => format_integer::<UInt16Type>,
+        DataType::UInt32 => format_integer::<UInt32Type>,
+        DataType::UInt64 => format_integer::<UInt64Type>,
+        DataType::Float32 => format_float_value::<Float32Type>,
+        DataType::Float64 => format_float_value::<Float64Type>,
+        DataType::Utf8 => format_string::<i32>,
+        DataType::LargeUtf8 => format_string::<i64>,
+        DataType::Utf8View => format_string_view,
+        DataType::Dictionary(key_type, value_type)
+            if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            dictionary_formatter(key_type).ok_or_else(|| unsupported_type(data_type))?
+        }
+        DataType::Date32 => format_date32,
+        DataType::Date64 => format_date64,
+        DataType::Timestamp(TimeUnit::Second, _) => format_timestamp::<TimestampSecondType>,
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            format_timestamp::<TimestampMillisecondType>
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            format_timestamp::<TimestampMicrosecondType>
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => format_timestamp::<TimestampNanosecondType>,
+        DataType::Decimal128(..) => format_decimal128_value,
+        DataType::Decimal256(..) => format_decimal256_value,
+        DataType::Binary => format_binary::<i32>,
+        DataType::LargeBinary => format_binary::<i64>,
+        DataType::BinaryView => format_binary_view,
+        DataType::FixedSizeBinary(_) => format_fixed_size_binary,
+        DataType::Interval(IntervalUnit::YearMonth) => format_year_month_value,
+        DataType::Interval(IntervalUnit::DayTime) => format_day_time_value,
+        DataType::Interval(IntervalUnit::MonthDayNano) => format_month_day_nano_value,
+        other => return Err(unsupported_type(other)),
+    };
+    Ok(formatter)
+}
+
+fn dictionary_formatter(key_type: &DataType) -> Option<ValueFormatter> {
+    let formatter: ValueFormatter = match key_type {
+        DataType::Int8 => format_dictionary_value::<Int8Type>,
+        DataType::Int16 => format_dictionary_value::<Int16Type>,
+        DataType::Int32 => format_dictionary_value::<Int32Type>,
+        DataType::Int64 => format_dictionary_value::<Int64Type>,
+        DataType::UInt8 => format_dictionary_value::<UInt8Type>,
+        DataType::UInt16 => format_dictionary_value::<UInt16Type>,
+        DataType::UInt32 => format_dictionary_value::<UInt32Type>,
+        DataType::UInt64 => format_dictionary_value::<UInt64Type>,
+        _ => return None,
+    };
+    Some(formatter)
+}
+
+fn unsupported_type(data_type: &DataType) -> ImportError {
+    ImportError::ConversionError(format!("{UNSUPPORTED_TYPE}: {data_type:?}"))
+}
+
+/// Checks that the import CSV conversion converts every column of `schema`, so a caller can
+/// reject an input before it writes any CSV text or changes a table.
+///
+/// # Errors
+/// Returns `ImportError::ConversionError` that names the first column whose Arrow type the
+/// conversion does not convert, and that type.
+pub(crate) fn check_schema_converts(schema: &Schema) -> Result<(), ImportError> {
+    for field in schema.fields() {
+        resolve_value_formatter(field.data_type()).map_err(|_| {
+            ImportError::ConversionError(format!(
+                "Column '{}': {UNSUPPORTED_TYPE}: {:?}",
+                field.name(),
+                field.data_type()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Format a value from an Arrow array at the given row index.
+///
+/// The type resolves before the null check, so a column of a type without a conversion
+/// fails even where it holds a null.
 fn format_value(
     options: &CsvWriterOptions,
     array: &dyn Array,
     row_idx: usize,
 ) -> Result<String, ImportError> {
+    let formatter = resolve_value_formatter(array.data_type())?;
     if array.is_null(row_idx) {
         return Ok(options.null_value.clone());
     }
-
-    let data_type = array.data_type();
-    match data_type {
-        DataType::Boolean => {
-            let arr = array.as_boolean();
-            Ok(if arr.value(row_idx) { "true" } else { "false" }.to_string())
-        }
-        DataType::Int8 => Ok(array.as_primitive::<Int8Type>().value(row_idx).to_string()),
-        DataType::Int16 => Ok(array.as_primitive::<Int16Type>().value(row_idx).to_string()),
-        DataType::Int32 => Ok(array.as_primitive::<Int32Type>().value(row_idx).to_string()),
-        DataType::Int64 => Ok(array.as_primitive::<Int64Type>().value(row_idx).to_string()),
-        DataType::UInt8 => Ok(array.as_primitive::<UInt8Type>().value(row_idx).to_string()),
-        DataType::UInt16 => Ok(array
-            .as_primitive::<UInt16Type>()
-            .value(row_idx)
-            .to_string()),
-        DataType::UInt32 => Ok(array
-            .as_primitive::<UInt32Type>()
-            .value(row_idx)
-            .to_string()),
-        DataType::UInt64 => Ok(array
-            .as_primitive::<UInt64Type>()
-            .value(row_idx)
-            .to_string()),
-        DataType::Float32 => {
-            let val = array.as_primitive::<Float32Type>().value(row_idx);
-            Ok(format_float(val as f64))
-        }
-        DataType::Float64 => {
-            let val = array.as_primitive::<Float64Type>().value(row_idx);
-            Ok(format_float(val))
-        }
-        DataType::Utf8 => {
-            let arr = array.as_string::<i32>();
-            Ok(escape_string(options, arr.value(row_idx)))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array.as_string::<i64>();
-            Ok(escape_string(options, arr.value(row_idx)))
-        }
-        DataType::Date32 => {
-            let val = array.as_primitive::<Date32Type>().value(row_idx);
-            crate::types::conversion::format_date32(val).map_err(ImportError::ConversionError)
-        }
-        DataType::Timestamp(unit, _tz) => format_timestamp(array, row_idx, unit),
-        DataType::Decimal128(_precision, scale) => format_decimal_value(array, row_idx, *scale),
-        DataType::Binary => {
-            let arr = array.as_binary::<i32>();
-            Ok(hex::encode(arr.value(row_idx)))
-        }
-        DataType::LargeBinary => {
-            let arr = array.as_binary::<i64>();
-            Ok(hex::encode(arr.value(row_idx)))
-        }
-        other => Err(ImportError::ConversionError(format!(
-            "Unsupported Arrow type for CSV conversion: {:?}",
-            other
-        ))),
-    }
+    formatter(options, array, row_idx)
 }
 
-/// Format a timestamp value of any Arrow time unit.
-fn format_timestamp(
+fn format_boolean(
+    _options: &CsvWriterOptions,
     array: &dyn Array,
     row_idx: usize,
-    unit: &arrow::datatypes::TimeUnit,
 ) -> Result<String, ImportError> {
-    use arrow::datatypes::TimeUnit;
-
-    let value = match unit {
-        TimeUnit::Second => array.as_primitive::<TimestampSecondType>().value(row_idx),
-        TimeUnit::Millisecond => array
-            .as_primitive::<TimestampMillisecondType>()
-            .value(row_idx),
-        TimeUnit::Microsecond => array
-            .as_primitive::<TimestampMicrosecondType>()
-            .value(row_idx),
-        TimeUnit::Nanosecond => array
-            .as_primitive::<TimestampNanosecondType>()
-            .value(row_idx),
-    };
-
-    crate::types::conversion::format_timestamp(unit, value).map_err(ImportError::ConversionError)
+    let value = array.as_boolean().value(row_idx);
+    Ok(if value { "true" } else { "false" }.to_string())
 }
 
-/// Format a Decimal128 array element using the column's declared scale.
-fn format_decimal_value(
+fn format_integer<T>(
+    _options: &CsvWriterOptions,
     array: &dyn Array,
     row_idx: usize,
-    scale: i8,
-) -> Result<String, ImportError> {
-    let arr = array
-        .as_any()
-        .downcast_ref::<arrow::array::Decimal128Array>()
-        .ok_or_else(|| ImportError::ConversionError("Expected Decimal128Array".to_string()))?;
+) -> Result<String, ImportError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: std::fmt::Display,
+{
+    Ok(array.as_primitive::<T>().value(row_idx).to_string())
+}
 
-    Ok(format_decimal128(arr.value(row_idx), scale))
+fn format_float_value<T>(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: Into<f64>,
+{
+    Ok(format_float(
+        array.as_primitive::<T>().value(row_idx).into(),
+    ))
+}
+
+fn format_string<O: OffsetSizeTrait>(
+    options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    Ok(escape_string(
+        options,
+        array.as_string::<O>().value(row_idx),
+    ))
+}
+
+fn format_string_view(
+    options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    Ok(escape_string(
+        options,
+        array.as_string_view().value(row_idx),
+    ))
+}
+
+fn format_dictionary_value<K: ArrowDictionaryKeyType>(
+    options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let dictionary = array.as_dictionary::<K>();
+    let key = dictionary.keys().value(row_idx).as_usize();
+    format_value(options, dictionary.values().as_ref(), key)
+}
+
+fn format_binary<O: OffsetSizeTrait>(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    Ok(hex::encode(array.as_binary::<O>().value(row_idx)))
+}
+
+fn format_binary_view(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    Ok(hex::encode(array.as_binary_view().value(row_idx)))
+}
+
+fn format_fixed_size_binary(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    Ok(hex::encode(array.as_fixed_size_binary().value(row_idx)))
+}
+
+fn format_date32(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let days = array.as_primitive::<Date32Type>().value(row_idx);
+    conversion::format_date32(days).map_err(ImportError::ConversionError)
+}
+
+fn format_date64(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let millis = array.as_primitive::<Date64Type>().value(row_idx);
+    conversion::format_date64(millis).map_err(ImportError::ConversionError)
+}
+
+fn format_year_month_value(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let months = array.as_primitive::<IntervalYearMonthType>().value(row_idx);
+    Ok(conversion::format_interval_year_to_month(months))
+}
+
+fn format_day_time_value(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let value = array.as_primitive::<IntervalDayTimeType>().value(row_idx);
+    conversion::format_interval_day_to_second(value.days, i64::from(value.milliseconds))
+        .map_err(ImportError::ConversionError)
+}
+
+fn format_month_day_nano_value(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let value = array
+        .as_primitive::<IntervalMonthDayNanoType>()
+        .value(row_idx);
+    conversion::format_interval_month_day_nano(value).map_err(ImportError::ConversionError)
+}
+
+fn format_timestamp<T: ArrowTimestampType>(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let value = array.as_primitive::<T>().value(row_idx);
+    conversion::format_timestamp(&T::UNIT, value).map_err(ImportError::ConversionError)
+}
+
+fn format_decimal128_value(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let decimals = array.as_primitive::<Decimal128Type>();
+    Ok(format_decimal_text(
+        decimals.value(row_idx).to_string(),
+        decimals.scale(),
+    ))
+}
+
+fn format_decimal256_value(
+    _options: &CsvWriterOptions,
+    array: &dyn Array,
+    row_idx: usize,
+) -> Result<String, ImportError> {
+    let decimals = array.as_primitive::<Decimal256Type>();
+    Ok(format_decimal_text(
+        decimals.value(row_idx).to_string(),
+        decimals.scale(),
+    ))
 }
 
 /// Escape a string value for CSV.
@@ -480,37 +663,22 @@ fn format_float(val: f64) -> String {
     }
 }
 
-/// Format a Decimal128 value to a string with proper scale.
-fn format_decimal128(value: i128, scale: i8) -> String {
+/// Places the decimal point of a decimal value, given as the text of its unscaled integer.
+///
+/// A negative scale appends one zero per unit instead of multiplying, which would overflow
+/// for a value near the largest of its precision.
+fn format_decimal_text(unscaled: String, scale: i8) -> String {
     if scale <= 0 {
-        // No decimal point needed, value is integer
-        let multiplier = 10_i128.pow((-scale) as u32);
-        return (value * multiplier).to_string();
+        return unscaled + &"0".repeat(usize::from(scale.unsigned_abs()));
     }
-
-    let scale = scale as u32;
-    let divisor = 10_i128.pow(scale);
-
-    let is_negative = value < 0;
-    let abs_value = value.unsigned_abs();
-
-    let integer_part = abs_value / divisor as u128;
-    let fractional_part = abs_value % divisor as u128;
-
-    let mut result = String::new();
-    if is_negative {
-        result.push('-');
-    }
-    write!(
-        result,
-        "{}.{:0width$}",
-        integer_part,
-        fractional_part,
-        width = scale as usize
-    )
-    .unwrap();
-
-    result
+    let (sign, digits) = match unscaled.strip_prefix('-') {
+        Some(digits) => ("-", digits),
+        None => ("", unscaled.as_str()),
+    };
+    let scale = usize::from(scale.unsigned_abs());
+    let digits = format!("{digits:0>width$}", width = scale + 1);
+    let (integer, fraction) = digits.split_at(digits.len() - scale);
+    format!("{sign}{integer}.{fraction}")
 }
 
 /// Convert a RecordBatch to CSV bytes.
@@ -886,13 +1054,13 @@ mod tests {
     }
 
     #[test]
-    fn test_format_decimal128() {
-        assert_eq!(format_decimal128(12345, 2), "123.45");
-        assert_eq!(format_decimal128(-12345, 2), "-123.45");
-        assert_eq!(format_decimal128(100, 2), "1.00");
-        assert_eq!(format_decimal128(1, 2), "0.01");
-        assert_eq!(format_decimal128(12345, 0), "12345");
-        assert_eq!(format_decimal128(12345, -2), "1234500");
+    fn test_format_decimal_text_places_the_decimal_point_by_scale() {
+        assert_eq!(format_decimal_text(12345.to_string(), 2), "123.45");
+        assert_eq!(format_decimal_text((-12345).to_string(), 2), "-123.45");
+        assert_eq!(format_decimal_text(100.to_string(), 2), "1.00");
+        assert_eq!(format_decimal_text(1.to_string(), 2), "0.01");
+        assert_eq!(format_decimal_text(12345.to_string(), 0), "12345");
+        assert_eq!(format_decimal_text(12345.to_string(), -2), "1234500");
     }
 
     #[test]
@@ -1280,6 +1448,15 @@ mod tests {
     }
 
     #[test]
+    fn test_large_utf8_value_containing_the_separator_is_quoted() {
+        let array = arrow::array::LargeStringArray::from(vec!["a,b"]);
+
+        let text = format_value(&CsvWriterOptions::default(), &array, 0).unwrap();
+
+        assert_eq!(text, "\"a,b\"");
+    }
+
+    #[test]
     fn test_binary_types_conversion() {
         use arrow::array::LargeBinaryArray;
 
@@ -1593,9 +1770,17 @@ mod tests {
         use arrow::array::TimestampSecondArray;
 
         let options = CsvWriterOptions::default();
-        let cases: [(ArrayRef, &str); 4] = [
+        let cases: [(ArrayRef, &str); 6] = [
             (Arc::new(Date32Array::from(vec![2_932_897])), "2932897"),
             (Arc::new(Date32Array::from(vec![-719_163])), "-719163"),
+            (
+                Arc::new(arrow::array::Date64Array::from(vec![253_402_300_800_000])),
+                "253402300800000",
+            ),
+            (
+                Arc::new(arrow::array::Date64Array::from(vec![i64::MAX])),
+                "9223372036854775807",
+            ),
             (
                 Arc::new(TimestampSecondArray::from(vec![i64::MAX])),
                 "9223372036854775807",
@@ -1630,6 +1815,463 @@ mod tests {
                 .contains("Unsupported Arrow type for CSV conversion"),
             "got: {err}"
         );
+    }
+
+    fn decimal128(value: i128, precision: u8, scale: i8) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(vec![value])
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+
+    fn decimal256(value: arrow::datatypes::i256, precision: u8, scale: i8) -> ArrayRef {
+        Arc::new(
+            arrow::array::Decimal256Array::from(vec![value])
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+
+    fn single_row_batch(columns: Vec<ArrayRef>) -> RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| Field::new(format!("c{idx}"), column.data_type().clone(), true))
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    /// Scenario: The import CSV conversion covers every Arrow type that has an Exasol column type
+    #[test]
+    fn test_import_csv_conversion_covers_every_mapped_arrow_type() {
+        use arrow::array::{
+            BinaryViewArray, Date64Array, DictionaryArray, FixedSizeBinaryArray, Int16Array,
+            Int8Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
+            LargeBinaryArray, LargeStringArray, StringViewArray, TimestampMillisecondArray,
+            TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
+            UInt8Array,
+        };
+        use arrow::datatypes::{i256, IntervalDayTime, IntervalMonthDayNano, UInt64Type};
+
+        let utc = "UTC";
+        let columns: Vec<(ArrayRef, String)> = vec![
+            (Arc::new(BooleanArray::from(vec![true])), "true".into()),
+            (Arc::new(Int8Array::from(vec![-8])), "-8".into()),
+            (Arc::new(Int16Array::from(vec![-16])), "-16".into()),
+            (Arc::new(Int32Array::from(vec![-32])), "-32".into()),
+            (Arc::new(Int64Array::from(vec![-64])), "-64".into()),
+            (Arc::new(UInt8Array::from(vec![8u8])), "8".into()),
+            (Arc::new(UInt16Array::from(vec![16u16])), "16".into()),
+            (Arc::new(UInt32Array::from(vec![32u32])), "32".into()),
+            (Arc::new(UInt64Array::from(vec![64u64])), "64".into()),
+            (Arc::new(Float32Array::from(vec![1.5f32])), "1.5".into()),
+            (Arc::new(Float64Array::from(vec![-2.25])), "-2.25".into()),
+            (Arc::new(StringArray::from(vec!["s"])), "s".into()),
+            (Arc::new(LargeStringArray::from(vec!["ls"])), "ls".into()),
+            (
+                Arc::new(StringViewArray::from(vec!["a,b"])),
+                "\"a,b\"".into(),
+            ),
+            (
+                Arc::new(DictionaryArray::<Int8Type>::new(
+                    Int8Array::from(vec![1]),
+                    Arc::new(StringArray::from(vec!["x", "p,q"])),
+                )),
+                "\"p,q\"".into(),
+            ),
+            (
+                Arc::new(DictionaryArray::<UInt64Type>::new(
+                    UInt64Array::from(vec![0]),
+                    Arc::new(LargeStringArray::from(vec!["large"])),
+                )),
+                "large".into(),
+            ),
+            (
+                Arc::new(BinaryArray::from(vec![&[0xABu8, 0xCD][..]])),
+                "abcd".into(),
+            ),
+            (
+                Arc::new(LargeBinaryArray::from(vec![&[0x01u8][..]])),
+                "01".into(),
+            ),
+            (
+                Arc::new(BinaryViewArray::from(vec![&[0xDEu8, 0xAD][..]])),
+                "dead".into(),
+            ),
+            (
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(vec![vec![0xBEu8, 0xEF, 0x00]].into_iter())
+                        .unwrap(),
+                ),
+                "beef00".into(),
+            ),
+            (
+                Arc::new(Date32Array::from(vec![18_262])),
+                "2020-01-01".into(),
+            ),
+            (
+                Arc::new(Date64Array::from(vec![1_577_836_800_000])),
+                "2020-01-01".into(),
+            ),
+            (
+                Arc::new(TimestampSecondArray::from(vec![1])),
+                "1970-01-01 00:00:01.000000".into(),
+            ),
+            (
+                Arc::new(TimestampSecondArray::from(vec![1]).with_timezone(utc)),
+                "1970-01-01 00:00:01.000000".into(),
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![1_500])),
+                "1970-01-01 00:00:01.500000".into(),
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![1_500]).with_timezone(utc)),
+                "1970-01-01 00:00:01.500000".into(),
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_123])),
+                "1970-01-01 00:00:01.000123".into(),
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_123]).with_timezone(utc)),
+                "1970-01-01 00:00:01.000123".into(),
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![1_000_123_999])),
+                "1970-01-01 00:00:01.000123".into(),
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![1_000_123_999]).with_timezone(utc)),
+                "1970-01-01 00:00:01.000123".into(),
+            ),
+            (decimal128(12_345, 36, 2), "123.45".into()),
+            (
+                decimal256(i256::from_i128(-123_456), 36, 2),
+                "-1234.56".into(),
+            ),
+            (
+                Arc::new(IntervalYearMonthArray::from(vec![63])),
+                "5-03".into(),
+            ),
+            (
+                Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(
+                    2, 46_210_123,
+                )])),
+                "2 12:50:10.123".into(),
+            ),
+            (
+                Arc::new(IntervalMonthDayNanoArray::from(vec![
+                    IntervalMonthDayNano::new(0, 2, 46_210_123_000_000),
+                ])),
+                "2 12:50:10.123".into(),
+            ),
+            (
+                decimal128(-12_345_678_901_234_567_890_123_456_789_012_345_678, 38, 2),
+                "-123456789012345678901234567890123456.78".into(),
+            ),
+            (
+                decimal128(10_i128.pow(37), 38, -5),
+                format!("1{}", "0".repeat(42)),
+            ),
+            (
+                decimal256(i256::from_string(&"9".repeat(76)).unwrap(), 76, -10),
+                format!("{}{}", "9".repeat(76), "0".repeat(10)),
+            ),
+        ];
+        let expected_line = columns
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let batch = single_row_batch(columns.into_iter().map(|(array, _)| array).collect());
+
+        let csv = record_batch_to_csv(&batch, CsvWriterOptions::default()).unwrap();
+
+        assert_eq!(
+            String::from_utf8(csv).unwrap(),
+            format!("{expected_line}\n")
+        );
+    }
+
+    /// Scenario: The import CSV conversion covers every Arrow type that has an Exasol column type
+    #[test]
+    fn test_import_csv_conversion_writes_a_null_dictionary_key_or_value_as_the_null_marker() {
+        use arrow::array::DictionaryArray;
+
+        let dictionary = DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![Some(0), None, Some(1)]),
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+        );
+        let options = CsvWriterOptions {
+            null_value: "\\N".to_string(),
+            ..Default::default()
+        };
+
+        let texts: Vec<String> = (0..3)
+            .map(|row| format_value(&options, &dictionary, row).unwrap())
+            .collect();
+
+        assert_eq!(texts, ["a", "\\N", "\\N"]);
+    }
+
+    /// Scenario: The import CSV conversion covers every Arrow type that has an Exasol column type
+    #[test]
+    fn test_import_csv_conversion_rejects_types_without_a_conversion() {
+        let cases: [(ArrayRef, &str); 3] = [
+            (
+                Arc::new(arrow::array::Time32SecondArray::from(vec![1])),
+                "Time32(Second)",
+            ),
+            (
+                Arc::new(arrow::array::DurationSecondArray::from(vec![1])),
+                "Duration(Second)",
+            ),
+            (
+                Arc::new(arrow::array::ListArray::from_iter_primitive::<
+                    Int32Type,
+                    _,
+                    _,
+                >(vec![Some(vec![Some(1)])])),
+                "List(",
+            ),
+        ];
+
+        for (array, type_name) in cases {
+            let err =
+                record_batch_to_csv(&single_row_batch(vec![array]), CsvWriterOptions::default())
+                    .unwrap_err();
+            assert!(
+                matches!(&err, ImportError::ConversionError(message) if message.contains(type_name)),
+                "{type_name}: {err}"
+            );
+        }
+    }
+
+    /// Scenario: The import CSV conversion rejects interval values that INTERVAL DAY TO SECOND cannot hold
+    #[tokio::test]
+    async fn test_import_from_record_batch_rejects_interval_values_that_day_to_second_cannot_hold()
+    {
+        use arrow::array::{IntervalDayTimeArray, IntervalMonthDayNanoArray};
+        use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano};
+        use std::sync::Mutex;
+
+        let month_day_nano = |months, days, nanoseconds| -> ArrayRef {
+            Arc::new(IntervalMonthDayNanoArray::from(vec![
+                IntervalMonthDayNano::new(months, days, nanoseconds),
+            ]))
+        };
+        let cases: [(ArrayRef, &str, &str); 4] = [
+            (
+                month_day_nano(1, 0, 0),
+                "1 months, 0 days, and 0 nanoseconds",
+                "Exasol INTERVAL DAY TO SECOND has no month component",
+            ),
+            (
+                month_day_nano(0, 0, 1_500_000),
+                "0 months, 0 days, and 1500000 nanoseconds",
+                "Exasol stores INTERVAL DAY TO SECOND values in whole milliseconds",
+            ),
+            (
+                month_day_nano(0, 1_000_000_000, 0),
+                "1000000000 days",
+                "INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days",
+            ),
+            (
+                Arc::new(IntervalDayTimeArray::from(vec![IntervalDayTime::new(
+                    -1_000_000_000,
+                    0,
+                )])),
+                "-1000000000 days",
+                "INTERVAL DAY(9) TO SECOND holds at most 999,999,999 days",
+            ),
+        ];
+
+        for (array, value, reason) in cases {
+            let statements = Arc::new(Mutex::new(Vec::<String>::new()));
+            let recorded = Arc::clone(&statements);
+            let execute_sql = move |sql: String| {
+                recorded.lock().unwrap().push(sql);
+                async { Ok(0) }
+            };
+
+            let err = import_from_record_batch(
+                execute_sql,
+                "T",
+                &single_row_batch(vec![array]),
+                ArrowImportOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(&err, ImportError::ConversionError(message)
+                    if message.contains(value) && message.contains(reason)),
+                "{value}: {err}"
+            );
+            assert!(statements.lock().unwrap().is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_arrow_to_exasol_maps_a_subset_of_the_types_the_import_csv_conversion_converts() {
+        use crate::types::TypeMapper;
+        use arrow::datatypes::{IntervalUnit, TimeUnit};
+
+        let dictionary =
+            |key: DataType, value: DataType| DataType::Dictionary(Box::new(key), Box::new(value));
+        let decimals_outside_exasol_limits = [
+            DataType::Decimal128(38, 2),
+            DataType::Decimal128(38, -5),
+            DataType::Decimal256(76, -10),
+            DataType::Decimal128(37, 0),
+            DataType::Decimal256(40, 5),
+            DataType::Decimal128(10, -2),
+            DataType::Decimal128(5, 6),
+        ];
+        let mut types = vec![
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            dictionary(DataType::Int8, DataType::Utf8),
+            dictionary(DataType::UInt64, DataType::LargeUtf8),
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(3),
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Decimal128(36, 2),
+            DataType::Decimal256(36, 2),
+            DataType::Interval(IntervalUnit::YearMonth),
+            DataType::Interval(IntervalUnit::DayTime),
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Null,
+            DataType::Float16,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+            dictionary(DataType::Int32, DataType::Int32),
+            dictionary(DataType::Int8, DataType::Binary),
+            dictionary(DataType::Float32, DataType::Utf8),
+        ];
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            types.push(DataType::Timestamp(unit, None));
+            types.push(DataType::Timestamp(unit, Some("UTC".into())));
+            types.push(DataType::Duration(unit));
+        }
+        types.extend(decimals_outside_exasol_limits.iter().cloned());
+
+        for data_type in types {
+            let mapped = TypeMapper::arrow_to_exasol(&data_type).is_ok();
+            let converts = resolve_value_formatter(&data_type).is_ok();
+            let outside_limits = decimals_outside_exasol_limits.contains(&data_type);
+            assert_eq!(
+                mapped,
+                converts && !outside_limits,
+                "{data_type:?}: mapped {mapped}, converts {converts}"
+            );
+            assert!(converts || !outside_limits, "{data_type:?}");
+        }
+    }
+
+    /// Scenario: RecordBatch import formats a pre-epoch Date64 value as the day that holds it
+    #[test]
+    fn test_format_date64_before_epoch_as_the_day_that_holds_it() {
+        let array = arrow::array::Date64Array::from(vec![-1, -86_400_000, -86_400_001]);
+        let options = CsvWriterOptions::default();
+
+        let texts: Vec<String> = (0..3)
+            .map(|row| format_value(&options, &array, row).unwrap())
+            .collect();
+
+        assert_eq!(texts, ["1969-12-31", "1969-12-31", "1969-12-30"]);
+    }
+
+    #[test]
+    fn test_check_schema_converts_names_the_first_column_it_rejects() {
+        use arrow::datatypes::TimeUnit;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("at", DataType::Time64(TimeUnit::Microsecond), true),
+            Field::new("span", DataType::Duration(TimeUnit::Second), true),
+        ]);
+
+        let err = check_schema_converts(&schema).unwrap_err();
+
+        assert!(
+            matches!(&err, ImportError::ConversionError(message)
+                if message.contains("'at'") && message.contains("Time64(Microsecond)")
+                    && !message.contains("span")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_schema_converts_accepts_a_schema_of_convertible_types() {
+        let schema = create_test_batch().schema();
+
+        assert!(check_schema_converts(&schema).is_ok());
+    }
+
+    #[test]
+    fn test_format_value_rejects_a_null_of_a_type_without_a_conversion() {
+        let array = arrow::array::Time32SecondArray::from(vec![None]);
+
+        let err = format_value(&CsvWriterOptions::default(), &array, 0).unwrap_err();
+
+        assert!(err.to_string().contains("Time32(Second)"), "got: {err}");
+    }
+
+    #[test]
+    fn test_writer_rejects_a_batch_with_a_type_without_a_conversion_before_writing_the_header() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "t",
+                DataType::Time32(arrow::datatypes::TimeUnit::Second),
+                true,
+            ),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(Vec::<i32>::new())),
+                Arc::new(arrow::array::Time32SecondArray::from(Vec::<i32>::new())),
+            ],
+        )
+        .unwrap();
+        let options = CsvWriterOptions {
+            write_header: true,
+            ..Default::default()
+        };
+        let mut buffer = Vec::new();
+
+        let err = SyncArrowToCsvWriter::new(&mut buffer, options)
+            .write_batch(&batch)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("'t'"), "got: {err}");
+        assert!(buffer.is_empty());
     }
 
     #[test]
