@@ -93,9 +93,9 @@ for SIZE in ${SIZES}; do
     done
 done
 
-# Run SELECT to Polars benchmarks (data should exist from import)
+# Run SELECT benchmarks (data should exist from import)
 for SIZE in ${SIZES}; do
-    echo "=== Benchmark: ${SIZE} SELECT-POLARS ==="
+    echo "=== Benchmark: ${SIZE} SELECT ==="
 
     # Python SELECT to Polars benchmark
     echo "Running PyExasol select-polars benchmark..."
@@ -106,14 +106,14 @@ for SIZE in ${SIZES}; do
         --warmup "${WARMUP}" \
         --output "${RESULTS_DIR}/pyexasol_${SIZE}_select_polars.json"
 
-    # exarrow-rs SELECT to Polars benchmark
-    echo "Running exarrow-rs select-polars benchmark..."
+    # exarrow-rs SELECT to Arrow benchmark
+    echo "Running exarrow-rs select-arrow benchmark..."
     cargo run --release --features benchmark --bin benchmark -- \
-        --operation select-polars \
+        --operation select-arrow \
         --size "${SIZE}" \
         --iterations "${ITERATIONS}" \
         --warmup "${WARMUP}" \
-        --output "${RESULTS_DIR}/exarrow_${SIZE}_select_polars.json"
+        --output "${RESULTS_DIR}/exarrow_${SIZE}_select_arrow.json"
 
     echo ""
 done

@@ -1,9 +1,8 @@
 //! Type mapping between Exasol and Apache Arrow data types.
 
 use crate::error::ConversionError;
-use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, Metadata, TimeUnit};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Column name handling mode for DDL generation.
 ///
@@ -341,8 +340,8 @@ impl TypeMapper {
     /// Create Arrow field metadata to preserve Exasol type information.
     ///
     /// This allows round-tripping type information.
-    pub fn create_field_metadata(exasol_type: &ExasolType) -> HashMap<String, String> {
-        let mut metadata = HashMap::new();
+    pub fn create_field_metadata(exasol_type: &ExasolType) -> Metadata {
+        let mut metadata = Metadata::new();
 
         metadata.insert(
             "exasol:type".to_string(),
@@ -375,7 +374,7 @@ impl TypeMapper {
     }
 
     /// Extract Exasol type from Arrow field metadata.
-    pub fn from_field_metadata(metadata: &HashMap<String, String>) -> Option<ExasolType> {
+    pub fn from_field_metadata(metadata: &Metadata) -> Option<ExasolType> {
         metadata
             .get("exasol:type")
             .and_then(|s| serde_json::from_str(s).ok())

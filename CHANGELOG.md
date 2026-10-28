@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.30.0
+
+- Security: fixes RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403, and RUSTSEC-2026-0410 in `zstd`, `zstd-safe`, and `zstd-sys`, which `parquet` pulls in.
+- Breaking: exarrow-rs uses `arrow` and `parquet` 60, and `adbc_core` and `adbc_ffi` 0.25. Rust code that passes Arrow types such as `RecordBatch` or `Schema` to or from exarrow-rs must move to `arrow` 60. Callers that load the driver through an ADBC driver manager are not affected.
+- Breaking: `TypeMapper::create_field_metadata` returns, and `TypeMapper::from_field_metadata` takes, `arrow::datatypes::Metadata` instead of `HashMap<String, String>`, matching `Field::metadata` in `arrow` 60.
+- Changed: the `benchmark` feature no longer depends on Polars. The `benchmark` binary's `select-polars` operation is replaced by `select-arrow`, which times a SELECT into Arrow RecordBatches.
+
 ## 0.29.0
 
 - Fix: ADBC ingest with a column type that the driver cannot ingest fails with `InvalidArguments` before any SQL statement, in every mode. Replace mode keeps the existing table and its rows, and create mode leaves no table. Before, create and replace mode failed after the DDL, and append mode failed with `Internal`. Fixes #111.
