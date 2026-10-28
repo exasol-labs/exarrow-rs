@@ -1,7 +1,7 @@
-//! Benchmark for exarrow-rs import and Polars streaming performance.
+//! Benchmark for exarrow-rs import and SELECT performance.
 //!
 //! Measures import performance for CSV and Parquet files,
-//! and SELECT streaming to Polars DataFrame.
+//! and SELECT streaming to Arrow RecordBatches.
 
 use std::env;
 use std::fs;
@@ -11,18 +11,17 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::import::{CsvImportOptions, ParquetImportOptions};
-use polars::prelude::*;
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum Operation {
     ImportCsv,
     ImportParquet,
-    SelectPolars,
+    SelectArrow,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "benchmark")]
-#[command(about = "Benchmark exarrow-rs import and Polars streaming performance")]
+#[command(about = "Benchmark exarrow-rs import and SELECT performance")]
 struct Args {
     /// Operation to benchmark
     #[arg(long, value_enum)]
@@ -167,36 +166,15 @@ async fn import_parquet(
     Ok((rows as i64, elapsed))
 }
 
-async fn select_to_polars(
-    conn: &mut Connection,
-) -> Result<(i64, f64, DataFrame), Box<dyn std::error::Error>> {
+async fn select_to_arrow(conn: &mut Connection) -> Result<(i64, f64), Box<dyn std::error::Error>> {
     let start = Instant::now();
 
-    let all_batches = conn.query("SELECT * FROM benchmark.benchmark_data").await?;
-
-    if all_batches.is_empty() {
-        return Err("No data returned".into());
-    }
-
-    // Convert Arrow batches to Polars DataFrame via IPC format
-    let mut ipc_buffer = Vec::new();
-    {
-        let schema = all_batches[0].schema();
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc_buffer, &schema)?;
-        for batch in &all_batches {
-            writer.write(batch)?;
-        }
-        writer.finish()?;
-    }
-
-    // Read IPC buffer with Polars
-    let cursor = std::io::Cursor::new(ipc_buffer);
-    let df = IpcStreamReader::new(cursor).finish()?;
+    let batches = conn.query("SELECT * FROM benchmark.benchmark_data").await?;
 
     let elapsed = start.elapsed().as_secs_f64();
-    let row_count = df.height() as i64;
+    let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
 
-    Ok((row_count, elapsed, df))
+    Ok((row_count as i64, elapsed))
 }
 
 async fn run_import_benchmark(
@@ -243,7 +221,7 @@ async fn run_import_benchmark(
     Ok((times, total_rows))
 }
 
-async fn run_select_polars_benchmark(
+async fn run_select_arrow_benchmark(
     conn: &mut Connection,
     iterations: usize,
     warmup: usize,
@@ -251,7 +229,7 @@ async fn run_select_polars_benchmark(
     // Warmup iterations
     println!("Running {} warmup iteration(s)...", warmup);
     for i in 0..warmup {
-        let (rows, elapsed, _df) = select_to_polars(conn).await?;
+        let (rows, elapsed) = select_to_arrow(conn).await?;
         println!("  Warmup {}: {} rows in {:.3}s", i + 1, rows, elapsed);
     }
 
@@ -261,7 +239,7 @@ async fn run_select_polars_benchmark(
     let mut total_rows: i64 = 0;
 
     for i in 0..iterations {
-        let (rows, elapsed, _df) = select_to_polars(conn).await?;
+        let (rows, elapsed) = select_to_arrow(conn).await?;
         times.push(elapsed);
         total_rows = rows;
         println!(
@@ -289,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.operation {
         Operation::ImportCsv => run_import_benchmark_main(&args, &config, "csv").await,
         Operation::ImportParquet => run_import_benchmark_main(&args, &config, "parquet").await,
-        Operation::SelectPolars => run_select_polars_benchmark_main(&args, &config).await,
+        Operation::SelectArrow => run_select_arrow_benchmark_main(&args, &config).await,
     }
 }
 
@@ -374,11 +352,11 @@ async fn run_import_benchmark_main(
     Ok(())
 }
 
-async fn run_select_polars_benchmark_main(
+async fn run_select_arrow_benchmark_main(
     args: &Args,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("exarrow-rs -> Polars Streaming Benchmark: {}", args.size);
+    println!("exarrow-rs -> Arrow SELECT Benchmark: {}", args.size);
     println!("  Host: {}:{}", config.host, config.port);
     println!("  Note: Data must already exist from prior import benchmark");
     println!();
@@ -426,7 +404,7 @@ async fn run_select_polars_benchmark_main(
     println!();
 
     let (times, total_rows) =
-        run_select_polars_benchmark(&mut conn, args.iterations, args.warmup).await?;
+        run_select_arrow_benchmark(&mut conn, args.iterations, args.warmup).await?;
 
     conn.close().await?;
 
@@ -441,8 +419,8 @@ async fn run_select_polars_benchmark_main(
 
     // Build results JSON
     let results = serde_json::json!({
-        "library": "exarrow-rs+polars",
-        "operation": "select-polars",
+        "library": "exarrow-rs",
+        "operation": "select-arrow",
         "size": args.size,
         "total_rows": total_rows,
         "iterations": args.iterations,

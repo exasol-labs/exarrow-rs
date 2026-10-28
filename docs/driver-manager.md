@@ -187,9 +187,9 @@ Add the dependencies to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adbc_core = "0.24"
-adbc_driver_manager = "0.24"
-arrow = "59"
+adbc_core = "0.25"
+adbc_driver_manager = "0.25"
+arrow = "60"
 ```
 
 Load the driver, connect, and query:

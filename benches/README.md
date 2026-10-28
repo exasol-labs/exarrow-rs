@@ -1,6 +1,6 @@
 # exarrow-rs vs PyExasol Benchmark
 
-Performance comparison of import and Polars streaming operations between **exarrow-rs** (Rust) and **PyExasol** (Python).
+Performance comparison of import and SELECT operations between **exarrow-rs** (Rust) and **PyExasol** (Python).
 
 ## Benchmark Types
 
@@ -8,7 +8,8 @@ Performance comparison of import and Polars streaming operations between **exarr
 |-----------|-------------------|-------------------|
 | CSV Import | `import-csv` | `import-csv` |
 | Parquet Import | `import-parquet` | `import-parquet` |
-| SELECT → Polars | `select-polars` | `select-polars` |
+| SELECT → Arrow | `select-arrow` | - |
+| SELECT → Polars | - | `select-polars` |
 | SELECT → Pandas | - | `select-pandas` |
 
 ## Prerequisites
@@ -60,7 +61,7 @@ Generated files are saved to `benches/data/`:
 ### 3. Run Benchmarks
 
 ```bash
-# Run all benchmarks (import + select-polars)
+# Run all benchmarks (import + select)
 ./scripts/run_benchmarks.sh
 
 # Or run individual benchmarks:
@@ -83,8 +84,8 @@ cargo run --release --features benchmark --bin benchmark -- --operation import-c
 # Rust Parquet Import (exarrow-rs)
 cargo run --release --features benchmark --bin benchmark -- --operation import-parquet --size 100mb
 
-# Rust SELECT to Polars (exarrow-rs)
-cargo run --release --features benchmark --bin benchmark -- --operation select-polars --size 100mb
+# Rust SELECT to Arrow (exarrow-rs)
+cargo run --release --features benchmark --bin benchmark -- --operation select-arrow --size 100mb
 ```
 
 ## Test Data Schema
@@ -142,7 +143,7 @@ SIZES="100mb 1gb" ITERATIONS=10 ./scripts/run_benchmarks.sh
 Usage: benchmark [OPTIONS] --operation <OPERATION>
 
 Options:
-      --operation <OPERATION>  Operation to benchmark [possible values: import-csv, import-parquet, select-polars]
+      --operation <OPERATION>  Operation to benchmark [possible values: import-csv, import-parquet, select-arrow]
   -s, --size <SIZE>            Data size [default: 100mb]
   -i, --iterations <N>         Benchmark iterations [default: 5]
   -w, --warmup <N>             Warmup iterations [default: 1]
