@@ -88,6 +88,8 @@ The connection timeout changes neither bound. `CsvExportOptions::timeout_ms` doe
 | Parquet   | Yes    | Yes    | Columnar with compression     |
 | Arrow IPC | Yes    | Yes    | Direct RecordBatch transfer   |
 
+Parquet support needs the `parquet` Cargo feature, which is on by default. See [Feature Flags and Build Options](setup-and-connect.md#feature-flags-and-build-options).
+
 ## Memory Use
 
 Each import function holds a different amount of data in memory. A "piece" is at most 64 KiB, and a "batch" is one Arrow RecordBatch of `batch_size` rows.

@@ -1429,6 +1429,7 @@ impl Connection {
     /// The `native_parquet_override` field on `options` takes precedence: if it
     /// is `Some(b)`, that value is used directly. Otherwise the result of
     /// `supports_native_parquet_import()` is returned.
+    #[cfg(feature = "parquet")]
     fn resolve_native_parquet(
         &self,
         options: &crate::import::parquet::ParquetImportOptions,
@@ -1465,6 +1466,7 @@ impl Connection {
     ///
     /// # Example
     ///
+    #[cfg(feature = "parquet")]
     pub async fn import_from_parquet(
         &mut self,
         table: &str,
@@ -1523,6 +1525,7 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `ImportError` if the import fails.
+    #[cfg(feature = "parquet")]
     pub async fn import_from_parquet_stream<R>(
         &mut self,
         table: &str,
@@ -1592,6 +1595,7 @@ impl Connection {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "parquet")]
     pub async fn import_parquet_from_files<S: crate::import::IntoFileSources>(
         &mut self,
         table: &str,
@@ -1647,6 +1651,7 @@ impl Connection {
     ///
     /// # Example
     ///
+    #[cfg(feature = "parquet")]
     pub async fn export_to_parquet(
         &mut self,
         source: crate::query::export::ExportSource,
@@ -1946,6 +1951,7 @@ impl Connection {
     ///
     /// # Example
     ///
+    #[cfg(feature = "parquet")]
     pub fn blocking_import_from_parquet(
         &mut self,
         table: &str,
@@ -1987,6 +1993,7 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `ImportError` if the import fails.
+    #[cfg(feature = "parquet")]
     pub fn blocking_import_from_parquet_stream<R>(
         &mut self,
         table: &str,
@@ -2017,6 +2024,7 @@ impl Connection {
     /// # Errors
     ///
     /// Returns `ImportError` if the import fails.
+    #[cfg(feature = "parquet")]
     pub fn blocking_import_parquet_from_files<S: crate::import::IntoFileSources>(
         &mut self,
         table: &str,
@@ -2159,6 +2167,7 @@ impl Connection {
     ///
     /// # Example
     ///
+    #[cfg(feature = "parquet")]
     pub fn blocking_export_to_parquet(
         &mut self,
         source: crate::query::export::ExportSource,
@@ -4957,6 +4966,7 @@ mod blocking_tests {
         }
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_connection_has_blocking_import_parquet() {
         fn _check_method_exists(_conn: &mut Connection) {
@@ -5008,6 +5018,7 @@ mod blocking_tests {
         }
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_connection_has_blocking_export_parquet() {
         fn _check_method_exists(_conn: &mut Connection) {
@@ -5054,6 +5065,7 @@ mod blocking_tests {
         }
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_connection_has_import_from_parquet_stream() {
         // Verify that import_from_parquet_stream is wired (async, takes reader).
@@ -5069,6 +5081,7 @@ mod blocking_tests {
         }
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_resolve_native_parquet_uses_override_when_set() {
         // Verify that ParquetImportOptions.native_parquet_override propagates correctly.

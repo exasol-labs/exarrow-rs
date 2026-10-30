@@ -4,6 +4,7 @@ Specifies Parquet file import through the HTTP tunnel, natively on Exasol 2025.1
 
 ## Background
 
+- Parquet import, Parquet export, and Parquet schema inference exist only with the `parquet` Cargo feature, which is on by default.
 - The driver selects the path from the connected server's `release_version`. On 2025.1.11 and newer, the server requests the Parquet file with HTTP range requests (footer first, then row groups). On older servers, the driver converts each `RecordBatch` to CSV with `record_batch_to_csv` and streams the CSV body.
 - The Parquet IMPORT statement omits all CSV format options and the `MULTIPLE LOCAL FILES` tag, because Exasol opens one HTTP server per file for native Parquet import.
 

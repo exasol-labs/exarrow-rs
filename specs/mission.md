@@ -98,8 +98,9 @@ cargo llvm-cov
 |------|---------|---------|
 | `native` | Yes | Native TCP binary protocol transport (ChaCha20 encryption, little-endian framing) |
 | `websocket` | No | WebSocket JSON protocol transport (opt-in fallback, requires `tokio-tungstenite`) |
+| `parquet` | Yes | Parquet import, export, and schema inference (requires `parquet`) |
 | `ffi` | No | ADBC FFI cdylib for driver manager integration |
-| `benchmark` | No | Benchmarking tools and data generation |
+| `benchmark` | No | Benchmarking tools and data generation (enables `parquet`) |
 
 ## Repository Structure
 

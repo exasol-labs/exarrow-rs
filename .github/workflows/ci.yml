@@ -80,6 +80,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # --all-features cannot catch code that only one feature uses, such as parquet or native.
+      - name: Clippy without the parquet feature
+        run: cargo clippy --all-targets --no-default-features --features ffi -- -D warnings
+
+      - name: Clippy for a websocket-only build
+        run: cargo clippy --all-targets --no-default-features --features websocket -- -D warnings
+
       - name: Check CI covers every integration test target
         run: python3 scripts/check_ci_test_targets.py
 

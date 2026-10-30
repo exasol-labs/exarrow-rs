@@ -141,8 +141,6 @@ pub use import::{
     import_from_callback,
     import_from_file,
     import_from_iter,
-    import_from_parquet,
-    import_from_parquet_stream,
     import_from_record_batch,
     import_from_record_batches,
     import_from_stream,
@@ -155,9 +153,11 @@ pub use import::{
     DataPipeSender,
     // Error type
     ImportError,
-    // Parquet import
-    ParquetImportOptions,
 };
+
+/// Parquet import options and functions.
+#[cfg(feature = "parquet")]
+pub use import::{import_from_parquet, import_from_parquet_stream, ParquetImportOptions};
 
 // Export Types
 /// CSV export options and functions.
@@ -168,15 +168,10 @@ pub use import::{
 /// # Example
 ///
 pub use export::{
-    csv_to_record_batches,
-    exasol_types_to_arrow_schema,
     export_to_arrow_ipc,
     export_to_callback,
     export_to_file,
     export_to_list,
-    export_to_parquet,
-    export_to_parquet_stream,
-    export_to_parquet_via_transport,
     export_to_record_batches,
     export_to_stream,
     // Arrow export
@@ -186,8 +181,13 @@ pub use export::{
     CsvToArrowReader,
     DataPipeReceiver,
     ExportError,
-    // Parquet export
-    ParquetCompression,
+};
+
+/// Parquet export options and functions.
+#[cfg(feature = "parquet")]
+pub use export::{
+    csv_to_record_batches, exasol_types_to_arrow_schema, export_to_parquet,
+    export_to_parquet_stream, export_to_parquet_via_transport, ParquetCompression,
     ParquetExportOptions,
 };
 

@@ -108,6 +108,7 @@ impl ExportSource {
     ///
     /// Preparing it describes the exported columns without running the export. It names the
     /// table exactly as the EXPORT statement does, so both resolve the same object.
+    #[cfg(feature = "parquet")]
     pub(crate) fn select_statement(&self) -> String {
         match self {
             ExportSource::Table {
@@ -445,6 +446,7 @@ impl ExportQuery {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_select_statement_for_table_without_schema_selects_star() {
         let source = ExportSource::Table {
@@ -455,6 +457,7 @@ mod tests {
         assert_eq!(source.select_statement(), "SELECT * FROM users");
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_select_statement_for_table_with_schema_and_columns() {
         let source = ExportSource::Table {
@@ -468,6 +471,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_select_statement_for_query_is_the_query_text() {
         let source = ExportSource::Query {
@@ -476,6 +480,7 @@ mod tests {
         assert_eq!(source.select_statement(), "SELECT 1 AS X");
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_select_statement_and_export_clause_name_the_same_table() {
         let source = ExportSource::Table {

@@ -4,7 +4,7 @@ Code quality standards for the exarrow-rs codebase, ensuring zero clippy warning
 
 ## Background
 
-The codebase SHALL maintain zero clippy warnings when built with all targets and features. ALL code changes MUST pass the complete test suite before being considered complete.
+The codebase SHALL maintain zero clippy warnings when built with all targets and features, without the `parquet` feature, and with the `websocket` feature alone, because code that only one feature uses passes an all-features build even when another build never uses it. ALL code changes MUST pass the complete test suite before being considered complete.
 
 ## Scenarios
 
@@ -14,6 +14,8 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 * *WHEN* running `cargo clippy --all-targets --all-features -- -D warnings`
 * *THEN* it SHALL produce zero warnings
 * *AND* it SHALL pass all lint checks
+* *AND* `cargo clippy --all-targets --no-default-features --features ffi -- -D warnings` SHALL produce zero warnings
+* *AND* `cargo clippy --all-targets --no-default-features --features websocket -- -D warnings` SHALL produce zero warnings
 
 ### Scenario: Test code lint exceptions
 

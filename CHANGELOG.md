@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.31.0
+
+- Added: a `parquet` Cargo feature, on by default, that gates Parquet import and export, Parquet schema inference, and the `parquet` dependency. Build with `default-features = false, features = ["native"]` to leave `parquet` out. The `ffi` feature does not enable it, and the `benchmark` feature does.
+- Breaking: a build with `default-features = false` no longer has the Parquet API. Add the `parquet` feature to keep it.
+
 ## 0.30.0
 
 - Security: fixes RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403, and RUSTSEC-2026-0410 in `zstd`, `zstd-safe`, and `zstd-sys`, which `parquet` pulls in.
