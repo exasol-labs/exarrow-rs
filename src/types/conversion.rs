@@ -94,6 +94,7 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
 
 /// Converts a pre-decoded timestamp (y, m, d, h, min, s, nanos) to microseconds
 /// since Unix epoch. Nanoseconds are truncated to microsecond precision.
+#[cfg(feature = "native")]
 pub fn ymd_hms_nanos_to_micros(
     year: i32,
     month: u32,
@@ -184,11 +185,14 @@ fn timestamp_unit_to_micros(unit: &TimeUnit, value: i64) -> Result<i64, String> 
 }
 
 /// Accepted form of DATE parameter text, quoted in rejection messages.
+#[cfg(feature = "native")]
 pub const DATE_TEXT_FORM: &str = "YYYY-MM-DD";
 /// Accepted form of TIMESTAMP parameter text, quoted in rejection messages.
+#[cfg(feature = "native")]
 pub const TIMESTAMP_TEXT_FORM: &str = "YYYY-MM-DD HH:MI:SS.FFFFFFFFF";
 
 /// Date and time fields exactly as written in parameter text, with no calendar check.
+#[cfg(feature = "native")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemporalFields {
     pub year: u16,
@@ -200,6 +204,7 @@ pub struct TemporalFields {
     pub nanos: u32,
 }
 
+#[cfg(feature = "native")]
 fn digits(part: &str, max_len: usize) -> Option<u32> {
     if part.is_empty() || part.len() > max_len || !part.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -207,6 +212,7 @@ fn digits(part: &str, max_len: usize) -> Option<u32> {
     part.parse().ok()
 }
 
+#[cfg(feature = "native")]
 fn parse_temporal_fields(text: &str) -> Option<TemporalFields> {
     let text = text.trim_matches(' ');
     let (date, time) = match text.split_once(' ') {
@@ -249,6 +255,7 @@ fn parse_temporal_fields(text: &str) -> Option<TemporalFields> {
 
 /// Parses TIMESTAMP parameter text: `Y-M-D`, optionally followed by spaces and `h`, `h:m`, `h:m:s`
 /// or `h:m:s.f` (up to 9 fraction digits). Leading and trailing spaces are ignored.
+#[cfg(feature = "native")]
 pub fn parse_timestamp_text(text: &str) -> Result<TemporalFields, String> {
     parse_temporal_fields(text).ok_or_else(|| {
         format!("Cannot read '{text}' as a timestamp, expected {TIMESTAMP_TEXT_FORM}")
@@ -257,6 +264,7 @@ pub fn parse_timestamp_text(text: &str) -> Result<TemporalFields, String> {
 
 /// Parses DATE parameter text in the forms of [`parse_timestamp_text`]. A DATE keeps only the
 /// date fields; the time fields must stay within the bounds Exasol's text cast accepts.
+#[cfg(feature = "native")]
 pub fn parse_date_text(text: &str) -> Result<TemporalFields, String> {
     parse_temporal_fields(text)
         .filter(|f| f.hour <= 23 && f.minute <= 60 && f.second <= 60)
@@ -634,6 +642,7 @@ pub fn exasol_type_to_arrow(exasol_type: &ExasolType) -> Result<DataType, String
 #[cfg(test)]
 mod tests {
     /// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
+    #[cfg(feature = "native")]
     #[test]
     fn formatter_output_parses_back_to_its_fields() {
         for (days, y, m, d) in [
@@ -760,6 +769,7 @@ mod tests {
     }
 
     /// Scenario: DATE and TIMESTAMP values count days in the proleptic Gregorian calendar
+    #[cfg(feature = "native")]
     #[test]
     fn test_ymd_hms_nanos_to_micros_before_epoch() {
         assert_eq!(
@@ -1023,17 +1033,20 @@ mod tests {
 
     // Tests for ymd_hms_nanos_to_micros
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_ymd_hms_nanos_to_micros_epoch() {
         assert_eq!(ymd_hms_nanos_to_micros(1970, 1, 1, 0, 0, 0, 0), 0);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_ymd_hms_nanos_to_micros_with_time() {
         let micros = ymd_hms_nanos_to_micros(1970, 1, 1, 1, 0, 0, 0);
         assert_eq!(micros, 3600 * 1_000_000);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_ymd_hms_nanos_to_micros_sub_second_precision() {
         // 123456789 nanos → 123456 micros (truncated)
@@ -1041,6 +1054,7 @@ mod tests {
         assert_eq!(micros, 123_456);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_ymd_hms_nanos_to_micros_full_timestamp() {
         // 2024-01-02 03:04:05.678 → known value

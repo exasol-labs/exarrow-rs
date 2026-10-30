@@ -228,6 +228,14 @@ exasol://user:password@host:8563?transport=websocket
 |---------|---------|-------------|
 | `native` | yes | default build, `--features ffi` |
 | `websocket` | no | opt-in: `--features websocket` |
+| `parquet` | no | opt-in: `--features parquet`, for Parquet import, export, and schema inference |
+
+The `parquet` feature pulls in the `parquet` crate. Enable it when you need Parquet support:
+
+```toml
+[dependencies]
+exarrow-rs = { version = "0.31", features = ["parquet"] }
+```
 
 Build with both transports compiled in (transport selected at runtime via connection string):
 

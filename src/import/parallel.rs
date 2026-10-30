@@ -444,6 +444,7 @@ pub async fn stream_parquet_files_parallel(
 /// # Errors
 ///
 /// Returns `ImportError` on first conversion failure (fail-fast).
+#[cfg(feature = "parquet")]
 pub async fn convert_parquet_files_to_csv(
     paths: Vec<PathBuf>,
     batch_size: usize,
@@ -995,6 +996,7 @@ mod tests {
         assert!(outcome.is_err(), "the pending task must drop its sender");
     }
 
+    #[cfg(feature = "parquet")]
     #[tokio::test]
     async fn test_convert_parquet_files_to_csv_reports_unreadable_file() {
         let result = convert_parquet_files_to_csv(
@@ -1017,6 +1019,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "parquet")]
     #[tokio::test]
     async fn test_convert_parquet_files_to_csv_rejects_non_parquet_content() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -1033,6 +1036,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "parquet")]
     #[tokio::test]
     async fn test_convert_parquet_files_to_csv_renders_every_file_as_csv_rows() {
         use arrow::array::{Int32Array, StringArray};
@@ -1073,6 +1077,7 @@ mod tests {
         assert_eq!(String::from_utf8(csv_data[1].clone()).unwrap(), "1,b\n");
     }
 
+    #[cfg(feature = "parquet")]
     #[tokio::test]
     async fn test_convert_parquet_files_to_csv_keeps_conversion_error_for_out_of_range_date() {
         use arrow::array::Date32Array;

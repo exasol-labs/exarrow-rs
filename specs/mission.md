@@ -82,7 +82,7 @@ cargo test --lib                         # Unit tests
 cargo test --test integration_tests      # Integration tests (requires Exasol)
 cargo test --test native_protocol_tests  # Native protocol tests (requires Exasol)
 cargo test --test driver_manager_tests   # Driver manager tests
-REQUIRE_EXASOL=1 cargo test --features ffi --test import_export_tests -- --test-threads=1  # Import/export tests (requires Exasol)
+REQUIRE_EXASOL=1 cargo test --features "ffi parquet" --test import_export_tests -- --test-threads=1  # Import/export tests (requires Exasol)
 
 # Lint & Format
 cargo fmt --all                          # Format code
@@ -98,8 +98,9 @@ cargo llvm-cov
 |------|---------|---------|
 | `native` | Yes | Native TCP binary protocol transport (ChaCha20 encryption, little-endian framing) |
 | `websocket` | No | WebSocket JSON protocol transport (opt-in fallback, requires `tokio-tungstenite`) |
+| `parquet` | No | Parquet import, export, and schema inference (requires `parquet`) |
 | `ffi` | No | ADBC FFI cdylib for driver manager integration |
-| `benchmark` | No | Benchmarking tools and data generation |
+| `benchmark` | No | Benchmarking tools and data generation (enables `parquet`) |
 
 ## Repository Structure
 

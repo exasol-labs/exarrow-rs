@@ -59,6 +59,7 @@
 
 pub mod arrow;
 pub mod csv;
+#[cfg(feature = "parquet")]
 pub mod parquet;
 
 // Re-export CSV types for convenience
@@ -68,6 +69,7 @@ pub use csv::{
 };
 
 // Re-export Parquet types for convenience
+#[cfg(feature = "parquet")]
 pub use parquet::{
     csv_to_record_batches, exasol_types_to_arrow_schema, export_to_parquet,
     export_to_parquet_stream, export_to_parquet_via_transport, ParquetCompression,

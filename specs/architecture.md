@@ -74,6 +74,7 @@
 
 - Rust edition 2021, and CI pins the stable toolchain
 - Cargo feature `native` is the default transport, `websocket` is optional, `ffi` enables `native`, and a build without either transport rejects every connection
+- Cargo feature `parquet` is off by default and is the only path to the `parquet` crate: Parquet import, Parquet export, and Parquet schema inference exist only with it, `ffi` does not enable it, and `benchmark` does
 - TLS and server certificate validation are on by default
 - Connection timeout defaults to 30 seconds and cannot exceed 300 seconds, and the driver has no idle timeout
 - The connection timeout is one deadline that bounds the TCP connect, the TLS handshake, the WebSocket upgrade, and the login together, and its error names the step that ran out
@@ -91,7 +92,7 @@
 - Credentials are never logged or exposed, the Debug output of Connection, ConnectionParams, and ConnectionBuilder omits the password, and a connection URI parse error names the field, the query key, or the query parameter position, never repeats the userinfo or a query value, and names an unknown query key as written, so a password with an unencoded `?` can show a fragment in that error
 - Runtime warnings go through the `log` crate facade, so the application's logger decides whether and where they appear
 - Results stream as Arrow RecordBatches, and conversion is Arrow-native and zero-copy where possible
-- CI rejects clippy warnings, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, a failing library unit test with the default features, the `websocket` feature, or the `ffi` feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
+- CI rejects clippy warnings with all features, without the `parquet` feature, and in a websocket-only build, cargo-deny license findings, cargo-deny advisory findings in the dependencies of every Cargo feature, a failing library unit test with the `parquet` feature, the `websocket` feature, or the `ffi` feature, an integration test target that the integration job does not run, production line coverage below 80 percent, any file below 50 percent, and a failed SonarQube Cloud quality gate (intended to become a required check once rolled out)
 - Library unit tests run in CI without a database server, so a unit test uses a test double, such as a mock transport or a local fake server, and never connects to Exasol
 - The `ffi` unit tests run in CI outside the coverage run, because cargo-llvm-cov with the `ffi` feature deadlocks
 - Integration tests require a running Exasol instance on port 8563, CI uses the `exasol/docker-db` image, and the CI integration job runs every integration test target under `tests/`

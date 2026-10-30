@@ -40,6 +40,7 @@
 pub mod arrow;
 pub mod csv;
 pub mod parallel;
+#[cfg(feature = "parquet")]
 pub mod parquet;
 pub mod source;
 
@@ -53,6 +54,7 @@ pub use csv::{
     import_from_stream, CsvImportOptions, DataPipeSender,
 };
 
+#[cfg(feature = "parquet")]
 pub use parquet::{
     import_from_parquet, import_from_parquet_files, import_from_parquet_stream,
     ParquetImportOptions,
@@ -148,6 +150,7 @@ impl From<::arrow::error::ArrowError> for ImportError {
     }
 }
 
+#[cfg(feature = "parquet")]
 impl From<::parquet::errors::ParquetError> for ImportError {
     fn from(err: ::parquet::errors::ParquetError) -> Self {
         ImportError::ParquetError(err.to_string())
@@ -170,6 +173,7 @@ mod tests {
         assert_eq!(err.to_string(), format!("Arrow error: {}", arrow_message));
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn test_import_error_from_parquet_error_keeps_the_parquet_message() {
         let parquet_error = ::parquet::errors::ParquetError::General("bad footer".to_string());

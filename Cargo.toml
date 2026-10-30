@@ -1,6 +1,6 @@
 [package]
 name = "exarrow-rs"
-version = "0.30.0"
+version = "0.31.0"
 edition = "2021"
 license = "MIT"
 authors = ["Exasol Labs <labs@exasol.com>"]
@@ -71,8 +71,8 @@ rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
-# Parquet file support
-parquet = { version = "60", features = ["async"] }
+# Parquet file support (optional, only needed with parquet feature)
+parquet = { version = "60", features = ["async"], optional = true }
 
 # Compression support for CSV import/export
 flate2 = "1.1"
@@ -114,6 +114,18 @@ tempfile = "3.24.0"
 # Environment variable loading for examples
 dotenvy = "0.15"
 
+[[test]]
+name = "import_export_tests"
+required-features = ["parquet"]
+
+[[example]]
+name = "import_export"
+required-features = ["parquet"]
+
+[[example]]
+name = "schema_inference"
+required-features = ["parquet"]
+
 [[bin]]
 name = "generate_data"
 path = "benches/rust/generate_data.rs"
@@ -127,6 +139,7 @@ required-features = ["benchmark"]
 [features]
 default = ["native"]
 native = []
+parquet = ["dep:parquet"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 ffi = ["dep:adbc_core", "dep:adbc_ffi", "native"]
-benchmark = ["dep:fake", "dep:rand", "dep:indicatif", "dep:clap", "dep:dotenvy"]
+benchmark = ["dep:fake", "dep:rand", "dep:indicatif", "dep:clap", "dep:dotenvy", "parquet"]

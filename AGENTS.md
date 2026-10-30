@@ -25,8 +25,9 @@
 ## Code quality
 
 - `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings` pass with zero warnings before committing.
+- Clippy also passes with `--features ffi` and with `--no-default-features --features websocket`. An all-features build misses code that only the `parquet` or `native` feature uses.
 - Keep the local Rust toolchain on the version pinned in `.github/workflows/ci.yml`.
-- Coverage counts production code only. Run `cargo llvm-cov --lib --lcov --output-path lcov-unit.info` with default features, then `scripts/strip_test_coverage.py strip` and `check`.
+- Coverage counts production code only. Run `cargo llvm-cov --lib --features parquet --lcov --output-path lcov-unit.info`, then `scripts/strip_test_coverage.py strip` and `check`.
 - Waive the per-file coverage floor only by naming the file in `PER_FILE_FLOOR_EXEMPTIONS` with a reason. Delete the exemption once the file no longer needs it.
 
 ## Code style

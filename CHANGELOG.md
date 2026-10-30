@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.0
+
+- Breaking: Parquet import, Parquet export, and Parquet schema inference need the new `parquet` Cargo feature, which is off by default. Add `features = ["parquet"]` to keep them. Without it, exarrow-rs no longer depends on the `parquet` crate. The `ffi` feature does not enable it, and the `benchmark` feature does.
+
 ## 0.30.0
 
 - Security: fixes RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403, and RUSTSEC-2026-0410 in `zstd`, `zstd-safe`, and `zstd-sys`, which `parquet` pulls in.
