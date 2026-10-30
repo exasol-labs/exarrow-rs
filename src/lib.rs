@@ -59,6 +59,8 @@
 //!
 //! ## Import data
 //!
+//! Parquet import needs the `parquet` feature.
+//!
 //! ```no_run
 //! use exarrow_rs::adbc::{Driver, Connection};
 //! use exarrow_rs::import::{CsvImportOptions, ParquetImportOptions};

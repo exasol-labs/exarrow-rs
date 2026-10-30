@@ -6,7 +6,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --example schema_inference
+//! cargo run --example schema_inference --features parquet
 //! ```
 
 use std::fs;

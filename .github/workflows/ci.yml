@@ -82,7 +82,7 @@ jobs:
 
       # --all-features cannot catch code that only one feature uses, such as parquet or native.
       - name: Clippy without the parquet feature
-        run: cargo clippy --all-targets --no-default-features --features ffi -- -D warnings
+        run: cargo clippy --all-targets --features ffi -- -D warnings
 
       - name: Clippy for a websocket-only build
         run: cargo clippy --all-targets --no-default-features --features websocket -- -D warnings
@@ -140,8 +140,9 @@ jobs:
       - name: Test the coverage tooling
         run: python3 -m unittest discover --start-directory scripts --pattern 'test_*.py'
 
+      # The parquet feature is off by default, so enable it to test and cover the Parquet code.
       - name: Run unit tests with coverage
-        run: cargo llvm-cov --lib --lcov --output-path lcov-unit.info
+        run: cargo llvm-cov --lib --features parquet --lcov --output-path lcov-unit.info
 
       # Outside the coverage run: AGENTS.md keeps the websocket feature out of it.
       - name: Run websocket unit tests
@@ -273,7 +274,7 @@ jobs:
         timeout-minutes: 10
         env:
           REQUIRE_EXASOL: "1"
-        run: cargo test --features ffi --test import_export_tests -- --test-threads=1
+        run: cargo test --features 'ffi parquet' --test import_export_tests -- --test-threads=1
 
       - name: Run native protocol tests
         env:

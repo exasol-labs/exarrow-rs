@@ -228,13 +228,13 @@ exasol://user:password@host:8563?transport=websocket
 |---------|---------|-------------|
 | `native` | yes | default build, `--features ffi` |
 | `websocket` | no | opt-in: `--features websocket` |
-| `parquet` | yes | default build: Parquet import, export, and schema inference |
+| `parquet` | no | opt-in: `--features parquet`, for Parquet import, export, and schema inference |
 
-The `parquet` feature pulls in the `parquet` crate. Leave it out when you do not need Parquet support:
+The `parquet` feature pulls in the `parquet` crate. Enable it when you need Parquet support:
 
 ```toml
 [dependencies]
-exarrow-rs = { version = "0.31", default-features = false, features = ["native"] }
+exarrow-rs = { version = "0.31", features = ["parquet"] }
 ```
 
 Build with both transports compiled in (transport selected at runtime via connection string):
@@ -243,7 +243,7 @@ Build with both transports compiled in (transport selected at runtime via connec
 cargo build --features websocket
 ```
 
-Build a WebSocket-only binary (no native protocol, no Parquet support):
+Build a WebSocket-only binary (no native protocol):
 
 ```bash
 cargo build --no-default-features --features websocket

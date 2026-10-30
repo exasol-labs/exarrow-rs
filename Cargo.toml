@@ -137,7 +137,7 @@ path = "benches/rust/benchmark.rs"
 required-features = ["benchmark"]
 
 [features]
-default = ["native", "parquet"]
+default = ["native"]
 native = []
 parquet = ["dep:parquet"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]

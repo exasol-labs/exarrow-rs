@@ -88,7 +88,7 @@ The connection timeout changes neither bound. `CsvExportOptions::timeout_ms` doe
 | Parquet   | Yes    | Yes    | Columnar with compression     |
 | Arrow IPC | Yes    | Yes    | Direct RecordBatch transfer   |
 
-Parquet support needs the `parquet` Cargo feature, which is on by default. See [Feature Flags and Build Options](setup-and-connect.md#feature-flags-and-build-options).
+Parquet support needs the `parquet` Cargo feature, which is off by default. See [Feature Flags and Build Options](setup-and-connect.md#feature-flags-and-build-options).
 
 ## Memory Use
 

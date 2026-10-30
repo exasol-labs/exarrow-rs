@@ -14,7 +14,7 @@ The codebase SHALL maintain zero clippy warnings when built with all targets and
 * *WHEN* running `cargo clippy --all-targets --all-features -- -D warnings`
 * *THEN* it SHALL produce zero warnings
 * *AND* it SHALL pass all lint checks
-* *AND* `cargo clippy --all-targets --no-default-features --features ffi -- -D warnings` SHALL produce zero warnings
+* *AND* `cargo clippy --all-targets --features ffi -- -D warnings` SHALL produce zero warnings
 * *AND* `cargo clippy --all-targets --no-default-features --features websocket -- -D warnings` SHALL produce zero warnings
 
 ### Scenario: Test code lint exceptions

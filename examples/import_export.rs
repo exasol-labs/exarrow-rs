@@ -19,7 +19,7 @@
 //! # Running
 //!
 //! ```bash
-//! cargo run --example import_export
+//! cargo run --example import_export --features parquet
 //! ```
 
 // Canonical patterns for working with query results:

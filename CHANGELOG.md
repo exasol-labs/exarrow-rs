@@ -2,8 +2,7 @@
 
 ## 0.31.0
 
-- Added: a `parquet` Cargo feature, on by default, that gates Parquet import and export, Parquet schema inference, and the `parquet` dependency. Build with `default-features = false, features = ["native"]` to leave `parquet` out. The `ffi` feature does not enable it, and the `benchmark` feature does.
-- Breaking: a build with `default-features = false` no longer has the Parquet API. Add the `parquet` feature to keep it.
+- Breaking: Parquet import, Parquet export, and Parquet schema inference need the new `parquet` Cargo feature, which is off by default. Add `features = ["parquet"]` to keep them. Without it, exarrow-rs no longer depends on the `parquet` crate. The `ffi` feature does not enable it, and the `benchmark` feature does.
 
 ## 0.30.0
 
