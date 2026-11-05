@@ -2772,6 +2772,7 @@ async fn test_ws_local_time_zone_timestamp_type_matches_native_and_value_differs
     // 2024-01-02 03:04:05.123456 as microseconds since the epoch, read as UTC.
     const SESSION_DATE_AND_TIME: i64 = 1_704_164_645_123_456;
     // The UTC instant of SESSION_DATE_AND_TIME in EUROPE/BERLIN, one hour earlier.
+    #[cfg(feature = "native")]
     const BERLIN_SESSION_UTC_INSTANT: i64 = 1_704_161_045_123_456;
     let mut conn = get_ws_connection().await.expect("Failed to connect");
 
