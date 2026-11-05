@@ -59,3 +59,10 @@ The server selects the native protocol when the first bytes received are `LOGIN_
 * *WHEN* the server's login response carries a protocol version below 14
 * *THEN* the login MUST fail with a `TransportError` whose message names the server's protocol version and the minimum supported version 14
 * *AND* the system MUST NOT send the password message to that server
+
+### Scenario: Login makes Exasol send TIMESTAMP WITH LOCAL TIME ZONE columns with their own wire type
+
+* *GIVEN* a TCP connection is established and TLS negotiation is complete
+* *WHEN* performing the login handshake
+* *THEN* the system SHALL set the session attribute `ATTR_TSUTC_ENABLED` (51) to the boolean value true during the login, before it sends the first statement
+* *AND* Exasol SHALL then send each `TIMESTAMP WITH LOCAL TIME ZONE` result column of the session with the wire type `T_TIMESTAMP_UTC` (125) instead of `T_TIMESTAMP` (21), so that the column reaches the driver as `TIMESTAMP WITH LOCAL TIME ZONE` and not as `TIMESTAMP`
