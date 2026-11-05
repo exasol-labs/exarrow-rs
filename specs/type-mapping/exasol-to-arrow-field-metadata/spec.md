@@ -15,8 +15,7 @@ The type mappings themselves are specified in `type-mapping/exasol-to-arrow`.
 
 * *GIVEN* a table `M` with the columns `AMOUNT DECIMAL(10,2) NOT NULL`, `NAME VARCHAR(50)`, `CODE CHAR(3)`, `RATE DOUBLE`, `ACTIVE BOOLEAN`, `D DATE`, `TS TIMESTAMP`, and `TSL TIMESTAMP WITH LOCAL TIME ZONE` that holds one row
 * *WHEN* `SELECT * FROM M` runs over the native transport or the WebSocket transport and the caller reads the result set metadata schema and the batch schema of the first RecordBatch
-* *THEN* the fields `AMOUNT`, `NAME`, `CODE`, `RATE`, `ACTIVE`, `D`, and `TS` of both schemas SHALL carry the key `exasol:type_name` with the values `DECIMAL`, `VARCHAR`, `CHAR`, `DOUBLE`, `BOOLEAN`, `DATE`, and `TIMESTAMP`
-* *AND* the field `TSL` of both schemas SHALL carry the key `exasol:type_name` with the value `TIMESTAMP WITH LOCAL TIME ZONE` over the WebSocket transport and the value `TIMESTAMP` over the native transport, because Exasol sends the native wire type `T_TIMESTAMP` (21) with the same column metadata for a `TIMESTAMP` column and a `TIMESTAMP WITH LOCAL TIME ZONE` column
+* *THEN* the fields `AMOUNT`, `NAME`, `CODE`, `RATE`, `ACTIVE`, `D`, `TS`, and `TSL` of both schemas SHALL carry the key `exasol:type_name` with the values `DECIMAL`, `VARCHAR`, `CHAR`, `DOUBLE`, `BOOLEAN`, `DATE`, `TIMESTAMP`, and `TIMESTAMP WITH LOCAL TIME ZONE` on both transports
 * *AND* the field `AMOUNT` SHALL carry the key `exasol:precision` with the value `10` and the key `exasol:scale` with the value `2`, and the fields `NAME` and `CODE` SHALL carry the key `exasol:size` with the values `50` and `3`
 * *AND* the fields `RATE`, `ACTIVE`, `D`, `TS`, and `TSL` SHALL NOT carry the keys `exasol:precision`, `exasol:scale`, or `exasol:size`
 
@@ -26,7 +25,7 @@ The type mappings themselves are specified in `type-mapping/exasol-to-arrow`.
 * *WHEN* the caller passes the field metadata of a field of the result set metadata schema to `TypeMapper::from_field_metadata`
 * *THEN* it SHALL return `ExasolType::Decimal` with precision `10` and scale `2` for the field `AMOUNT`
 * *AND* it SHALL return `ExasolType::Varchar` with size `50` for the field `NAME`
-* *AND* it SHALL return `ExasolType::Timestamp` for the field `TSL`, with `with_local_time_zone` set to true over the WebSocket transport and set to false over the native transport
+* *AND* it SHALL return `ExasolType::Timestamp` with `with_local_time_zone` set to true for the field `TSL`, on both transports
 
 ### Scenario: Result set fields are nullable when Exasol reports no nullability
 

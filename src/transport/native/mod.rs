@@ -37,8 +37,7 @@ use self::constants::{
     CMD_FETCH2, CMD_GET_ATTRIBUTES, CMD_SET_ATTRIBUTES, HEADER_SIZE, IS_UTF8, IS_VARCHAR,
     MAX_DATA_MESSAGE_SIZE, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SMALL_RESULTSET,
     TIMESTAMP_PARAM_PRECISION, T_BOOLEAN, T_CHAR, T_DATE, T_DECIMAL, T_DOUBLE, T_GEOMETRY,
-    T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_TIMESTAMP, T_TIMESTAMP_LOCAL_TZ,
-    T_TIMESTAMP_UTC,
+    T_HASHTYPE, T_INTERVAL_DAY, T_INTERVAL_YEAR, T_TIMESTAMP,
 };
 use self::encryption::ChaCha20Encryptor;
 use self::framing::{MessageHeader, SerialCounter};
@@ -544,7 +543,7 @@ impl NativeTcpTransport {
                 buf.extend_from_slice(&prec.to_le_bytes());
                 buf.extend_from_slice(&scale.to_le_bytes());
             }
-            T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC => {
+            T_TIMESTAMP => {
                 buf.extend_from_slice(&TIMESTAMP_PARAM_PRECISION.to_le_bytes());
             }
             _ => {}
@@ -611,8 +610,8 @@ impl NativeTcpTransport {
             "BOOLEAN" => T_BOOLEAN,
             "VARCHAR" | "CHAR" => T_CHAR,
             "DATE" => T_DATE,
-            "TIMESTAMP" => T_TIMESTAMP,
-            "TIMESTAMP WITH LOCAL TIME ZONE" => T_TIMESTAMP_UTC,
+            // Exasol reads a T_TIMESTAMP_UTC parameter as UTC, not in the session time zone.
+            "TIMESTAMP" | "TIMESTAMP WITH LOCAL TIME ZONE" => T_TIMESTAMP,
             "GEOMETRY" => T_GEOMETRY,
             "HASHTYPE" => T_HASHTYPE,
             "INTERVAL YEAR TO MONTH" => T_INTERVAL_YEAR,
@@ -650,10 +649,8 @@ impl NativeTcpTransport {
         value: &serde_json::Value,
         scale: i32,
     ) -> Result<(), TransportError> {
-        let empty_temporal = matches!(
-            wire_type,
-            T_DATE | T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC
-        ) && value.as_str() == Some("");
+        let empty_temporal =
+            matches!(wire_type, T_DATE | T_TIMESTAMP) && value.as_str() == Some("");
         if value.is_null() || empty_temporal {
             buf.push(0u8); // null marker
             return Ok(());
@@ -680,7 +677,7 @@ impl NativeTcpTransport {
                 let packed = ((f.year as i32) << 16) + ((f.month as i32) << 8) + f.day as i32;
                 buf.extend_from_slice(&packed.to_le_bytes());
             }
-            T_TIMESTAMP | T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC => {
+            T_TIMESTAMP => {
                 // Timestamp: [year:2 LE][month:1][day:1][hour:1][min:1][sec:1][nanos:4 LE]
                 let f = parse_timestamp_text(Self::temporal_text(value, TIMESTAMP_TEXT_FORM)?)
                     .map_err(TransportError::SerializationError)?;
@@ -2131,6 +2128,7 @@ mod tests {
         }
     }
 
+    /// Scenario: Outbound precision on a TIMESTAMP parameter column header
     #[test]
     fn declared_parameter_types_map_to_their_wire_types() {
         let cases = [
@@ -2141,7 +2139,7 @@ mod tests {
             ("CHAR", T_CHAR),
             ("DATE", T_DATE),
             ("TIMESTAMP", T_TIMESTAMP),
-            ("TIMESTAMP WITH LOCAL TIME ZONE", T_TIMESTAMP_UTC),
+            ("TIMESTAMP WITH LOCAL TIME ZONE", T_TIMESTAMP),
             ("GEOMETRY", T_GEOMETRY),
             ("HASHTYPE", T_HASHTYPE),
             ("INTERVAL YEAR TO MONTH", T_INTERVAL_YEAR),
@@ -2434,11 +2432,8 @@ mod tests {
 
     /// Scenario: Outbound precision on a TIMESTAMP parameter column header
     #[test]
-    fn prepared_payload_writes_timestamp_precision_for_each_timestamp_wire_type() {
-        for (name, wire) in [
-            ("TIMESTAMP", T_TIMESTAMP),
-            ("TIMESTAMP WITH LOCAL TIME ZONE", T_TIMESTAMP_UTC),
-        ] {
+    fn prepared_payload_writes_timestamp_precision_for_both_timestamp_types() {
+        for name in ["TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE"] {
             let handle = PreparedStatementHandle::new(
                 1,
                 1,
@@ -2451,16 +2446,11 @@ mod tests {
                 NativeTcpTransport::build_execute_prepared_payload(&handle, Some(&parameters))
                     .unwrap();
 
-            let mut tail = (wire as i32).to_le_bytes().to_vec();
+            let mut tail = (T_TIMESTAMP as i32).to_le_bytes().to_vec();
             tail.extend_from_slice(&9i32.to_le_bytes());
             tail.extend_from_slice(&ts_bytes(2024, [3, 9, 14, 25, 36], 0));
-            assert_eq!(payload[payload.len() - tail.len()..], tail[..]);
+            assert_eq!(payload[payload.len() - tail.len()..], tail[..], "{name}");
         }
-
-        let mut buf = Vec::new();
-        let handle = PreparedStatementHandle::new(1, 1, Vec::new(), Vec::new());
-        NativeTcpTransport::write_column_metadata(&mut buf, &handle, 0, T_TIMESTAMP_LOCAL_TZ);
-        assert_eq!(buf, 9i32.to_le_bytes());
     }
 
     /// Scenario: Outbound precision on a TIMESTAMP parameter column header

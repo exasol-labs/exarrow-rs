@@ -9,8 +9,8 @@ use super::attributes::{AttributeSet, AttributeValue};
 use super::constants::{
     ATTR_CLIENTNAME, ATTR_CLIENTOS, ATTR_CLIENTVERSION, ATTR_CLIENT_KEYS_LEN,
     ATTR_CLIENT_RECEIVE_KEY, ATTR_CLIENT_SEND_KEY, ATTR_DRIVERNAME, ATTR_ENCODED_PASSWORD,
-    ATTR_USERNAME, CHACHA20_KEY_LEN, CHANGE_DATE, CMD_SET_ATTRIBUTES, HEADER_SIZE, LOGIN_MAGIC,
-    PROTOCOL_VERSION,
+    ATTR_TSUTC_ENABLED, ATTR_USERNAME, CHACHA20_KEY_LEN, CHANGE_DATE, CMD_SET_ATTRIBUTES,
+    HEADER_SIZE, LOGIN_MAGIC, PROTOCOL_VERSION,
 };
 use super::encryption::ChaCha20Encryptor;
 use super::framing::{MessageHeader, SerialCounter};
@@ -24,6 +24,7 @@ pub struct AuthMessage {
 
 /// Build the initial login packet sent when first connecting.
 /// It sends the username and the client identity from `credentials`, never the password, which `build_auth_message` sends RSA-encrypted.
+/// It also turns on `ATTR_TSUTC_ENABLED`, so that a TIMESTAMP WITH LOCAL TIME ZONE column keeps its own type.
 ///
 /// Format: [MAGIC 4B] [msg_len 4B] [protocol_version 4B] [change_date 4B] [attributes...]
 ///
@@ -51,6 +52,8 @@ pub fn build_login_packet(credentials: &Credentials) -> Vec<u8> {
         ATTR_CLIENTVERSION,
         AttributeValue::String(credentials.client_version.clone()),
     );
+    // Without it, Exasol sends a TIMESTAMP WITH LOCAL TIME ZONE column with the wire type T_TIMESTAMP.
+    attrs.add(ATTR_TSUTC_ENABLED, AttributeValue::Bool(true));
 
     let attr_bytes = attrs.serialize();
     // msg_len covers protocol_version(4) + change_date(4) + attributes
@@ -407,13 +410,20 @@ mod tests {
         assert_eq!(packet.len(), 8 + msg_len);
     }
 
+    const LOGIN_HEADER_LEN: usize = 16;
+    const LOGIN_ATTRIBUTE_COUNT: u32 = 6;
+
+    fn login_attributes(credentials: &Credentials) -> AttributeSet {
+        let packet = build_login_packet(credentials);
+        parse_attributes(&packet[LOGIN_HEADER_LEN..], LOGIN_ATTRIBUTE_COUNT).unwrap()
+    }
+
     /// Scenario: Client name and version identify the session
     #[test]
     fn login_packet_identifies_the_user_and_the_driver() {
         let credentials = Credentials::new("test_user".to_string(), "pw".to_string())
             .with_client("dbt".to_string(), "9.9".to_string());
-        let packet = build_login_packet(&credentials);
-        let attrs = parse_attributes(&packet[16..], 5).unwrap();
+        let attrs = login_attributes(&credentials);
 
         assert_eq!(
             attrs.get(ATTR_USERNAME),
@@ -434,6 +444,17 @@ mod tests {
         assert_eq!(
             attrs.get(ATTR_CLIENTVERSION),
             Some(&AttributeValue::String("9.9".into()))
+        );
+    }
+
+    /// Scenario: Login makes Exasol send TIMESTAMP WITH LOCAL TIME ZONE columns with their own wire type
+    #[test]
+    fn login_packet_turns_on_local_time_zone_timestamps() {
+        let attrs = login_attributes(&Credentials::new("sys".to_string(), "pw".to_string()));
+
+        assert_eq!(
+            attrs.get(ATTR_TSUTC_ENABLED),
+            Some(&AttributeValue::Bool(true))
         );
     }
 

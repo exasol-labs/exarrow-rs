@@ -406,11 +406,9 @@ impl ResultSet {
     ///
     /// An Arrow batch keeps its own column arrays, field names, Arrow data types,
     /// and nullability, and takes the field metadata of the result set metadata
-    /// schema. The native transport can decode a column to another Arrow type
-    /// than `TypeMapper` maps: a `T_TIMESTAMP_LOCAL_TZ` column, which Exasol
-    /// 2025.2.1 does not send, would decode to Timestamp(Microsecond, None) under
-    /// a Timestamp(Microsecond, "UTC") field. So the metadata goes onto the
-    /// batch's own fields.
+    /// schema. The native transport derives each Arrow type from the wire type it
+    /// decodes, not from `TypeMapper`, so the metadata goes onto the batch's own
+    /// fields instead of replacing them with the metadata schema's fields.
     fn payload_to_record_batch(
         data: &ResultData,
         schema: &Arc<Schema>,

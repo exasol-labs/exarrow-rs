@@ -863,7 +863,7 @@ fn fill_timestamp_column(
     }
 
     let finished = builder.finish();
-    if meta.type_id == T_TIMESTAMP_UTC {
+    if matches!(meta.type_id, T_TIMESTAMP_LOCAL_TZ | T_TIMESTAMP_UTC) {
         return Ok((
             Field::new(
                 &meta.name,
@@ -1647,31 +1647,6 @@ mod tests {
     }
 
     #[test]
-    fn single_pass_timestamp_utc_has_utc_timezone() {
-        use arrow::array::Array;
-        use arrow::datatypes::{DataType, TimeUnit};
-
-        let columns = vec![meta("ts", T_TIMESTAMP_UTC, None, None)];
-        let mut data = Vec::new();
-        data.push(1u8);
-        data.extend_from_slice(&1970i16.to_le_bytes());
-        data.push(1u8);
-        data.push(1u8);
-        data.push(0u8);
-        data.push(0u8);
-        data.push(0u8);
-        data.extend_from_slice(&0i32.to_le_bytes());
-
-        let mut offset = 0;
-        let batch = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap();
-        let arr = batch.column(0);
-        assert_eq!(
-            arr.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        );
-    }
-
-    #[test]
     fn single_pass_string_column_decodes_utf8_without_owning_string() {
         use arrow::array::{Array, StringArray};
 
@@ -2068,27 +2043,44 @@ mod tests {
         }
     }
 
+    /// Scenario: Direct binary to Arrow conversion for temporal types
     #[test]
-    fn single_pass_timestamp_with_local_time_zone_has_no_arrow_timezone() {
+    fn single_pass_local_time_zone_timestamps_have_the_utc_arrow_timezone() {
+        use arrow::array::TimestampMicrosecondArray;
         use arrow::datatypes::{DataType, TimeUnit};
 
-        let columns = vec![meta("ts", T_TIMESTAMP_LOCAL_TZ, None, None)];
-        let mut data = Vec::new();
-        data.push(1u8);
-        data.extend_from_slice(&1970i16.to_le_bytes());
-        data.push(1u8);
-        data.push(1u8);
-        data.push(0u8);
-        data.push(0u8);
-        data.push(0u8);
-        data.extend_from_slice(&0i32.to_le_bytes());
+        let mut data = vec![1u8];
+        data.extend_from_slice(&2024i16.to_le_bytes());
+        data.extend_from_slice(&[1u8, 2, 3, 4, 5]);
+        data.extend_from_slice(&123_456_000i32.to_le_bytes());
+        let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let cases = [
+            (T_TIMESTAMP_LOCAL_TZ, utc.clone()),
+            (T_TIMESTAMP_UTC, utc),
+            (
+                T_TIMESTAMP,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+        ];
 
-        let mut offset = 0;
-        let batch = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap();
-        assert_eq!(
-            batch.schema().field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
+        for (type_id, expected_type) in cases {
+            let columns = vec![meta("ts", type_id, None, None)];
+            let mut offset = 0;
+            let batch = build_batch_from_wire(&data, &mut offset, &columns, 1).unwrap();
+
+            assert_eq!(
+                batch.schema().field(0).data_type(),
+                &expected_type,
+                "{type_id}"
+            );
+            assert_eq!(batch.column(0).data_type(), &expected_type, "{type_id}");
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(values.value(0), 1_704_164_645_123_456, "{type_id}");
+        }
     }
 
     #[test]

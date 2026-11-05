@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.0
+
+- Breaking: on the native transport, a `TIMESTAMP WITH LOCAL TIME ZONE` column reports `exasol:type_name` `TIMESTAMP WITH LOCAL TIME ZONE` instead of `TIMESTAMP` and has the Arrow type `Timestamp(Microsecond, "UTC")` instead of `Timestamp(Microsecond, None)`, and `TypeMapper::from_field_metadata` returns `with_local_time_zone: true`, as on the WebSocket transport. ADBC `get_parameter_schema` reports such a native parameter as `Timestamp(Microsecond, "UTC")`. Native values of this type are now UTC instants. Native and WebSocket values of this type differ in a session whose time zone is not `UTC`: native returns the UTC instant, and WebSocket returns the session date and time under the time zone `UTC`. In a `EUROPE/BERLIN` session, `2024-01-02 03:04:05.123456` is `2024-01-02 02:04:05.123456 UTC` over native and `2024-01-02 03:04:05.123456 UTC` over WebSocket.
+
 ## 0.31.0
 
 - Breaking: Parquet import, Parquet export, and Parquet schema inference need the new `parquet` Cargo feature, which is off by default. Add `features = ["parquet"]` to keep them. Without it, exarrow-rs no longer depends on the `parquet` crate. The `ffi` feature does not enable it, and the `benchmark` feature does.
