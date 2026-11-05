@@ -4,7 +4,7 @@
 
 # Type Mapping
 
-Type mappings below apply to the **native TCP transport** (the default). See [WebSocket transport differences](#websocket-transport-differences) if you use `transport=websocket`.
+Type mappings below apply to both transports: the **native TCP transport** (the default) and the WebSocket transport (`transport=websocket`). [WebSocket transport differences](#websocket-transport-differences) lists the values that differ between them.
 
 ## Exasol to Arrow Type Conversions
 
@@ -19,7 +19,7 @@ Type mappings below apply to the **native TCP transport** (the default). See [We
 | `SMALLINT`                       | `Decimal128(9, 0)`                  | Alias of `DECIMAL(9, 0)`        |
 | `DATE`                           | `Date32`                            |                                 |
 | `TIMESTAMP`                      | `Timestamp(Microsecond, None)`      | 0–9 fractional digits           |
-| `TIMESTAMP WITH LOCAL TIME ZONE` | `Timestamp(Microsecond, None)`      | `Timestamp(Microsecond, "UTC")` over WebSocket |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `Timestamp(Microsecond, "UTC")`     | Values differ by transport, see [WebSocket transport differences](#websocket-transport-differences) |
 | `INTERVAL YEAR TO MONTH`         | `Interval(MonthDayNano)`            | Months only                     |
 | `INTERVAL DAY TO SECOND`         | `Interval(MonthDayNano)`            | Days and nanoseconds            |
 | `BINARY`                         | `Binary`                            |                                 |
@@ -159,13 +159,15 @@ Every result set field is nullable, even when the column is declared `NOT NULL`,
 Some metadata values do not reflect the declared column type:
 
 - On the native transport, `GEOMETRY` carries no SRID, because the protocol sends none, so the key `exasol:srid` is absent. On the WebSocket transport, the key holds the SRID that Exasol reports, which is `0` for a column declared without one.
-- On the native transport, `TIMESTAMP WITH LOCAL TIME ZONE` reports `TIMESTAMP`, because the protocol sends the same wire type for both.
 - For `HASHTYPE`, `exasol:type` holds the byte size as half the size that Exasol reports, because Exasol reports the number of hex characters, which assumes the default session format `HASHTYPE_FORMAT=HEX`. With `UUID` or `BASE64`, Exasol reports another size, and the byte size is wrong. Without a reported size, the byte size is 16.
 
 ## WebSocket Transport Differences
 
-When using `transport=websocket`, the following types map differently from the native protocol:
+Both transports map `TIMESTAMP WITH LOCAL TIME ZONE` to `Timestamp(Microsecond, "UTC")`, with the same `exasol:` field metadata. The values differ:
 
-| Exasol Type                      | Native (default)               | WebSocket                       |
-|----------------------------------|--------------------------------|---------------------------------|
-| `TIMESTAMP WITH LOCAL TIME ZONE` | `Timestamp(Microsecond, None)` | `Timestamp(Microsecond, "UTC")` |
+- The native transport returns the UTC instant of the stored value.
+- The WebSocket transport returns the date and time that the session time zone shows, under the time zone `UTC`.
+
+The values are equal only in a session whose time zone is `UTC`. For example, in a `EUROPE/BERLIN` session, `2024-01-02 03:04:05.123456` is `1_704_161_045_123_456` µs (`2024-01-02 02:04:05.123456 UTC`) over the native transport and `1_704_164_645_123_456` µs (`2024-01-02 03:04:05.123456 UTC`) over WebSocket.
+
+Both transports store a value bound to a `TIMESTAMP WITH LOCAL TIME ZONE` parameter in the session time zone: Exasol reads the bound date and time as a date and time of that zone. An Arrow Timestamp binds as its UTC date and time, so on the native transport in a session outside `UTC`, an Arrow `UTC` timestamp bound to such a column reads back shifted by the session's UTC offset.

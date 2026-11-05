@@ -217,16 +217,64 @@ pub async fn metadata_schema_and_batches(
     (metadata_schema, batches)
 }
 
-/// The type that the default transport reports for a `TIMESTAMP WITH LOCAL TIME ZONE` column.
-///
-/// The default transport is the one that `get_test_connection` selects: native when the `native`
-/// feature is enabled, websocket otherwise. The native protocol sends one wire type for `TIMESTAMP`
-/// and for `TIMESTAMP WITH LOCAL TIME ZONE`, so it reports a plain `TIMESTAMP`.
+/// Binds the text `2024-01-01 08:00:00` to a TIMESTAMP WITH LOCAL TIME ZONE parameter in a `UTC` and in a `EUROPE/BERLIN` session, and asserts that `TO_CHAR` reads it back unchanged.
 #[allow(dead_code)]
-pub fn default_transport_local_time_zone_timestamp() -> ExasolType {
-    ExasolType::Timestamp {
-        with_local_time_zone: !cfg!(feature = "native"),
+pub async fn assert_local_time_zone_text_parameter_reads_in_session_time_zone(
+    conn: &mut Connection,
+) {
+    let schema = generate_test_schema_name();
+    conn.execute_update(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .expect("Failed to create schema");
+    conn.execute_update(&format!(
+        "CREATE TABLE {schema}.T (TSL TIMESTAMP(6) WITH LOCAL TIME ZONE)"
+    ))
+    .await
+    .expect("Failed to create table");
+
+    for time_zone in ["UTC", "EUROPE/BERLIN"] {
+        conn.execute_update(&format!("ALTER SESSION SET TIME_ZONE = '{time_zone}'"))
+            .await
+            .expect("ALTER SESSION should succeed");
+        conn.execute_update(&format!("DELETE FROM {schema}.T"))
+            .await
+            .expect("DELETE should succeed");
+        let mut prepared = conn
+            .prepare(&format!("INSERT INTO {schema}.T VALUES (?)"))
+            .await
+            .expect("Failed to prepare insert");
+        prepared.bind(0, "2024-01-01 08:00:00").unwrap();
+
+        let affected = conn
+            .execute_prepared_update(&prepared)
+            .await
+            .unwrap_or_else(|e| panic!("{time_zone}: {e}"));
+
+        assert_eq!(affected, 1, "{time_zone}");
+        let batches = conn
+            .execute(&format!(
+                "SELECT TO_CHAR(TSL, 'YYYY-MM-DD HH24:MI:SS') FROM {schema}.T"
+            ))
+            .await
+            .unwrap()
+            .fetch_all()
+            .await
+            .unwrap();
+        let read_back = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(read_back, "2024-01-01 08:00:00", "{time_zone}");
+        conn.close_prepared(prepared)
+            .await
+            .expect("Failed to close prepared statement");
     }
+
+    let _ = conn
+        .execute_update(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await;
 }
 
 /// Establish a test connection using a specific transport.
@@ -611,13 +659,8 @@ struct ExpectedField {
 /// Assert that every field of `schema`, a schema of `SELECT * FROM M`, carries
 /// the `exasol:` field metadata of its column and is nullable, and that
 /// `TypeMapper::from_field_metadata` restores the Exasol type of each field.
-///
-/// `local_time_zone_timestamp` is the type that the transport reports for the
-/// column `TSL`: the native protocol sends wire type 21 for `TIMESTAMP` and for
-/// `TIMESTAMP WITH LOCAL TIME ZONE` alike, so the native transport reports a
-/// plain `TIMESTAMP`.
 #[allow(dead_code)]
-pub fn assert_column_metadata_table_fields(schema: &Schema, local_time_zone_timestamp: ExasolType) {
+pub fn assert_column_metadata_table_fields(schema: &Schema) {
     let expected = [
         ExpectedField {
             name: "AMOUNT",
@@ -668,8 +711,10 @@ pub fn assert_column_metadata_table_fields(schema: &Schema, local_time_zone_time
         },
         ExpectedField {
             name: "TSL",
-            type_name: local_time_zone_timestamp.type_name(),
-            exasol_type: local_time_zone_timestamp,
+            type_name: "TIMESTAMP WITH LOCAL TIME ZONE",
+            exasol_type: ExasolType::Timestamp {
+                with_local_time_zone: true,
+            },
             parameters: &[],
         },
     ];

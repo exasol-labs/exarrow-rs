@@ -78,9 +78,9 @@ use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArr
 use arrow::datatypes::DataType;
 use common::{
     assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
-    assert_every_key_once, assert_partly_inline, column_metadata_table_ddl,
-    column_metadata_table_insert, connection_error_from_a_silent_server,
-    default_transport_local_time_zone_timestamp, disable_query_cache, drain_iterator,
+    assert_every_key_once, assert_local_time_zone_text_parameter_reads_in_session_time_zone,
+    assert_partly_inline, column_metadata_table_ddl, column_metadata_table_insert,
+    connection_error_from_a_silent_server, disable_query_cache, drain_iterator,
     end_of_stream_query, generate_test_schema_name, get_host, get_port, get_test_connection,
     get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
     multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
@@ -2045,6 +2045,17 @@ async fn test_prepared_temporal_text_parameters() {
     let _ = conn
         .execute_update(&format!("DROP SCHEMA {schema} CASCADE"))
         .await;
+    conn.close().await.unwrap();
+}
+
+/// Scenario: TIMESTAMP WITH LOCAL TIME ZONE text parameters are stored the same on both transports
+/// Scenario: Outbound precision on a TIMESTAMP parameter column header
+#[tokio::test]
+async fn test_local_time_zone_timestamp_text_parameter_reads_in_session_time_zone() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_test_connection().await.expect("Failed to connect");
+    assert_local_time_zone_text_parameter_reads_in_session_time_zone(&mut conn).await;
     conn.close().await.unwrap();
 }
 
@@ -4093,6 +4104,7 @@ async fn create_column_metadata_table(conn: &mut Connection, schema_name: &str) 
 /// Scenario: Column metadata
 /// Scenario: Result set fields are nullable when Exasol reports no nullability
 /// Scenario: Schema documentation
+/// Scenario: Login makes Exasol send TIMESTAMP WITH LOCAL TIME ZONE columns with their own wire type
 #[tokio::test]
 async fn test_result_set_fields_carry_exasol_column_metadata() {
     skip_if_no_exasol!();
@@ -4115,14 +4127,8 @@ async fn test_result_set_fields_carry_exasol_column_metadata() {
         .await
         .expect("fetch_all should succeed");
 
-    assert_column_metadata_table_fields(
-        &metadata_schema,
-        default_transport_local_time_zone_timestamp(),
-    );
-    assert_column_metadata_table_fields(
-        &batches[0].schema(),
-        default_transport_local_time_zone_timestamp(),
-    );
+    assert_column_metadata_table_fields(&metadata_schema);
+    assert_column_metadata_table_fields(&batches[0].schema());
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
@@ -4200,10 +4206,7 @@ async fn test_zero_row_result_batch_carries_field_metadata() {
 
     assert_eq!(batches.len(), 1, "a zero-row result yields one batch");
     assert_eq!(batches[0].num_rows(), 0);
-    assert_column_metadata_table_fields(
-        &batches[0].schema(),
-        default_transport_local_time_zone_timestamp(),
-    );
+    assert_column_metadata_table_fields(&batches[0].schema());
 
     cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");

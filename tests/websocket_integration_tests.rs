@@ -18,16 +18,16 @@ mod schema_activation;
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Decimal128Array, Float64Array, IntervalMonthDayNanoArray,
-    StringArray,
+    StringArray, TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit};
+use arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit, TimeUnit};
 use common::{
     assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
-    assert_every_key_once, assert_partly_inline, column_metadata_table_ddl,
-    column_metadata_table_insert, connection_error_from_a_silent_server, drain_iterator,
-    end_of_stream_query, generate_test_schema_name, get_host, get_password, get_port, get_user,
-    multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
-    PARTIAL_INLINE_ROWS,
+    assert_every_key_once, assert_local_time_zone_text_parameter_reads_in_session_time_zone,
+    assert_partly_inline, column_metadata_table_ddl, column_metadata_table_insert,
+    connection_error_from_a_silent_server, drain_iterator, end_of_stream_query,
+    generate_test_schema_name, get_host, get_password, get_port, get_user, multi_fetch_query,
+    open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
 use exarrow_rs::adbc::{Connection, Driver};
 use exarrow_rs::transport::{ConnectionParams, Credentials, TransportProtocol, WebSocketTransport};
@@ -1650,6 +1650,16 @@ async fn test_ws_prepared_temporal_text_parameters() {
     conn.close().await.unwrap();
 }
 
+/// Scenario: TIMESTAMP WITH LOCAL TIME ZONE text parameters are stored the same on both transports
+#[tokio::test]
+async fn test_ws_local_time_zone_timestamp_text_parameter_reads_in_session_time_zone() {
+    skip_if_no_exasol!();
+
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+    assert_local_time_zone_text_parameter_reads_in_session_time_zone(&mut conn).await;
+    conn.close().await.unwrap();
+}
+
 /// 8.2 Prepared statement with parameters (INSERT) over WebSocket.
 #[tokio::test]
 async fn test_ws_prepared_statement_with_parameters() {
@@ -2303,11 +2313,6 @@ async fn test_client_name_and_version_identify_the_session_websocket() {
     conn.close().await.expect("Failed to close connection");
 }
 
-/// The type that the WebSocket transport reports for the column `TSL` of table `M`.
-const WS_TSL_TYPE: ExasolType = ExasolType::Timestamp {
-    with_local_time_zone: true,
-};
-
 async fn ws_create_column_metadata_table(conn: &mut Connection, schema_name: &str) {
     conn.execute_update(&format!("CREATE SCHEMA {schema_name}"))
         .await
@@ -2345,8 +2350,8 @@ async fn test_ws_result_set_fields_carry_exasol_column_metadata() {
         .await
         .expect("fetch_all should succeed");
 
-    assert_column_metadata_table_fields(&metadata_schema, WS_TSL_TYPE);
-    assert_column_metadata_table_fields(&batches[0].schema(), WS_TSL_TYPE);
+    assert_column_metadata_table_fields(&metadata_schema);
+    assert_column_metadata_table_fields(&batches[0].schema());
 
     ws_cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
@@ -2368,7 +2373,7 @@ async fn test_ws_zero_row_result_batch_carries_field_metadata() {
 
     assert_eq!(batches.len(), 1, "a zero-row result yields one batch");
     assert_eq!(batches[0].num_rows(), 0);
-    assert_column_metadata_table_fields(&batches[0].schema(), WS_TSL_TYPE);
+    assert_column_metadata_table_fields(&batches[0].schema());
 
     ws_cleanup_schema(&mut conn, &schema_name).await;
     conn.close().await.expect("Failed to close connection");
@@ -2528,6 +2533,58 @@ async fn assert_equals_native(ws_batch: &arrow::record_batch::RecordBatch, case:
         native_batch.column_by_name("V").unwrap()
     );
     native.close().await.expect("Failed to close connection");
+}
+
+/// `2024-01-02 03:04:05.123456` as TIMESTAMP WITH LOCAL TIME ZONE in row 1, NULL in row 2.
+const LOCAL_TIME_ZONE_CASE: TwoRowCase = TwoRowCase {
+    literal_cast:
+        "CAST(TIMESTAMP '2024-01-02 03:04:05.123456' AS TIMESTAMP(6) WITH LOCAL TIME ZONE)",
+    type_sql: "TIMESTAMP(6) WITH LOCAL TIME ZONE",
+};
+
+/// Sets the session time zone of `conn` to `time_zone`, then asserts that field `V` of
+/// `LOCAL_TIME_ZONE_CASE` has the Arrow type `Timestamp(Microsecond, "UTC")` and the type name
+/// `TIMESTAMP WITH LOCAL TIME ZONE`, and that its first value is `expected` microseconds.
+async fn assert_local_time_zone_result(conn: &mut Connection, time_zone: &str, expected: i64) {
+    conn.execute_update(&format!("ALTER SESSION SET TIME_ZONE = '{time_zone}'"))
+        .await
+        .expect("ALTER SESSION should succeed");
+    let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+    let batch = assert_two_row_result(conn, &LOCAL_TIME_ZONE_CASE, &utc).await;
+    assert_eq!(timestamp_value(&batch, 0), expected, "{time_zone}");
+
+    let (metadata_schema, batch) =
+        metadata_schema_and_batch(conn, &LOCAL_TIME_ZONE_CASE.query("")).await;
+    for schema in [metadata_schema, batch.schema()] {
+        let field = schema.field_with_name("V").expect("field V");
+        assert_eq!(
+            field.metadata().get("exasol:type_name").map(String::as_str),
+            Some("TIMESTAMP WITH LOCAL TIME ZONE"),
+            "{time_zone}"
+        );
+    }
+}
+
+/// Runs `LOCAL_TIME_ZONE_CASE` over the native transport in the session time zone `time_zone`
+/// and asserts its type and that its first value is `expected_native` microseconds.
+#[cfg(feature = "native")]
+async fn assert_native_local_time_zone_result(time_zone: &str, expected_native: i64) {
+    let mut native = common::get_test_connection_with_transport("native")
+        .await
+        .expect("Failed to connect over native");
+    assert_local_time_zone_result(&mut native, time_zone, expected_native).await;
+    native.close().await.expect("Failed to close connection");
+}
+
+fn timestamp_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> i64 {
+    batch
+        .column_by_name("V")
+        .expect("column V")
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("a timestamp column")
+        .value(row)
 }
 
 fn interval_value(batch: &arrow::record_batch::RecordBatch, row: usize) -> IntervalMonthDayNano {
@@ -2701,6 +2758,30 @@ async fn test_ws_smallint_result_equals_native() {
     assert_eq!(decimal_value(&batch, 0), 999_999_999);
     #[cfg(feature = "native")]
     assert_equals_native(&batch, &CASE).await;
+
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: TIMESTAMP WITH LOCAL TIME ZONE results have the same type on both transports
+/// Scenario: TIMESTAMP WITH LOCAL TIME ZONE values differ between the transports in a session outside UTC
+/// Scenario: Direct binary to Arrow conversion for temporal types
+#[tokio::test]
+async fn test_ws_local_time_zone_timestamp_type_matches_native_and_value_differs_outside_utc() {
+    skip_if_no_exasol!();
+
+    // 2024-01-02 03:04:05.123456 as microseconds since the epoch, read as UTC.
+    const SESSION_DATE_AND_TIME: i64 = 1_704_164_645_123_456;
+    // The UTC instant of SESSION_DATE_AND_TIME in EUROPE/BERLIN, one hour earlier.
+    const BERLIN_SESSION_UTC_INSTANT: i64 = 1_704_161_045_123_456;
+    let mut conn = get_ws_connection().await.expect("Failed to connect");
+
+    assert_local_time_zone_result(&mut conn, "UTC", SESSION_DATE_AND_TIME).await;
+    #[cfg(feature = "native")]
+    assert_native_local_time_zone_result("UTC", SESSION_DATE_AND_TIME).await;
+
+    assert_local_time_zone_result(&mut conn, "EUROPE/BERLIN", SESSION_DATE_AND_TIME).await;
+    #[cfg(feature = "native")]
+    assert_native_local_time_zone_result("EUROPE/BERLIN", BERLIN_SESSION_UTC_INSTANT).await;
 
     conn.close().await.expect("Failed to close connection");
 }

@@ -2885,9 +2885,10 @@ fn temporal_values_in(column: &dyn Array) -> Vec<Option<i64>> {
     panic!("unexpected temporal column type {:?}", column.data_type());
 }
 
-/// Bind the temporal RecordBatch of the spec scenario over the transport that `uri` selects,
-/// and check what Exasol stored.
-fn assert_bound_temporal_values_are_stored(uri: String) {
+/// Bind the temporal RecordBatch of the spec scenario over the transport that `uri` selects in a
+/// `EUROPE/BERLIN` session, and check what Exasol stored. `local_time_zone_values` are the values
+/// that the transport reads back from the `TIMESTAMP WITH LOCAL TIME ZONE` column, ordered by `D`.
+fn assert_bound_temporal_values_are_stored(uri: String, local_time_zone_values: Vec<Option<i64>>) {
     use arrow::array::{
         Date32Array, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray,
@@ -2904,6 +2905,10 @@ fn assert_bound_temporal_values_are_stored(uri: String) {
         .new_database_with_opts(vec![(OptionDatabase::Uri, OptionValue::String(uri))])
         .expect("Failed to create database");
     let mut conn = db.new_connection().expect("Failed to create connection");
+    execute_ddl(
+        &mut conn,
+        "ALTER SESSION SET TIME_ZONE = 'EUROPE/BERLIN'".to_string(),
+    );
 
     let schema_name = generate_unique_test_name("TEST_BIND_TEMPORAL");
     execute_ddl(&mut conn, format!("CREATE SCHEMA {schema_name}"));
@@ -3009,7 +3014,7 @@ fn assert_bound_temporal_values_are_stored(uri: String) {
             vec![Some(-999_999), Some(1_704_096_000_123_456), None],
             vec![Some(-1), Some(1_704_096_000_123_456), None],
             vec![Some(-1_000_000), Some(1_704_096_000_000_000), None],
-            vec![Some(-999_999), Some(1_704_096_000_000_000), None],
+            local_time_zone_values,
             vec![Some(-731), Some(19_723), None],
         ]
     );
@@ -3041,14 +3046,17 @@ fn assert_bound_temporal_values_are_stored(uri: String) {
 
 /// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
 ///
-/// Compares date and time values, not instants: Exasol reads a value bound to a
-/// `TIMESTAMP WITH LOCAL TIME ZONE` column in the session time zone.
+/// Exasol reads the UTC date and time bound to `TS_LOCAL` in the session time zone, and the native
+/// read returns the UTC instant: one hour before the bound value in `EUROPE/BERLIN` in winter.
 #[test]
 fn test_bind_arrow_temporal_values_round_trip() {
     skip_if_no_library!();
     skip_if_no_exasol!();
 
-    assert_bound_temporal_values_are_stored(get_test_uri());
+    assert_bound_temporal_values_are_stored(
+        get_test_uri(),
+        vec![Some(-3_600_999_999), Some(1_704_092_400_000_000), None],
+    );
 }
 
 /// Scenario: Bound Arrow Timestamp and Date32 values are stored on both transports
@@ -3060,7 +3068,10 @@ fn test_bind_arrow_temporal_values_round_trip_websocket() {
     skip_if_no_library!();
     skip_if_no_exasol!();
 
-    assert_bound_temporal_values_are_stored(format!("{}&transport=websocket", get_test_uri()));
+    assert_bound_temporal_values_are_stored(
+        format!("{}&transport=websocket", get_test_uri()),
+        vec![Some(-999_999), Some(1_704_096_000_000_000), None],
+    );
 }
 
 /// Scenario: A zero-row bound batch runs no execution
