@@ -3,7 +3,7 @@
 //! This module provides types for handling query results, including
 //! streaming result sets and metadata.
 
-use crate::error::{ColumnConversionError, ConversionError, QueryError};
+use crate::error::{ColumnConversionError, ConversionError, QueryError, TransportError};
 use crate::transport::messages::{ColumnInfo, ResultData, ResultPayload, ResultSetHandle};
 use crate::transport::protocol::QueryResult as TransportQueryResult;
 use crate::transport::TransportProtocol;
@@ -19,9 +19,11 @@ use arrow::datatypes::{
     IntervalUnit, Schema, TimestampMicrosecondType,
 };
 use serde_json::Value;
+use std::future::Future;
 use std::num::{IntErrorKind, ParseIntError};
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 /// Metadata about a query execution.
 #[derive(Debug, Clone)]
@@ -95,8 +97,8 @@ enum ResultSetInner {
         handle: Option<ResultSetHandle>,
         /// Query metadata
         metadata: QueryMetadata,
-        /// Buffered batches
-        batches: Vec<RecordBatch>,
+        /// The batch of the execute response, zero rows when it delivered none
+        first_batch: RecordBatch,
         /// Whether all data has been fetched
         complete: bool,
     },
@@ -185,13 +187,12 @@ impl ResultSet {
                 // RecordBatchReader, used by dbt Fusion for `WHERE FALSE LIMIT 0`
                 // schema probes) still receive the columns. Returning an empty Vec
                 // here would drop the schema for zero-row results.
-                let batch = if data.data.is_empty() {
+                let first_batch = if data.data.is_empty() {
                     Self::empty_record_batch(&schema)
                 } else {
                     Self::payload_to_record_batch(&data, &schema)
                 }
                 .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
-                let batches = vec![batch];
 
                 let complete = handle.is_none() || data.total_rows == num_rows_received;
 
@@ -199,7 +200,7 @@ impl ResultSet {
                     inner: ResultSetInner::Stream {
                         handle, // Already Option<ResultSetHandle>
                         metadata,
-                        batches,
+                        first_batch,
                         complete,
                     },
                     transport,
@@ -229,7 +230,7 @@ impl ResultSet {
         matches!(&self.inner, ResultSetInner::Stream { .. })
     }
 
-    /// Convert to an iterator over RecordBatches.
+    /// Convert to an iterator that reads the result set one batch at a time.
     ///
     /// # Errors
     /// Returns `QueryError::NoResultSet` if this is not a streaming result.
@@ -238,14 +239,14 @@ impl ResultSet {
             ResultSetInner::Stream {
                 handle,
                 metadata,
-                batches,
+                first_batch,
                 complete,
             } => Ok(ResultSetIterator {
                 handle,
                 transport: self.transport,
                 metadata,
-                batches,
-                current_index: 0,
+                rows_received: first_batch.num_rows(),
+                first_batch: Some(first_batch),
                 complete,
             }),
             ResultSetInner::RowCount { .. } => Err(QueryError::NoResultSet(
@@ -254,38 +255,39 @@ impl ResultSet {
         }
     }
 
-    /// Fetch all remaining batches into memory.
+    /// Fetch all remaining batches into memory and close the result set handle.
+    ///
+    /// Dropping the returned future while a fetch or close request awaits its
+    /// response terminates the connection; see [`ResultSetIterator::next_batch`].
     ///
     /// # Errors
     /// Returns `QueryError` if fetching fails or if this is not a streaming result.
     /// Returns `QueryError::ExecutionFailed` when the result set delivers fewer or
     /// more rows than its total row count.
-    pub async fn fetch_all(mut self) -> Result<Vec<RecordBatch>, QueryError> {
+    pub async fn fetch_all(self) -> Result<Vec<RecordBatch>, QueryError> {
         let ResultSetInner::Stream {
             handle,
             metadata,
-            batches,
+            first_batch,
             complete,
-        } = &mut self.inner
+        } = self.inner
         else {
             return Err(QueryError::NoResultSet(
                 "Cannot fetch batches from row count result".to_string(),
             ));
         };
 
-        let pagination = match *handle {
-            Some(handle_val) if !*complete => {
-                Self::paginate_remaining(&self.transport, handle_val, metadata, batches.clone())
+        let pagination = match handle {
+            Some(handle) if !complete => {
+                Self::paginate_remaining(&self.transport, handle, &metadata, vec![first_batch])
                     .await
             }
-            _ => Self::check_buffered_rows(metadata, batches).map(|()| batches.clone()),
+            _ => Self::check_buffered_rows(&metadata, &first_batch).map(|()| vec![first_batch]),
         };
 
-        // Close the result set handle on the server to release resources
-        if let Some(handle_val) = handle.take() {
-            let mut transport = self.transport.lock().await;
-            // Ignore close errors - the pagination result is what the caller needs
-            let _ = transport.close_result_set(handle_val).await;
+        if let Some(handle) = handle {
+            // A failed close leaves the pagination result unchanged.
+            let _ = close_result_set(&self.transport, handle).await;
         }
 
         pagination
@@ -331,12 +333,10 @@ impl ResultSet {
             return Ok(None);
         }
 
-        let result_data = transport
-            .lock()
-            .await
-            .fetch_results(handle)
-            .await
-            .map_err(|e| PageFetchError::Fetch(QueryError::ExecutionFailed(e.to_string())))?;
+        let result_data =
+            send_result_set_request(transport, |transport| transport.fetch_results(handle))
+                .await
+                .map_err(|e| PageFetchError::Fetch(QueryError::ExecutionFailed(e.to_string())))?;
 
         if result_data.data.is_empty() {
             if total == 0 {
@@ -360,13 +360,13 @@ impl ResultSet {
         Ok(Some(batch))
     }
 
-    /// Verify that buffered rows match a known total, for results that need no fetch.
+    /// Verify that the execute response rows match a known total, for results that need no fetch.
     fn check_buffered_rows(
         metadata: &QueryMetadata,
-        batches: &[RecordBatch],
+        first_batch: &RecordBatch,
     ) -> Result<(), QueryError> {
         let total = metadata.total_rows.unwrap_or(0).max(0) as usize;
-        let rows = Self::row_count_of(batches);
+        let rows = first_batch.num_rows();
         if total > 0 && rows != total {
             return Err(QueryError::ExecutionFailed(format!(
                 "Result set delivered {rows} rows, but its total row count is {total}"
@@ -778,21 +778,26 @@ impl DecimalParseFailure {
     }
 }
 
-/// Iterator over RecordBatches from a result set.
+/// Reads a result set one batch at a time.
 ///
-/// Lazily fetches data from the transport as needed.
+/// The iterator holds at most the batch of the execute response until its
+/// first call and keeps no batch it has returned, so its memory does not grow
+/// with the result set. It closes the result set handle when it reports the
+/// end of the result set or a row count error. A caller that stops earlier
+/// awaits [`close`](Self::close); dropping the iterator leaves the handle open
+/// until the session ends.
 pub struct ResultSetIterator {
-    /// Result set handle
+    /// Result set handle, `None` once the iterator closed it
     handle: Option<ResultSetHandle>,
     /// Transport reference
     transport: Arc<Mutex<dyn TransportProtocol>>,
     /// Query metadata
     metadata: QueryMetadata,
-    /// Buffered batches
-    batches: Vec<RecordBatch>,
-    /// Current iteration index
-    current_index: usize,
-    /// Whether all data has been fetched
+    /// The batch of the execute response until the first call returns it
+    first_batch: Option<RecordBatch>,
+    /// Rows returned so far, which the end rule of `fetch_page_after` compares with the total
+    rows_received: usize,
+    /// Whether the execute response delivered every row
     complete: bool,
 }
 
@@ -802,98 +807,132 @@ impl ResultSetIterator {
         &self.metadata
     }
 
-    /// Fetch the next batch from the transport.
-    async fn fetch_next_batch(&mut self) -> Result<Option<RecordBatch>, QueryError> {
+    /// Return the next batch of the result set, or `None` at its end.
+    ///
+    /// The first call returns the batch of the execute response without a
+    /// request, and each later call sends at most one fetch request. At the end
+    /// of the result set, or with a row count error, the iterator closes the
+    /// result set handle and ignores a failed close; every later call then
+    /// returns `None` without a request. After a failed fetch the handle stays
+    /// open, and the next call fetches again.
+    ///
+    /// Dropping the returned future while its fetch or close request awaits
+    /// the response, for example through `tokio::time::timeout`, terminates the
+    /// connection, so every later operation on it except `close` fails. A
+    /// future dropped while it waits for the connection has sent nothing and
+    /// leaves the connection open.
+    ///
+    /// # Errors
+    /// Returns `QueryError::ExecutionFailed` when a fetch fails, or when the
+    /// result set delivers fewer or more rows than its total row count.
+    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>, QueryError> {
+        if let Some(batch) = self.first_batch.take() {
+            return Ok(Some(batch));
+        }
+        let Some(handle) = self.handle else {
+            return Ok(None);
+        };
         if self.complete {
+            self.close_handle().await;
             return Ok(None);
         }
 
-        let handle = match self.handle {
-            Some(h) => h,
-            None => {
-                self.complete = true;
-                return Ok(None);
-            }
-        };
-
-        let rows_received = ResultSet::row_count_of(&self.batches);
-        match ResultSet::fetch_page_after(&self.transport, handle, &self.metadata, rows_received)
-            .await
+        match ResultSet::fetch_page_after(
+            &self.transport,
+            handle,
+            &self.metadata,
+            self.rows_received,
+        )
+        .await
         {
+            Ok(Some(batch)) => {
+                self.rows_received += batch.num_rows();
+                Ok(Some(batch))
+            }
             Ok(None) => {
-                self.complete = true;
+                self.close_handle().await;
                 Ok(None)
             }
-            Ok(batch) => Ok(batch),
-            Err(error @ PageFetchError::RowCountMismatch(_)) => {
-                self.complete = true;
-                Err(error.into())
+            Err(PageFetchError::RowCountMismatch(message)) => {
+                self.close_handle().await;
+                Err(QueryError::ExecutionFailed(message))
             }
-            Err(error) => Err(error.into()),
+            Err(PageFetchError::Fetch(error)) => Err(error),
         }
     }
 
-    /// Get the next batch synchronously (blocking).
+    /// Close the result set handle unless the iterator has already closed it.
     ///
-    /// This is useful for implementing sync Iterator trait.
+    /// A caller that stops reading before the end of the result set awaits
+    /// this to release the handle on the server. Dropping the returned future
+    /// while the close request awaits its response terminates the connection,
+    /// as for [`next_batch`](Self::next_batch).
     ///
     /// # Errors
-    /// Returns `QueryError::ExecutionFailed` when the result set delivers fewer or
-    /// more rows than its total row count. After that error, every later call
-    /// returns `None`.
-    pub fn next_batch(&mut self) -> Option<Result<RecordBatch, QueryError>> {
-        // Return buffered batch if available
-        if self.current_index < self.batches.len() {
-            let batch = self.batches[self.current_index].clone();
-            self.current_index += 1;
-            return Some(Ok(batch));
-        }
-
-        // Need to fetch more data
-        if self.complete {
-            return None;
-        }
-
-        // Use block_on for async fetch (not ideal, but works for Phase 1)
-        let runtime = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = runtime {
-            let result = handle.block_on(self.fetch_next_batch());
-            match result {
-                Ok(Some(batch)) => {
-                    self.batches.push(batch.clone());
-                    self.current_index += 1;
-                    Some(Ok(batch))
-                }
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            }
-        } else {
-            // No runtime available
-            Some(Err(QueryError::InvalidState(
-                "No async runtime available".to_string(),
-            )))
-        }
-    }
-
-    /// Close the result set and release resources.
+    /// Returns `QueryError::ExecutionFailed` when the close request fails.
     pub async fn close(mut self) -> Result<(), QueryError> {
         if let Some(handle) = self.handle.take() {
-            let mut transport = self.transport.lock().await;
-            transport
-                .close_result_set(handle)
+            close_result_set(&self.transport, handle)
                 .await
                 .map_err(|e| QueryError::ExecutionFailed(e.to_string()))?;
         }
         Ok(())
     }
+
+    async fn close_handle(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // A failed close changes neither the end nor the error the caller gets.
+            let _ = close_result_set(&self.transport, handle).await;
+        }
+    }
 }
 
-// Implement Iterator for ResultSetIterator
-impl Iterator for ResultSetIterator {
-    type Item = Result<RecordBatch, QueryError>;
+async fn close_result_set(
+    transport: &Mutex<dyn TransportProtocol>,
+    handle: ResultSetHandle,
+) -> Result<(), TransportError> {
+    send_result_set_request(transport, |transport| transport.close_result_set(handle)).await
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_batch()
+type TransportRequest<'t, T> = Pin<Box<dyn Future<Output = Result<T, TransportError>> + Send + 't>>;
+
+/// Sends one fetch or close request of a result set while holding the transport.
+///
+/// A response that a dropped future never read would answer the next request
+/// on the connection, so dropping the future after the request started
+/// terminates the transport, as ADR `client-give-up-terminates-connection`
+/// requires. A future dropped while it waits for the lock has sent nothing.
+async fn send_result_set_request<T>(
+    transport: &Mutex<dyn TransportProtocol>,
+    request: impl for<'t> FnOnce(&'t mut dyn TransportProtocol) -> TransportRequest<'t, T>,
+) -> Result<T, TransportError> {
+    let mut in_flight = InFlightRequest {
+        transport: transport.lock().await,
+        answered: false,
+    };
+    let response = request(&mut *in_flight.transport).await;
+    in_flight.answered = true;
+    response
+}
+
+/// Holds the transport lock for one request and terminates the transport when
+/// it is dropped before the request has its response.
+///
+/// A panic inside the request also drops the guard and terminates the
+/// transport, because the response state is then unknown.
+/// `TransportProtocol::terminate` must not panic, because the guard can call it
+/// during unwinding, so a test double needs a non-panicking `terminate`
+/// expectation.
+struct InFlightRequest<'a> {
+    transport: MutexGuard<'a, dyn TransportProtocol>,
+    answered: bool,
+}
+
+impl Drop for InFlightRequest<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.transport.terminate();
+        }
     }
 }
 
@@ -902,11 +941,13 @@ mod tests {
     use super::*;
     use crate::error::TransportError;
     use crate::transport::messages::{ColumnInfo, DataType, ResultPayload};
-    use crate::transport::test_support::MockTransport;
+    use crate::transport::test_support::{GatedQueryTransport, MockTransport};
     use crate::types::TypeMapper;
     use arrow::array::Array;
     use mockall::predicate::eq;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     // =========================================================================
     // Shared test fixtures
@@ -986,13 +1027,16 @@ mod tests {
         }
     }
 
-    fn streaming_result_set(
-        transport: MockTransport,
+    fn shared(transport: impl TransportProtocol + 'static) -> Arc<Mutex<dyn TransportProtocol>> {
+        Arc::new(Mutex::new(transport))
+    }
+
+    fn result_set_over(
+        transport: Arc<Mutex<dyn TransportProtocol>>,
         values: &[i64],
         total_rows: i64,
         handle: Option<ResultSetHandle>,
     ) -> ResultSet {
-        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(transport));
         ResultSet::from_transport_result(
             TransportQueryResult::ResultSet {
                 handle,
@@ -1003,8 +1047,17 @@ mod tests {
         .unwrap()
     }
 
+    fn streaming_result_set(
+        transport: impl TransportProtocol + 'static,
+        values: &[i64],
+        total_rows: i64,
+        handle: Option<ResultSetHandle>,
+    ) -> ResultSet {
+        result_set_over(shared(transport), values, total_rows, handle)
+    }
+
     fn streaming_iterator(
-        transport: MockTransport,
+        transport: impl TransportProtocol + 'static,
         values: &[i64],
         total_rows: i64,
         handle: Option<ResultSetHandle>,
@@ -1014,10 +1067,31 @@ mod tests {
             .unwrap()
     }
 
-    fn entered_runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("current-thread runtime")
+    /// Serves `pages` in order, one per fetch request, and returns the number
+    /// of fetch requests received so far.
+    fn serve_pages(
+        transport: &mut MockTransport,
+        pages: &'static [&'static [i64]],
+    ) -> Arc<AtomicUsize> {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetches);
+        transport
+            .expect_fetch_results()
+            .times(pages.len())
+            .returning(move |_| {
+                let page = counter.fetch_add(1, Ordering::SeqCst);
+                Ok(single_column_result_data(pages[page], 0))
+            });
+        fetches
+    }
+
+    fn ids_of(batch: &RecordBatch) -> Vec<i128> {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("the id column is DECIMAL(18,0)");
+        ids.iter().map(|id| id.expect("ids are not NULL")).collect()
     }
 
     #[tokio::test]
@@ -2407,50 +2481,179 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for ResultSetIterator batch fetching
+    // Tests for ResultSetIterator::next_batch
     // =========================================================================
 
-    #[test]
-    fn test_next_batch_serves_buffered_page_then_fetches_the_next() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
+    /// Reads a result set of three one-row batches, two of them by fetch, and
+    /// checks after each call how many fetch requests the iterator has sent.
+    async fn assert_one_fetch_per_next_batch() {
+        let handle = ResultSetHandle::new(4);
+        let mut transport = MockTransport::new();
+        let fetches = serve_pages(&mut transport, &[&[2], &[3]]);
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(handle));
 
-        let transport = transport_serving_one_more_page(&[2]);
+        for (expected_id, expected_fetches) in [(1, 0), (2, 1), (3, 2)] {
+            let batch = iterator.next_batch().await.unwrap().expect("a batch");
+            assert_eq!(ids_of(&batch), vec![expected_id]);
+            assert_eq!(fetches.load(Ordering::SeqCst), expected_fetches);
+        }
+        assert!(iterator.next_batch().await.unwrap().is_none());
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
 
-        let mut iterator = streaming_iterator(transport, &[1], 0, Some(ResultSetHandle::new(1)));
+    /// Scenario: Result set iterator fetches one batch per call
+    /// Scenario: Result set iterator reads inside an async runtime
+    #[tokio::test]
+    async fn test_next_batch_serves_execute_response_then_one_fetch_per_call() {
+        assert_one_fetch_per_next_batch().await;
+    }
 
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
-        assert!(iterator.next_batch().is_none());
-        // Once exhausted the iterator must not fetch again.
-        assert!(iterator.next_batch().is_none());
+    /// Scenario: Result set iterator fetches one batch per call
+    /// Scenario: Result set iterator reads inside an async runtime
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_next_batch_fetches_one_batch_per_call_on_multi_thread_runtime() {
+        assert_one_fetch_per_next_batch().await;
+    }
+
+    /// Scenario: Result set iterator keeps no batch that it has yielded
+    #[tokio::test]
+    async fn test_next_batch_keeps_no_yielded_batch() {
+        let mut transport = MockTransport::new();
+        serve_pages(&mut transport, &[&[2], &[3]]);
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
+
+        let mut ids = Vec::new();
+        while let Some(batch) = iterator.next_batch().await.unwrap() {
+            ids.extend(ids_of(&batch));
+            let columns = batch.columns().to_vec();
+            drop(batch);
+            for column in &columns {
+                assert_eq!(Arc::strong_count(column), 1, "the iterator kept a column");
+            }
+        }
+
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
-    fn test_next_batch_propagates_fetch_error() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
+    fn test_next_batch_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let mut iterator = streaming_iterator(MockTransport::new(), &[1], 1, None);
 
+        assert_send(&iterator.next_batch());
+    }
+
+    /// Scenario: Result set iterator closes the result set handle when it ends
+    #[tokio::test]
+    async fn test_next_batch_closes_handle_at_end_and_ignores_close_error() {
+        let handle = ResultSetHandle::new(5);
+        let mut transport = transport_serving_one_more_page(&[2]);
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Err(TransportError::IoError("socket gone".to_string())));
+        let mut iterator = streaming_iterator(transport, &[1], 0, Some(handle));
+
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        assert!(iterator.next_batch().await.unwrap().is_none());
+        assert!(iterator.next_batch().await.unwrap().is_none());
+        iterator.close().await.unwrap();
+    }
+
+    /// Scenario: Result set iterator closes the result set handle when it ends
+    #[tokio::test]
+    async fn test_next_batch_closes_handle_after_row_count_error() {
+        let handle = ResultSetHandle::new(6);
+        let mut transport = MockTransport::new();
+        transport
+            .expect_fetch_results()
+            .times(1)
+            .returning(|_| Ok(single_column_result_data(&[], 3)));
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Err(TransportError::IoError("socket gone".to_string())));
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(handle));
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        let err = iterator.next_batch().await.unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        let message = err.to_string();
+        assert!(message.contains("ended after 1 rows"), "{message}");
+        assert!(!message.contains("socket gone"), "{message}");
+        assert!(iterator.next_batch().await.unwrap().is_none());
+        iterator.close().await.unwrap();
+    }
+
+    /// Scenario: Result set iterator closes the result set handle when it ends
+    #[tokio::test]
+    async fn test_close_after_end_sends_no_request() {
+        let handle = ResultSetHandle::new(7);
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().never();
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut iterator = streaming_iterator(transport, &[1, 2], 2, Some(handle));
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 2);
+        assert!(iterator.next_batch().await.unwrap().is_none());
+
+        iterator.close().await.unwrap();
+    }
+
+    /// Scenario: Result set iterator closed before its end releases the result set handle
+    #[tokio::test]
+    async fn test_close_before_end_closes_handle_without_fetch() {
+        let handle = ResultSetHandle::new(8);
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().never();
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(handle));
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        iterator.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_next_batch_propagates_fetch_error() {
         let mut transport = MockTransport::new();
         transport
             .expect_fetch_results()
             .times(1)
             .returning(|_| Err(TransportError::ReceiveError("no page".to_string())));
+        transport.expect_close_result_set().never();
 
         let mut iterator = streaming_iterator(transport, &[1], 0, Some(ResultSetHandle::new(1)));
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
 
-        let err = iterator.next_batch().unwrap().unwrap_err();
+        let err = iterator.next_batch().await.unwrap_err();
 
         assert!(matches!(err, QueryError::ExecutionFailed(_)));
         assert!(err.to_string().contains("no page"));
     }
 
-    #[test]
-    fn test_next_batch_fetches_again_after_a_transport_error() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
-
+    #[tokio::test]
+    async fn test_next_batch_fetches_again_after_a_transport_error() {
         let mut transport = MockTransport::new();
         let mut call = 0;
         transport
@@ -2464,159 +2667,185 @@ mod tests {
                     Ok(single_column_result_data(&[2], 2))
                 }
             });
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut iterator = streaming_iterator(transport, &[1], 2, Some(ResultSetHandle::new(1)));
 
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
         assert!(matches!(
-            iterator.next_batch().unwrap().unwrap_err(),
+            iterator.next_batch().await.unwrap_err(),
             QueryError::ExecutionFailed(_)
         ));
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
-        assert!(iterator.next_batch().is_none());
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+        assert!(iterator.next_batch().await.unwrap().is_none());
     }
 
     /// Scenario: Result set iterator ends after the last row
-    #[test]
-    fn test_next_batch_stops_at_total_rows_without_another_fetch() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
-
+    #[tokio::test]
+    async fn test_next_batch_stops_at_total_rows_without_another_fetch() {
         let mut transport = MockTransport::new();
         transport
             .expect_fetch_results()
             .times(1)
             .returning(|_| Ok(single_column_result_data(&[2, 3], 3)));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
 
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 2);
-        assert!(iterator.next_batch().is_none());
-        assert!(iterator.next_batch().is_none());
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 2);
+        assert!(iterator.next_batch().await.unwrap().is_none());
+        assert!(iterator.next_batch().await.unwrap().is_none());
     }
 
     /// Scenario: Result set that ends before its total row count fails
-    #[test]
-    fn test_next_batch_fails_when_the_stream_ends_before_the_total() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
-
+    #[tokio::test]
+    async fn test_next_batch_fails_when_the_stream_ends_before_the_total() {
         let mut transport = MockTransport::new();
         transport
             .expect_fetch_results()
             .times(1)
             .returning(|_| Ok(single_column_result_data(&[], 3)));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
 
-        let err = iterator.next_batch().unwrap().unwrap_err();
+        let err = iterator.next_batch().await.unwrap_err();
 
         assert!(matches!(err, QueryError::ExecutionFailed(_)));
         let message = err.to_string();
         assert!(message.contains('1') && message.contains('3'), "{message}");
-        assert!(iterator.next_batch().is_none());
+        assert!(iterator.next_batch().await.unwrap().is_none());
     }
 
     /// Scenario: Result set that exceeds its total row count fails
-    #[test]
-    fn test_next_batch_fails_when_a_page_exceeds_the_total() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
-
+    #[tokio::test]
+    async fn test_next_batch_fails_when_a_page_exceeds_the_total() {
         let mut transport = MockTransport::new();
         transport
             .expect_fetch_results()
             .times(1)
             .returning(|_| Ok(single_column_result_data(&[2, 3], 2)));
+        transport
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
 
         let mut iterator = streaming_iterator(transport, &[1], 2, Some(ResultSetHandle::new(1)));
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
 
-        let err = iterator.next_batch().unwrap().unwrap_err();
+        let err = iterator.next_batch().await.unwrap_err();
 
         assert!(matches!(err, QueryError::ExecutionFailed(_)));
         let message = err.to_string();
         assert!(message.contains('3') && message.contains('2'), "{message}");
-        assert!(iterator.next_batch().is_none());
+        assert!(iterator.next_batch().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn test_fetch_next_batch_short_circuits_once_the_stream_is_complete() {
+    // =========================================================================
+    // Tests for result set requests whose future is dropped
+    // =========================================================================
+
+    /// A transport double that expects one `terminate` and no fetch or close request.
+    fn expecting_one_termination() -> MockTransport {
         let mut transport = MockTransport::new();
-        transport.expect_fetch_results().times(0);
-        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(transport));
-
-        let mut iterator = ResultSetIterator {
-            handle: Some(ResultSetHandle::new(1)),
-            transport,
-            metadata: QueryMetadata::new(
-                ResultSet::build_schema(&[decimal_column("id")]).unwrap(),
-                Some(1),
-            ),
-            batches: Vec::new(),
-            current_index: 0,
-            complete: true,
-        };
-
-        assert!(iterator.fetch_next_batch().await.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_next_batch_reports_exhausted_when_handle_was_already_released() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
-
-        let mut transport = MockTransport::new();
-        transport.expect_fetch_results().times(0);
-        let transport: Arc<Mutex<dyn TransportProtocol>> = Arc::new(Mutex::new(transport));
-
-        let mut iterator = ResultSetIterator {
-            handle: None,
-            transport,
-            metadata: QueryMetadata::new(
-                ResultSet::build_schema(&[decimal_column("id")]).unwrap(),
-                Some(1),
-            ),
-            batches: Vec::new(),
-            current_index: 0,
-            complete: false,
-        };
-
-        assert!(iterator.next_batch().is_none());
-    }
-
-    #[test]
-    fn test_next_batch_without_async_runtime_reports_invalid_state() {
-        let mut transport = MockTransport::new();
-        transport.expect_fetch_results().times(0);
-
-        let mut iterator = streaming_iterator(transport, &[1], 0, Some(ResultSetHandle::new(1)));
-        assert_eq!(iterator.next_batch().unwrap().unwrap().num_rows(), 1);
-
-        let err = iterator.next_batch().unwrap().unwrap_err();
-
-        assert!(matches!(err, QueryError::InvalidState(_)));
-        assert!(err.to_string().contains("No async runtime available"));
-    }
-
-    #[test]
-    fn test_iterator_trait_yields_every_page_until_exhausted() {
-        let runtime = entered_runtime();
-        let _guard = runtime.enter();
-
-        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().never();
+        transport.expect_close_result_set().never();
+        transport.expect_terminate().times(1).return_const(());
         transport
+    }
+
+    /// Scenario: Result set request dropped before its response terminates the connection
+    #[tokio::test]
+    async fn test_dropped_next_batch_during_fetch_terminates_transport() {
+        let transport = GatedQueryTransport::stalled_fetch(expecting_one_termination());
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        let abandoned = tokio::time::timeout(Duration::ZERO, iterator.next_batch()).await;
+
+        assert!(abandoned.is_err(), "the held fetch must not answer");
+    }
+
+    /// Scenario: Result set request dropped before its response terminates the connection
+    #[tokio::test]
+    async fn test_dropped_close_during_close_terminates_transport() {
+        let transport = GatedQueryTransport::stalled_result_set_close(expecting_one_termination());
+        let mut iterator = streaming_iterator(transport, &[1], 3, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        let abandoned = tokio::time::timeout(Duration::ZERO, iterator.close()).await;
+
+        assert!(abandoned.is_err(), "the held close must not answer");
+    }
+
+    /// Scenario: Result set request dropped before its response terminates the connection
+    #[tokio::test]
+    async fn test_dropped_end_of_stream_close_terminates_transport() {
+        let transport = GatedQueryTransport::stalled_result_set_close(expecting_one_termination());
+        let mut iterator = streaming_iterator(transport, &[1], 1, Some(ResultSetHandle::new(1)));
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        let abandoned = tokio::time::timeout(Duration::ZERO, iterator.next_batch()).await;
+
+        assert!(abandoned.is_err(), "the held close must not answer");
+    }
+
+    /// Scenario: Result set request dropped before its response terminates the connection
+    #[tokio::test]
+    async fn test_dropped_fetch_all_during_fetch_terminates_transport() {
+        let transport = GatedQueryTransport::stalled_fetch(expecting_one_termination());
+        let result_set = streaming_result_set(transport, &[1], 3, Some(ResultSetHandle::new(1)));
+
+        let abandoned = tokio::time::timeout(Duration::ZERO, result_set.fetch_all()).await;
+
+        assert!(abandoned.is_err(), "the held fetch must not answer");
+    }
+
+    /// Scenario: Result set request dropped before its response terminates the connection
+    #[tokio::test]
+    async fn test_next_batch_dropped_while_waiting_for_transport_does_not_terminate() {
+        let mut inner = MockTransport::new();
+        inner.expect_terminate().never();
+        inner
             .expect_fetch_results()
             .times(1)
-            .returning(|_| Ok(single_column_result_data(&[], 0)));
+            .returning(|_| Ok(single_column_result_data(&[2, 3], 3)));
+        inner
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+        let transport = shared(inner);
+        let mut iterator = result_set_over(
+            Arc::clone(&transport),
+            &[1],
+            3,
+            Some(ResultSetHandle::new(1)),
+        )
+        .into_iterator()
+        .unwrap();
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
 
-        let iterator = streaming_iterator(transport, &[1, 2], 0, Some(ResultSetHandle::new(1)));
-        let batches: Vec<RecordBatch> = iterator.collect::<Result<Vec<_>, _>>().unwrap();
+        let held = transport.lock().await;
+        let abandoned = tokio::time::timeout(Duration::ZERO, iterator.next_batch()).await;
+        drop(held);
 
-        assert_eq!(batches.len(), 1);
-        assert_eq!(ResultSet::row_count_of(&batches), 2);
+        assert!(
+            abandoned.is_err(),
+            "the call must still wait for the transport"
+        );
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 2);
+        assert!(iterator.next_batch().await.unwrap().is_none());
     }
 
     // =========================================================================

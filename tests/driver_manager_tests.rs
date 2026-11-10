@@ -47,7 +47,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
-use common::{generate_unique_test_name, get_host, get_password, get_port, get_user};
+use common::{
+    assert_multi_fetch_batches, generate_unique_test_name, get_host, get_password, get_port,
+    get_user, multi_fetch_query, MULTI_FETCH_ROWS,
+};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -4146,6 +4149,272 @@ fn test_reader_schema_carries_exasol_field_metadata_websocket() {
         "{}&transport=websocket",
         get_test_uri()
     ));
+}
+
+/// The URI of `get_test_uri` with the websocket transport selected.
+#[cfg(feature = "websocket")]
+fn websocket_test_uri() -> String {
+    format!("{}&transport=websocket", get_test_uri())
+}
+
+/// Execute `sql` with no bound RecordBatch on a fresh statement and hand its reader to `read`.
+fn with_reader<C: AdbcConnection, T>(
+    conn: &mut C,
+    sql: &str,
+    read: impl FnOnce(&mut dyn RecordBatchReader) -> T,
+) -> T {
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(sql).unwrap();
+    let mut reader = stmt
+        .execute()
+        .unwrap_or_else(|e| panic!("execute of {sql:?} failed: {e:?}"));
+    read(&mut reader)
+}
+
+/// Read `reader` to its end and keep a copy of the `V` column of each batch,
+/// so no batch that the reader returned stays referenced.
+fn read_keys(reader: &mut dyn RecordBatchReader) -> Vec<RecordBatch> {
+    reader
+        .map(|batch| {
+            let batch = batch.expect("a read of the streaming reader failed");
+            let keys = arrow::compute::cast(
+                batch.column_by_name("V").expect("column V"),
+                &DataType::Int64,
+            )
+            .expect("V casts to Int64");
+            RecordBatch::try_from_iter([("V", keys)]).expect("key batch")
+        })
+        .collect()
+}
+
+/// Assert that `conn` still runs a statement and returns its row.
+fn assert_connection_usable<C: AdbcConnection>(conn: &mut C) {
+    assert_eq!(first_column_text(conn, "SELECT 1 AS ONE"), vec!["1"]);
+}
+
+fn assert_execute_streams_multi_fetch_result(uri: String) {
+    let (_driver, _db, mut conn) = open_connection(uri);
+
+    let keys = with_reader(&mut conn, &multi_fetch_query(), read_keys);
+
+    assert_multi_fetch_batches(&keys);
+}
+
+/// Scenario: execute streams a query result one batch per read
+#[test]
+fn test_execute_streams_multi_fetch_result() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_execute_streams_multi_fetch_result(get_test_uri());
+}
+
+/// Scenario: execute streams a query result one batch per read
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_execute_streams_multi_fetch_result_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_execute_streams_multi_fetch_result(websocket_test_uri());
+}
+
+fn assert_streaming_reader_end_keeps_connection_usable(uri: String) {
+    let (_driver, _db, mut conn) = open_connection(uri);
+    let mut stmt = conn.new_statement().expect("Failed to create statement");
+    stmt.set_sql_query(multi_fetch_query()).unwrap();
+    let mut reader = stmt.execute().expect("execute");
+
+    let keys = read_keys(&mut reader);
+
+    assert_multi_fetch_batches(&keys);
+    assert!(reader.next().is_none(), "the reader must stay ended");
+    assert_connection_usable(&mut conn);
+    drop(reader);
+    assert_connection_usable(&mut conn);
+}
+
+/// Scenario: A streaming reader closes the result set handle at its end
+#[test]
+fn test_streaming_reader_end_keeps_connection_usable() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_streaming_reader_end_keeps_connection_usable(get_test_uri());
+}
+
+/// Scenario: A streaming reader closes the result set handle at its end
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_streaming_reader_end_keeps_connection_usable_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_streaming_reader_end_keeps_connection_usable(websocket_test_uri());
+}
+
+fn assert_releasing_streaming_reader_before_end_keeps_connection_usable(uri: String) {
+    let (_driver, _db, mut conn) = open_connection(uri);
+
+    // The execute response can carry no rows, so read until a fetch delivered some.
+    let rows_read = with_reader(&mut conn, &multi_fetch_query(), |reader| {
+        let mut rows = 0;
+        while rows == 0 {
+            rows += reader
+                .next()
+                .expect("a multi-fetch result has rows")
+                .expect("a read should succeed")
+                .num_rows();
+        }
+        rows
+    });
+
+    assert!(
+        rows_read < MULTI_FETCH_ROWS,
+        "the reader should be released before its end, but read {rows_read} rows"
+    );
+    assert_connection_usable(&mut conn);
+}
+
+/// Scenario: Releasing a streaming reader before its end closes the result set handle
+#[test]
+fn test_releasing_streaming_reader_before_end_keeps_connection_usable() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_releasing_streaming_reader_before_end_keeps_connection_usable(get_test_uri());
+}
+
+/// Scenario: Releasing a streaming reader before its end closes the result set handle
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_releasing_streaming_reader_before_end_keeps_connection_usable_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_releasing_streaming_reader_before_end_keeps_connection_usable(websocket_test_uri());
+}
+
+fn assert_streaming_reader_read_fails_after_session_is_killed(uri: String) {
+    let (_driver, db, mut conn) = open_connection(uri);
+    let session_id = first_column_text(
+        &mut conn,
+        "SELECT CAST(CURRENT_SESSION AS VARCHAR(20)) AS SESSION_ID",
+    )
+    .remove(0);
+    let mut killer = db
+        .new_connection()
+        .expect("Failed to open a second connection");
+
+    with_reader(&mut conn, &multi_fetch_query(), |reader| {
+        let mut rows = reader
+            .next()
+            .expect("a multi-fetch result has a first batch")
+            .expect("the first read should succeed")
+            .num_rows();
+        execute_ddl(&mut killer, format!("KILL SESSION {session_id}"));
+
+        let error = loop {
+            match reader.next() {
+                Some(Ok(batch)) => rows += batch.num_rows(),
+                Some(Err(error)) => break error,
+                None => panic!("the reader ended after {rows} rows without a failed read"),
+            }
+        };
+
+        assert!(
+            rows < MULTI_FETCH_ROWS,
+            "the failed read should come before all rows, got {rows}"
+        );
+        assert!(
+            !error.to_string().trim().is_empty(),
+            "the error carries no message"
+        );
+    });
+}
+
+/// Scenario: A failed fetch fails the read of a streaming reader
+#[test]
+fn test_streaming_reader_read_fails_after_session_is_killed() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_streaming_reader_read_fails_after_session_is_killed(get_test_uri());
+}
+
+/// Scenario: A failed fetch fails the read of a streaming reader
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_streaming_reader_read_fails_after_session_is_killed_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_streaming_reader_read_fails_after_session_is_killed(websocket_test_uri());
+}
+
+/// Check, for a zero-row query and a multi-fetch query over the transport that `uri`
+/// selects, that the reader schema is set before the first read and matches every batch.
+fn assert_reader_schema_is_available_before_the_first_read(uri: String) {
+    let (_driver, _db, mut conn) = open_connection(uri);
+    let zero_row_query = format!("{} WHERE FALSE", multi_fetch_query());
+
+    for sql in [zero_row_query, multi_fetch_query()] {
+        with_reader(&mut conn, &sql, |reader| {
+            let schema = reader.schema();
+            assert_eq!(field_names(&schema), ["V", "S"], "{sql}");
+            assert!(
+                matches!(schema.field(0).data_type(), DataType::Decimal128(_, 0)),
+                "{sql}: {:?}",
+                schema.field(0)
+            );
+            assert_eq!(schema.field(1).data_type(), &DataType::Utf8, "{sql}");
+            assert_eq!(
+                field_metadata(schema.field(0), "exasol:type_name"),
+                "DECIMAL"
+            );
+            assert_eq!(
+                field_metadata(schema.field(1), "exasol:type_name"),
+                "VARCHAR"
+            );
+
+            let mut batches = 0;
+            for batch in reader {
+                let batch = batch.expect("a read of the streaming reader failed");
+                assert_eq!(batch.schema().fields(), schema.fields(), "{sql}");
+                batches += 1;
+            }
+            assert!(batches > 0, "{sql}: the reader returned no batch");
+        });
+    }
+}
+
+/// Scenario: Reader schema is available before the first read
+#[test]
+fn test_reader_schema_is_available_before_the_first_read() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_reader_schema_is_available_before_the_first_read(get_test_uri());
+}
+
+/// Scenario: Reader schema is available before the first read
+///
+/// The release cdylib must be built with `--features 'ffi websocket'` for this to connect.
+#[cfg(feature = "websocket")]
+#[test]
+fn test_reader_schema_is_available_before_the_first_read_websocket() {
+    skip_if_no_library!();
+    skip_if_no_exasol!();
+
+    assert_reader_schema_is_available_before_the_first_read(websocket_test_uri());
 }
 
 /// Scenario: Execute schema of a parameterized query needs no bound parameters

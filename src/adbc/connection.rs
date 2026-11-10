@@ -696,6 +696,10 @@ impl Connection {
     ///
     /// This is a convenience method that fetches all results into memory.
     ///
+    /// Dropping the returned future while a fetch or close request awaits its
+    /// response terminates the connection; see
+    /// [`ResultSetIterator::next_batch`](crate::query::ResultSetIterator::next_batch).
+    ///
     /// # Arguments
     ///
     /// * `sql` - SQL query text
@@ -1049,7 +1053,8 @@ impl Connection {
     ///
     /// Reports closed when either the session has been closed or the transport
     /// has been terminated. A terminating export timeout
-    /// (`ExportError::Timeout { transport_terminated: true }`) is what makes the
+    /// (`ExportError::Timeout { transport_terminated: true }`) or a result set
+    /// request whose future was dropped before its response arrived makes the
     /// transport half of this check fire even while the session still believes
     /// it is open.
     ///

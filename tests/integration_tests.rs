@@ -77,14 +77,15 @@ mod schema_activation;
 use arrow::array::{Array, BooleanArray, Decimal128Array, Float64Array, StringArray};
 use arrow::datatypes::DataType;
 use common::{
-    assert_column_metadata_table_fields, assert_every_batch_carries_field_metadata,
+    assert_column_metadata_table_fields, assert_connection_usable,
+    assert_dropped_next_batch_terminates_connection, assert_every_batch_carries_field_metadata,
     assert_every_key_once, assert_local_time_zone_text_parameter_reads_in_session_time_zone,
-    assert_partly_inline, column_metadata_table_ddl, column_metadata_table_insert,
-    connection_error_from_a_silent_server, disable_query_cache, drain_iterator,
-    end_of_stream_query, generate_test_schema_name, get_host, get_port, get_test_connection,
-    get_test_connection_string, get_user, is_exasol_available, long_running_count_query,
-    multi_fetch_query, open_iterator, partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS,
-    PARTIAL_INLINE_ROWS,
+    assert_multi_fetch_batches, assert_partly_inline, column_metadata_table_ddl,
+    column_metadata_table_insert, connection_error_from_a_silent_server, disable_query_cache,
+    drain_iterator, drain_iterator_dropping_each_batch, end_of_stream_query,
+    generate_test_schema_name, get_host, get_port, get_test_connection, get_test_connection_string,
+    get_user, is_exasol_available, long_running_count_query, multi_fetch_query, open_iterator,
+    partial_inline_query, END_OF_STREAM_ROWS, MULTI_FETCH_ROWS, PARTIAL_INLINE_ROWS,
 };
 #[cfg(feature = "native")]
 use common::{
@@ -3570,8 +3571,7 @@ async fn test_csv_export_explicit_timeout_terminates_connection() {
     );
     let message = error.to_string();
     assert!(
-        message
-            .contains("Transport was terminated after an export gave up on an in-flight response"),
+        message.contains("Transport was terminated because an in-flight response was abandoned"),
         "{message}"
     );
     assert!(message.contains("reconnect"), "{message}");
@@ -3929,36 +3929,120 @@ async fn test_fetch_all_partial_inline_result_returns_every_row_once() {
 }
 
 /// Scenario: Result set iterator ends after the last row
-#[test]
-fn test_iterator_ends_after_last_row() {
+#[tokio::test]
+async fn test_iterator_ends_after_last_row() {
     skip_if_no_exasol!();
 
-    let (runtime, conn, mut iterator) = open_iterator(get_test_connection(), end_of_stream_query());
+    let (conn, mut iterator) = open_iterator(get_test_connection(), end_of_stream_query()).await;
 
-    let batches = drain_iterator(&runtime, &mut iterator);
+    let batches = drain_iterator(&mut iterator).await;
 
     assert_every_key_once(&batches, END_OF_STREAM_ROWS);
-    runtime
-        .block_on(conn.close())
-        .expect("Failed to close connection");
+    conn.close().await.expect("Failed to close connection");
 }
 
 /// Scenario: Result partly delivered with the execute response
 /// Scenario: Result set iterator ends after the last row
-#[test]
-fn test_iterator_partial_inline_result_returns_every_row_once() {
+#[tokio::test]
+async fn test_iterator_partial_inline_result_returns_every_row_once() {
     skip_if_no_exasol!();
 
-    let (runtime, conn, mut iterator) =
-        open_iterator(get_test_connection(), partial_inline_query());
+    let (conn, mut iterator) = open_iterator(get_test_connection(), partial_inline_query()).await;
 
-    let batches = drain_iterator(&runtime, &mut iterator);
+    let batches = drain_iterator(&mut iterator).await;
 
     assert_partly_inline(&batches);
     assert_every_key_once(&batches, PARTIAL_INLINE_ROWS);
-    runtime
-        .block_on(conn.close())
-        .expect("Failed to close connection");
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator fetches one batch per call
+/// Scenario: Result set iterator reads inside an async runtime
+#[tokio::test]
+async fn test_iterator_reads_multi_fetch_result_on_current_thread_runtime() {
+    skip_if_no_exasol!();
+
+    let (conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query()).await;
+
+    let batches = drain_iterator(&mut iterator).await;
+
+    assert_multi_fetch_batches(&batches);
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator reads inside an async runtime
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_iterator_reads_multi_fetch_result_on_multi_thread_runtime() {
+    skip_if_no_exasol!();
+
+    let (conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query()).await;
+
+    let batches = drain_iterator(&mut iterator).await;
+
+    assert_multi_fetch_batches(&batches);
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator keeps no batch that it has yielded
+#[tokio::test]
+async fn test_iterator_keeps_no_yielded_batch() {
+    skip_if_no_exasol!();
+
+    let (conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query()).await;
+
+    let keys = drain_iterator_dropping_each_batch(&mut iterator).await;
+
+    assert_multi_fetch_batches(&keys);
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator closes the result set handle when it ends
+#[tokio::test]
+async fn test_iterator_end_closes_handle_and_connection_stays_usable() {
+    skip_if_no_exasol!();
+
+    let (mut conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query()).await;
+
+    let batches = drain_iterator(&mut iterator).await;
+    iterator
+        .close()
+        .await
+        .expect("close after the end sends nothing and succeeds");
+
+    assert_multi_fetch_batches(&batches);
+    assert_connection_usable(&mut conn).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set iterator closed before its end releases the result set handle
+#[tokio::test]
+async fn test_iterator_close_before_end_keeps_connection_usable() {
+    skip_if_no_exasol!();
+
+    let (mut conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query()).await;
+    let first = iterator
+        .next_batch()
+        .await
+        .expect("the first batch should arrive")
+        .expect("a multi-fetch result has a first batch");
+    assert!(first.num_rows() < MULTI_FETCH_ROWS);
+
+    iterator
+        .close()
+        .await
+        .expect("closing the result set before its end should succeed");
+
+    assert!(!conn.is_closed().await);
+    assert_connection_usable(&mut conn).await;
+    conn.close().await.expect("Failed to close connection");
+}
+
+/// Scenario: Result set request dropped before its response terminates the connection
+#[tokio::test]
+async fn test_dropped_next_batch_terminates_connection() {
+    skip_if_no_exasol!();
+
+    assert_dropped_next_batch_terminates_connection(get_test_connection).await;
 }
 
 /// Scenario: Large result set (multi-fetch)
@@ -4238,19 +4322,17 @@ async fn test_every_fetched_batch_carries_the_result_set_field_metadata() {
 }
 
 /// Scenario: Every batch carries the field metadata of the result set metadata schema
-#[test]
-fn test_every_iterated_batch_carries_the_result_set_field_metadata() {
+#[tokio::test]
+async fn test_every_iterated_batch_carries_the_result_set_field_metadata() {
     skip_if_no_exasol!();
 
-    let (runtime, conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query());
+    let (conn, mut iterator) = open_iterator(get_test_connection(), multi_fetch_query()).await;
     let metadata_schema = iterator.metadata().schema.clone();
 
-    let batches = drain_iterator(&runtime, &mut iterator);
+    let batches = drain_iterator(&mut iterator).await;
 
     assert_every_batch_carries_field_metadata(&metadata_schema, &batches);
-    runtime
-        .block_on(conn.close())
-        .expect("Failed to close connection");
+    conn.close().await.expect("Failed to close connection");
 }
 
 /// Scenario: HASHTYPE field metadata carries the byte size of the column

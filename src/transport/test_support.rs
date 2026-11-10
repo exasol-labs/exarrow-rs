@@ -91,21 +91,31 @@ pub(crate) fn exa_response_packet(ip: &str, port: i32) -> [u8; EXA_RESPONSE_PACK
     packet
 }
 
-/// A transport whose `execute_query` is held back, delegating every other call
-/// to the wrapped mock. It either never resolves ([`Self::stalled`]) or
-/// resolves with a preset result once a signal fires ([`Self::new`]).
+/// A transport that holds back one request, delegating every other call to the
+/// wrapped mock. A held `execute_query` either never resolves
+/// ([`Self::stalled`]) or resolves with a preset result once a signal fires
+/// ([`Self::new`]); a held `fetch_results` ([`Self::stalled_fetch`]) or
+/// `close_result_set` ([`Self::stalled_result_set_close`]) never resolves.
 ///
 /// `mockall` hands back an already-ready future, so a mock on its own cannot
-/// represent a SQL response that is still outstanding, the one state a
-/// client-side deadline exists to interrupt. Delegating the rest keeps
-/// expectations and their verification with the inner mock.
+/// represent a response that is still outstanding, the one state a
+/// client-side deadline or a dropped request future exists to interrupt.
+/// Delegating the rest keeps expectations and their verification with the
+/// inner mock.
 ///
 /// Exasol answers an EXPORT statement only after the tunnel transfer ended, so
 /// a loopback test of the export order has to decide when the response
 /// arrives, which a mock's ready future cannot. A dropped signal never fires.
 pub(crate) struct GatedQueryTransport {
     inner: MockTransport,
-    answer: Option<Answer>,
+    held: HeldRequest,
+}
+
+enum HeldRequest {
+    /// `None` keeps the query pending forever.
+    Query(Option<Answer>),
+    Fetch,
+    ResultSetClose,
 }
 
 struct Answer {
@@ -121,14 +131,28 @@ impl GatedQueryTransport {
     ) -> Self {
         Self {
             inner,
-            answer: Some(Answer { release, result }),
+            held: HeldRequest::Query(Some(Answer { release, result })),
         }
     }
 
     pub(crate) fn stalled(inner: MockTransport) -> Self {
         Self {
             inner,
-            answer: None,
+            held: HeldRequest::Query(None),
+        }
+    }
+
+    pub(crate) fn stalled_fetch(inner: MockTransport) -> Self {
+        Self {
+            inner,
+            held: HeldRequest::Fetch,
+        }
+    }
+
+    pub(crate) fn stalled_result_set_close(inner: MockTransport) -> Self {
+        Self {
+            inner,
+            held: HeldRequest::ResultSetClose,
         }
     }
 }
@@ -146,8 +170,11 @@ impl TransportProtocol for GatedQueryTransport {
         self.inner.authenticate(credentials).await
     }
 
-    async fn execute_query(&mut self, _sql: &str) -> Result<QueryResult, TransportError> {
-        let Some(answer) = self.answer.take() else {
+    async fn execute_query(&mut self, sql: &str) -> Result<QueryResult, TransportError> {
+        let HeldRequest::Query(answer) = &mut self.held else {
+            return self.inner.execute_query(sql).await;
+        };
+        let Some(answer) = answer.take() else {
             return std::future::pending().await;
         };
         if answer.release.await.is_err() {
@@ -160,10 +187,16 @@ impl TransportProtocol for GatedQueryTransport {
         &mut self,
         handle: ResultSetHandle,
     ) -> Result<ResultData, TransportError> {
+        if matches!(self.held, HeldRequest::Fetch) {
+            return std::future::pending().await;
+        }
         self.inner.fetch_results(handle).await
     }
 
     async fn close_result_set(&mut self, handle: ResultSetHandle) -> Result<(), TransportError> {
+        if matches!(self.held, HeldRequest::ResultSetClose) {
+            return std::future::pending().await;
+        }
         self.inner.close_result_set(handle).await
     }
 
@@ -518,7 +551,7 @@ pub(crate) const DISCONNECT_BOUND: Duration = Duration::from_secs(5);
 pub(crate) const SILENT_SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_millis(300);
 
 const TERMINATED_CAUSE: &str =
-    "Transport was terminated after an export gave up on an in-flight response";
+    "Transport was terminated because an in-flight response was abandoned";
 
 pub(crate) fn test_credentials() -> Credentials {
     Credentials::new("sys".to_string(), "exasol".to_string())

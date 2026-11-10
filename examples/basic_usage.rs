@@ -78,6 +78,25 @@ async fn example_transaction(conn: &mut Connection) -> Result<usize, Box<dyn Err
     Ok(row_count)
 }
 
+/// Reads a 70,000-row result one batch at a time and returns the row and batch counts.
+async fn stream_rows(conn: &mut Connection) -> Result<(usize, usize), Box<dyn Error>> {
+    let mut iterator = conn
+        .execute(
+            "SELECT t.v AS v, RPAD(TO_CHAR(t.v), 1000, 'x') AS s \
+             FROM VALUES BETWEEN 1 AND 70000 AS t(v)",
+        )
+        .await?
+        .into_iterator()?;
+
+    let mut rows = 0;
+    let mut batches = 0;
+    while let Some(batch) = iterator.next_batch().await? {
+        rows += batch.num_rows();
+        batches += 1;
+    }
+    Ok((rows, batches))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut conn = example_connection().await?;
@@ -88,6 +107,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let rows = example_transaction(&mut conn).await?;
     println!("Transaction: {} row(s)", rows);
+
+    let (rows, batches) = stream_rows(&mut conn).await?;
+    println!("Streamed {} rows in {} batches", rows, batches);
 
     conn.close().await?;
     println!("Done");
