@@ -51,6 +51,6 @@ The driver closes a connection only when the caller closes it or the driver term
 
 * *GIVEN* an export timeout terminated the transport before the EXPORT response was read
 * *WHEN* the caller runs any operation other than `close` on that transport, including connect and authenticate, before or after closing it
-* *THEN* the operation SHALL fail with an error that states the transport was terminated after an export gave up on an in-flight response and that tells the caller to reconnect
+* *THEN* the operation SHALL fail with an error that states the transport was terminated because an in-flight response was abandoned and that tells the caller to reconnect
 * *AND* the error MUST NOT tell the caller to authenticate
 * *AND* a transport that a graceful `close` ended without a prior termination MUST NOT report this cause
