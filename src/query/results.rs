@@ -827,6 +827,12 @@ impl ResultSetIterator {
     /// result set delivers fewer or more rows than its total row count.
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>, QueryError> {
         if let Some(batch) = self.first_batch.take() {
+            if self.complete || self.handle.is_none() {
+                if let Err(error) = ResultSet::check_buffered_rows(&self.metadata, &batch) {
+                    self.close_handle().await;
+                    return Err(error);
+                }
+            }
             return Ok(Some(batch));
         }
         let Some(handle) = self.handle else {
@@ -880,9 +886,11 @@ impl ResultSetIterator {
     }
 
     async fn close_handle(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle {
             // A failed close changes neither the end nor the error the caller gets.
+            // The handle is cleared only after the close, so a cancelled close can be retried.
             let _ = close_result_set(&self.transport, handle).await;
+            self.handle = None;
         }
     }
 }
@@ -2799,6 +2807,46 @@ mod tests {
         let abandoned = tokio::time::timeout(Duration::ZERO, iterator.next_batch()).await;
 
         assert!(abandoned.is_err(), "the held close must not answer");
+    }
+
+    #[tokio::test]
+    async fn test_next_batch_rejects_incomplete_execute_response_without_handle() {
+        let mut transport = MockTransport::new();
+        transport.expect_fetch_results().never();
+        let mut iterator = streaming_iterator(transport, &[1], 5, None);
+
+        let err = iterator.next_batch().await.unwrap_err();
+
+        assert!(matches!(err, QueryError::ExecutionFailed(_)));
+        assert!(iterator.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_end_of_stream_close_while_waiting_keeps_handle() {
+        let mut inner = MockTransport::new();
+        inner.expect_terminate().never();
+        inner
+            .expect_close_result_set()
+            .times(1)
+            .returning(|_| Ok(()));
+        let transport = shared(inner);
+        let mut iterator = result_set_over(
+            Arc::clone(&transport),
+            &[1],
+            1,
+            Some(ResultSetHandle::new(1)),
+        )
+        .into_iterator()
+        .unwrap();
+        assert_eq!(iterator.next_batch().await.unwrap().unwrap().num_rows(), 1);
+
+        let guard = transport.lock().await;
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), iterator.next_batch()).await;
+        drop(guard);
+        assert!(cancelled.is_err());
+
+        assert!(iterator.next_batch().await.unwrap().is_none());
     }
 
     /// Scenario: Result set request dropped before its response terminates the connection
