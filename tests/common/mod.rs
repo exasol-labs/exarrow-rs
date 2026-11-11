@@ -942,10 +942,16 @@ where
         .expect("close() on a terminated connection must succeed");
 
     let mut admin = connect().await.expect("Failed to connect");
-    admin
+    // Older servers drop the session on disconnect, so it may no longer exist.
+    if let Err(error) = admin
         .execute_update(format!("KILL SESSION {session_id}"))
         .await
-        .expect("the terminated session should be killable");
+    {
+        assert!(
+            error.to_string().contains("Process does not exist"),
+            "the terminated session should be killable or gone: {error}"
+        );
+    }
     admin.close().await.expect("close the second connection");
 }
 
