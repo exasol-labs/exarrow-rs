@@ -71,6 +71,7 @@ use adbc_core::{Optionable, PartitionedResult};
 use arrow::array::{Array, RecordBatch, RecordBatchReader};
 use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
+use arrow::error::ArrowError;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
@@ -78,7 +79,7 @@ use crate::adbc::Connection as ExaConnection;
 use crate::connection::ConnectionParams;
 use crate::error::QueryError;
 use crate::query::prepared::PreparedStatement;
-use crate::query::{Parameter, ResultSet};
+use crate::query::{Parameter, ResultSet, ResultSetIterator};
 use crate::transport::messages::DataType as TransportDataType;
 use crate::types::{ExasolType, TypeMapper};
 
@@ -1549,6 +1550,105 @@ impl RecordBatchReader for VecRecordBatchReader {
     }
 }
 
+/// A RecordBatchReader that fetches one batch of a result set per read.
+///
+/// It holds the batch of the execute response until the first read and no
+/// batch it has returned, so the caller's memory does not grow with the
+/// result. Its schema is the schema of that batch, so reading the schema sends
+/// no request. When the execute response carries no rows, that batch has the
+/// result set metadata schema, whose Arrow types come from `TypeMapper` rather
+/// than from the transport's decoder. The Arrow C stream gives the consumer no
+/// per-batch schema, so a read fails on a fetched batch whose field names,
+/// Arrow data types, or field metadata differ from the reader schema instead
+/// of returning it. Releasing the reader before the end of the result set
+/// closes the result set handle and returns only after Exasol answered the
+/// close, so the close precedes the caller's next statement on the connection.
+struct StreamingRecordBatchReader {
+    schema: Arc<Schema>,
+    first_batch: Option<RecordBatch>,
+    /// `None` once the result set has ended and its handle is closed
+    iterator: Option<ResultSetIterator>,
+}
+
+impl StreamingRecordBatchReader {
+    /// Open a reader over `iterator`, whose first call returns the batch of
+    /// the execute response without a request.
+    async fn open(mut iterator: ResultSetIterator) -> Result<Self, QueryError> {
+        let first_batch = iterator.next_batch().await?.ok_or_else(|| {
+            QueryError::InvalidState(
+                "a result set iterator returns the execute response batch first".to_string(),
+            )
+        })?;
+        Ok(Self {
+            schema: first_batch.schema(),
+            first_batch: Some(first_batch),
+            iterator: Some(iterator),
+        })
+    }
+}
+
+impl Iterator for StreamingRecordBatchReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(batch) = self.first_batch.take() {
+            return Some(Ok(batch));
+        }
+        let iterator = self.iterator.as_mut()?;
+        match get_runtime().block_on(iterator.next_batch()) {
+            Ok(Some(batch)) => Some(matches_reader_schema(&self.schema, &batch).map(|()| batch)),
+            Ok(None) => {
+                self.iterator = None;
+                None
+            }
+            Err(error) => Some(Err(ArrowError::ExternalError(Box::new(error)))),
+        }
+    }
+}
+
+fn matches_reader_schema(schema: &Schema, batch: &RecordBatch) -> Result<(), ArrowError> {
+    let batch_schema = batch.schema();
+    if batch_schema.fields().len() != schema.fields().len() {
+        return Err(ArrowError::SchemaError(format!(
+            "the reader schema has {} columns, but a fetched batch has {}",
+            schema.fields().len(),
+            batch_schema.fields().len()
+        )));
+    }
+    let mismatch = schema
+        .fields()
+        .iter()
+        .zip(batch_schema.fields())
+        .find(|(expected, actual)| {
+            expected.name() != actual.name()
+                || expected.data_type() != actual.data_type()
+                || expected.metadata() != actual.metadata()
+        });
+    match mismatch {
+        Some((expected, actual)) => Err(ArrowError::SchemaError(format!(
+            "column {}: the reader schema has {expected:?}, but a fetched batch has {actual:?}",
+            expected.name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+impl RecordBatchReader for StreamingRecordBatchReader {
+    fn schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Drop for StreamingRecordBatchReader {
+    fn drop(&mut self) {
+        if let Some(iterator) = self.iterator.take() {
+            // A release has no error channel, and the close of a session that
+            // is already gone may fail.
+            let _ = get_runtime().block_on(iterator.close());
+        }
+    }
+}
+
 impl adbc_core::Connection for FfiConnection {
     type StatementType = FfiStatement;
 
@@ -2080,20 +2180,28 @@ impl FfiStatement {
             .map_err(batch_execution_error)
     }
 
-    /// Run `sql` as a query on the parent connection and collect its batches.
+    /// Run `sql` on the parent connection and return a reader that fetches
+    /// one batch of its result set per read.
     ///
-    /// A statement that produces no result set yields no batches rather than
-    /// an error.
-    fn query_sql(&self, sql: &str) -> AdbcResult<Vec<RecordBatch>> {
+    /// A statement that returns an affected-row count yields an empty reader
+    /// rather than an error.
+    fn stream_sql(&self, sql: &str) -> AdbcResult<Box<dyn RecordBatchReader + Send>> {
         let conn_arc = self.require_connection()?;
-        match get_runtime().block_on(async {
-            let mut conn = conn_arc.lock().await;
-            conn.query(sql).await
-        }) {
-            Ok(batches) => Ok(batches),
-            Err(QueryError::NoResultSet(_)) => Ok(vec![]),
-            Err(e) => Err(to_adbc_error(e)),
-        }
+        let reader = get_runtime()
+            .block_on(async {
+                let result_set = conn_arc.lock().await.execute(sql).await?;
+                if result_set.row_count().is_some() {
+                    return Ok(None);
+                }
+                StreamingRecordBatchReader::open(result_set.into_iterator()?)
+                    .await
+                    .map(Some)
+            })
+            .map_err(to_adbc_error)?;
+        Ok(match reader {
+            Some(reader) => Box::new(reader),
+            None => reader_over_batches(Vec::new()),
+        })
     }
 
     /// Run `sql` as a non-query statement on the parent connection and report
@@ -2353,7 +2461,7 @@ impl adbc_core::Statement for FfiStatement {
             return Ok(reader_over_batches(self.execute_bound_batch(batch)?));
         }
 
-        Ok(reader_over_batches(self.query_sql(&sql)?))
+        self.stream_sql(&sql)
     }
 
     fn execute_update(&mut self) -> AdbcResult<Option<i64>> {
@@ -4610,6 +4718,421 @@ mod tests {
             .collect();
 
         assert_eq!(row_counts, vec![1, 2]);
+    }
+
+    // ========================================================================
+    // Streaming reader
+    // ========================================================================
+
+    use crate::transport::messages::{ResultData, ResultPayload, ResultSetHandle};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn id_column() -> ColumnInfo {
+        ColumnInfo {
+            name: "ID".to_string(),
+            data_type: ExaDataType::decimal(18, 0),
+        }
+    }
+
+    fn id_rows(values: &[i64], total_rows: i64) -> ResultData {
+        ResultData {
+            columns: vec![id_column()],
+            data: ResultPayload::Json(values.iter().map(|v| vec![serde_json::json!(v)]).collect()),
+            total_rows,
+        }
+    }
+
+    /// A connected transport that answers one query with `result`, and the
+    /// number of transport terminations so far.
+    fn transport_answering(result: QueryResult) -> (MockTransport, Arc<AtomicUsize>) {
+        let mut transport = schema_transport();
+        transport
+            .expect_execute_query()
+            .times(1)
+            .returning(move |_| Ok(result.clone()));
+        let terminations = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&terminations);
+        // Counts instead of panicking: a request guard calls terminate while a
+        // failed expectation unwinds, and a second panic there aborts the run.
+        transport.expect_terminate().returning(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        (transport, terminations)
+    }
+
+    /// A connected transport whose query returns `first` as the execute
+    /// response rows of a result set with `total_rows` rows under `handle`,
+    /// and the number of transport terminations so far.
+    fn query_transport(
+        first: &'static [i64],
+        total_rows: i64,
+        handle: Option<ResultSetHandle>,
+    ) -> (MockTransport, Arc<AtomicUsize>) {
+        transport_answering(QueryResult::result_set(handle, id_rows(first, total_rows)))
+    }
+
+    /// Serves `pages` in order, one per fetch request, and returns the number
+    /// of fetch requests received so far.
+    fn serve_pages(
+        transport: &mut MockTransport,
+        pages: &'static [&'static [i64]],
+    ) -> Arc<AtomicUsize> {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetches);
+        transport
+            .expect_fetch_results()
+            .times(pages.len())
+            .returning(move |_| {
+                let page = pages[counter.fetch_add(1, Ordering::SeqCst)];
+                Ok(id_rows(page, 0))
+            });
+        fetches
+    }
+
+    /// Returns the number of close requests for `handle` received so far.
+    fn count_closes(transport: &mut MockTransport, handle: ResultSetHandle) -> Arc<AtomicUsize> {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&closes);
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .returning(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        closes
+    }
+
+    /// Execute a query with no bound batch over `transport`, returning the
+    /// reader and the connection that must outlive it.
+    fn execute_over(
+        transport: MockTransport,
+    ) -> (Box<dyn RecordBatchReader + Send>, FfiConnection) {
+        let conn = connected_connection(transport);
+        let inner = conn.inner.as_ref().map(Arc::clone).expect("connected");
+        let mut stmt = FfiStatement::with_connection(inner);
+        stmt.set_sql_query("SELECT ID FROM T").expect("sql");
+        let reader = stmt.execute().expect("execute");
+        (reader, conn)
+    }
+
+    fn ids_of(batch: &RecordBatch) -> Vec<i128> {
+        use arrow::array::Decimal128Array;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("the ID column is DECIMAL(18,0)");
+        ids.iter().map(|id| id.expect("ids are not NULL")).collect()
+    }
+
+    /// Scenario: execute streams a query result one batch per read
+    #[test]
+    fn streaming_reader_fetches_nothing_on_execute_and_once_per_read() {
+        let handle = ResultSetHandle::new(41);
+        let (mut transport, _) = query_transport(&[1], 3, Some(handle));
+        let fetches = serve_pages(&mut transport, &[&[2], &[3]]);
+        let closes = count_closes(&mut transport, handle);
+
+        let (mut reader, _conn) = execute_over(transport);
+        assert_eq!(fetches.load(Ordering::SeqCst), 0, "execute sent a fetch");
+
+        for (expected_id, expected_fetches) in [(1, 0), (2, 1), (3, 2)] {
+            let batch = reader.next().expect("a batch").expect("a valid batch");
+            assert_eq!(ids_of(&batch), vec![expected_id]);
+            assert_eq!(fetches.load(Ordering::SeqCst), expected_fetches);
+        }
+        assert!(reader.next().is_none());
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        drop(reader);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn streaming_reader_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<StreamingRecordBatchReader>();
+    }
+
+    /// Scenario: execute streams a query result one batch per read
+    #[test]
+    fn streaming_reader_keeps_no_returned_batch() {
+        let handle = ResultSetHandle::new(42);
+        let (mut transport, _) = query_transport(&[1], 3, Some(handle));
+        serve_pages(&mut transport, &[&[2], &[3]]);
+        count_closes(&mut transport, handle);
+        let (reader, _conn) = execute_over(transport);
+
+        let mut ids = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("a valid batch");
+            ids.extend(ids_of(&batch));
+            let columns = batch.columns().to_vec();
+            drop(batch);
+            for column in &columns {
+                assert_eq!(Arc::strong_count(column), 1, "the reader kept a column");
+            }
+        }
+
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// Scenario: A streaming reader closes the result set handle at its end
+    #[test]
+    fn streaming_reader_closes_handle_at_end_and_drop_sends_nothing() {
+        let handle = ResultSetHandle::new(43);
+        let (mut transport, _) = query_transport(&[1], 2, Some(handle));
+        serve_pages(&mut transport, &[&[2]]);
+        let closes = count_closes(&mut transport, handle);
+        let (mut reader, _conn) = execute_over(transport);
+
+        assert_eq!(
+            reader
+                .by_ref()
+                .map(|b| b.unwrap().num_rows())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "the end did not close");
+
+        drop(reader);
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "the release sent a close");
+    }
+
+    /// Scenario: Releasing a streaming reader before its end closes the result set handle
+    #[test]
+    fn releasing_streaming_reader_before_end_closes_handle_without_fetch() {
+        let handle = ResultSetHandle::new(44);
+        let (mut transport, terminations) = query_transport(&[1], 3, Some(handle));
+        transport.expect_fetch_results().never();
+        let closes = count_closes(&mut transport, handle);
+        let (mut reader, _conn) = execute_over(transport);
+        assert_eq!(reader.next().expect("a batch").unwrap().num_rows(), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+
+        drop(reader);
+
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "the release did not close"
+        );
+        assert_eq!(terminations.load(Ordering::SeqCst), 0);
+    }
+
+    /// Scenario: Releasing a streaming reader before its end closes the result set handle
+    #[test]
+    fn releasing_streaming_reader_ignores_a_failed_close() {
+        let handle = ResultSetHandle::new(45);
+        let (mut transport, terminations) = query_transport(&[1], 3, Some(handle));
+        transport
+            .expect_close_result_set()
+            .with(eq(handle))
+            .times(1)
+            .returning(|_| Err(TransportError::IoError("socket gone".to_string())));
+        let (reader, _conn) = execute_over(transport);
+
+        drop(reader);
+
+        assert_eq!(terminations.load(Ordering::SeqCst), 0);
+    }
+
+    /// Scenario: A failed fetch fails the read of a streaming reader
+    #[test]
+    fn streaming_reader_read_fails_with_fetch_error_message() {
+        let handle = ResultSetHandle::new(46);
+        let (mut transport, terminations) = query_transport(&[1], 3, Some(handle));
+        transport.expect_fetch_results().times(1).returning(|_| {
+            Err(TransportError::ReceiveError(
+                "page lost in transit".to_string(),
+            ))
+        });
+        let closes = count_closes(&mut transport, handle);
+        let (mut reader, _conn) = execute_over(transport);
+        assert_eq!(reader.next().expect("a batch").unwrap().num_rows(), 1);
+
+        let error = reader
+            .next()
+            .expect("the failed read reports")
+            .expect_err("a failed fetch returns no batch");
+
+        assert!(
+            error.to_string().contains("page lost in transit"),
+            "got: {error}"
+        );
+        drop(reader);
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "the release did not close"
+        );
+        assert_eq!(terminations.load(Ordering::SeqCst), 0);
+    }
+
+    /// Scenario: A failed fetch fails the read of a streaming reader
+    #[test]
+    fn streaming_reader_read_fails_on_row_count_mismatch() {
+        let handle = ResultSetHandle::new(47);
+        let (mut transport, terminations) = query_transport(&[1], 3, Some(handle));
+        serve_pages(&mut transport, &[&[]]);
+        let closes = count_closes(&mut transport, handle);
+        let (mut reader, _conn) = execute_over(transport);
+        assert_eq!(reader.next().expect("a batch").unwrap().num_rows(), 1);
+
+        let error = reader
+            .next()
+            .expect("the failed read reports")
+            .expect_err("a short result returns no batch");
+
+        assert!(
+            error.to_string().contains("ended after 1 rows"),
+            "got: {error}"
+        );
+        assert!(reader.next().is_none());
+        drop(reader);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(terminations.load(Ordering::SeqCst), 0);
+    }
+
+    /// Scenario: Reader schema is available before the first read
+    #[test]
+    fn streaming_reader_schema_is_set_before_the_first_read() {
+        use arrow::array::Int64Array;
+        // Int64 stands in for a decoded type that differs from the metadata
+        // type, which the native decoder does not produce today.
+        let decoded = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        )
+        .expect("test batch");
+        let handle = ResultSetHandle::new(48);
+        let (mut transport, _) = transport_answering(QueryResult::result_set(
+            Some(handle),
+            ResultData {
+                columns: vec![id_column()],
+                data: ResultPayload::Arrow(decoded),
+                total_rows: 2,
+            },
+        ));
+        transport.expect_fetch_results().never();
+        count_closes(&mut transport, handle);
+        let (mut reader, _conn) = execute_over(transport);
+
+        let schema = reader.schema();
+
+        let field = schema.field(0);
+        assert_eq!(field.name(), "ID");
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert_eq!(
+            field.metadata().get("exasol:type_name").map(String::as_str),
+            Some("DECIMAL")
+        );
+        let first = reader.next().expect("a batch").expect("a valid batch");
+        assert_eq!(first.schema(), schema);
+    }
+
+    /// Scenario: Reader schema is available before the first read
+    #[test]
+    fn streaming_reader_schema_of_a_zero_row_result_is_set_before_the_first_read() {
+        let (mut transport, _) = query_transport(&[], 0, None);
+        transport.expect_fetch_results().never();
+        transport.expect_close_result_set().never();
+        let (mut reader, _conn) = execute_over(transport);
+
+        let schema = reader.schema();
+
+        assert_eq!(schema.field(0).name(), "ID");
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(18, 0));
+        assert!(schema.field(0).metadata().contains_key("exasol:type_name"));
+        let first = reader.next().expect("a batch").expect("a valid batch");
+        assert_eq!(first.num_rows(), 0);
+        assert_eq!(first.schema(), schema);
+        assert!(reader.next().is_none());
+    }
+
+    /// Scenario: Reader schema is available before the first read
+    #[test]
+    fn streaming_reader_read_fails_when_a_fetched_batch_differs_from_the_reader_schema() {
+        use arrow::array::Int64Array;
+        let handle = ResultSetHandle::new(49);
+        let (mut transport, _) = query_transport(&[], 1, Some(handle));
+        transport.expect_fetch_results().times(1).returning(|_| {
+            let decoded = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, true)])),
+                vec![Arc::new(Int64Array::from(vec![7]))],
+            )
+            .expect("test batch");
+            Ok(ResultData {
+                columns: vec![id_column()],
+                data: ResultPayload::Arrow(decoded),
+                total_rows: 1,
+            })
+        });
+        let closes = count_closes(&mut transport, handle);
+        let (mut reader, _conn) = execute_over(transport);
+        assert_eq!(
+            reader.schema().field(0).data_type(),
+            &DataType::Decimal128(18, 0)
+        );
+        assert_eq!(reader.next().expect("a batch").unwrap().num_rows(), 0);
+
+        let error = reader
+            .next()
+            .expect("the failed read reports")
+            .expect_err("a batch that differs from the reader schema is not returned");
+
+        assert!(error.to_string().contains("ID"), "got: {error}");
+        drop(reader);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    fn int64_batch(fields: Vec<Field>) -> RecordBatch {
+        use arrow::array::Int64Array;
+        let columns = fields
+            .iter()
+            .map(|_| Arc::new(Int64Array::from(vec![1])) as Arc<dyn Array>)
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("test batch")
+    }
+
+    #[test]
+    fn reader_schema_check_rejects_a_batch_with_another_column_count() {
+        let schema = Schema::new(vec![Field::new("ID", DataType::Int64, true)]);
+        let batch = int64_batch(vec![
+            Field::new("ID", DataType::Int64, true),
+            Field::new("V", DataType::Int64, true),
+        ]);
+
+        let error =
+            matches_reader_schema(&schema, &batch).expect_err("two columns differ from one");
+
+        assert!(error.to_string().contains("1 columns"), "got: {error}");
+    }
+
+    #[test]
+    fn reader_schema_check_rejects_a_field_with_another_name_or_metadata() {
+        let expected = Field::new("ID", DataType::Int64, true)
+            .with_metadata([("exasol:type_name".to_string(), "DECIMAL".to_string())]);
+        let schema = Schema::new(vec![expected.clone()]);
+        let renamed = expected.clone().with_name("KEY");
+        let other_metadata = expected.with_metadata(arrow::datatypes::Metadata::default());
+
+        for field in [renamed, other_metadata] {
+            let batch = int64_batch(vec![field]);
+
+            let error = matches_reader_schema(&schema, &batch).expect_err("the field differs");
+
+            assert!(error.to_string().contains("column ID"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn execute_of_an_affected_row_count_returns_an_empty_reader() {
+        let (transport, _) = transport_answering(QueryResult::row_count(3));
+        let (mut reader, _conn) = execute_over(transport);
+
+        assert_eq!(reader.schema().fields().len(), 0);
+        assert!(reader.next().is_none());
     }
 
     #[test]

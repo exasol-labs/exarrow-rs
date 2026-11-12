@@ -61,6 +61,7 @@ use exarrow_rs::{ExasolType, ResultSetIterator, TypeMapper};
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Connection Constants with Default Values
@@ -789,34 +790,21 @@ pub fn assert_every_batch_carries_field_metadata(
     }
 }
 
-/// Open a connection with `connect`, execute `sql`, and return its result as an
-/// iterator, together with the connection and the runtime that owns both.
-///
-/// The iterator blocks on that runtime while it fetches, so the caller keeps
-/// the runtime and passes it to `drain_iterator`.
+/// Open a connection with `connect`, execute `sql`, and return the connection
+/// together with the result as an iterator.
 #[allow(dead_code)]
-pub fn open_iterator<F>(
-    connect: F,
-    sql: String,
-) -> (tokio::runtime::Runtime, Connection, ResultSetIterator)
+pub async fn open_iterator<F>(connect: F, sql: String) -> (Connection, ResultSetIterator)
 where
     F: std::future::Future<Output = Result<Connection, exarrow_rs::error::ExasolError>>,
 {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let (conn, iterator) = runtime.block_on(async {
-        let mut conn = connect.await.expect("Failed to connect");
-        let iterator = conn
-            .execute(sql)
-            .await
-            .expect("query should succeed")
-            .into_iterator()
-            .expect("a SELECT yields an iterator");
-        (conn, iterator)
-    });
-    (runtime, conn, iterator)
+    let mut conn = connect.await.expect("Failed to connect");
+    let iterator = conn
+        .execute(sql)
+        .await
+        .expect("query should succeed")
+        .into_iterator()
+        .expect("a SELECT yields an iterator");
+    (conn, iterator)
 }
 
 const MAX_NEXT_BATCH_CALLS: usize = 100;
@@ -824,22 +812,23 @@ const MAX_NEXT_BATCH_CALLS: usize = 100;
 /// Read `iterator` to its end and assert that it then reports no further batch
 /// on two consecutive calls. Fails after `MAX_NEXT_BATCH_CALLS` calls, so a
 /// missing end of stream cannot hang the test.
-///
-/// `next_batch` blocks on the runtime that owns the connection, so the caller
-/// passes that runtime and the helper enters it for the duration of the reads.
 #[allow(dead_code)]
-pub fn drain_iterator(
-    runtime: &tokio::runtime::Runtime,
-    iterator: &mut ResultSetIterator,
-) -> Vec<RecordBatch> {
-    let _guard = runtime.enter();
+pub async fn drain_iterator(iterator: &mut ResultSetIterator) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
     for _ in 0..MAX_NEXT_BATCH_CALLS {
-        match iterator.next_batch() {
-            Some(batch) => batches.push(batch.expect("next_batch should not fail")),
+        match iterator
+            .next_batch()
+            .await
+            .expect("next_batch should not fail")
+        {
+            Some(batch) => batches.push(batch),
             None => {
                 assert!(
-                    iterator.next_batch().is_none(),
+                    iterator
+                        .next_batch()
+                        .await
+                        .expect("next_batch after the end should not fail")
+                        .is_none(),
                     "the iterator must stay ended after it reports no further batch"
                 );
                 return batches;
@@ -847,6 +836,123 @@ pub fn drain_iterator(
         }
     }
     panic!("the iterator did not end within {MAX_NEXT_BATCH_CALLS} next_batch calls");
+}
+
+/// Assert that `batches`, read from a `multi_fetch_query` result, hold every
+/// row once in at least two batches, the first of which holds only some rows.
+#[allow(dead_code)]
+pub fn assert_multi_fetch_batches(batches: &[RecordBatch]) {
+    assert!(
+        batches.len() >= 2,
+        "expected at least two batches, got {}",
+        batches.len()
+    );
+    assert!(
+        batches[0].num_rows() < MULTI_FETCH_ROWS,
+        "the execute response should not deliver all {MULTI_FETCH_ROWS} rows"
+    );
+    assert_every_key_once(batches, MULTI_FETCH_ROWS);
+}
+
+/// Read `iterator` to its end, dropping each batch before the next call, and
+/// assert after each drop that the test holds the only reference to every
+/// column array of that batch. Returns the `V` column of each batch.
+#[allow(dead_code)]
+pub async fn drain_iterator_dropping_each_batch(
+    iterator: &mut ResultSetIterator,
+) -> Vec<RecordBatch> {
+    let mut keys = Vec::new();
+    for _ in 0..MAX_NEXT_BATCH_CALLS {
+        let Some(batch) = iterator
+            .next_batch()
+            .await
+            .expect("next_batch should not fail")
+        else {
+            return keys;
+        };
+        let key_index = batch.schema().index_of("V").expect("column V");
+        let columns = batch.columns().to_vec();
+        drop(batch);
+        for (index, column) in columns.iter().enumerate() {
+            assert_eq!(
+                Arc::strong_count(column),
+                1,
+                "column {index} of a yielded batch is still referenced after the batch was dropped"
+            );
+        }
+        let key_column = Arc::clone(&columns[key_index]);
+        keys.push(RecordBatch::try_from_iter([("V", key_column)]).expect("key batch"));
+    }
+    panic!("the iterator did not end within {MAX_NEXT_BATCH_CALLS} next_batch calls");
+}
+
+/// Assert that `conn` still runs a statement and returns its row.
+#[allow(dead_code)]
+pub async fn assert_connection_usable(conn: &mut Connection) {
+    let batches = conn
+        .query("SELECT 1 AS ONE")
+        .await
+        .expect("the connection should stay usable for later statements");
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 1);
+}
+
+/// Read the first batch of a `multi_fetch_query` result, drop the next
+/// `next_batch` future while its fetch awaits the response, and assert that the
+/// connection was terminated and refuses the next statement.
+///
+/// Exasol keeps the session of a client that disconnects during a fetch, so
+/// the helper kills it from a second connection.
+#[allow(dead_code)]
+pub async fn assert_dropped_next_batch_terminates_connection<F>(connect: impl Fn() -> F)
+where
+    F: std::future::Future<Output = Result<Connection, exarrow_rs::error::ExasolError>>,
+{
+    let (mut conn, mut iterator) = open_iterator(connect(), multi_fetch_query()).await;
+    let session_id = conn.session_id().to_string();
+    iterator
+        .next_batch()
+        .await
+        .expect("the first batch should arrive")
+        .expect("a multi-fetch result has a first batch");
+
+    let abandoned = tokio::time::timeout(Duration::ZERO, iterator.next_batch()).await;
+
+    assert!(
+        abandoned.is_err(),
+        "the fetch should still await its response when the zero timeout elapses"
+    );
+    assert!(
+        conn.is_closed().await,
+        "the connection should be terminated"
+    );
+    let error = conn
+        .execute("SELECT 1")
+        .await
+        .expect_err("a statement after the dropped fetch must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("Transport was terminated because an in-flight response was abandoned"),
+        "{message}"
+    );
+    assert!(message.contains("reconnect"), "{message}");
+    drop(iterator);
+    conn.close()
+        .await
+        .expect("close() on a terminated connection must succeed");
+
+    let mut admin = connect().await.expect("Failed to connect");
+    // Older servers drop the session on disconnect, so it may no longer exist.
+    if let Err(error) = admin
+        .execute_update(format!("KILL SESSION {session_id}"))
+        .await
+    {
+        assert!(
+            error.to_string().contains("Process does not exist"),
+            "the terminated session should be killable or gone: {error}"
+        );
+    }
+    admin.close().await.expect("close the second connection");
 }
 
 #[cfg(test)]

@@ -102,6 +102,21 @@ stmt.execute_update()
 stmt.close()
 ```
 
+### Streaming query results
+
+`execute` of a query with no bound parameters returns a reader that fetches one batch of the result from Exasol per read, so the driver's memory does not grow with the size of the result. The reader schema is available before the first read and matches every batch. A read whose fetch fails returns an error with the message of the failure.
+
+Reading the reader to its end closes the result set on the server. Releasing the reader before its end, for example by closing the cursor in Python or by dropping the reader in Rust, also closes the result set and returns after Exasol has answered the close:
+
+```python
+cursor.execute("SELECT * FROM big_table")
+for batch in cursor.fetch_record_batch():
+    print(batch.num_rows)
+cursor.close()
+```
+
+A caller that collects the whole result, such as `cursor.fetch_arrow_table()`, still holds every batch in memory. A query with bound parameters, bulk ingestion, and metadata calls such as `GetObjects` return their results in memory. Read a reader to its end or release it before you run the next statement on the same connection, because Exasol does not document whether an open result set stays readable while the session runs another statement.
+
 ### Parameters and row counts
 
 Bind parameters with `cursor.execute` or `cursor.executemany`:

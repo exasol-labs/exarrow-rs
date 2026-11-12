@@ -97,11 +97,11 @@ impl ConnectionLifecycle {
 
 /// The error of every operation on a terminated transport except `close`.
 ///
-/// The export timeout is the only caller of `terminate()` apart from `close()`,
-/// so the text names the export; a new caller of `terminate()` must revise it.
+/// An export timeout and a dropped result set request both call `terminate()`,
+/// so the text names the abandoned response, not the caller that gave up on it.
 fn terminated_error() -> TransportError {
     TransportError::ProtocolError(
-        "Transport was terminated after an export gave up on an in-flight response; \
+        "Transport was terminated because an in-flight response was abandoned; \
          reconnect before the next operation"
             .to_string(),
     )

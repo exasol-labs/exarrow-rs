@@ -49,6 +49,38 @@ for batch in results {
 
 An `INTEGER` column is `Decimal128(18, 0)`, and its `value(i)` is the integer because the scale is 0.
 
+## Streaming Results
+
+`query` keeps every batch of the result in memory. To read a large result with bounded memory, call `execute` and read the result one batch at a time:
+
+```rust
+let result_set = connection.execute("SELECT * FROM events").await?;
+let mut iterator = result_set.into_iterator()?;
+
+while let Some(batch) = iterator.next_batch().await? {
+    println!("Got {} rows", batch.num_rows());
+}
+```
+
+- The first `next_batch` call returns the rows that came with the execute response. Each later call fetches at most one batch from Exasol.
+- The iterator keeps no batch that it has returned, so memory holds about one batch at a time.
+- When the iterator reports the end of the result, it closes the result set on the server.
+
+To stop before the end, close the iterator, so that Exasol releases the result set:
+
+```rust
+let mut iterator = connection.execute("SELECT * FROM events").await?.into_iterator()?;
+
+if let Some(batch) = iterator.next_batch().await? {
+    println!("First batch has {} rows", batch.num_rows());
+}
+iterator.close().await?;
+```
+
+If you drop the iterator without `close`, the result set stays open until the session ends.
+
+If you drop a `query`, `fetch_all`, `next_batch`, or `close` future while it waits for a fetch or close response from Exasol, for example when a `tokio::time::timeout` around it elapses, the driver terminates the connection, because it can no longer match the next response to its request. Every later statement on that connection fails with `Transport was terminated because an in-flight response was abandoned; reconnect before the next operation`. Open a new connection to continue.
+
 ## Execute Update
 
 For INSERT, UPDATE, DELETE, and DDL statements:

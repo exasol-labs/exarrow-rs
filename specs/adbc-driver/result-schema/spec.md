@@ -23,3 +23,11 @@ Statement execution is specified in `adbc-driver/statement-and-results`.
 * *THEN* the field `AMOUNT` of the reader schema SHALL carry the key `exasol:type_name` with the value `DECIMAL`, the key `exasol:precision` with the value `10`, and the key `exasol:scale` with the value `2`
 * *AND* the field `NAME` of the reader schema SHALL carry the key `exasol:type_name` with the value `VARCHAR` and the key `exasol:size` with the value `20`
 * *AND* each batch that the reader yields SHALL carry the same field metadata as the reader schema
+
+### Scenario: Reader schema is available before the first read
+
+* *GIVEN* an ADBC connection opened through an ADBC driver manager that loads the driver library
+* *WHEN* a statement with no bound RecordBatch executes a query that returns zero rows, or a query whose rows need more than one fetch request, and the caller reads the RecordBatchReader schema before it reads a batch
+* *THEN* the reader schema SHALL carry the column names, the Arrow data types, and the `exasol:` field metadata of the result columns
+* *AND* reading the schema SHALL NOT send a fetch request
+* *AND* every batch that the reader returns SHALL have the field names, the Arrow data types, and the field metadata of the reader schema

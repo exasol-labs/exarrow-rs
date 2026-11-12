@@ -98,6 +98,33 @@ fn execute_select(conn: &mut impl Connection, sql: &str) -> Result<(usize, usize
     Ok((total_rows, schema.fields().len()))
 }
 
+/// Stream a result of 70,000 rows of about 1,000 bytes, which the driver
+/// fetches one batch per read, and return its row and batch counts.
+fn stream_rows(conn: &mut impl Connection) -> Result<(usize, usize), Box<dyn Error>> {
+    let mut stmt = conn.new_statement()?;
+    stmt.set_sql_query(
+        "SELECT t.v AS v, RPAD(TO_CHAR(t.v), 1000, 'x') AS s \
+         FROM VALUES BETWEEN 1 AND 70000 AS t(v)",
+    )?;
+
+    let mut reader = stmt.execute()?;
+    let schema = reader.schema();
+    let names: Vec<&str> = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect();
+    println!("Schema before first read: {}", names.join(", "));
+
+    let mut rows = 0;
+    let mut batches = 0;
+    for batch_result in reader.by_ref() {
+        rows += batch_result?.num_rows();
+        batches += 1;
+    }
+    Ok((rows, batches))
+}
+
 /// Execute a DDL/DML statement and return the affected row count.
 fn execute_update(conn: &mut impl Connection, sql: &str) -> Result<Option<i64>, Box<dyn Error>> {
     let mut stmt = conn.new_statement()?;
@@ -121,6 +148,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mut conn,
         "SELECT LEVEL AS id, 'Row ' || LEVEL AS label FROM DUAL CONNECT BY LEVEL <= 5",
     )?;
+
+    let (rows, batches) = stream_rows(&mut conn)?;
+    println!("Streamed {} rows in {} batches", rows, batches);
 
     {
         let mut reader = conn.get_info(None)?;

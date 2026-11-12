@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.0
+
+- Breaking: `ResultSetIterator::next_batch` is now `async fn next_batch(&mut self) -> Result<Option<RecordBatch>, QueryError>`, and `ResultSetIterator` no longer implements `Iterator`. Replace `for batch in result_set.into_iterator()?` with `while let Some(batch) = iterator.next_batch().await?`. The iterator now works inside any Tokio runtime, keeps no batch that it has returned, and closes the result set handle at the end of the result set. A caller that stops early awaits `close`. Dropping a `Connection::query`, `fetch_all`, `next_batch`, or `close` future while its request awaits the response, for example through `tokio::time::timeout`, now terminates the connection, and every later operation on it except `close` fails. The terminated-transport error text is now `Transport was terminated because an in-flight response was abandoned; reconnect before the next operation`. Fixes #66.
+- Changed: ADBC `execute` of SQL with no bound RecordBatch returns a reader that fetches one batch per read, so driver-manager callers no longer hold the whole result in memory before the first batch. The reader schema is available before the first read. Releasing the reader before its end closes the result set handle on the server. Fixes #66.
+
 ## 0.32.0
 
 - Breaking: on the native transport, a `TIMESTAMP WITH LOCAL TIME ZONE` column reports `exasol:type_name` `TIMESTAMP WITH LOCAL TIME ZONE` instead of `TIMESTAMP` and has the Arrow type `Timestamp(Microsecond, "UTC")` instead of `Timestamp(Microsecond, None)`, and `TypeMapper::from_field_metadata` returns `with_local_time_zone: true`, as on the WebSocket transport. ADBC `get_parameter_schema` reports such a native parameter as `Timestamp(Microsecond, "UTC")`. Native values of this type are now UTC instants. Native and WebSocket values of this type differ in a session whose time zone is not `UTC`: native returns the UTC instant, and WebSocket returns the session date and time under the time zone `UTC`. In a `EUROPE/BERLIN` session, `2024-01-02 03:04:05.123456` is `2024-01-02 02:04:05.123456 UTC` over native and `2024-01-02 03:04:05.123456 UTC` over WebSocket.

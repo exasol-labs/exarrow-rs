@@ -29,9 +29,9 @@
 //! // Execute via Connection
 //! let result_set = connection.execute_statement(&stmt).await?;
 //!
-//! // Iterate over results
-//! for batch in result_set.into_iterator()? {
-//!     let batch = batch?;
+//! // Read the results one batch at a time
+//! let mut iterator = result_set.into_iterator()?;
+//! while let Some(batch) = iterator.next_batch().await? {
 //!     println!("Batch rows: {}", batch.num_rows());
 //! }
 //! # Ok(())

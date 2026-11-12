@@ -4,7 +4,9 @@ Specifies result set retrieval, pagination, and metadata for SQL query execution
 
 ## Background
 
-Query results are retrieved efficiently with support for both small single-fetch result sets and large paginated result sets. All result data is converted to Arrow RecordBatch format with full schema metadata.
+* A result set holds the rows and the column metadata of one query, converted to Arrow RecordBatches with full schema metadata.
+* A caller reads a result set all at once with `fetch_all`, or one batch at a time with the result set iterator that `ResultSet::into_iterator` returns.
+* A result set whose rows the execute response does not fully deliver carries a result set handle, and fetch requests deliver the remaining rows.
 
 ## Scenarios
 

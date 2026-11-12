@@ -1,6 +1,6 @@
 # Feature: FFI Statement Execution
 
-Specifies how the FFI driver's ADBC Statement executes SQL with a bound RecordBatch: how many prepared-statement executions reach Exasol, what `execute` and `execute_update` return, what a failed batch leaves in the database, and which affected-row count a driver manager reads after `execute`.
+Specifies how the FFI driver's ADBC Statement executes SQL, with or without a bound RecordBatch: how many prepared-statement executions reach Exasol, what `execute` and `execute_update` return, what a failed batch leaves in the database, and which affected-row count a driver manager reads after `execute`.
 
 ## Background
 
