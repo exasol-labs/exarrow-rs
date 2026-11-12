@@ -10,10 +10,8 @@
 //!
 //! - [`NoVerifier`] accepts any certificate (used when validation is disabled).
 //! - [`FingerprintVerifier`] validates by SHA-256 fingerprint of the DER-encoded
-//!   certificate, bypassing hostname and CA-chain validation.
-//!
-//! Both report the same set of supported signature schemes via
-//! [`all_supported_verify_schemes`].
+//!   certificate, bypassing hostname and CA-chain validation, and verifies the
+//!   handshake signature against that certificate.
 
 #[cfg(any(feature = "websocket", feature = "native"))]
 use std::sync::Arc;
@@ -41,9 +39,7 @@ pub(crate) fn client_config(
     if let Some(fingerprint) = certificate_fingerprint {
         return rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
-                expected_fingerprint: fingerprint.to_string(),
-            }))
+            .with_custom_certificate_verifier(Arc::new(FingerprintVerifier::new(fingerprint)))
             .with_no_client_auth();
     }
     if validate_server_certificate {
@@ -85,7 +81,7 @@ pub(crate) async fn client_handshake(
         .map_err(|e| TransportError::TlsError(e.to_string()))
 }
 
-/// The signature schemes advertised by the custom verifiers.
+/// The signature schemes that [`NoVerifier`] advertises.
 pub(crate) fn all_supported_verify_schemes() -> Vec<rustls::SignatureScheme> {
     vec![
         rustls::SignatureScheme::RSA_PKCS1_SHA256,
@@ -99,40 +95,6 @@ pub(crate) fn all_supported_verify_schemes() -> Vec<rustls::SignatureScheme> {
         rustls::SignatureScheme::RSA_PSS_SHA512,
         rustls::SignatureScheme::ED25519,
     ]
-}
-
-/// Emits the [`rustls::client::danger::ServerCertVerifier`] members that every
-/// verifier in this module shares.
-///
-/// Both verifiers deliberately skip handshake-signature checking — they
-/// establish trust from the certificate itself (or from the operator's explicit
-/// decision to skip validation), never from the signature — and both advertise
-/// the same scheme list. Only `verify_server_cert` differs, so it stays
-/// hand-written per verifier while these three members are generated once.
-macro_rules! accept_any_handshake_signature {
-    () => {
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            all_supported_verify_schemes()
-        }
-    };
 }
 
 /// A certificate verifier that accepts any certificate.
@@ -152,10 +114,32 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
-    accept_any_handshake_signature!();
+    // Validation is off by the operator's choice, so a signature check would add no trust.
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        all_supported_verify_schemes()
+    }
 }
 
-/// A certificate verifier that validates by SHA-256 fingerprint of the DER-encoded certificate.
+/// A certificate verifier that pins the SHA-256 fingerprint of the DER-encoded
+/// certificate and checks that the handshake is signed with that certificate's key.
 /// Bypasses hostname and CA chain validation.
 ///
 /// Only the WebSocket and native-TCP transports construct this; gate it on those
@@ -163,7 +147,19 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 #[cfg(any(feature = "websocket", feature = "native"))]
 #[derive(Debug)]
 pub(crate) struct FingerprintVerifier {
-    pub(crate) expected_fingerprint: String,
+    expected_fingerprint: String,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+#[cfg(any(feature = "websocket", feature = "native"))]
+impl FingerprintVerifier {
+    pub(crate) fn new(expected_fingerprint: &str) -> Self {
+        Self {
+            expected_fingerprint: expected_fingerprint.to_string(),
+            algorithms: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
 }
 
 #[cfg(any(feature = "websocket", feature = "native"))]
@@ -193,7 +189,28 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
         }
     }
 
-    accept_any_handshake_signature!();
+    // Like CA validation, check that the handshake is signed with the pinned certificate's key.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
 }
 
 #[cfg(test)]
@@ -238,10 +255,9 @@ mod tests {
     /// `rustls::internal` is documented by rustls itself as "used in
     /// integration tests... DOES NOT form part of the stable interface", so a
     /// rustls upgrade (even a patch release) can break this function. If it
-    /// does, delete this function and the two `verify_tls1{2,3}_signature`
-    /// assertions in `assert_shared_verifier_members_are_permissive` below —
-    /// keep its `supported_verify_schemes` assertion, which needs no internal
-    /// API and does not depend on this helper.
+    /// does, delete this function and the `verify_tls1{2,3}_signature`
+    /// assertions that use it; keep the `supported_verify_schemes` assertions,
+    /// which need no internal API.
     fn digitally_signed_struct() -> rustls::DigitallySignedStruct {
         const RSA_PKCS1_SHA256: [u8; 2] = [0x04, 0x01];
         let signature: &[u8] = b"not-a-real-signature";
@@ -257,10 +273,9 @@ mod tests {
         dss
     }
 
-    /// Asserts the members the `accept_any_handshake_signature!` macro generates
-    /// for every verifier: neither handshake-signature check inspects anything,
-    /// and the advertised scheme list is the shared one.
-    fn assert_shared_verifier_members_are_permissive(verifier: &dyn ServerCertVerifier) {
+    #[test]
+    fn no_verifier_accepts_any_handshake_signature_and_advertises_the_shared_schemes() {
+        let verifier = NoVerifier;
         let signature = digitally_signed_struct();
 
         assert!(
@@ -340,15 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn no_verifier_accepts_any_handshake_signature_and_advertises_the_shared_schemes() {
-        assert_shared_verifier_members_are_permissive(&NoVerifier);
-    }
-
-    #[test]
     fn fingerprint_verifier_accepts_a_certificate_whose_sha256_matches() {
-        let verifier = FingerprintVerifier {
-            expected_fingerprint: CERTIFICATE_SHA256_HEX.to_string(),
-        };
+        let verifier = FingerprintVerifier::new(CERTIFICATE_SHA256_HEX);
 
         let result =
             verifier.verify_server_cert(&certificate(), &[], &server_name(), &[], fixed_now());
@@ -362,9 +370,7 @@ mod tests {
 
     #[test]
     fn fingerprint_verifier_ignores_hostname_and_intermediates_when_the_hash_matches() {
-        let verifier = FingerprintVerifier {
-            expected_fingerprint: CERTIFICATE_SHA256_HEX.to_string(),
-        };
+        let verifier = FingerprintVerifier::new(CERTIFICATE_SHA256_HEX);
         let intermediate = CertificateDer::from(b"untrusted-intermediate".to_vec());
 
         let result = verifier.verify_server_cert(
@@ -381,9 +387,7 @@ mod tests {
     #[test]
     fn fingerprint_verifier_rejects_a_certificate_whose_sha256_differs() {
         let expected = "0".repeat(64);
-        let verifier = FingerprintVerifier {
-            expected_fingerprint: expected.clone(),
-        };
+        let verifier = FingerprintVerifier::new(&expected);
 
         let error = verifier
             .verify_server_cert(&certificate(), &[], &server_name(), &[], fixed_now())
@@ -402,9 +406,7 @@ mod tests {
 
     #[test]
     fn fingerprint_verifier_rejects_the_correct_hash_in_uppercase_hex() {
-        let verifier = FingerprintVerifier {
-            expected_fingerprint: CERTIFICATE_SHA256_HEX.to_uppercase(),
-        };
+        let verifier = FingerprintVerifier::new(&CERTIFICATE_SHA256_HEX.to_uppercase());
 
         let error = verifier
             .verify_server_cert(&certificate(), &[], &server_name(), &[], fixed_now())
@@ -421,9 +423,7 @@ mod tests {
 
     #[test]
     fn fingerprint_verifier_rejects_an_empty_expected_fingerprint() {
-        let verifier = FingerprintVerifier {
-            expected_fingerprint: String::new(),
-        };
+        let verifier = FingerprintVerifier::new("");
 
         let result =
             verifier.verify_server_cert(&certificate(), &[], &server_name(), &[], fixed_now());
@@ -431,11 +431,32 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Scenario: Certificate fingerprint requires a valid handshake signature
     #[test]
-    fn fingerprint_verifier_accepts_any_handshake_signature_and_advertises_the_shared_schemes() {
-        assert_shared_verifier_members_are_permissive(&FingerprintVerifier {
-            expected_fingerprint: CERTIFICATE_SHA256_HEX.to_string(),
-        });
+    fn fingerprint_verifier_rejects_a_handshake_signature_that_does_not_verify() {
+        let verifier = FingerprintVerifier::new(CERTIFICATE_SHA256_HEX);
+        let signature = digitally_signed_struct();
+
+        assert!(verifier
+            .verify_tls12_signature(b"transcript", &certificate(), &signature)
+            .is_err());
+        assert!(verifier
+            .verify_tls13_signature(b"transcript", &certificate(), &signature)
+            .is_err());
+    }
+
+    #[test]
+    fn fingerprint_verifier_advertises_only_the_schemes_it_can_verify() {
+        let verifier = FingerprintVerifier::new(CERTIFICATE_SHA256_HEX);
+        let verifiable = rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes();
+
+        let advertised = verifier.supported_verify_schemes();
+
+        assert_eq!(advertised, verifiable);
+        assert!(!advertised.contains(&rustls::SignatureScheme::RSA_PKCS1_SHA1));
+        assert!(!advertised.contains(&rustls::SignatureScheme::ECDSA_SHA1_Legacy));
     }
 
     #[cfg(any(feature = "websocket", feature = "native"))]
@@ -443,8 +464,18 @@ mod tests {
         use super::super::{client_config, client_handshake};
         use crate::error::TransportError;
         use crate::transport::test_support::{finish_within, SilentServer, LOOPBACK_TEST_BOUND};
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::crypto::aws_lc_rs::sign::any_supported_type;
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::server::{ClientHello, ResolvesServerCert};
+        use rustls::sign::CertifiedKey;
+        use rustls::version::{TLS12, TLS13};
+        use rustls::{ServerConfig, SupportedProtocolVersion};
         use sha2::{Digest, Sha256};
-        use tokio::net::TcpStream;
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_rustls::TlsAcceptor;
 
         /// The name the self-signed certificate of `SilentServer::after_tls` is issued for.
         const HOST: &str = "localhost";
@@ -515,6 +546,106 @@ mod tests {
                         .await
                         .expect_err("the client must reject the certificate");
                     assert!(matches!(error, TransportError::TlsError(_)), "{error:?}");
+                }
+            })
+            .await;
+        }
+
+        /// Serves one fixed certificate and signs the handshake with a key
+        /// that need not belong to it, which `with_single_cert` would refuse.
+        #[derive(Debug)]
+        struct FixedCertificate(Arc<CertifiedKey>);
+
+        impl ResolvesServerCert for FixedCertificate {
+            fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        /// A loopback TLS server for one connection that presents the
+        /// certificate of `certificate_key` and signs with `signing_key`.
+        async fn pinned_server(
+            certificate_key: &KeyPair,
+            signing_key: &KeyPair,
+            version: &'static SupportedProtocolVersion,
+        ) -> (u16, String) {
+            let certificate = CertificateParams::new(vec![HOST.to_string()])
+                .expect("certificate params")
+                .self_signed(certificate_key)
+                .expect("self-sign the certificate");
+            let certificate_der = certificate.der().clone();
+            let fingerprint = lowercase_sha256_hex(&certificate_der);
+            let signer =
+                any_supported_type(&PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()))
+                    .expect("load the signing key");
+            let resolver =
+                FixedCertificate(Arc::new(CertifiedKey::new(vec![certificate_der], signer)));
+            let server_config = ServerConfig::builder_with_protocol_versions(&[version])
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(resolver));
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("local address").port();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept the connection");
+                // A client that rejects the handshake ends the peer here.
+                if let Ok(mut tls_stream) = acceptor.accept(stream).await {
+                    let mut buffer = [0u8; 64];
+                    while matches!(tls_stream.read(&mut buffer).await, Ok(n) if n > 0) {}
+                }
+            });
+            (port, fingerprint)
+        }
+
+        async fn pinned_handshake(
+            certificate_key: &KeyPair,
+            signing_key: &KeyPair,
+            version: &'static SupportedProtocolVersion,
+        ) -> Result<(), TransportError> {
+            let (port, fingerprint) = pinned_server(certificate_key, signing_key, version).await;
+            let tcp = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect to the loopback server");
+            client_handshake(tcp, HOST, client_config(Some(&fingerprint), false))
+                .await
+                .map(drop)
+        }
+
+        /// Scenario: Certificate fingerprint requires a valid handshake signature
+        #[tokio::test]
+        async fn pinned_handshake_fails_when_the_server_signs_with_another_key() {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                let mut outcomes = Vec::new();
+                for version in [&TLS12, &TLS13] {
+                    let certificate_key = KeyPair::generate().expect("certificate key");
+                    let other_key = KeyPair::generate().expect("other key");
+                    let result = pinned_handshake(&certificate_key, &other_key, version).await;
+                    outcomes.push((version.version, result));
+                }
+
+                for (version, result) in &outcomes {
+                    assert!(
+                        matches!(result, Err(TransportError::TlsError(message)) if message.contains("BadSignature")),
+                        "{version:?} must reject a handshake signed with another key: {outcomes:?}"
+                    );
+                }
+            })
+            .await;
+        }
+
+        /// Scenario: Certificate fingerprint requires a valid handshake signature
+        #[tokio::test]
+        async fn pinned_handshake_completes_when_the_server_signs_with_the_certificate_key() {
+            finish_within(LOOPBACK_TEST_BOUND, async {
+                for version in [&TLS12, &TLS13] {
+                    let certificate_key = KeyPair::generate().expect("certificate key");
+
+                    pinned_handshake(&certificate_key, &certificate_key, version)
+                        .await
+                        .unwrap_or_else(|error| panic!("{:?}: {error:?}", version.version));
                 }
             })
             .await;
