@@ -249,7 +249,7 @@ impl NativeTcpTransport {
         Ok((header, self.recv_buf.clone()))
     }
 
-    /// Send a command and receive its response, handling StillExecuting retries.
+    /// Send a command and receive its response; Exasol pushes `R_StillExecuting` unprompted, so the loop sends nothing (#103).
     /// The response payload is stored in `self.recv_buf`; only the header is returned.
     /// This avoids cloning the payload — callers access `self.recv_buf` directly.
     async fn send_and_fill_buf(
@@ -276,7 +276,7 @@ impl NativeTcpTransport {
         }
     }
 
-    /// Send a command and receive its response, handling StillExecuting retries.
+    /// Same as `send_and_fill_buf`, including its `R_StillExecuting` wait, but returns a copy of the payload.
     async fn send_and_receive(
         &mut self,
         command: u8,
@@ -2833,6 +2833,10 @@ mod tests {
     }
 
     fn row_count_response(attrs: &AttributeSet) -> Vec<u8> {
+        row_count_response_of(attrs, 0)
+    }
+
+    fn row_count_response_of(attrs: &AttributeSet, count: i64) -> Vec<u8> {
         let mut payload = attrs.serialize();
         let mut header = MessageHeader::new(
             CMD_EXECUTE,
@@ -2843,7 +2847,17 @@ mod tests {
         );
         payload.extend_from_slice(&1i32.to_le_bytes());
         payload.push(constants::R_ROW_COUNT as u8);
-        payload.extend_from_slice(&0i64.to_le_bytes());
+        payload.extend_from_slice(&count.to_le_bytes());
+        header.message_length = payload.len() as u32;
+        let mut wire = header.serialize().to_vec();
+        wire.extend_from_slice(&payload);
+        wire
+    }
+
+    fn still_executing_response() -> Vec<u8> {
+        let mut payload = 1i32.to_le_bytes().to_vec();
+        payload.push(constants::R_STILL_EXECUTING as u8);
+        let mut header = MessageHeader::new(CMD_EXECUTE, 1, 0, 0, 1);
         header.message_length = payload.len() as u32;
         let mut wire = header.serialize().to_vec();
         wire.extend_from_slice(&payload);
@@ -2873,11 +2887,66 @@ mod tests {
         transport
     }
 
+    /// Read one request, push every response back to back, then collect all
+    /// bytes the driver sends until it disconnects.
+    async fn transport_pushing(
+        responses: Vec<Vec<u8>>,
+    ) -> (NativeTcpTransport, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_SIZE];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let len = MessageHeader::parse(&hdr).unwrap().message_length as usize;
+            let mut body = vec![0u8; len];
+            sock.read_exact(&mut body).await.unwrap();
+            for response in responses {
+                sock.write_all(&response).await.unwrap();
+            }
+            let mut after_request = Vec::new();
+            sock.read_to_end(&mut after_request)
+                .await
+                .expect("the fake server reads what the driver sends until it disconnects");
+            after_request
+        });
+        let mut transport = NativeTcpTransport::new();
+        transport.stream = Some(NativeStream::Plain(TcpStream::connect(addr).await.unwrap()));
+        transport.lifecycle = ConnectionLifecycle::in_state(ConnectionState::Authenticated);
+        (transport, server)
+    }
+
     fn schema_attrs(schema: &str) -> AttributeSet {
         attribute_set(&[(
             ATTR_CURRENT_SCHEMA,
             AttributeValue::String(schema.to_owned()),
         )])
+    }
+
+    /// Scenario: Still-executing handling
+    #[tokio::test]
+    async fn still_executing_responses_are_awaited_without_sending_a_command() {
+        let (mut transport, server) = transport_pushing(vec![
+            still_executing_response(),
+            still_executing_response(),
+            still_executing_response(),
+            row_count_response_of(&AttributeSet::new(), 7),
+        ])
+        .await;
+
+        let result = finish_within(LOOPBACK_TEST_BOUND, transport.execute_query("SELECT 1"))
+            .await
+            .unwrap();
+        drop(transport);
+
+        assert!(matches!(result, QueryResult::RowCount { count: 7 }));
+        let sent_after_request = finish_within(DISCONNECT_BOUND, server).await.unwrap();
+        assert!(
+            sent_after_request.is_empty(),
+            "the driver sent {} bytes after the CMD_EXECUTE request",
+            sent_after_request.len()
+        );
     }
 
     /// Scenario: Track the current schema attribute from responses
