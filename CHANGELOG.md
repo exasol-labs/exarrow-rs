@@ -2,7 +2,7 @@
 
 ## 0.34.0
 
-- Changed: a connection with `certificate_fingerprint` also verifies the server's TLS handshake signature against the pinned certificate, on the native and WebSocket transports, as certificate chain validation does. The server must sign the handshake with the pinned certificate's private key. The pinned connection no longer offers the SHA-1 signature schemes.
+- Changed: a connection with `certificate_fingerprint` also verifies the server's TLS handshake signature against the pinned certificate, on the native and WebSocket transports, as certificate chain validation does. The server must sign the handshake with the pinned certificate's private key.
 
 ## 0.33.1
 
