@@ -41,9 +41,11 @@ Every command is a binary message: a 21-byte header followed by an attribute set
 ### Scenario: Still-executing handling
 
 * *GIVEN* an authenticated native TCP session exists
-* *WHEN* the server responds with `R_StillExecuting` (5)
-* *THEN* the system SHALL send `CMD_CONTINUE` (38) to poll for completion
-* *AND* the system SHALL repeat until a final result type is received
+* *AND* the driver has sent a command and awaits its response
+* *WHEN* the server sends one or more `R_StillExecuting` (5) responses for that command, followed by a response of another result type
+* *THEN* the system SHALL read each `R_StillExecuting` response and wait for the next response message
+* *AND* the system MUST NOT send `CMD_CONTINUE` (38) or any other message while it waits, because the server sends the `R_StillExecuting` responses and the final response without a request
+* *AND* the system SHALL return the first response of another result type as the response to the command
 
 ### Scenario: Set session attributes
 

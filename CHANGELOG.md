@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.1
+
+- Docs: the native protocol spec now says the driver waits for Exasol's `R_StillExecuting` messages and sends no `CMD_CONTINUE`, because Exasol sends them and the final response without a request. Driver behavior is unchanged. Fixes #103.
+
 ## 0.33.0
 
 - Breaking: `ResultSetIterator::next_batch` is now `async fn next_batch(&mut self) -> Result<Option<RecordBatch>, QueryError>`, and `ResultSetIterator` no longer implements `Iterator`. Replace `for batch in result_set.into_iterator()?` with `while let Some(batch) = iterator.next_batch().await?`. The iterator now works inside any Tokio runtime, keeps no batch that it has returned, and closes the result set handle at the end of the result set. A caller that stops early awaits `close`. Dropping a `Connection::query`, `fetch_all`, `next_batch`, or `close` future while its request awaits the response, for example through `tokio::time::timeout`, now terminates the connection, and every later operation on it except `close` fails. The terminated-transport error text is now `Transport was terminated because an in-flight response was abandoned; reconnect before the next operation`. Fixes #66.
