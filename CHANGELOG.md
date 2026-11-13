@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.0
+
+- Changed: a connection with `certificate_fingerprint` also verifies the server's TLS handshake signature against the pinned certificate, on the native and WebSocket transports, as certificate chain validation does. The server must sign the handshake with the pinned certificate's private key.
+
 ## 0.33.1
 
 - Docs: the native protocol spec now says the driver waits for Exasol's `R_StillExecuting` messages and sends no `CMD_CONTINUE`, because Exasol sends them and the final response without a request. Driver behavior is unchanged. Fixes #103.
