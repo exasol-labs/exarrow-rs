@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.2
+
+- Fixed: the package manifest drops `homepage`, which repeated `repository` and made newer Cargo versions warn, which fails builds that deny warnings.
+
 ## 0.34.1
 
 - Fixed: CI accepts the new RUSTSEC-2026-0543 advisory (chrono is unmaintained), which arrow pulls in. 0.34.0 was never published, so this release also carries its change below.
