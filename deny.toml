@@ -1,5 +1,7 @@
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "RUSTSEC-2026-0543: chrono is unmaintained (no security flaw, no fixed version). Blocker: arrow 60 depends on chrono, so it stays in the tree even if exarrow-rs drops its direct use. Re-evaluate when arrow drops chrono or a chrono security advisory appears." },
+]
 
 [licenses]
 allow = [
