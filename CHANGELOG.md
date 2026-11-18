@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.34.0
+## 0.34.1
+
+- Fixed: CI accepts the new RUSTSEC-2026-0543 advisory (chrono is unmaintained), which arrow pulls in. 0.34.0 was never published, so this release also carries its change below.
 
 - Changed: a connection with `certificate_fingerprint` also verifies the server's TLS handshake signature against the pinned certificate, on the native and WebSocket transports, as certificate chain validation does. The server must sign the handshake with the pinned certificate's private key.
 
