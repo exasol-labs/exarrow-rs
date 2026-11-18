@@ -40,4 +40,12 @@ TLS is enabled by default for production Exasol connections.
 * *AND* `certificate_fingerprint` is set
 * *WHEN* the TLS handshake completes
 * *THEN* the driver SHALL skip standard certificate chain and hostname validation
-* *AND* it SHALL rely solely on the fingerprint match for trust
+* *AND* it SHALL trust the server on the fingerprint match and a valid handshake signature, with no CA or hostname check
+
+### Scenario: Certificate fingerprint requires a valid handshake signature
+
+* *GIVEN* a TLS connection is being established
+* *AND* `certificate_fingerprint` is set to the SHA-256 hex fingerprint of the certificate that the server presents
+* *WHEN* the server signs the TLS 1.2 or TLS 1.3 handshake
+* *THEN* the driver SHALL verify the handshake signature against the presented certificate's public key
+* *AND* it SHALL reject the connection with a TLS error when the signature does not verify, as certificate chain validation does
