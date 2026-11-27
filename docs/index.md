@@ -1,6 +1,6 @@
 # exarrow-rs Documentation
 
-![exarrow-rs logo](../assets/exarrow-logo.svg)
+<img src="../assets/logo.svg" alt="exarrow-rs logo" width="160">
 
 ADBC-compatible driver for Exasol with Apache Arrow data format support.
 

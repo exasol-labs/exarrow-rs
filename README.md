@@ -1,6 +1,8 @@
 <div align="center">
 
-![exarrow-rs logo](assets/exarrow-logo.svg)
+<img src="assets/logo.svg" alt="exarrow-rs logo" width="160">
+
+# exarrow-rs
 
 [![Crates.io](https://img.shields.io/crates/v/exarrow-rs.svg)](https://crates.io/crates/exarrow-rs)
 [![Documentation](https://docs.rs/exarrow-rs/badge.svg)](https://docs.rs/exarrow-rs)
