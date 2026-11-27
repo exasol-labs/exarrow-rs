@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.3
+
+- Fixed: the lockfile moves `parquet` and `arrow` to 60.2.0 for RUSTSEC-2026-0595 (bloom filters written as plaintext in encrypted Parquet files).
+
 ## 0.34.2
 
 - Fixed: the package manifest drops `homepage`, which repeated `repository` and made newer Cargo versions warn, which fails builds that deny warnings.
